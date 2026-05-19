@@ -46,7 +46,7 @@ R2_CHUNKS    = 8
 CONCURRENCY  = 15     # parallel Upstox calls (stay under rate limit)
 FUND_CONCURRENCY = 1  # sequential — avoid rate limit
 RETRY        = 3
-SLEEP_MS     = 2.0    # rate limit guard for fundamentals
+SLEEP_MS     = 3.0    # rate limit guard for fundamentals
 
 HERE = Path(__file__).parent
 
@@ -204,8 +204,8 @@ async def _upstox_get(client: httpx.AsyncClient, sem: asyncio.Semaphore, endpoin
                 log.error("❌ TOKEN EXPIRED")
                 sys.exit(1)
             if r.status_code == 429:
-                log.warning("  Rate limited — waiting 10s")
-                await asyncio.sleep(10)
+                log.warning("  Rate limited — waiting 30s")
+                await asyncio.sleep(30)
                 continue
             if r.status_code != 200:
                 return None
