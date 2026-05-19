@@ -419,20 +419,12 @@ async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
     log.info(f"BSE CSV sample row: {lines[1] if len(lines)>1 else 'none'}")
 
     # Find date column flexibly
-    date_idx = -1
-    for candidate in ["BOARD_MEETING_DATE", "MEETING_DATE", "DATE"]:
-        if candidate in headers_row:
-            date_idx = headers_row.index(candidate)
-            break
-    if date_idx == -1:
-        date_idx = next((i for i,h in enumerate(headers_row) if "DATE" in h or "MEET" in h), -1)
+    date_idx = next((i for i,h in enumerate(headers_row) if "DATE" in h.upper() or "RESULT" in h.upper()), -1)
 
-    # Find name column flexibly
-    name_idx = -1
-    for candidate in ["SCRIP_NAME", "SYMBOL", "NAME", "SECURITY_NAME"]:
-        if candidate in headers_row:
-            name_idx = headers_row.index(candidate)
-            break
+    # Find name column flexibly — "Security Name" is BSE short name (like NSE symbol)
+    name_idx = next((i for i,h in enumerate(headers_row) if "SECURITY" in h.upper() and "NAME" in h.upper()), -1)
+    if name_idx == -1:
+        name_idx = next((i for i,h in enumerate(headers_row) if "NAME" in h.upper()), -1)
 
     if date_idx == -1 or name_idx == -1:
         log.warning(f"BSE CSV column not found — headers: {headers_row}")
@@ -443,10 +435,19 @@ async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
     isin_symbols = set(ISIN_MAP.keys())
 
     def normalize_date(val):
-        val = val.strip()
         import re
-        m = re.match(r'^(\d{2})-(\d{2})-(\d{4})$', val)
-        if m: return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        val = val.strip()
+        # "19 May 2026" format
+        MONTHS = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+                  "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
+        m = re.match(r'^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$', val)
+        if m:
+            mon = MONTHS.get(m.group(2)[:3].lower())
+            if mon: return f"{m.group(3)}-{mon}-{m.group(1).zfill(2)}"
+        # "20-05-2026" format
+        m2 = re.match(r'^(\d{2})-(\d{2})-(\d{4})$', val)
+        if m2: return f"{m2.group(3)}-{m2.group(2)}-{m2.group(1)}"
+        # Already ISO
         if re.match(r'\d{4}-\d{2}-\d{2}', val): return val[:10]
         return val
 
