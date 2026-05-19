@@ -1,0 +1,30 @@
+name: OHLC Daily
+
+on:
+  schedule:
+    # 4:00 PM IST = 10:30 UTC  (weekdays only)
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:   # manual trigger from Actions tab
+
+jobs:
+  ohlc-daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run daily OHLC pipeline
+        run: python pipeline.py daily
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
