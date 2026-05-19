@@ -377,12 +377,58 @@ async def fetch_one_fundamental(client, sem, sym, isin):
         return sym, None
 
     obj = {"symbol": sym, "updated": today_ist()}
+
+    # Ratios
     if ratios: obj.update(ratios)
+
+    # Shareholding — flat keys
     if sh: obj.update({k: sh[k] for k in sh})
-    if income: obj.update({k: income[k] for k in income})
-    obj["_bs"] = bs or {}
-    obj["_cf"] = cf or {}
-    obj["_ca"] = ca or {}
+
+    # Income — flat keys (q1_period, q1_sales, etc.)
+    if income:
+        quarters = income.get("quarters", [])
+        for i, q in enumerate(quarters[:4]):
+            n = i + 1
+            obj[f"q{n}_period"]   = q
+            obj[f"q{n}_sales"]    = income["sales"][i]    if i < len(income.get("sales",[]))    else ""
+            obj[f"q{n}_sales_ch"] = income["sales_ch"][i] if i < len(income.get("sales_ch",[])) else ""
+            obj[f"q{n}_op"]       = income["op"][i]       if i < len(income.get("op",[]))       else ""
+            obj[f"q{n}_op_ch"]    = income["op_ch"][i]    if i < len(income.get("op_ch",[]))    else ""
+            obj[f"q{n}_pat"]      = income["pat"][i]      if i < len(income.get("pat",[]))      else ""
+            obj[f"q{n}_pat_ch"]   = income["pat_ch"][i]   if i < len(income.get("pat_ch",[]))   else ""
+            obj[f"q{n}_eps"]      = income["eps"][i]      if i < len(income.get("eps",[]))      else ""
+            obj[f"q{n}_eps_d"]    = income["eps_d"][i]    if i < len(income.get("eps_d",[]))    else ""
+
+    # Balance Sheet — flat keys (bs_y1_period, bs_y1_assets, etc.)
+    if bs:
+        obj["bs_type"]  = bs.get("bs_type", "")
+        obj["bs_units"] = bs.get("bs_units", "crore")
+        for i in range(4):
+            n = i + 1
+            obj[f"bs_y{n}_period"]       = bs["bs_periods"][i]       if i < len(bs.get("bs_periods",[]))       else ""
+            obj[f"bs_y{n}_assets"]       = bs["bs_assets"][i]        if i < len(bs.get("bs_assets",[]))        else ""
+            obj[f"bs_y{n}_liab"]         = bs["bs_liab"][i]          if i < len(bs.get("bs_liab",[]))          else ""
+            obj[f"bs_y{n}_equity"]       = bs["bs_equity"][i]        if i < len(bs.get("bs_equity",[]))        else ""
+            obj[f"bs_y{n}_cur_assets"]   = bs["bs_cur_assets"][i]    if i < len(bs.get("bs_cur_assets",[]))    else ""
+            obj[f"bs_y{n}_noncur_assets"]= bs["bs_noncur_assets"][i] if i < len(bs.get("bs_noncur_assets",[])) else ""
+            obj[f"bs_y{n}_cur_liab"]     = bs["bs_cur_liab"][i]      if i < len(bs.get("bs_cur_liab",[]))      else ""
+            obj[f"bs_y{n}_noncur_liab"]  = bs["bs_noncur_liab"][i]   if i < len(bs.get("bs_noncur_liab",[]))   else ""
+
+    # Cash Flow — flat keys (cf_y1_period, cf_y1_op, etc.)
+    if cf:
+        obj["cf_type"]  = cf.get("cf_type", "")
+        obj["cf_units"] = cf.get("cf_units", "crore")
+        for i in range(4):
+            n = i + 1
+            obj[f"cf_y{n}_period"] = cf["cf_periods"][i] if i < len(cf.get("cf_periods",[])) else ""
+            obj[f"cf_y{n}_op"]     = cf["cf_op"][i]      if i < len(cf.get("cf_op",[]))      else ""
+            obj[f"cf_y{n}_op_ch"]  = cf["cf_op_ch"][i]   if i < len(cf.get("cf_op_ch",[]))   else ""
+            obj[f"cf_y{n}_inv"]    = cf["cf_inv"][i]     if i < len(cf.get("cf_inv",[]))     else ""
+            obj[f"cf_y{n}_fin"]    = cf["cf_fin"][i]     if i < len(cf.get("cf_fin",[]))     else ""
+            obj[f"cf_y{n}_fcf"]    = cf["cf_fcf"][i]     if i < len(cf.get("cf_fcf",[]))     else ""
+
+    # Corporate Actions — flat keys
+    if ca: obj.update(ca)
     return sym, obj
 
 
@@ -495,14 +541,19 @@ async def r2_download_fund(client: httpx.AsyncClient) -> dict:
         raise RuntimeError(f"Download failed: HTTP {r.status_code}")
     log.info(f"  ↓ fundamentals.json ({len(r.content)/1024:.0f} KB)")
     data = r.json()
-    # Handle both formats: {"updated":..., "stocks": {...}} or direct dict
+    # Handle Array format (new Python pipeline)
+    if isinstance(data, list):
+        return {d["symbol"]: d for d in data if d.get("symbol")}
+    # Handle dict format: {"updated":..., "stocks": {...}}
     if isinstance(data, dict):
         return data.get("stocks", data)
-    return {}  # fallback — start fresh
+    return {}  # fallback
 
 
 async def r2_upload_fund(client: httpx.AsyncClient, data: dict) -> None:
-    payload = json.dumps({"updated": today_ist(), "stocks": data})
+    # Website expects Array of objects (GAS format)
+    arr = list(data.values())
+    payload = json.dumps(arr)
     url = f"{WORKER_URL}?file=fundamentals.json"
     r = await client.post(
         url,
