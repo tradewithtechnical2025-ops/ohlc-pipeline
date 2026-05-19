@@ -1,0 +1,26 @@
+name: Fundamentals Weekly Part 10
+
+on:
+  schedule:
+    # 06:00 PM IST Sun
+    - cron: '30 12 * * 0'
+  workflow_dispatch:
+
+jobs:
+  fund-weekly-10:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install httpx
+      - name: Run fundamentals weekly part 10
+        run: python pipeline.py fund_weekly_10
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
