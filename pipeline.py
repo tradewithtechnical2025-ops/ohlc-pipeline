@@ -391,16 +391,16 @@ async def fetch_one_fundamental(client, sem, sym, isin):
 async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
     """Fetch today's BSE result symbols using BSE API."""
     today = today_ist()
-    next30 = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
+    next_day = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
 
     url = (f"https://api.bseindia.com/BseIndiaAPI/api/DownloadCSV1/w"
-           f"?fromdate={today}&todate={next30}&scripcode=")
-    headers = {
+           f"?fromdate={today}&todate={next_day}&scripcode=")
+    req_headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://www.bseindia.com/"
     }
     try:
-        r = await client.get(url, headers=headers, timeout=30)
+        r = await client.get(url, headers=req_headers, timeout=30)
         if r.status_code != 200:
             log.warning(f"BSE API returned {r.status_code}")
             return []
@@ -410,27 +410,74 @@ async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
 
     lines = r.text.strip().splitlines()
     if len(lines) < 2:
+        log.info("BSE CSV empty — no results today")
         return []
 
-    headers_row = [h.strip() for h in lines[0].split(",")]
-    try:
-        scrip_idx = headers_row.index("SCRIP_CD")
-        name_idx  = headers_row.index("SCRIP_NAME") if "SCRIP_NAME" in headers_row else -1
-        date_idx  = headers_row.index("BOARD_MEETING_DATE") if "BOARD_MEETING_DATE" in headers_row else -1
-    except ValueError:
-        log.warning("BSE CSV column mismatch")
+    # Parse headers flexibly
+    headers_row = [h.strip().strip('"') for h in lines[0].split(",")]
+    log.info(f"BSE CSV headers: {headers_row}")
+    log.info(f"BSE CSV sample row: {lines[1] if len(lines)>1 else 'none'}")
+
+    # Find date column flexibly
+    date_idx = -1
+    for candidate in ["BOARD_MEETING_DATE", "MEETING_DATE", "DATE"]:
+        if candidate in headers_row:
+            date_idx = headers_row.index(candidate)
+            break
+    if date_idx == -1:
+        date_idx = next((i for i,h in enumerate(headers_row) if "DATE" in h or "MEET" in h), -1)
+
+    # Find name column flexibly
+    name_idx = -1
+    for candidate in ["SCRIP_NAME", "SYMBOL", "NAME", "SECURITY_NAME"]:
+        if candidate in headers_row:
+            name_idx = headers_row.index(candidate)
+            break
+
+    if date_idx == -1 or name_idx == -1:
+        log.warning(f"BSE CSV column not found — headers: {headers_row}")
         return []
+
+    # Build reverse map: BSE name → NSE symbol
+    # Try direct match first, then partial match
+    isin_symbols = set(ISIN_MAP.keys())
+
+    def normalize_date(val):
+        val = val.strip()
+        import re
+        m = re.match(r'^(\d{2})-(\d{2})-(\d{4})$', val)
+        if m: return f"{m.group(3)}-{m.group(2)}-{m.group(1)}"
+        if re.match(r'\d{4}-\d{2}-\d{2}', val): return val[:10]
+        return val
 
     matched = []
     for line in lines[1:]:
-        cols = [c.strip() for c in line.split(",")]
-        if len(cols) <= max(scrip_idx, date_idx):
+        cols = [c.strip().strip('"') for c in line.split(",")]
+        if len(cols) <= max(name_idx, date_idx):
             continue
-        # Match by scrip name to ISIN_MAP symbol
-        name = cols[name_idx].strip().upper() if name_idx >= 0 else ""
-        if name in ISIN_MAP:
-            matched.append(name)
 
+        # Check date matches today
+        raw_date = cols[date_idx] if date_idx < len(cols) else ""
+        if not raw_date:
+            continue
+        norm_date = normalize_date(raw_date)
+        if norm_date != today:
+            continue
+
+        bse_name = cols[name_idx].strip().upper() if name_idx < len(cols) else ""
+
+        # Direct match
+        if bse_name in isin_symbols:
+            matched.append(bse_name)
+            continue
+
+        # Partial match — BSE name may differ slightly from NSE symbol
+        for sym in isin_symbols:
+            if sym in bse_name or bse_name.startswith(sym[:5]):
+                matched.append(sym)
+                break
+
+    matched = list(set(matched))  # deduplicate
     log.info(f"BSE results today ({today}): {len(matched)} stocks — {', '.join(matched) or 'none'}")
     return matched
 
