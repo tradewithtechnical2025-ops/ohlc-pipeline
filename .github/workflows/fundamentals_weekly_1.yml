@@ -2,8 +2,8 @@ name: Fundamentals Weekly Part 1
 
 on:
   schedule:
-    # Sunday 6:00 AM IST IST
-    - cron: '30 0 * * 0'
+    # 12:00 AM IST Sun
+    - cron: '30 18 * * 6'
   workflow_dispatch:
 
 jobs:
