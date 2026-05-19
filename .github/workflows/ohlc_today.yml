@@ -1,0 +1,30 @@
+name: OHLC Today (T+0)
+
+on:
+  schedule:
+    # 4:50 PM IST = 11:20 UTC  (weekdays only)
+    - cron: '20 11 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  ohlc-today:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run T+0 intraday pipeline
+        run: python pipeline.py today
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
