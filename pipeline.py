@@ -204,9 +204,13 @@ async def _upstox_get(client: httpx.AsyncClient, sem: asyncio.Semaphore, endpoin
                 log.error("❌ TOKEN EXPIRED")
                 sys.exit(1)
             if r.status_code == 429:
-                log.warning("  Rate limited — waiting 30s")
-                await asyncio.sleep(30)
-                continue
+                if attempt < RETRY - 1:
+                    log.warning("  Rate limited — waiting 30s")
+                    await asyncio.sleep(30)
+                    continue
+                else:
+                    log.warning("  Rate limited after all retries — skipping")
+                    return None
             if r.status_code != 200:
                 return None
             d = r.json()
@@ -365,14 +369,13 @@ async def fetch_corporate_actions(client, sem, isin):
 
 
 async def fetch_one_fundamental(client, sem, sym, isin):
-    income, ratios, sh, bs, cf, ca = await asyncio.gather(
-        fetch_income_statement(client, sem, isin),
-        fetch_key_ratios(client, sem, isin),
-        fetch_shareholding(client, sem, isin),
-        fetch_balance_sheet(client, sem, isin),
-        fetch_cash_flow(client, sem, isin),
-        fetch_corporate_actions(client, sem, isin),
-    )
+    # Sequential — avoid rate limit (6 calls per stock)
+    income = await fetch_income_statement(client, sem, isin)
+    ratios = await fetch_key_ratios(client, sem, isin)
+    sh     = await fetch_shareholding(client, sem, isin)
+    bs     = await fetch_balance_sheet(client, sem, isin)
+    cf     = await fetch_cash_flow(client, sem, isin)
+    ca     = await fetch_corporate_actions(client, sem, isin)
     if not any([income, ratios, sh, bs, cf]):
         return sym, None
 
@@ -908,15 +911,16 @@ async def run_fund_weekly(part: int = 0) -> None:
     symbols = list(ISIN_MAP.keys())
     total   = len(symbols)
 
-    # Split into 4 parts
-    part_size = (total + 3) // 4
+    # Split into 10 parts
+    TOTAL_PARTS = 10
+    part_size = (total + TOTAL_PARTS - 1) // TOTAL_PARTS
     if part == 0:
         start_idx, end_idx = 0, total
         label = "Full"
     else:
         start_idx = (part - 1) * part_size
         end_idx   = min(part * part_size, total)
-        label     = f"Part {part}/4"
+        label     = f"Part {part}/{TOTAL_PARTS}"
 
     chunk = symbols[start_idx:end_idx]
     log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(chunk)} stocks [{start_idx}-{end_idx}]) ━━━")
@@ -966,11 +970,17 @@ if __name__ == "__main__":
         case "full":         asyncio.run(run_full())
         case "status":       asyncio.run(run_status())
         case "fund_daily":   asyncio.run(run_fund_daily())
-        case "fund_weekly":   asyncio.run(run_fund_weekly(0))
-        case "fund_weekly_1": asyncio.run(run_fund_weekly(1))
-        case "fund_weekly_2": asyncio.run(run_fund_weekly(2))
-        case "fund_weekly_3": asyncio.run(run_fund_weekly(3))
-        case "fund_weekly_4": asyncio.run(run_fund_weekly(4))
+        case "fund_weekly":    asyncio.run(run_fund_weekly(0))
+        case "fund_weekly_1":  asyncio.run(run_fund_weekly(1))
+        case "fund_weekly_2":  asyncio.run(run_fund_weekly(2))
+        case "fund_weekly_3":  asyncio.run(run_fund_weekly(3))
+        case "fund_weekly_4":  asyncio.run(run_fund_weekly(4))
+        case "fund_weekly_5":  asyncio.run(run_fund_weekly(5))
+        case "fund_weekly_6":  asyncio.run(run_fund_weekly(6))
+        case "fund_weekly_7":  asyncio.run(run_fund_weekly(7))
+        case "fund_weekly_8":  asyncio.run(run_fund_weekly(8))
+        case "fund_weekly_9":  asyncio.run(run_fund_weekly(9))
+        case "fund_weekly_10": asyncio.run(run_fund_weekly(10))
         case _:
             print(__doc__)
             sys.exit(1)
