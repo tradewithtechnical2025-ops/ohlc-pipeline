@@ -445,7 +445,11 @@ async def r2_download_fund(client: httpx.AsyncClient) -> dict:
     if r.status_code != 200:
         raise RuntimeError(f"Download failed: HTTP {r.status_code}")
     log.info(f"  ↓ fundamentals.json ({len(r.content)/1024:.0f} KB)")
-    return r.json()
+    data = r.json()
+    # Handle both formats: {"updated":..., "stocks": {...}} or direct dict
+    if isinstance(data, dict):
+        return data.get("stocks", data)
+    return {}  # fallback — start fresh
 
 
 async def r2_upload_fund(client: httpx.AsyncClient, data: dict) -> None:
