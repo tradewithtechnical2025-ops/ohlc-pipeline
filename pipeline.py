@@ -895,29 +895,44 @@ async def run_fund_daily() -> None:
     log.info("━━━ Fundamentals Daily complete ━━━")
 
 
-async def run_fund_weekly() -> None:
+async def run_fund_weekly(part: int = 0) -> None:
     """
-    Sunday — full refresh of all 2300 stocks.
-    Runs in batches to avoid rate limits. Takes ~20-30 min.
+    Sunday — full refresh split into 4 parts.
+    part 1: stocks 0-574
+    part 2: stocks 575-1149
+    part 3: stocks 1150-1724
+    part 4: stocks 1725-end
+    part 0: all stocks (manual full run)
     """
     today   = today_ist()
     symbols = list(ISIN_MAP.keys())
-    log.info(f"━━━ Fundamentals Weekly Full Refresh  {today}  ({len(symbols)} stocks) ━━━")
+    total   = len(symbols)
+
+    # Split into 4 parts
+    part_size = (total + 3) // 4
+    if part == 0:
+        start_idx, end_idx = 0, total
+        label = "Full"
+    else:
+        start_idx = (part - 1) * part_size
+        end_idx   = min(part * part_size, total)
+        label     = f"Part {part}/4"
+
+    chunk = symbols[start_idx:end_idx]
+    log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(chunk)} stocks [{start_idx}-{end_idx}]) ━━━")
 
     sem = asyncio.Semaphore(FUND_CONCURRENCY)
 
     async with httpx.AsyncClient() as client:
-        # Download existing data first
         log.info("Downloading existing fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
-        # Fetch all stocks in batches of 50
         batch_size = 50
         ok = 0
         failed = 0
 
-        for i in range(0, len(symbols), batch_size):
-            batch = symbols[i : i + batch_size]
+        for i in range(0, len(chunk), batch_size):
+            batch = chunk[i : i + batch_size]
             tasks = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in batch]
             results = await asyncio.gather(*tasks)
 
@@ -928,15 +943,15 @@ async def run_fund_weekly() -> None:
                 else:
                     failed += 1
 
-            pct = min(i + batch_size, len(symbols))
-            log.info(f"  {pct}/{len(symbols)}  ✓{ok}  ✗{failed}")
+            pct = min(i + batch_size, len(chunk))
+            log.info(f"  {pct}/{len(chunk)}  ✓{ok}  ✗{failed}")
 
-            # Upload checkpoint every 500 stocks
-            if pct % 500 == 0 or pct == len(symbols):
+            # Upload checkpoint every 200 stocks
+            if pct % 200 == 0 or pct == len(chunk):
                 log.info("  Checkpoint upload…")
                 await r2_upload_fund(client, fund_data)
 
-    log.info(f"━━━ Weekly complete — ✓{ok}  ✗{failed} ━━━")
+    log.info(f"━━━ Weekly {label} complete — ✓{ok}  ✗{failed} ━━━")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -951,7 +966,11 @@ if __name__ == "__main__":
         case "full":         asyncio.run(run_full())
         case "status":       asyncio.run(run_status())
         case "fund_daily":   asyncio.run(run_fund_daily())
-        case "fund_weekly":  asyncio.run(run_fund_weekly())
+        case "fund_weekly":   asyncio.run(run_fund_weekly(0))
+        case "fund_weekly_1": asyncio.run(run_fund_weekly(1))
+        case "fund_weekly_2": asyncio.run(run_fund_weekly(2))
+        case "fund_weekly_3": asyncio.run(run_fund_weekly(3))
+        case "fund_weekly_4": asyncio.run(run_fund_weekly(4))
         case _:
             print(__doc__)
             sys.exit(1)
