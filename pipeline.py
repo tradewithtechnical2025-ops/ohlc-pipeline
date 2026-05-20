@@ -1041,10 +1041,6 @@ def _detect_ep(
 
 
 async def run_ep_scan() -> None:
-    """
-    Weekdays 4:15 PM IST — scan all stocks for active EP formations.
-    Runs after daily OHLC update. Uploads ep_signals.json to R2.
-    """
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
@@ -1054,28 +1050,52 @@ async def run_ep_scan() -> None:
 
     async with httpx.AsyncClient() as client:
 
-        # 1. Download all OHLC chunks
-        log.info("Downloading OHLC chunks…")
-        all_data = await download_all_chunks(client)
+        # 1. Download OHLC + Fundamentals parallel
+        log.info("Downloading OHLC chunks + fundamentals…")
+        ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
+        ohlc_results, fund_raw = await asyncio.gather(
+            asyncio.gather(*ohlc_tasks, return_exceptions=True),
+            r2_download_fund(client),
+        )
+
+        all_data: dict = {}
+        for i, res in enumerate(ohlc_results):
+            if isinstance(res, Exception):
+                log.warning(f"  ohlc_{i+1}.json error: {res}")
+            elif res and "stocks" in res:
+                all_data.update(res["stocks"])
         log.info(f"Loaded {len(all_data)} stocks")
 
-        # 2. Scan all stocks
+        # 2. Scan
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
-
-        # Sort — most recent EP first, then by gap %
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
-        normal  = sum(1 for s in signals if s["ep_type"] == "Normal EP")
-        delayed = sum(1 for s in signals if s["ep_type"] == "Delayed EP")
-        log.info(f"Found {len(signals)} EP signals — Normal: {normal}  Delayed: {delayed}")
+        # 3. Merge fundamentals
+        for sig in signals:
+            sym  = sig["symbol"]
+            fund = fund_raw.get(sym, {})
 
-        # 3. Upload ep_signals.json
+            q1_eps_d = fund.get("q1_eps_d", "")
+            q2_eps_d = fund.get("q2_eps_d", "")
+
+            try:
+                eps_ch = round((float(q1_eps_d) - float(q2_eps_d))
+                               / abs(float(q2_eps_d)) * 100, 1)
+            except (TypeError, ValueError, ZeroDivisionError):
+                eps_ch = ""
+
+            sig["q_name"]   = fund.get("q1_period", "")
+            sig["sales_ch"] = fund.get("q1_sales_ch", "")
+            sig["eps_ch"]   = eps_ch
+
+        # 4. Upload
+        delayed = len(signals)
+        log.info(f"Found {delayed} Delayed EP signals")
+
         payload = json.dumps({
             "updated" : today,
-            "count"   : len(signals),
-            "normal"  : normal,
-            "delayed" : delayed,
+            "count"   : delayed,
             "signals" : signals,
         })
         await r2_upload(client, "ep_signals.json", payload)
