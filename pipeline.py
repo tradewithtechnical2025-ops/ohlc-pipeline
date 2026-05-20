@@ -124,7 +124,7 @@ async def fetch_ohlc(
             log.error("❌ TOKEN EXPIRED — update UPSTOX_TOKEN secret!")
             sys.exit(1)
         if r.status_code == 429:
-            await asyncio.sleep(3)
+            await asyncio.sleep(10)
             continue
         if r.status_code != 200:
             return sym, None
@@ -169,7 +169,7 @@ async def fetch_today_candle(
             log.error("❌ TOKEN EXPIRED")
             sys.exit(1)
         if r.status_code == 429:
-            await asyncio.sleep(3)
+            await asyncio.sleep(10)
             continue
         if r.status_code != 200:
             return sym, None
