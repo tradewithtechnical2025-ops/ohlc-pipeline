@@ -1001,7 +1001,25 @@ async def run_ep_scan() -> None:
                     eps_ch = f"+{ec:.1f}%" if ec >= 0 else f"{ec:.1f}%"
                 except:
                     eps_ch = ""
-                screener[sym] = {"sales_ch": sales_ch, "eps_ch": eps_ch}
+                pat_cols = ["NR7","WIB","DIB","MCP","W-MCP","HVQ","VD",
+                            "PullBack","ATR Tightness","Volume footprint",
+                            "Launchpad","HLR","BS","GAPUP","PP","HPBC",
+                            "TL/HL BO","3WTC"]
+                combined = set()
+                for p in (row.get("Patterns","") or "").split("||"):
+                    p = p.strip()
+                    if p: combined.add(p)
+                for col in pat_cols:
+                    v = row.get(col, "")
+                    if v and v not in ("", None, 0, "No"):
+                        combined.add(v if isinstance(v, str) else col)
+                screener[sym] = {
+                    "sales_ch" : sales_ch,
+                    "eps_ch"   : eps_ch,
+                    "patterns" : "||".join(sorted(combined)),
+                    "sector"   : row.get("SECTOR", ""),
+                    "rs"       : row.get("RS Rating", ""),
+                }
         log.info(f"Screener loaded: {len(screener)} stocks")
 
         fund_lookup: dict = {}
@@ -1020,6 +1038,9 @@ async def run_ep_scan() -> None:
             sc = screener.get(sym, {})
             sig["sales_ch"] = sc.get("sales_ch", "")
             sig["eps_ch"]   = sc.get("eps_ch", "")
+            sig["patterns"] = sc.get("patterns", "")
+            sig["sector"]   = sc.get("sector", "")
+            sig["rs"]       = sc.get("rs", "")
             fund = fund_lookup.get(sym, {})
             sig["q_name"] = fund.get("q1_period", "")
             vol_x = sig.pop("vol_spike_x", 1)
