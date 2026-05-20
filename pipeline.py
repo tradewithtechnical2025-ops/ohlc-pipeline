@@ -994,7 +994,7 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 20,
+    max_consolidation: int = 30,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
@@ -1036,7 +1036,7 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 3:
+            if consol_count < 0:
                 continue
             if consol_count >= max_consolidation:
                 continue
