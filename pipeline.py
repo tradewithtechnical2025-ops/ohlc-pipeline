@@ -1050,12 +1050,13 @@ async def run_ep_scan() -> None:
 
     async with httpx.AsyncClient() as client:
 
-        # 1. Download OHLC + Screener parallel
-        log.info("Downloading OHLC chunks + screener…")
+        # 1. Download OHLC + Screener + Fundamentals parallel
+        log.info("Downloading OHLC chunks + screener + fundamentals…")
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
-        ohlc_results, screener_raw = await asyncio.gather(
+        ohlc_results, screener_raw, fund_raw = await asyncio.gather(
             asyncio.gather(*ohlc_tasks, return_exceptions=True),
             r2_download(client, "screener.json"),
+            r2_download_fund(client),
         )
 
         all_data: dict = {}
@@ -1066,7 +1067,7 @@ async def run_ep_scan() -> None:
                 all_data.update(res["stocks"])
         log.info(f"Loaded {len(all_data)} stocks")
 
-        # 2. Build screener lookup — { "MRF": {"sales_ch": "+13.7%", "eps_ch": "+37.1%"} }
+        # 2. Screener lookup
         screener = {}
         if isinstance(screener_raw, list):
             for row in screener_raw:
@@ -1091,13 +1092,22 @@ async def run_ep_scan() -> None:
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
-        # 4. Merge screener data
+        # 4. Merge screener + fundamentals
         for sig in signals:
             sym = sig["symbol"]
-            sc  = screener.get(sym, {})
+
+            # Screener — sales & EPS
+            sc = screener.get(sym, {})
             sig["sales_ch"] = sc.get("sales_ch", "")
             sig["eps_ch"]   = sc.get("eps_ch", "")
-            sig["q_name"]   = fund_raw.get(sym, {}).get("q1_period", "") if False else ""
+
+            # Fundamentals — q_name only
+            fund = fund_raw.get(sym, {}) if isinstance(fund_raw, dict) else {}
+            sig["q_name"] = fund.get("q1_period", "")
+
+            # Volume — x → %
+            vol_x = sig.get("vol_spike_x", 0)
+            sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
 
         # 5. Upload
         log.info(f"Found {len(signals)} Delayed EP signals")
