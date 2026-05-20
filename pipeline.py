@@ -969,7 +969,7 @@ def _detect_ep(
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
     max_consolidation: int = 20,
-    max_ep_age_days: int   = 30,   # ← EP candle max 30 trading days purana ho
+    max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
 
@@ -981,10 +981,9 @@ def _detect_ep(
         if n < volume_lookback + 2:
             continue
 
-        # Sirf last 30 candles mein EP dhundo
         scan_from = max(volume_lookback, n - max_ep_age_days)
 
-        for i in range(scan_from, n):       # ← yahan change hai
+        for i in range(scan_from, n):
             prev_high = highs[i - 1]
             today_low = lows[i]
             if today_low <= prev_high:
@@ -998,32 +997,47 @@ def _detect_ep(
             vol_x = volumes[i] / avg_vol
             if vol_x < volume_spike_x:
                 continue
+
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
+
             for j in range(i + 1, min(i + max_consolidation + 1, n)):
                 if closes[j] < gap_lower:
                     ep_intact = False
                     break
                 consol_count += 1
+
             if not ep_intact:
                 continue
-            ep_type  = "Delayed EP" if consol_count > 2 else "Normal EP"
+            if consol_count < 3:          # min 3 din
+                continue
+            if consol_count >= max_consolidation:   # 20 din se purana
+                continue
+
             last_idx = min(i + consol_count, n - 1)
             signals.append({
-                "symbol"        : sym,
-                "ep_date"       : dates[i],
-                "gap_lower"     : round(gap_lower, 2),
-                "gap_pct"       : round(gap_pct, 2),
-                "vol_spike_x"   : round(vol_x, 1),
-                "ep_candle_low" : round(today_low, 2),
-                "last_close"    : round(closes[last_idx], 2),
-                "last_date"     : dates[last_idx],
-                "consolidation" : consol_count,
-                "ep_type"       : ep_type,
+                "symbol"         : sym,
+                "ep_date"        : dates[i],
+                "gap_lower"      : round(gap_lower, 2),
+                "gap_pct"        : round(gap_pct, 2),
+                "vol_spike_x"    : round(vol_x, 1),
+                "ep_candle_high" : round(highs[i], 2),
+                "ep_candle_low"  : round(today_low, 2),
+                "last_close"     : round(closes[last_idx], 2),
+                "last_date"      : dates[last_idx],
+                "consolidation"  : consol_count,
+                "ep_type"        : "Delayed EP",
             })
 
-    return signals
+    # Per stock sirf latest EP
+    seen: dict[str, dict] = {}
+    for sig in signals:
+        sym = sig["symbol"]
+        if sym not in seen or sig["ep_date"] > seen[sym]["ep_date"]:
+            seen[sym] = sig
+
+    return list(seen.values())
 
 
 async def run_ep_scan() -> None:
