@@ -1041,6 +1041,10 @@ def _detect_ep(
 
 
 async def run_ep_scan() -> None:
+    """
+    Weekdays 4:15 PM IST — scan all stocks for active Delayed EP formations.
+    Runs after daily OHLC update. Uploads ep_signals.json to R2.
+    """
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
@@ -1059,6 +1063,7 @@ async def run_ep_scan() -> None:
             r2_download_fund(client),
         )
 
+        # Build OHLC master
         all_data: dict = {}
         for i, res in enumerate(ohlc_results):
             if isinstance(res, Exception):
@@ -1067,8 +1072,8 @@ async def run_ep_scan() -> None:
                 all_data.update(res["stocks"])
         log.info(f"Loaded {len(all_data)} stocks")
 
-        # 2. Screener lookup
-        screener = {}
+        # 2. Screener lookup — { "MRF": {"sales_ch": "+13.7%", "eps_ch": "+37.1%"} }
+        screener: dict = {}
         if isinstance(screener_raw, list):
             for row in screener_raw:
                 sym = row.get("Stocks", "").strip()
@@ -1087,39 +1092,48 @@ async def run_ep_scan() -> None:
                 screener[sym] = {"sales_ch": sales_ch, "eps_ch": eps_ch}
         log.info(f"Screener loaded: {len(screener)} stocks")
 
-        # 3. Scan
+        # 3. Fundamentals lookup — { "MRF": {"q1_period": "Mar 2026", ...} }
+        fund_lookup: dict = {}
+        if isinstance(fund_raw, dict):
+            fund_lookup = fund_raw
+        elif isinstance(fund_raw, list):
+            fund_lookup = {d["symbol"]: d for d in fund_raw if d.get("symbol")}
+        log.info(f"Fundamentals loaded: {len(fund_lookup)} stocks")
+
+        # 4. Scan
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
-        # 4. Merge screener + fundamentals
+        # 5. Merge screener + fundamentals into each signal
         for sig in signals:
             sym = sig["symbol"]
 
-            # Screener — sales & EPS
+            # Screener — sales & EPS change
             sc = screener.get(sym, {})
             sig["sales_ch"] = sc.get("sales_ch", "")
             sig["eps_ch"]   = sc.get("eps_ch", "")
 
-            # Fundamentals — q_name only
-            fund = fund_raw.get(sym, {}) if isinstance(fund_raw, dict) else {}
+            # Fundamentals — last quarter name only
+            fund = fund_lookup.get(sym, {})
             sig["q_name"] = fund.get("q1_period", "")
 
-            # Volume — x → %
-            vol_x = sig.get("vol_spike_x", 0)
+            # Volume: x → % above average
+            vol_x = sig.pop("vol_spike_x", 1)
             sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
 
-        # 5. Upload
-        log.info(f"Found {len(signals)} Delayed EP signals")
+        # 6. Upload ep_signals.json to R2
+        count = len(signals)
+        log.info(f"Found {count} Delayed EP signals")
+
         payload = json.dumps({
             "updated" : today,
-            "count"   : len(signals),
+            "count"   : count,
             "signals" : signals,
         })
         await r2_upload(client, "ep_signals.json", payload)
 
     log.info("━━━ EP Scan complete ━━━")
-
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
