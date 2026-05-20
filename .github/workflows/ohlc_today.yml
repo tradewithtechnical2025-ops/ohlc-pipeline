@@ -3,7 +3,7 @@ name: OHLC Today (T+0)
 on:
   schedule:
     # 4:50 PM IST = 11:20 UTC  (weekdays only)
-    - cron: '20 11 * * 1-5'
+    - cron: '30 10 * * 1-5'
   workflow_dispatch:
 
 jobs:
