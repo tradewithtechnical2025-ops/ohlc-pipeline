@@ -25,7 +25,6 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-# ── Logging ───────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)s  %(message)s",
@@ -33,30 +32,28 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Env ───────────────────────────────────────────────────────
 UPSTOX_TOKEN = os.environ["UPSTOX_TOKEN"]
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
-# ── Constants ─────────────────────────────────────────────────
 BASE_URL     = "https://api.upstox.com/v2/historical-candle"
 V3_URL       = "https://api.upstox.com/v3/historical-candle/intraday"
 FUND_URL     = "https://api.upstox.com/v2/fundamentals"
-ROLLING_DAYS = 548    # 1.5 years
+ROLLING_DAYS = 548
 R2_CHUNKS    = 8
-CONCURRENCY  = 5      # parallel Upstox calls (stay under rate limit)
-FUND_CONCURRENCY = 1  # sequential — avoid rate limit
+CONCURRENCY  = 5      # parallel Upstox calls
+FUND_CONCURRENCY = 1
 RETRY        = 3
-SLEEP_MS     = 3.0    # rate limit guard for fundamentals
+SLEEP_MS     = 3.0
+RATE_DELAY   = 0.5    # 500ms between requests = ~200 req/min
 
 HERE = Path(__file__).parent
 
-# ── Data files ────────────────────────────────────────────────
 with open(HERE / "isin_map.json") as f:
-    ISIN_MAP: dict[str, str] = json.load(f)       # { "RELIANCE": "INE002A01018", ... }
+    ISIN_MAP: dict[str, str] = json.load(f)
 
 with open(HERE / "nse_holidays.json") as f:
-    NSE_HOLIDAYS: set[str] = set(json.load(f))    # ["2025-01-26", "2025-08-15", ...]
+    NSE_HOLIDAYS: set[str] = set(json.load(f))
 
 UPSTOX_HEADERS = {
     "Authorization": f"Bearer {UPSTOX_TOKEN}",
@@ -97,7 +94,7 @@ def rolling_cutoff(anchor: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# UPSTOX OHLC API  (async)
+# UPSTOX OHLC API
 # ══════════════════════════════════════════════════════════════
 
 async def fetch_ohlc(
@@ -113,6 +110,7 @@ async def fetch_ohlc(
 
     for attempt in range(RETRY):
         async with sem:
+            await asyncio.sleep(RATE_DELAY)   # ← rate limit guard
             try:
                 r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
             except httpx.RequestError as e:
@@ -124,7 +122,8 @@ async def fetch_ohlc(
             log.error("❌ TOKEN EXPIRED — update UPSTOX_TOKEN secret!")
             sys.exit(1)
         if r.status_code == 429:
-            await asyncio.sleep(3)
+            log.warning(f"  {sym}: 429 — waiting 10s")
+            await asyncio.sleep(10)
             continue
         if r.status_code != 200:
             return sym, None
@@ -159,6 +158,7 @@ async def fetch_today_candle(
 
     for attempt in range(RETRY):
         async with sem:
+            await asyncio.sleep(RATE_DELAY)   # ← rate limit guard
             try:
                 r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
             except httpx.RequestError:
@@ -169,7 +169,8 @@ async def fetch_today_candle(
             log.error("❌ TOKEN EXPIRED")
             sys.exit(1)
         if r.status_code == 429:
-            await asyncio.sleep(3)
+            log.warning(f"  {sym}: 429 — waiting 10s")
+            await asyncio.sleep(10)
             continue
         if r.status_code != 200:
             return sym, None
@@ -186,7 +187,7 @@ async def fetch_today_candle(
 
 
 # ══════════════════════════════════════════════════════════════
-# UPSTOX FUNDAMENTALS API  (async)
+# UPSTOX FUNDAMENTALS API
 # ══════════════════════════════════════════════════════════════
 
 async def _upstox_get(client: httpx.AsyncClient, sem: asyncio.Semaphore, endpoint: str) -> dict | None:
@@ -370,7 +371,6 @@ async def fetch_corporate_actions(client, sem, isin):
 
 
 async def fetch_one_fundamental(client, sem, sym, isin):
-    # Sequential — avoid rate limit (6 calls per stock)
     income = await fetch_income_statement(client, sem, isin)
     ratios = await fetch_key_ratios(client, sem, isin)
     sh     = await fetch_shareholding(client, sem, isin)
@@ -382,13 +382,9 @@ async def fetch_one_fundamental(client, sem, sym, isin):
 
     obj = {"symbol": sym, "updated": today_ist()}
 
-    # Ratios
     if ratios: obj.update(ratios)
-
-    # Shareholding — flat keys
     if sh: obj.update({k: sh[k] for k in sh})
 
-    # Income — flat keys (q1_period, q1_sales, etc.)
     if income:
         quarters = income.get("quarters", [])
         for i, q in enumerate(quarters[:4]):
@@ -403,22 +399,20 @@ async def fetch_one_fundamental(client, sem, sym, isin):
             obj[f"q{n}_eps"]      = income["eps"][i]      if i < len(income.get("eps",[]))      else ""
             obj[f"q{n}_eps_d"]    = income["eps_d"][i]    if i < len(income.get("eps_d",[]))    else ""
 
-    # Balance Sheet — flat keys (bs_y1_period, bs_y1_assets, etc.)
     if bs:
         obj["bs_type"]  = bs.get("bs_type", "")
         obj["bs_units"] = bs.get("bs_units", "crore")
         for i in range(4):
             n = i + 1
-            obj[f"bs_y{n}_period"]       = bs["bs_periods"][i]       if i < len(bs.get("bs_periods",[]))       else ""
-            obj[f"bs_y{n}_assets"]       = bs["bs_assets"][i]        if i < len(bs.get("bs_assets",[]))        else ""
-            obj[f"bs_y{n}_liab"]         = bs["bs_liab"][i]          if i < len(bs.get("bs_liab",[]))          else ""
-            obj[f"bs_y{n}_equity"]       = bs["bs_equity"][i]        if i < len(bs.get("bs_equity",[]))        else ""
-            obj[f"bs_y{n}_cur_assets"]   = bs["bs_cur_assets"][i]    if i < len(bs.get("bs_cur_assets",[]))    else ""
-            obj[f"bs_y{n}_noncur_assets"]= bs["bs_noncur_assets"][i] if i < len(bs.get("bs_noncur_assets",[])) else ""
-            obj[f"bs_y{n}_cur_liab"]     = bs["bs_cur_liab"][i]      if i < len(bs.get("bs_cur_liab",[]))      else ""
-            obj[f"bs_y{n}_noncur_liab"]  = bs["bs_noncur_liab"][i]   if i < len(bs.get("bs_noncur_liab",[]))   else ""
+            obj[f"bs_y{n}_period"]        = bs["bs_periods"][i]        if i < len(bs.get("bs_periods",[]))        else ""
+            obj[f"bs_y{n}_assets"]        = bs["bs_assets"][i]         if i < len(bs.get("bs_assets",[]))         else ""
+            obj[f"bs_y{n}_liab"]          = bs["bs_liab"][i]           if i < len(bs.get("bs_liab",[]))           else ""
+            obj[f"bs_y{n}_equity"]        = bs["bs_equity"][i]         if i < len(bs.get("bs_equity",[]))         else ""
+            obj[f"bs_y{n}_cur_assets"]    = bs["bs_cur_assets"][i]     if i < len(bs.get("bs_cur_assets",[]))     else ""
+            obj[f"bs_y{n}_noncur_assets"] = bs["bs_noncur_assets"][i]  if i < len(bs.get("bs_noncur_assets",[])) else ""
+            obj[f"bs_y{n}_cur_liab"]      = bs["bs_cur_liab"][i]       if i < len(bs.get("bs_cur_liab",[]))       else ""
+            obj[f"bs_y{n}_noncur_liab"]   = bs["bs_noncur_liab"][i]    if i < len(bs.get("bs_noncur_liab",[]))    else ""
 
-    # Cash Flow — flat keys (cf_y1_period, cf_y1_op, etc.)
     if cf:
         obj["cf_type"]  = cf.get("cf_type", "")
         obj["cf_units"] = cf.get("cf_units", "crore")
@@ -431,24 +425,20 @@ async def fetch_one_fundamental(client, sem, sym, isin):
             obj[f"cf_y{n}_fin"]    = cf["cf_fin"][i]     if i < len(cf.get("cf_fin",[]))     else ""
             obj[f"cf_y{n}_fcf"]    = cf["cf_fcf"][i]     if i < len(cf.get("cf_fcf",[]))     else ""
 
-    # Corporate Actions — flat keys
     if ca: obj.update(ca)
     return sym, obj
 
 
-# ── BSE result dates fetcher ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# BSE RESULT FETCHER
+# ══════════════════════════════════════════════════════════════
 
 async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
-    """Fetch today's BSE result symbols using BSE API."""
     today = today_ist()
     next_day = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
-
     url = (f"https://api.bseindia.com/BseIndiaAPI/api/DownloadCSV1/w"
            f"?fromdate={today}&todate={next_day}&scripcode=")
-    req_headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.bseindia.com/"
-    }
+    req_headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bseindia.com/"}
     try:
         r = await client.get(url, headers=req_headers, timeout=30)
         if r.status_code != 200:
@@ -463,41 +453,29 @@ async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
         log.info("BSE CSV empty — no results today")
         return []
 
-    # Parse headers flexibly
     headers_row = [h.strip().strip('"') for h in lines[0].split(",")]
     log.info(f"BSE CSV headers: {headers_row}")
-    log.info(f"BSE CSV sample row: {lines[1] if len(lines)>1 else 'none'}")
-
-    # Find date column flexibly
     date_idx = next((i for i,h in enumerate(headers_row) if "DATE" in h.upper() or "RESULT" in h.upper()), -1)
-
-    # Find name column flexibly — "Security Name" is BSE short name (like NSE symbol)
     name_idx = next((i for i,h in enumerate(headers_row) if "SECURITY" in h.upper() and "NAME" in h.upper()), -1)
     if name_idx == -1:
         name_idx = next((i for i,h in enumerate(headers_row) if "NAME" in h.upper()), -1)
-
     if date_idx == -1 or name_idx == -1:
         log.warning(f"BSE CSV column not found — headers: {headers_row}")
         return []
 
-    # Build reverse map: BSE name → NSE symbol
-    # Try direct match first, then partial match
     isin_symbols = set(ISIN_MAP.keys())
 
     def normalize_date(val):
         import re
         val = val.strip()
-        # "19 May 2026" format
         MONTHS = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
                   "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
         m = re.match(r'^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$', val)
         if m:
             mon = MONTHS.get(m.group(2)[:3].lower())
             if mon: return f"{m.group(3)}-{mon}-{m.group(1).zfill(2)}"
-        # "20-05-2026" format
         m2 = re.match(r'^(\d{2})-(\d{2})-(\d{4})$', val)
         if m2: return f"{m2.group(3)}-{m2.group(2)}-{m2.group(1)}"
-        # Already ISO
         if re.match(r'\d{4}-\d{2}-\d{2}', val): return val[:10]
         return val
 
@@ -506,34 +484,28 @@ async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
         cols = [c.strip().strip('"') for c in line.split(",")]
         if len(cols) <= max(name_idx, date_idx):
             continue
-
-        # Check date matches today
         raw_date = cols[date_idx] if date_idx < len(cols) else ""
         if not raw_date:
             continue
-        norm_date = normalize_date(raw_date)
-        if norm_date != today:
+        if normalize_date(raw_date) != today:
             continue
-
         bse_name = cols[name_idx].strip().upper() if name_idx < len(cols) else ""
-
-        # Direct match
         if bse_name in isin_symbols:
             matched.append(bse_name)
             continue
-
-        # Partial match — BSE name may differ slightly from NSE symbol
         for sym in isin_symbols:
             if sym in bse_name or bse_name.startswith(sym[:5]):
                 matched.append(sym)
                 break
 
-    matched = list(set(matched))  # deduplicate
+    matched = list(set(matched))
     log.info(f"BSE results today ({today}): {len(matched)} stocks — {', '.join(matched) or 'none'}")
     return matched
 
 
-# ── R2 fundamentals helpers ───────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# R2 HELPERS
+# ══════════════════════════════════════════════════════════════
 
 async def r2_download_fund(client: httpx.AsyncClient) -> dict:
     url = f"{WORKER_URL}/fundamentals.json"
@@ -545,17 +517,14 @@ async def r2_download_fund(client: httpx.AsyncClient) -> dict:
         raise RuntimeError(f"Download failed: HTTP {r.status_code}")
     log.info(f"  ↓ fundamentals.json ({len(r.content)/1024:.0f} KB)")
     data = r.json()
-    # Handle Array format (new Python pipeline)
     if isinstance(data, list):
         return {d["symbol"]: d for d in data if d.get("symbol")}
-    # Handle dict format: {"updated":..., "stocks": {...}}
     if isinstance(data, dict):
         return data.get("stocks", data)
-    return {}  # fallback
+    return {}
 
 
 async def r2_upload_fund(client: httpx.AsyncClient, data: dict) -> None:
-    # Website expects Array of objects (GAS format)
     arr = list(data.values())
     payload = json.dumps(arr)
     url = f"{WORKER_URL}?file=fundamentals.json"
@@ -569,10 +538,6 @@ async def r2_upload_fund(client: httpx.AsyncClient, data: dict) -> None:
         raise RuntimeError(f"Upload failed: HTTP {r.status_code}")
     log.info(f"  ↑ fundamentals.json ({len(payload)/1024:.1f} KB)")
 
-
-# ══════════════════════════════════════════════════════════════
-# R2 / CLOUDFLARE WORKER  (OHLC)
-# ══════════════════════════════════════════════════════════════
 
 async def r2_upload(client: httpx.AsyncClient, filename: str, data: str | bytes) -> None:
     if isinstance(data, str):
@@ -621,21 +586,18 @@ async def upload_all_chunks(client: httpx.AsyncClient, all_data: dict, today: st
     for i in range(R2_CHUNKS):
         chunk_syms = symbols[i * size : (i + 1) * size]
         chunk = {s: all_data[s] for s in chunk_syms}
-        payload = json.dumps(
-            {"updated": today, "chunk": i + 1, "total": R2_CHUNKS, "stocks": chunk}
-        )
+        payload = json.dumps({"updated": today, "chunk": i + 1, "total": R2_CHUNKS, "stocks": chunk})
         tasks.append(r2_upload(client, f"ohlc_{i+1}.json", payload))
     await asyncio.gather(*tasks)
     log.info(f"✓ {R2_CHUNKS} chunks uploaded ({n} stocks)")
 
 
 # ══════════════════════════════════════════════════════════════
-# DATA HELPERS (OHLC)
+# DATA HELPERS
 # ══════════════════════════════════════════════════════════════
 
 def build_stock_obj(candles: list) -> dict:
     return {k: [c[k] for c in candles] for k in ("d", "o", "h", "l", "c", "v", "oi")}
-
 
 def apply_rolling_window(all_data: dict, cutoff: str) -> int:
     dropped = 0
@@ -646,12 +608,10 @@ def apply_rolling_window(all_data: dict, cutoff: str) -> int:
             s[k] = [s[k][i] for i in keep]
     return dropped
 
-
 def _sort_stock(s: dict) -> None:
     order = sorted(range(len(s["d"])), key=lambda i: s["d"][i])
     for k in s:
         s[k] = [s[k][i] for i in order]
-
 
 def merge_candles_into(all_data: dict, sym: str, candles: list, cutoff: str) -> int:
     if sym not in all_data:
@@ -669,7 +629,6 @@ def merge_candles_into(all_data: dict, sym: str, candles: list, cutoff: str) -> 
     if added:
         _sort_stock(s)
     return added
-
 
 def upsert_candle(all_data: dict, sym: str, c: dict) -> None:
     if sym not in all_data:
@@ -729,17 +688,14 @@ async def run_daily() -> None:
                 delta[sym] = today_c
 
         log.info(f"Merged: {total_new} new candles  Delta: {len(delta)} stocks")
-
         dropped = apply_rolling_window(all_data, cutoff)
         log.info(f"Rolling: dropped {dropped} old candles")
 
         log.info("Uploading…")
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json",
-                      json.dumps({"date": today, "stocks": delta})),
+            r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
         )
-
     log.info("━━━ Daily complete ━━━")
 
 
@@ -750,7 +706,6 @@ async def run_today() -> None:
         return
 
     log.info(f"━━━ Today (v3 intraday)  {today} ━━━")
-
     sem     = asyncio.Semaphore(CONCURRENCY)
     symbols = list(ISIN_MAP.keys())
 
@@ -772,11 +727,9 @@ async def run_today() -> None:
         delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json",
-                      json.dumps({"date": today, "stocks": delta})),
+            r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
         )
         log.info(f"✅ delta: {len(delta)} stocks with today's candle")
-
     log.info("━━━ Today complete ━━━")
 
 
@@ -793,7 +746,6 @@ async def run_full() -> None:
     async with httpx.AsyncClient() as client:
         symbols = list(ISIN_MAP.keys())
         batch   = 50
-
         for i in range(0, len(symbols), batch):
             chunk_syms = symbols[i : i + batch]
             tasks   = [fetch_ohlc(client, sem, sym, ISIN_MAP[sym], start, today) for sym in chunk_syms]
@@ -811,16 +763,12 @@ async def run_full() -> None:
         log.info(f"✓ {len(all_data)} loaded  ✗ {len(failed)} failed")
         if failed:
             (HERE / "failed_stocks.txt").write_text("\n".join(failed))
-
         apply_rolling_window(all_data, cutoff)
-
         log.info("Uploading to R2…")
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_all.json",
-                      json.dumps({"updated": today, "stocks": all_data})),
+            r2_upload(client, "ohlc_all.json", json.dumps({"updated": today, "stocks": all_data})),
         )
-
     log.info("━━━ Full load complete ━━━")
 
 
@@ -852,31 +800,23 @@ async def run_status() -> None:
 # ══════════════════════════════════════════════════════════════
 
 async def run_fund_daily() -> None:
-    """
-    Weekdays 4:30 PM IST — fetch BSE result stocks and update their fundamentals.
-    Only updates stocks that have results today — fast run (~5 min).
-    """
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
         return
 
     log.info(f"━━━ Fundamentals Daily  {today} ━━━")
-
     sem = asyncio.Semaphore(FUND_CONCURRENCY)
 
     async with httpx.AsyncClient() as client:
-        # 1. Get today's BSE result symbols
         symbols = await get_bse_result_symbols(client)
         if not symbols:
             log.info("No BSE results today — exiting")
             return
 
-        # 2. Download existing fundamentals
         log.info("Downloading fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
-        # 3. Fetch fundamentals for result stocks
         log.info(f"Fetching fundamentals for {len(symbols)} stocks…")
         tasks   = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in symbols if sym in ISIN_MAP]
         results = await asyncio.gather(*tasks)
@@ -891,28 +831,15 @@ async def run_fund_daily() -> None:
                 log.warning(f"  ✗ {sym}: no data")
 
         log.info(f"Updated {ok}/{len(symbols)} stocks")
-
-        # 4. Upload
         log.info("Uploading fundamentals.json…")
         await r2_upload_fund(client, fund_data)
-
     log.info("━━━ Fundamentals Daily complete ━━━")
 
 
 async def run_fund_weekly(part: int = 0) -> None:
-    """
-    Sunday — full refresh split into 4 parts.
-    part 1: stocks 0-574
-    part 2: stocks 575-1149
-    part 3: stocks 1150-1724
-    part 4: stocks 1725-end
-    part 0: all stocks (manual full run)
-    """
     today   = today_ist()
     symbols = list(ISIN_MAP.keys())
     total   = len(symbols)
-
-    # Split into 10 parts
     TOTAL_PARTS = 10
     part_size = (total + TOTAL_PARTS - 1) // TOTAL_PARTS
     if part == 0:
@@ -924,10 +851,9 @@ async def run_fund_weekly(part: int = 0) -> None:
         label     = f"Part {part}/{TOTAL_PARTS}"
 
     chunk = symbols[start_idx:end_idx]
-    log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(chunk)} stocks [{start_idx}-{end_idx}]) ━━━")
+    log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(chunk)} stocks) ━━━")
 
     sem = asyncio.Semaphore(FUND_CONCURRENCY)
-
     async with httpx.AsyncClient() as client:
         log.info("Downloading existing fundamentals.json…")
         fund_data = await r2_download_fund(client)
@@ -935,23 +861,18 @@ async def run_fund_weekly(part: int = 0) -> None:
         batch_size = 50
         ok = 0
         failed = 0
-
         for i in range(0, len(chunk), batch_size):
             batch = chunk[i : i + batch_size]
             tasks = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in batch]
             results = await asyncio.gather(*tasks)
-
             for sym, data in results:
                 if data:
                     fund_data[sym] = data
                     ok += 1
                 else:
                     failed += 1
-
             pct = min(i + batch_size, len(chunk))
             log.info(f"  {pct}/{len(chunk)}  ✓{ok}  ✗{failed}")
-
-            # Upload checkpoint every 200 stocks
             if pct % 200 == 0 or pct == len(chunk):
                 log.info("  Checkpoint upload…")
                 await r2_upload_fund(client, fund_data)
@@ -969,43 +890,28 @@ def _detect_ep(
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
     max_consolidation: int = 20,
+    max_ep_age_days: int   = 30,
 ) -> list[dict]:
-    """
-    EP Formation rules:
-      1. Gap Up  : today_low > prev_high  AND gap >= 2%
-                   gap% = (today_low - prev_high) / prev_high * 100
-      2. Volume  : EP candle volume >= 2x avg of last 20 candles
-      3. Boundary: gap_lower = prev_high — no candle should CLOSE below this
-      4. Window  : track up to 20 candles after EP candle
-      5. Type    : Normal EP (<=2 candles)  |  Delayed EP (3-20 candles)
-    """
     signals = []
 
     for sym, s in all_data.items():
-        dates   = s["d"]
-        highs   = s["h"]
-        lows    = s["l"]
-        closes  = s["c"]
-        volumes = s["v"]
-
+        dates, highs, lows, closes, volumes = (
+            s["d"], s["h"], s["l"], s["c"], s["v"]
+        )
         n = len(dates)
         if n < volume_lookback + 2:
             continue
 
-        for i in range(volume_lookback, n):
+        scan_from = max(volume_lookback, n - max_ep_age_days)
 
-            # ── 1. True Gap Up ────────────────────────────────
+        for i in range(scan_from, n):
             prev_high = highs[i - 1]
             today_low = lows[i]
-
             if today_low <= prev_high:
                 continue
-
             gap_pct = (today_low - prev_high) / prev_high * 100
             if gap_pct < min_gap_pct:
                 continue
-
-            # ── 2. Volume Spike ───────────────────────────────
             avg_vol = sum(volumes[i - volume_lookback:i]) / volume_lookback
             if avg_vol == 0:
                 continue
@@ -1013,7 +919,6 @@ def _detect_ep(
             if vol_x < volume_spike_x:
                 continue
 
-            # ── 3. Consolidation — no close below prev_high ───
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
@@ -1026,31 +931,36 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-
-            ep_type = "Delayed EP" if consol_count > 2 else "Normal EP"
+            if consol_count < 3:
+                continue
+            if consol_count >= max_consolidation:
+                continue
 
             last_idx = min(i + consol_count, n - 1)
             signals.append({
-                "symbol"        : sym,
-                "ep_date"       : dates[i],
-                "gap_lower"     : round(gap_lower, 2),
-                "gap_pct"       : round(gap_pct, 2),
-                "vol_spike_x"   : round(vol_x, 1),
-                "ep_candle_low" : round(today_low, 2),
-                "last_close"    : round(closes[last_idx], 2),
-                "last_date"     : dates[last_idx],
-                "consolidation" : consol_count,
-                "ep_type"       : ep_type,
+                "symbol"         : sym,
+                "ep_date"        : dates[i],
+                "gap_lower"      : round(gap_lower, 2),
+                "gap_pct"        : round(gap_pct, 2),
+                "vol_spike_x"    : round(vol_x, 1),
+                "ep_candle_high" : round(highs[i], 2),
+                "ep_candle_low"  : round(today_low, 2),
+                "last_close"     : round(closes[last_idx], 2),
+                "last_date"      : dates[last_idx],
+                "consolidation"  : consol_count,
+                "ep_type"        : "Delayed EP",
             })
 
-    return signals
+    seen: dict[str, dict] = {}
+    for sig in signals:
+        sym = sig["symbol"]
+        if sym not in seen or sig["ep_date"] > seen[sym]["ep_date"]:
+            seen[sym] = sig
+
+    return list(seen.values())
 
 
 async def run_ep_scan() -> None:
-    """
-    Weekdays 4:15 PM IST — scan all stocks for active EP formations.
-    Runs after daily OHLC update. Uploads ep_signals.json to R2.
-    """
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
@@ -1059,33 +969,67 @@ async def run_ep_scan() -> None:
     log.info(f"━━━ EP Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
+        log.info("Downloading OHLC chunks + screener + fundamentals…")
+        ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
+        ohlc_results, screener_raw, fund_raw = await asyncio.gather(
+            asyncio.gather(*ohlc_tasks, return_exceptions=True),
+            r2_download(client, "screener.json"),
+            r2_download_fund(client),
+        )
 
-        # 1. Download all OHLC chunks
-        log.info("Downloading OHLC chunks…")
-        all_data = await download_all_chunks(client)
+        all_data: dict = {}
+        for i, res in enumerate(ohlc_results):
+            if isinstance(res, Exception):
+                log.warning(f"  ohlc_{i+1}.json error: {res}")
+            elif res and "stocks" in res:
+                all_data.update(res["stocks"])
         log.info(f"Loaded {len(all_data)} stocks")
 
-        # 2. Scan all stocks
+        screener: dict = {}
+        if isinstance(screener_raw, list):
+            for row in screener_raw:
+                sym = row.get("Stocks", "").strip()
+                if not sym:
+                    continue
+                try:
+                    sc = float(row.get("SALES CH%", 0)) * 100
+                    sales_ch = f"+{sc:.1f}%" if sc >= 0 else f"{sc:.1f}%"
+                except:
+                    sales_ch = ""
+                try:
+                    ec = float(row.get("EPS CHANGE", 0)) * 100
+                    eps_ch = f"+{ec:.1f}%" if ec >= 0 else f"{ec:.1f}%"
+                except:
+                    eps_ch = ""
+                screener[sym] = {"sales_ch": sales_ch, "eps_ch": eps_ch}
+        log.info(f"Screener loaded: {len(screener)} stocks")
+
+        fund_lookup: dict = {}
+        if isinstance(fund_raw, dict):
+            fund_lookup = fund_raw
+        elif isinstance(fund_raw, list):
+            fund_lookup = {d["symbol"]: d for d in fund_raw if d.get("symbol")}
+        log.info(f"Fundamentals loaded: {len(fund_lookup)} stocks")
+
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
-
-        # Sort — most recent EP first, then by gap %
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
-        normal  = sum(1 for s in signals if s["ep_type"] == "Normal EP")
-        delayed = sum(1 for s in signals if s["ep_type"] == "Delayed EP")
-        log.info(f"Found {len(signals)} EP signals — Normal: {normal}  Delayed: {delayed}")
+        for sig in signals:
+            sym = sig["symbol"]
+            sc = screener.get(sym, {})
+            sig["sales_ch"] = sc.get("sales_ch", "")
+            sig["eps_ch"]   = sc.get("eps_ch", "")
+            fund = fund_lookup.get(sym, {})
+            sig["q_name"] = fund.get("q1_period", "")
+            vol_x = sig.pop("vol_spike_x", 1)
+            sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
 
-        # 3. Upload ep_signals.json
-        payload = json.dumps({
-            "updated" : today,
-            "count"   : len(signals),
-            "normal"  : normal,
-            "delayed" : delayed,
-            "signals" : signals,
-        })
+        count = len(signals)
+        log.info(f"Found {count} Delayed EP signals")
+
+        payload = json.dumps({"updated": today, "count": count, "signals": signals})
         await r2_upload(client, "ep_signals.json", payload)
-
     log.info("━━━ EP Scan complete ━━━")
 
 
@@ -1096,11 +1040,11 @@ async def run_ep_scan() -> None:
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     match mode:
-        case "daily":        asyncio.run(run_daily())
-        case "today":        asyncio.run(run_today())
-        case "full":         asyncio.run(run_full())
-        case "status":       asyncio.run(run_status())
-        case "fund_daily":   asyncio.run(run_fund_daily())
+        case "daily":          asyncio.run(run_daily())
+        case "today":          asyncio.run(run_today())
+        case "full":           asyncio.run(run_full())
+        case "status":         asyncio.run(run_status())
+        case "fund_daily":     asyncio.run(run_fund_daily())
         case "fund_weekly":    asyncio.run(run_fund_weekly(0))
         case "fund_weekly_1":  asyncio.run(run_fund_weekly(1))
         case "fund_weekly_2":  asyncio.run(run_fund_weekly(2))
@@ -1112,7 +1056,7 @@ if __name__ == "__main__":
         case "fund_weekly_8":  asyncio.run(run_fund_weekly(8))
         case "fund_weekly_9":  asyncio.run(run_fund_weekly(9))
         case "fund_weekly_10": asyncio.run(run_fund_weekly(10))
-        case "ep_scan":      asyncio.run(run_ep_scan())
+        case "ep_scan":        asyncio.run(run_ep_scan())
         case _:
             print(__doc__)
             sys.exit(1)
