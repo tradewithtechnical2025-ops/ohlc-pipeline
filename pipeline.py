@@ -1050,12 +1050,12 @@ async def run_ep_scan() -> None:
 
     async with httpx.AsyncClient() as client:
 
-        # 1. Download OHLC + Fundamentals parallel
-        log.info("Downloading OHLC chunks + fundamentals…")
+        # 1. Download OHLC + Screener parallel
+        log.info("Downloading OHLC chunks + screener…")
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
-        ohlc_results, fund_raw = await asyncio.gather(
+        ohlc_results, screener_raw = await asyncio.gather(
             asyncio.gather(*ohlc_tasks, return_exceptions=True),
-            r2_download_fund(client),
+            r2_download(client, "screener.json"),
         )
 
         all_data: dict = {}
@@ -1066,53 +1066,49 @@ async def run_ep_scan() -> None:
                 all_data.update(res["stocks"])
         log.info(f"Loaded {len(all_data)} stocks")
 
-        # 2. Scan
+        # 2. Build screener lookup — { "MRF": {"sales_ch": "+13.7%", "eps_ch": "+37.1%"} }
+        screener = {}
+        if isinstance(screener_raw, list):
+            for row in screener_raw:
+                sym = row.get("Stocks", "").strip()
+                if not sym:
+                    continue
+                try:
+                    sc = float(row.get("SALES CH%", 0)) * 100
+                    sales_ch = f"+{sc:.1f}%" if sc >= 0 else f"{sc:.1f}%"
+                except:
+                    sales_ch = ""
+                try:
+                    ec = float(row.get("EPS CHANGE", 0)) * 100
+                    eps_ch = f"+{ec:.1f}%" if ec >= 0 else f"{ec:.1f}%"
+                except:
+                    eps_ch = ""
+                screener[sym] = {"sales_ch": sales_ch, "eps_ch": eps_ch}
+        log.info(f"Screener loaded: {len(screener)} stocks")
+
+        # 3. Scan
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
-        # 3. Merge fundamentals — YoY sales & EPS
+        # 4. Merge screener data
         for sig in signals:
-            sym  = sig["symbol"]
-            fund = fund_raw.get(sym, {})
+            sym = sig["symbol"]
+            sc  = screener.get(sym, {})
+            sig["sales_ch"] = sc.get("sales_ch", "")
+            sig["eps_ch"]   = sc.get("eps_ch", "")
+            sig["q_name"]   = fund_raw.get(sym, {}).get("q1_period", "") if False else ""
 
-            q1_eps_d = fund.get("q1_eps_d", "")
-            q5_eps_d = fund.get("q5_eps_d", "")   # same quarter last year
-
-            q1_sales = fund.get("q1_sales", "")
-            q5_sales = fund.get("q5_sales", "")   # same quarter last year
-
-            # EPS YoY %
-            try:
-                eps_ch = round((float(q1_eps_d) - float(q5_eps_d))
-                               / abs(float(q5_eps_d)) * 100, 1)
-                sig["eps_ch"] = f"+{eps_ch}%" if eps_ch >= 0 else f"{eps_ch}%"
-            except (TypeError, ValueError, ZeroDivisionError):
-                sig["eps_ch"] = ""
-
-            # Sales YoY %
-            try:
-                sales_ch = round((float(q1_sales) - float(q5_sales))
-                                 / abs(float(q5_sales)) * 100, 1)
-                sig["sales_ch"] = f"+{sales_ch}%" if sales_ch >= 0 else f"{sales_ch}%"
-            except (TypeError, ValueError, ZeroDivisionError):
-                sig["sales_ch"] = ""
-
-            sig["q_name"] = fund.get("q1_period", "")
-
-        # 4. Upload
-        delayed = len(signals)
-        log.info(f"Found {delayed} Delayed EP signals")
-
+        # 5. Upload
+        log.info(f"Found {len(signals)} Delayed EP signals")
         payload = json.dumps({
             "updated" : today,
-            "count"   : delayed,
+            "count"   : len(signals),
             "signals" : signals,
         })
         await r2_upload(client, "ep_signals.json", payload)
 
     log.info("━━━ EP Scan complete ━━━")
-
 
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
