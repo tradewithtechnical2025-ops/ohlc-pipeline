@@ -1,0 +1,22 @@
+name: Test EP Scan
+
+on:
+  workflow_dispatch:   # manually trigger karo
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install httpx
+
+      - name: Run EP Test
+        env:
+          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python test_ep.py
