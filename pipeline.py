@@ -969,66 +969,46 @@ def _detect_ep(
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
     max_consolidation: int = 20,
+    max_ep_age_days: int   = 30,   # ← EP candle max 30 trading days purana ho
 ) -> list[dict]:
-    """
-    EP Formation rules:
-      1. Gap Up  : today_low > prev_high  AND gap >= 2%
-                   gap% = (today_low - prev_high) / prev_high * 100
-      2. Volume  : EP candle volume >= 2x avg of last 20 candles
-      3. Boundary: gap_lower = prev_high — no candle should CLOSE below this
-      4. Window  : track up to 20 candles after EP candle
-      5. Type    : Normal EP (<=2 candles)  |  Delayed EP (3-20 candles)
-    """
     signals = []
 
     for sym, s in all_data.items():
-        dates   = s["d"]
-        highs   = s["h"]
-        lows    = s["l"]
-        closes  = s["c"]
-        volumes = s["v"]
-
+        dates, highs, lows, closes, volumes = (
+            s["d"], s["h"], s["l"], s["c"], s["v"]
+        )
         n = len(dates)
         if n < volume_lookback + 2:
             continue
 
-        for i in range(volume_lookback, n):
+        # Sirf last 30 candles mein EP dhundo
+        scan_from = max(volume_lookback, n - max_ep_age_days)
 
-            # ── 1. True Gap Up ────────────────────────────────
+        for i in range(scan_from, n):       # ← yahan change hai
             prev_high = highs[i - 1]
             today_low = lows[i]
-
             if today_low <= prev_high:
                 continue
-
             gap_pct = (today_low - prev_high) / prev_high * 100
             if gap_pct < min_gap_pct:
                 continue
-
-            # ── 2. Volume Spike ───────────────────────────────
             avg_vol = sum(volumes[i - volume_lookback:i]) / volume_lookback
             if avg_vol == 0:
                 continue
             vol_x = volumes[i] / avg_vol
             if vol_x < volume_spike_x:
                 continue
-
-            # ── 3. Consolidation — no close below prev_high ───
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
-
             for j in range(i + 1, min(i + max_consolidation + 1, n)):
                 if closes[j] < gap_lower:
                     ep_intact = False
                     break
                 consol_count += 1
-
             if not ep_intact:
                 continue
-
-            ep_type = "Delayed EP" if consol_count > 2 else "Normal EP"
-
+            ep_type  = "Delayed EP" if consol_count > 2 else "Normal EP"
             last_idx = min(i + consol_count, n - 1)
             signals.append({
                 "symbol"        : sym,
