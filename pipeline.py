@@ -44,7 +44,7 @@ V3_URL       = "https://api.upstox.com/v3/historical-candle/intraday"
 FUND_URL     = "https://api.upstox.com/v2/fundamentals"
 ROLLING_DAYS = 548    # 1.5 years
 R2_CHUNKS    = 8
-CONCURRENCY  = 15     # parallel Upstox calls (stay under rate limit)
+CONCURRENCY  = 5      # parallel Upstox calls (stay under rate limit)
 FUND_CONCURRENCY = 1  # sequential — avoid rate limit
 RETRY        = 3
 SLEEP_MS     = 3.0    # rate limit guard for fundamentals
@@ -124,7 +124,7 @@ async def fetch_ohlc(
             log.error("❌ TOKEN EXPIRED — update UPSTOX_TOKEN secret!")
             sys.exit(1)
         if r.status_code == 429:
-            await asyncio.sleep(10)
+            await asyncio.sleep(3)
             continue
         if r.status_code != 200:
             return sym, None
@@ -169,7 +169,7 @@ async def fetch_today_candle(
             log.error("❌ TOKEN EXPIRED")
             sys.exit(1)
         if r.status_code == 429:
-            await asyncio.sleep(10)
+            await asyncio.sleep(3)
             continue
         if r.status_code != 200:
             return sym, None
@@ -969,28 +969,43 @@ def _detect_ep(
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
     max_consolidation: int = 20,
-    max_ep_age_days: int   = 30,
 ) -> list[dict]:
+    """
+    EP Formation rules:
+      1. Gap Up  : today_low > prev_high  AND gap >= 2%
+                   gap% = (today_low - prev_high) / prev_high * 100
+      2. Volume  : EP candle volume >= 2x avg of last 20 candles
+      3. Boundary: gap_lower = prev_high — no candle should CLOSE below this
+      4. Window  : track up to 20 candles after EP candle
+      5. Type    : Normal EP (<=2 candles)  |  Delayed EP (3-20 candles)
+    """
     signals = []
 
     for sym, s in all_data.items():
-        dates, highs, lows, closes, volumes = (
-            s["d"], s["h"], s["l"], s["c"], s["v"]
-        )
+        dates   = s["d"]
+        highs   = s["h"]
+        lows    = s["l"]
+        closes  = s["c"]
+        volumes = s["v"]
+
         n = len(dates)
         if n < volume_lookback + 2:
             continue
 
-        scan_from = max(volume_lookback, n - max_ep_age_days)
+        for i in range(volume_lookback, n):
 
-        for i in range(scan_from, n):
+            # ── 1. True Gap Up ────────────────────────────────
             prev_high = highs[i - 1]
             today_low = lows[i]
+
             if today_low <= prev_high:
                 continue
+
             gap_pct = (today_low - prev_high) / prev_high * 100
             if gap_pct < min_gap_pct:
                 continue
+
+            # ── 2. Volume Spike ───────────────────────────────
             avg_vol = sum(volumes[i - volume_lookback:i]) / volume_lookback
             if avg_vol == 0:
                 continue
@@ -998,6 +1013,7 @@ def _detect_ep(
             if vol_x < volume_spike_x:
                 continue
 
+            # ── 3. Consolidation — no close below prev_high ───
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
@@ -1010,39 +1026,29 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 3:          # min 3 din
-                continue
-            if consol_count >= max_consolidation:   # 20 din se purana
-                continue
+
+            ep_type = "Delayed EP" if consol_count > 2 else "Normal EP"
 
             last_idx = min(i + consol_count, n - 1)
             signals.append({
-                "symbol"         : sym,
-                "ep_date"        : dates[i],
-                "gap_lower"      : round(gap_lower, 2),
-                "gap_pct"        : round(gap_pct, 2),
-                "vol_spike_x"    : round(vol_x, 1),
-                "ep_candle_high" : round(highs[i], 2),
-                "ep_candle_low"  : round(today_low, 2),
-                "last_close"     : round(closes[last_idx], 2),
-                "last_date"      : dates[last_idx],
-                "consolidation"  : consol_count,
-                "ep_type"        : "Delayed EP",
+                "symbol"        : sym,
+                "ep_date"       : dates[i],
+                "gap_lower"     : round(gap_lower, 2),
+                "gap_pct"       : round(gap_pct, 2),
+                "vol_spike_x"   : round(vol_x, 1),
+                "ep_candle_low" : round(today_low, 2),
+                "last_close"    : round(closes[last_idx], 2),
+                "last_date"     : dates[last_idx],
+                "consolidation" : consol_count,
+                "ep_type"       : ep_type,
             })
 
-    # Per stock sirf latest EP
-    seen: dict[str, dict] = {}
-    for sig in signals:
-        sym = sig["symbol"]
-        if sym not in seen or sig["ep_date"] > seen[sym]["ep_date"]:
-            seen[sym] = sig
-
-    return list(seen.values())
+    return signals
 
 
 async def run_ep_scan() -> None:
     """
-    Weekdays 4:15 PM IST — scan all stocks for active Delayed EP formations.
+    Weekdays 4:15 PM IST — scan all stocks for active EP formations.
     Runs after daily OHLC update. Uploads ep_signals.json to R2.
     """
     today = today_ist()
@@ -1054,86 +1060,35 @@ async def run_ep_scan() -> None:
 
     async with httpx.AsyncClient() as client:
 
-        # 1. Download OHLC + Screener + Fundamentals parallel
-        log.info("Downloading OHLC chunks + screener + fundamentals…")
-        ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
-        ohlc_results, screener_raw, fund_raw = await asyncio.gather(
-            asyncio.gather(*ohlc_tasks, return_exceptions=True),
-            r2_download(client, "screener.json"),
-            r2_download_fund(client),
-        )
-
-        # Build OHLC master
-        all_data: dict = {}
-        for i, res in enumerate(ohlc_results):
-            if isinstance(res, Exception):
-                log.warning(f"  ohlc_{i+1}.json error: {res}")
-            elif res and "stocks" in res:
-                all_data.update(res["stocks"])
+        # 1. Download all OHLC chunks
+        log.info("Downloading OHLC chunks…")
+        all_data = await download_all_chunks(client)
         log.info(f"Loaded {len(all_data)} stocks")
 
-        # 2. Screener lookup — { "MRF": {"sales_ch": "+13.7%", "eps_ch": "+37.1%"} }
-        screener: dict = {}
-        if isinstance(screener_raw, list):
-            for row in screener_raw:
-                sym = row.get("Stocks", "").strip()
-                if not sym:
-                    continue
-                try:
-                    sc = float(row.get("SALES CH%", 0)) * 100
-                    sales_ch = f"+{sc:.1f}%" if sc >= 0 else f"{sc:.1f}%"
-                except:
-                    sales_ch = ""
-                try:
-                    ec = float(row.get("EPS CHANGE", 0)) * 100
-                    eps_ch = f"+{ec:.1f}%" if ec >= 0 else f"{ec:.1f}%"
-                except:
-                    eps_ch = ""
-                screener[sym] = {"sales_ch": sales_ch, "eps_ch": eps_ch}
-        log.info(f"Screener loaded: {len(screener)} stocks")
-
-        # 3. Fundamentals lookup — { "MRF": {"q1_period": "Mar 2026", ...} }
-        fund_lookup: dict = {}
-        if isinstance(fund_raw, dict):
-            fund_lookup = fund_raw
-        elif isinstance(fund_raw, list):
-            fund_lookup = {d["symbol"]: d for d in fund_raw if d.get("symbol")}
-        log.info(f"Fundamentals loaded: {len(fund_lookup)} stocks")
-
-        # 4. Scan
+        # 2. Scan all stocks
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
+
+        # Sort — most recent EP first, then by gap %
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
-        # 5. Merge screener + fundamentals into each signal
-        for sig in signals:
-            sym = sig["symbol"]
+        normal  = sum(1 for s in signals if s["ep_type"] == "Normal EP")
+        delayed = sum(1 for s in signals if s["ep_type"] == "Delayed EP")
+        log.info(f"Found {len(signals)} EP signals — Normal: {normal}  Delayed: {delayed}")
 
-            # Screener — sales & EPS change
-            sc = screener.get(sym, {})
-            sig["sales_ch"] = sc.get("sales_ch", "")
-            sig["eps_ch"]   = sc.get("eps_ch", "")
-
-            # Fundamentals — last quarter name only
-            fund = fund_lookup.get(sym, {})
-            sig["q_name"] = fund.get("q1_period", "")
-
-            # Volume: x → % above average
-            vol_x = sig.pop("vol_spike_x", 1)
-            sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
-
-        # 6. Upload ep_signals.json to R2
-        count = len(signals)
-        log.info(f"Found {count} Delayed EP signals")
-
+        # 3. Upload ep_signals.json
         payload = json.dumps({
             "updated" : today,
-            "count"   : count,
+            "count"   : len(signals),
+            "normal"  : normal,
+            "delayed" : delayed,
             "signals" : signals,
         })
         await r2_upload(client, "ep_signals.json", payload)
 
     log.info("━━━ EP Scan complete ━━━")
+
+
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
