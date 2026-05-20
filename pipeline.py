@@ -1071,23 +1071,34 @@ async def run_ep_scan() -> None:
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
-        # 3. Merge fundamentals
+        # 3. Merge fundamentals — YoY sales & EPS
         for sig in signals:
             sym  = sig["symbol"]
             fund = fund_raw.get(sym, {})
 
             q1_eps_d = fund.get("q1_eps_d", "")
-            q2_eps_d = fund.get("q2_eps_d", "")
+            q5_eps_d = fund.get("q5_eps_d", "")   # same quarter last year
 
+            q1_sales = fund.get("q1_sales", "")
+            q5_sales = fund.get("q5_sales", "")   # same quarter last year
+
+            # EPS YoY %
             try:
-                eps_ch = round((float(q1_eps_d) - float(q2_eps_d))
-                               / abs(float(q2_eps_d)) * 100, 1)
+                eps_ch = round((float(q1_eps_d) - float(q5_eps_d))
+                               / abs(float(q5_eps_d)) * 100, 1)
+                sig["eps_ch"] = f"+{eps_ch}%" if eps_ch >= 0 else f"{eps_ch}%"
             except (TypeError, ValueError, ZeroDivisionError):
-                eps_ch = ""
+                sig["eps_ch"] = ""
 
-            sig["q_name"]   = fund.get("q1_period", "")
-            sig["sales_ch"] = fund.get("q1_sales_ch", "")
-            sig["eps_ch"]   = eps_ch
+            # Sales YoY %
+            try:
+                sales_ch = round((float(q1_sales) - float(q5_sales))
+                                 / abs(float(q5_sales)) * 100, 1)
+                sig["sales_ch"] = f"+{sales_ch}%" if sales_ch >= 0 else f"{sales_ch}%"
+            except (TypeError, ValueError, ZeroDivisionError):
+                sig["sales_ch"] = ""
+
+            sig["q_name"] = fund.get("q1_period", "")
 
         # 4. Upload
         delayed = len(signals)
