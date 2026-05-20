@@ -10,6 +10,7 @@ Usage:
   python pipeline.py status              # print R2 chunk summary
   python pipeline.py fund_daily          # BSE result stocks update (4:30 PM IST, weekdays)
   python pipeline.py fund_weekly         # full 2300 stocks refresh (Sunday)
+  python pipeline.py ep_scan             # EP formation scan        (4:15 PM IST, weekdays)
 """
 
 import asyncio
@@ -959,6 +960,136 @@ async def run_fund_weekly(part: int = 0) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+# EP FORMATION SCANNER
+# ══════════════════════════════════════════════════════════════
+
+def _detect_ep(
+    all_data: dict,
+    min_gap_pct: float     = 2.0,
+    volume_spike_x: float  = 2.0,
+    volume_lookback: int   = 20,
+    max_consolidation: int = 20,
+) -> list[dict]:
+    """
+    EP Formation rules:
+      1. Gap Up  : today_low > prev_high  AND gap >= 2%
+                   gap% = (today_low - prev_high) / prev_high * 100
+      2. Volume  : EP candle volume >= 2x avg of last 20 candles
+      3. Boundary: gap_lower = prev_high — no candle should CLOSE below this
+      4. Window  : track up to 20 candles after EP candle
+      5. Type    : Normal EP (<=2 candles)  |  Delayed EP (3-20 candles)
+    """
+    signals = []
+
+    for sym, s in all_data.items():
+        dates   = s["d"]
+        highs   = s["h"]
+        lows    = s["l"]
+        closes  = s["c"]
+        volumes = s["v"]
+
+        n = len(dates)
+        if n < volume_lookback + 2:
+            continue
+
+        for i in range(volume_lookback, n):
+
+            # ── 1. True Gap Up ────────────────────────────────
+            prev_high = highs[i - 1]
+            today_low = lows[i]
+
+            if today_low <= prev_high:
+                continue
+
+            gap_pct = (today_low - prev_high) / prev_high * 100
+            if gap_pct < min_gap_pct:
+                continue
+
+            # ── 2. Volume Spike ───────────────────────────────
+            avg_vol = sum(volumes[i - volume_lookback:i]) / volume_lookback
+            if avg_vol == 0:
+                continue
+            vol_x = volumes[i] / avg_vol
+            if vol_x < volume_spike_x:
+                continue
+
+            # ── 3. Consolidation — no close below prev_high ───
+            gap_lower    = prev_high
+            consol_count = 0
+            ep_intact    = True
+
+            for j in range(i + 1, min(i + max_consolidation + 1, n)):
+                if closes[j] < gap_lower:
+                    ep_intact = False
+                    break
+                consol_count += 1
+
+            if not ep_intact:
+                continue
+
+            ep_type = "Delayed EP" if consol_count > 2 else "Normal EP"
+
+            last_idx = min(i + consol_count, n - 1)
+            signals.append({
+                "symbol"        : sym,
+                "ep_date"       : dates[i],
+                "gap_lower"     : round(gap_lower, 2),
+                "gap_pct"       : round(gap_pct, 2),
+                "vol_spike_x"   : round(vol_x, 1),
+                "ep_candle_low" : round(today_low, 2),
+                "last_close"    : round(closes[last_idx], 2),
+                "last_date"     : dates[last_idx],
+                "consolidation" : consol_count,
+                "ep_type"       : ep_type,
+            })
+
+    return signals
+
+
+async def run_ep_scan() -> None:
+    """
+    Weekdays 4:15 PM IST — scan all stocks for active EP formations.
+    Runs after daily OHLC update. Uploads ep_signals.json to R2.
+    """
+    today = today_ist()
+    if not is_trading_day(today):
+        log.info(f"⏭  {today} is not a trading day — exiting")
+        return
+
+    log.info(f"━━━ EP Scan  {today} ━━━")
+
+    async with httpx.AsyncClient() as client:
+
+        # 1. Download all OHLC chunks
+        log.info("Downloading OHLC chunks…")
+        all_data = await download_all_chunks(client)
+        log.info(f"Loaded {len(all_data)} stocks")
+
+        # 2. Scan all stocks
+        log.info("Scanning for EP formations…")
+        signals = _detect_ep(all_data)
+
+        # Sort — most recent EP first, then by gap %
+        signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
+
+        normal  = sum(1 for s in signals if s["ep_type"] == "Normal EP")
+        delayed = sum(1 for s in signals if s["ep_type"] == "Delayed EP")
+        log.info(f"Found {len(signals)} EP signals — Normal: {normal}  Delayed: {delayed}")
+
+        # 3. Upload ep_signals.json
+        payload = json.dumps({
+            "updated" : today,
+            "count"   : len(signals),
+            "normal"  : normal,
+            "delayed" : delayed,
+            "signals" : signals,
+        })
+        await r2_upload(client, "ep_signals.json", payload)
+
+    log.info("━━━ EP Scan complete ━━━")
+
+
+# ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
@@ -981,6 +1112,7 @@ if __name__ == "__main__":
         case "fund_weekly_8":  asyncio.run(run_fund_weekly(8))
         case "fund_weekly_9":  asyncio.run(run_fund_weekly(9))
         case "fund_weekly_10": asyncio.run(run_fund_weekly(10))
+        case "ep_scan":      asyncio.run(run_ep_scan())
         case _:
             print(__doc__)
             sys.exit(1)
