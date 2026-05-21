@@ -889,7 +889,7 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 30,
+    max_consolidation: int = 20,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
@@ -931,7 +931,7 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 0:
+            if consol_count < 3:
                 continue
             if consol_count >= max_consolidation:
                 continue
@@ -1061,7 +1061,14 @@ async def run_ep_scan() -> None:
             sig["rs"]       = sc.get("rs", "")
             sig["ltp"]      = sc.get("ltp", "")
             fund = fund_lookup.get(sym, {})
-            sig["q_name"] = fund.get("q1_period", "")
+            # Latest quarter — Upstox ascending order mein deta hai (q1=oldest, q4=newest)
+            q_name = ""
+            for _n in range(4, 0, -1):
+                _p = fund.get(f"q{_n}_period", "")
+                if _p:
+                    q_name = _p
+                    break
+            sig["q_name"] = q_name
             vol_x = sig.pop("vol_spike_x", 1)
             sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
 
