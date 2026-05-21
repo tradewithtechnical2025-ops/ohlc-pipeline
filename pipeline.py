@@ -47,9 +47,6 @@ RETRY        = 3
 SLEEP_MS     = 3.0
 RATE_DELAY   = 0.5    # 500ms between requests = ~200 req/min
 
-# Max quarters to retain per stock in fundamentals
-MAX_QUARTERS = 8
-
 HERE = Path(__file__).parent
 
 with open(HERE / "isin_map.json") as f:
@@ -113,7 +110,7 @@ async def fetch_ohlc(
 
     for attempt in range(RETRY):
         async with sem:
-            await asyncio.sleep(RATE_DELAY)
+            await asyncio.sleep(RATE_DELAY)   # ← rate limit guard
             try:
                 r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
             except httpx.RequestError as e:
@@ -161,7 +158,7 @@ async def fetch_today_candle(
 
     for attempt in range(RETRY):
         async with sem:
-            await asyncio.sleep(RATE_DELAY)
+            await asyncio.sleep(RATE_DELAY)   # ← rate limit guard
             try:
                 r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
             except httpx.RequestError:
@@ -236,7 +233,7 @@ async def fetch_income_statement(client, sem, isin):
         if not rev and not np_:
             continue
         src = rev or np_
-        n = min(len(src["history"]), MAX_QUARTERS)
+        n = min(len(src["history"]), 4)
         quarters = [q["period"] for q in src["history"][:n]]
         def ex(arr, key="value"): return [(q.get(key) if q.get(key) is not None else "") for q in (arr or [])[:n]]
         def exf(name): return [(q["value"] if q.get("value") is not None else "") for q in (next((s for s in full if s.get("particular") == name), {}).get("history", []))[:n]]
@@ -373,91 +370,7 @@ async def fetch_corporate_actions(client, sem, isin):
     return result
 
 
-# ══════════════════════════════════════════════════════════════
-# FIX 2: CUMULATIVE QUARTER MERGE
-# Existing quarters ko preserve karo, naya data front mein add karo.
-# ══════════════════════════════════════════════════════════════
-
-def _merge_quarters(existing: dict, fresh: dict) -> dict:
-    """
-    Merge fresh quarter data into existing stored object.
-    Fresh quarters (from API) are most-recent-first.
-    Existing stored quarters may already have some of these.
-    Result: deduplicated, sorted newest-first, capped at MAX_QUARTERS.
-    """
-    # Reconstruct existing quarter list from flat fields
-    existing_quarters: list[dict] = []
-    i = 1
-    while f"q{i}_period" in existing and existing[f"q{i}_period"]:
-        existing_quarters.append({
-            "period":   existing[f"q{i}_period"],
-            "sales":    existing.get(f"q{i}_sales", ""),
-            "sales_ch": existing.get(f"q{i}_sales_ch", ""),
-            "op":       existing.get(f"q{i}_op", ""),
-            "op_ch":    existing.get(f"q{i}_op_ch", ""),
-            "pat":      existing.get(f"q{i}_pat", ""),
-            "pat_ch":   existing.get(f"q{i}_pat_ch", ""),
-            "eps":      existing.get(f"q{i}_eps", ""),
-            "eps_d":    existing.get(f"q{i}_eps_d", ""),
-        })
-        i += 1
-
-    # Build fresh quarter list
-    fresh_quarters: list[dict] = []
-    if fresh:
-        for j, period in enumerate(fresh.get("quarters", [])):
-            fresh_quarters.append({
-                "period":   period,
-                "sales":    fresh["sales"][j]    if j < len(fresh.get("sales", []))    else "",
-                "sales_ch": fresh["sales_ch"][j] if j < len(fresh.get("sales_ch", [])) else "",
-                "op":       fresh["op"][j]       if j < len(fresh.get("op", []))       else "",
-                "op_ch":    fresh["op_ch"][j]    if j < len(fresh.get("op_ch", []))    else "",
-                "pat":      fresh["pat"][j]      if j < len(fresh.get("pat", []))      else "",
-                "pat_ch":   fresh["pat_ch"][j]   if j < len(fresh.get("pat_ch", []))   else "",
-                "eps":      fresh["eps"][j]      if j < len(fresh.get("eps", []))      else "",
-                "eps_d":    fresh["eps_d"][j]    if j < len(fresh.get("eps_d", []))    else "",
-            })
-
-    # Merge: fresh overrides existing for same period, then append older existing periods
-    merged_by_period: dict[str, dict] = {}
-    for q in existing_quarters:
-        merged_by_period[q["period"]] = q
-    for q in fresh_quarters:
-        merged_by_period[q["period"]] = q  # fresh overwrites same period
-
-    # Sort newest-first (period strings like "Q3FY25" sort lexically — use as-is, newest first)
-    all_quarters = sorted(merged_by_period.values(), key=lambda q: q["period"], reverse=True)
-    all_quarters = all_quarters[:MAX_QUARTERS]
-
-    return all_quarters
-
-
-def _write_quarters_to_obj(obj: dict, merged_quarters: list[dict]) -> None:
-    """Write merged quarter list back to flat fields on obj."""
-    # Clear old quarter fields first
-    i = 1
-    while f"q{i}_period" in obj:
-        for suffix in ("period","sales","sales_ch","op","op_ch","pat","pat_ch","eps","eps_d"):
-            obj.pop(f"q{i}_{suffix}", None)
-        i += 1
-
-    for i, q in enumerate(merged_quarters, 1):
-        obj[f"q{i}_period"]   = q["period"]
-        obj[f"q{i}_sales"]    = q["sales"]
-        obj[f"q{i}_sales_ch"] = q["sales_ch"]
-        obj[f"q{i}_op"]       = q["op"]
-        obj[f"q{i}_op_ch"]    = q["op_ch"]
-        obj[f"q{i}_pat"]      = q["pat"]
-        obj[f"q{i}_pat_ch"]   = q["pat_ch"]
-        obj[f"q{i}_eps"]      = q["eps"]
-        obj[f"q{i}_eps_d"]    = q["eps_d"]
-
-
-async def fetch_one_fundamental(client, sem, sym, isin, existing: dict | None = None):
-    """
-    Fetch fresh fundamentals and merge quarters cumulatively with existing data.
-    Pass existing={} for weekly full refresh, or existing=fund_data.get(sym, {}) for daily.
-    """
+async def fetch_one_fundamental(client, sem, sym, isin):
     income = await fetch_income_statement(client, sem, isin)
     ratios = await fetch_key_ratios(client, sem, isin)
     sh     = await fetch_shareholding(client, sem, isin)
@@ -467,17 +380,24 @@ async def fetch_one_fundamental(client, sem, sym, isin, existing: dict | None = 
     if not any([income, ratios, sh, bs, cf]):
         return sym, None
 
-    # Start from existing data so we preserve old quarters
-    obj = dict(existing) if existing else {}
-    obj["symbol"]  = sym
-    obj["updated"] = today_ist()
+    obj = {"symbol": sym, "updated": today_ist()}
 
     if ratios: obj.update(ratios)
     if sh: obj.update({k: sh[k] for k in sh})
 
-    # FIX 2: Merge quarters cumulatively instead of overwriting
-    merged_quarters = _merge_quarters(existing or {}, income)
-    _write_quarters_to_obj(obj, merged_quarters)
+    if income:
+        quarters = income.get("quarters", [])
+        for i, q in enumerate(quarters[:4]):
+            n = i + 1
+            obj[f"q{n}_period"]   = q
+            obj[f"q{n}_sales"]    = income["sales"][i]    if i < len(income.get("sales",[]))    else ""
+            obj[f"q{n}_sales_ch"] = income["sales_ch"][i] if i < len(income.get("sales_ch",[])) else ""
+            obj[f"q{n}_op"]       = income["op"][i]       if i < len(income.get("op",[]))       else ""
+            obj[f"q{n}_op_ch"]    = income["op_ch"][i]    if i < len(income.get("op_ch",[]))    else ""
+            obj[f"q{n}_pat"]      = income["pat"][i]      if i < len(income.get("pat",[]))      else ""
+            obj[f"q{n}_pat_ch"]   = income["pat_ch"][i]   if i < len(income.get("pat_ch",[]))   else ""
+            obj[f"q{n}_eps"]      = income["eps"][i]      if i < len(income.get("eps",[]))      else ""
+            obj[f"q{n}_eps_d"]    = income["eps_d"][i]    if i < len(income.get("eps_d",[]))    else ""
 
     if bs:
         obj["bs_type"]  = bs.get("bs_type", "")
@@ -584,29 +504,8 @@ async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
 
 
 # ══════════════════════════════════════════════════════════════
-# FIX 1: R2 HELPERS — Normalized fund download (list/dict/wrapped)
+# R2 HELPERS
 # ══════════════════════════════════════════════════════════════
-
-def _normalize_fund_data(raw) -> dict:
-    """
-    Always return {symbol: obj} dict regardless of R2 storage format.
-    Handles three formats:
-      - list:  [{symbol: "X", ...}, ...]          (old upload_fund format)
-      - dict:  {"stocks": {...}}                   (wrapped dict)
-      - dict:  {"X": {...}, "Y": {...}}            (plain symbol-keyed dict)
-    """
-    if isinstance(raw, list):
-        return {d["symbol"]: d for d in raw if d.get("symbol")}
-    if isinstance(raw, dict):
-        # Wrapped format: {"stocks": {...}} or {"updated": ..., "stocks": {...}}
-        if "stocks" in raw and isinstance(raw["stocks"], dict):
-            return raw["stocks"]
-        if "stocks" in raw and isinstance(raw["stocks"], list):
-            return {d["symbol"]: d for d in raw["stocks"] if d.get("symbol")}
-        # Plain symbol-keyed dict
-        return raw
-    return {}
-
 
 async def r2_download_fund(client: httpx.AsyncClient) -> dict:
     url = f"{WORKER_URL}/fundamentals.json"
@@ -617,13 +516,17 @@ async def r2_download_fund(client: httpx.AsyncClient) -> dict:
     if r.status_code != 200:
         raise RuntimeError(f"Download failed: HTTP {r.status_code}")
     log.info(f"  ↓ fundamentals.json ({len(r.content)/1024:.0f} KB)")
-    # FIX 1: normalize whatever format is stored
-    return _normalize_fund_data(r.json())
+    data = r.json()
+    if isinstance(data, list):
+        return {d["symbol"]: d for d in data if d.get("symbol")}
+    if isinstance(data, dict):
+        return data.get("stocks", data)
+    return {}
 
 
 async def r2_upload_fund(client: httpx.AsyncClient, data: dict) -> None:
-    # Always upload as plain {symbol: obj} dict (no wrapping) — consistent with download
-    payload = json.dumps(data)
+    arr = list(data.values())
+    payload = json.dumps(arr)
     url = f"{WORKER_URL}?file=fundamentals.json"
     r = await client.post(
         url,
@@ -915,11 +818,7 @@ async def run_fund_daily() -> None:
         fund_data = await r2_download_fund(client)
 
         log.info(f"Fetching fundamentals for {len(symbols)} stocks…")
-        # FIX 2: pass existing data per stock so quarters accumulate
-        tasks = [
-            fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym], existing=fund_data.get(sym, {}))
-            for sym in symbols if sym in ISIN_MAP
-        ]
+        tasks   = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in symbols if sym in ISIN_MAP]
         results = await asyncio.gather(*tasks)
 
         ok = 0
@@ -964,11 +863,7 @@ async def run_fund_weekly(part: int = 0) -> None:
         failed = 0
         for i in range(0, len(chunk), batch_size):
             batch = chunk[i : i + batch_size]
-            # FIX 2: pass existing data so quarters accumulate on weekly too
-            tasks = [
-                fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym], existing=fund_data.get(sym, {}))
-                for sym in batch
-            ]
+            tasks = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in batch]
             results = await asyncio.gather(*tasks)
             for sym, data in results:
                 if data:
@@ -994,11 +889,11 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 30,
+    max_consolidation: int = 20,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
- 
+
     for sym, s in all_data.items():
         dates, highs, lows, closes, volumes = (
             s["d"], s["h"], s["l"], s["c"], s["v"]
@@ -1006,9 +901,9 @@ def _detect_ep(
         n = len(dates)
         if n < volume_lookback + 2:
             continue
- 
+
         scan_from = max(volume_lookback, n - max_ep_age_days)
- 
+
         for i in range(scan_from, n):
             prev_high = highs[i - 1]
             today_low = lows[i]
@@ -1023,31 +918,39 @@ def _detect_ep(
             vol_x = volumes[i] / avg_vol
             if vol_x < volume_spike_x:
                 continue
- 
+
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
- 
+
             for j in range(i + 1, min(i + max_consolidation + 1, n)):
                 if closes[j] < gap_lower:
                     ep_intact = False
                     break
                 consol_count += 1
- 
+
             if not ep_intact:
                 continue
-            if consol_count < 0:
+            if consol_count < 3:
                 continue
             if consol_count >= max_consolidation:
                 continue
- 
+
             last_idx = min(i + consol_count, n - 1)
             ep_close = closes[i]
             ep_5d_idx = min(i + 5, n - 1)
             ep_5d_return = round((closes[ep_5d_idx] - ep_close) / ep_close * 100, 2) \
                            if ep_5d_idx > i else ""
             ep_return = round((closes[last_idx] - ep_close) / ep_close * 100, 2)
- 
+
+            # EP Pullback — no consolidation candle closed above EP high
+            ep_high = highs[i]
+            never_broke_high = all(
+                closes[j] <= ep_high
+                for j in range(i + 1, last_idx + 1)
+            )
+            ep_type = "Consolidating below EP high" if never_broke_high else "Delayed EP"
+
             signals.append({
                 "symbol"          : sym,
                 "ep_date"         : dates[i],
@@ -1062,26 +965,26 @@ def _detect_ep(
                 "last_close"      : round(closes[last_idx], 2),
                 "last_date"       : dates[last_idx],
                 "consolidation"   : consol_count,
-                "ep_type"         : "Delayed EP",
+                "ep_type"         : ep_type,
             })
- 
+
     seen: dict[str, dict] = {}
     for sig in signals:
         sym = sig["symbol"]
         if sym not in seen or sig["ep_date"] > seen[sym]["ep_date"]:
             seen[sym] = sig
- 
+
     return list(seen.values())
- 
- 
+
+
 async def run_ep_scan() -> None:
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
         return
- 
+
     log.info(f"━━━ EP Scan  {today} ━━━")
- 
+
     async with httpx.AsyncClient() as client:
         log.info("Downloading OHLC chunks + screener + fundamentals…")
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
@@ -1090,7 +993,7 @@ async def run_ep_scan() -> None:
             r2_download(client, "screener.json"),
             r2_download_fund(client),
         )
- 
+
         all_data: dict = {}
         for i, res in enumerate(ohlc_results):
             if isinstance(res, Exception):
@@ -1098,7 +1001,7 @@ async def run_ep_scan() -> None:
             elif res and "stocks" in res:
                 all_data.update(res["stocks"])
         log.info(f"Loaded {len(all_data)} stocks")
- 
+
         screener: dict = {}
         if isinstance(screener_raw, list):
             for row in screener_raw:
@@ -1136,18 +1039,18 @@ async def run_ep_scan() -> None:
                     "ltp"      : row.get("LTP", ""),
                 }
         log.info(f"Screener loaded: {len(screener)} stocks")
- 
+
         fund_lookup: dict = {}
         if isinstance(fund_raw, dict):
             fund_lookup = fund_raw
         elif isinstance(fund_raw, list):
             fund_lookup = {d["symbol"]: d for d in fund_raw if d.get("symbol")}
         log.info(f"Fundamentals loaded: {len(fund_lookup)} stocks")
- 
+
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
- 
+
         for sig in signals:
             sym = sig["symbol"]
             sc = screener.get(sym, {})
@@ -1161,10 +1064,10 @@ async def run_ep_scan() -> None:
             sig["q_name"] = fund.get("q1_period", "")
             vol_x = sig.pop("vol_spike_x", 1)
             sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
- 
+
         count = len(signals)
         log.info(f"Found {count} Delayed EP signals")
- 
+
         payload = json.dumps({"updated": today, "count": count, "signals": signals})
         await r2_upload(client, "ep_signals.json", payload)
     log.info("━━━ EP Scan complete ━━━")
