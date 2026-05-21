@@ -12,6 +12,7 @@ Usage:
   python pipeline.py fund_weekly         # full 2300 stocks refresh (Sunday)
   python pipeline.py ep_scan             # EP formation scan        (4:15 PM IST, weekdays)
   python pipeline.py hlr_scan            # Horizontal resistance scan (4:20 PM IST, weekdays)
+  python pipeline.py pattern_scan        # Price action pattern scan  (4:25 PM IST, weekdays)
 """
 
 import asyncio
@@ -1267,6 +1268,246 @@ async def run_hlr_scan() -> None:
 
     log.info("━━━ HLR Scan complete ━━━")
 
+
+
+# ══════════════════════════════════════════════════════════════
+# PATTERN SCANNER
+# ══════════════════════════════════════════════════════════════
+
+def _build_weekly(dates, opens, highs, lows, closes, volumes):
+    """Aggregate daily OHLC into weekly (Mon-Fri, ISO week)."""
+    from datetime import date as dt
+    weekly = {}
+    for d, o, h, l, c, v in zip(dates, opens, highs, lows, closes, volumes):
+        key = dt.fromisoformat(d).isocalendar()[:2]  # (year, week)
+        if key not in weekly:
+            weekly[key] = {"o": o, "h": h, "l": l, "c": c, "v": v, "d": d}
+        else:
+            weekly[key]["h"] = max(weekly[key]["h"], h)
+            weekly[key]["l"] = min(weekly[key]["l"], l)
+            weekly[key]["c"] = c
+            weekly[key]["v"] += v
+    return weekly
+
+
+def _detect_patterns(
+    all_data: dict,
+    min_volume: int    = 2500,
+    coil_min_babies: int = 3,
+    tight_close_weeks: int = 3,
+    tight_close_pct: float = 2.0,
+) -> list[dict]:
+
+    from datetime import date as dt
+    signals = []
+
+    for sym, s in all_data.items():
+        dates   = s["d"]
+        opens   = s["o"]
+        highs   = s["h"]
+        lows    = s["l"]
+        closes  = s["c"]
+        volumes = s["v"]
+        n       = len(dates)
+
+        if n < 10:
+            continue
+
+        # ── Volume filter — today's volume ──────────────────
+        if volumes[-1] < min_volume:
+            continue
+
+        today = dates[-1]
+
+        # ══════════════════════════════════════════════════
+        # DAILY PATTERNS
+        # ══════════════════════════════════════════════════
+
+        # ── Inside Bar ───────────────────────────────────
+        if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2]):
+            signals.append({
+                "symbol"  : sym,
+                "pattern" : "Inside Bar",
+                "date"    : today,
+                "high"    : round(highs[-1], 2),
+                "low"     : round(lows[-1], 2),
+                "prev_high": round(highs[-2], 2),
+                "prev_low" : round(lows[-2], 2),
+            })
+
+        # ── Double Inside Bar ─────────────────────────────
+        if n >= 3:
+            if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2] and
+                    highs[-2] <= highs[-3] and lows[-2] >= lows[-3]):
+                signals.append({
+                    "symbol"  : sym,
+                    "pattern" : "Double Inside Bar",
+                    "date"    : today,
+                    "high"    : round(highs[-1], 2),
+                    "low"     : round(lows[-1], 2),
+                    "mother_high": round(highs[-3], 2),
+                    "mother_low" : round(lows[-3], 2),
+                })
+
+        # ── NR7 ──────────────────────────────────────────
+        if n >= 7:
+            today_range = highs[-1] - lows[-1]
+            past_ranges = [highs[-i] - lows[-i] for i in range(2, 8)]
+            if today_range <= min(past_ranges):
+                signals.append({
+                    "symbol"  : sym,
+                    "pattern" : "NR7",
+                    "date"    : today,
+                    "range"   : round(today_range, 2),
+                    "high"    : round(highs[-1], 2),
+                    "low"     : round(lows[-1], 2),
+                })
+
+        # ── Mini Coil (MCP) ───────────────────────────────
+        # Find most recent valid mother candle + babies
+        for m_idx in range(n - coil_min_babies - 1, max(0, n - 30), -1):
+            m_high = highs[m_idx]
+            m_low  = lows[m_idx]
+
+            # Count consecutive babies inside mother
+            baby_count = 0
+            coil_state = "Coiling"
+            for b in range(m_idx + 1, n):
+                if highs[b] > m_high:
+                    coil_state = "Upper BO"
+                    break
+                elif lows[b] < m_low:
+                    coil_state = "Lower BD"
+                    break
+                else:
+                    baby_count += 1
+
+            if baby_count >= coil_min_babies:
+                signals.append({
+                    "symbol"     : sym,
+                    "pattern"    : f"{baby_count} Bar MCP" if baby_count <= 6 else "Mini Coil",
+                    "date"       : today,
+                    "mcp_high"   : round(m_high, 2),
+                    "mcp_low"    : round(m_low, 2),
+                    "baby_count" : baby_count,
+                    "coil_state" : coil_state,
+                    "mother_date": dates[m_idx],
+                })
+                break   # sirf most recent coil
+
+        # ══════════════════════════════════════════════════
+        # WEEKLY PATTERNS
+        # ══════════════════════════════════════════════════
+
+        weekly = _build_weekly(dates, opens, highs, lows, closes, volumes)
+        if not weekly:
+            continue
+
+        current_week = dt.fromisoformat(today).isocalendar()[:2]
+        past_weeks   = sorted(k for k in weekly if k < current_week)
+
+        if len(past_weeks) < 2:
+            continue
+
+        lw  = weekly[past_weeks[-1]]   # last complete week
+        lw2 = weekly[past_weeks[-2]]   # 2 weeks ago
+
+        # ── Weekly Inside Bar ─────────────────────────────
+        if lw["h"] <= lw2["h"] and lw["l"] >= lw2["l"]:
+            signals.append({
+                "symbol"   : sym,
+                "pattern"  : "Weekly IB",
+                "date"     : today,
+                "w_high"   : round(lw["h"], 2),
+                "w_low"    : round(lw["l"], 2),
+                "w_close"  : round(lw["c"], 2),
+                "prev_w_high": round(lw2["h"], 2),
+                "prev_w_low" : round(lw2["l"], 2),
+            })
+
+            # ── Weekly Double Inside Bar ──────────────────
+            if len(past_weeks) >= 3:
+                lw3 = weekly[past_weeks[-3]]
+                if lw2["h"] <= lw3["h"] and lw2["l"] >= lw3["l"]:
+                    signals.append({
+                        "symbol"      : sym,
+                        "pattern"     : "Weekly Double IB",
+                        "date"        : today,
+                        "w_high"      : round(lw["h"], 2),
+                        "w_low"       : round(lw["l"], 2),
+                        "mother_w_high": round(lw3["h"], 2),
+                        "mother_w_low" : round(lw3["l"], 2),
+                    })
+
+        # ── Weekly NR7 ────────────────────────────────────
+        if len(past_weeks) >= 7:
+            lw_range    = lw["h"] - lw["l"]
+            past_ranges = [weekly[past_weeks[-i]]["h"] - weekly[past_weeks[-i]]["l"]
+                           for i in range(2, 8)]
+            if lw_range <= min(past_ranges):
+                signals.append({
+                    "symbol"  : sym,
+                    "pattern" : "Weekly NR7",
+                    "date"    : today,
+                    "w_range" : round(lw_range, 2),
+                    "w_high"  : round(lw["h"], 2),
+                    "w_low"   : round(lw["l"], 2),
+                })
+
+        # ── Weekly Tight Close ────────────────────────────
+        if len(past_weeks) >= tight_close_weeks:
+            last_n_closes = [weekly[past_weeks[-i]]["c"]
+                             for i in range(1, tight_close_weeks + 1)]
+            tc_range = (max(last_n_closes) - min(last_n_closes)) / min(last_n_closes) * 100
+            if tc_range <= tight_close_pct:
+                signals.append({
+                    "symbol"   : sym,
+                    "pattern"  : "Weekly Tight Close",
+                    "date"     : today,
+                    "closes"   : [round(c, 2) for c in last_n_closes],
+                    "range_pct": round(tc_range, 2),
+                })
+
+    return signals
+
+
+async def run_pattern_scan() -> None:
+    """
+    Weekdays — scan all stocks for price action patterns.
+    Uploads pattern_signals.json to R2.
+    """
+    today = today_ist()
+    if not is_trading_day(today):
+        log.info(f"⏭  {today} is not a trading day — exiting")
+        return
+
+    log.info(f"━━━ Pattern Scan  {today} ━━━")
+
+    async with httpx.AsyncClient() as client:
+
+        log.info("Downloading OHLC chunks…")
+        all_data = await download_all_chunks(client)
+        log.info(f"Loaded {len(all_data)} stocks")
+
+        signals = _detect_patterns(all_data)
+
+        # Summary by pattern
+        from collections import Counter
+        counts = Counter(s["pattern"] for s in signals)
+        for pat, cnt in sorted(counts.items()):
+            log.info(f"  {pat}: {cnt}")
+        log.info(f"Total: {len(signals)} signals")
+
+        payload = json.dumps({
+            "updated" : today,
+            "count"   : len(signals),
+            "summary" : dict(counts),
+            "signals" : signals,
+        })
+        await r2_upload(client, "pattern_signals.json", payload)
+
+    log.info("━━━ Pattern Scan complete ━━━")
+
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
@@ -1292,6 +1533,7 @@ if __name__ == "__main__":
         case "fund_weekly_10": asyncio.run(run_fund_weekly(10))
         case "ep_scan":        asyncio.run(run_ep_scan())
         case "hlr_scan":       asyncio.run(run_hlr_scan())
+        case "pattern_scan":   asyncio.run(run_pattern_scan())
         case _:
             print(__doc__)
             sys.exit(1)
