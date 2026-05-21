@@ -891,7 +891,7 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 30,
+    max_consolidation: int = 20,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
@@ -933,7 +933,7 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 0:
+            if consol_count < 3:
                 continue
             if consol_count >= max_consolidation:
                 continue
@@ -1363,11 +1363,16 @@ def _detect_patterns(
                     "low"     : round(lows[-1], 2),
                 })
 
-        # ── Mini Coil (MCP) ───────────────────────────────
-        # Find most recent valid mother candle + babies
-        for m_idx in range(n - coil_min_babies - 1, max(0, n - 30), -1):
+        # ── Mini Coil (MCP) — Active + Nested ───────────────
+        seen_mothers = set()
+        for m_idx in range(n - coil_min_babies - 1, max(0, n - 60), -1):
             m_high = highs[m_idx]
             m_low  = lows[m_idx]
+
+            # Skip duplicate mother levels (within 0.5%)
+            m_key = round(m_high * 200)
+            if m_key in seen_mothers:
+                continue
 
             # Count consecutive babies inside mother
             baby_count = 0
@@ -1382,7 +1387,9 @@ def _detect_patterns(
                 else:
                     baby_count += 1
 
-            if baby_count >= coil_min_babies:
+            # Only active (Coiling) MCPs with min babies
+            if baby_count >= coil_min_babies and coil_state == "Coiling":
+                seen_mothers.add(m_key)
                 signals.append({
                     "symbol"     : sym,
                     "pattern"    : f"{baby_count} Bar MCP" if baby_count <= 6 else "Mini Coil",
@@ -1393,7 +1400,6 @@ def _detect_patterns(
                     "coil_state" : coil_state,
                     "mother_date": dates[m_idx],
                 })
-                break   # sirf most recent coil
 
         # ══════════════════════════════════════════════════
         # WEEKLY PATTERNS
