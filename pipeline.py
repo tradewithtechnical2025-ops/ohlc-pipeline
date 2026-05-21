@@ -1061,13 +1061,21 @@ async def run_ep_scan() -> None:
             sig["rs"]       = sc.get("rs", "")
             sig["ltp"]      = sc.get("ltp", "")
             fund = fund_lookup.get(sym, {})
-            # Latest quarter — Upstox ascending order mein deta hai (q1=oldest, q4=newest)
+            # Latest quarter — parse dates, order not guaranteed
+            _MNUM = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                     "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+            def _pq(q):
+                try:
+                    p = q.strip().split()
+                    return (int(p[1]), _MNUM.get(p[0].lower()[:3], 0))
+                except: return (0, 0)
             q_name = ""
-            for _n in range(4, 0, -1):
+            _best = (0, 0)
+            for _n in range(1, 5):
                 _p = fund.get(f"q{_n}_period", "")
-                if _p:
+                if _p and _pq(_p) > _best:
+                    _best = _pq(_p)
                     q_name = _p
-                    break
             sig["q_name"] = q_name
             vol_x = sig.pop("vol_spike_x", 1)
             sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
