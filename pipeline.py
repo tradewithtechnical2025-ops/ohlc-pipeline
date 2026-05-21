@@ -1115,12 +1115,16 @@ def _detect_hlr(
         if n < swing_n * 2 + consol_days + 2:
             continue
 
-        # ── Step 1: Find swing highs (price, date) ───────────
+        # ── Step 1: Find swing highs — only UNBROKEN ones ──────
         swing_highs = []
         for i in range(swing_n, n - swing_n):
             if (all(highs[i] >= highs[i - k] for k in range(1, swing_n + 1)) and
                     all(highs[i] >= highs[i + k] for k in range(1, swing_n + 1))):
-                swing_highs.append((highs[i], dates[i]))
+                sh_price = highs[i]
+                # Skip if any candle after this swing high closed above it
+                broken = any(closes[j] > sh_price for j in range(i + 1, n))
+                if not broken:
+                    swing_highs.append((sh_price, dates[i]))
 
         if not swing_highs:
             continue
