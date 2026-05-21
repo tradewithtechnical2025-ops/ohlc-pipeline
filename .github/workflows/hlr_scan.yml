@@ -18,3 +18,9 @@ jobs:
           WORKER_URL:   ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: python pipeline.py hlr_scan
+      - name: Run Pattern Scan
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline.py pattern_scan
