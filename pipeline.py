@@ -994,11 +994,11 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 30,
+    max_consolidation: int = 20,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
-
+ 
     for sym, s in all_data.items():
         dates, highs, lows, closes, volumes = (
             s["d"], s["h"], s["l"], s["c"], s["v"]
@@ -1006,9 +1006,9 @@ def _detect_ep(
         n = len(dates)
         if n < volume_lookback + 2:
             continue
-
+ 
         scan_from = max(volume_lookback, n - max_ep_age_days)
-
+ 
         for i in range(scan_from, n):
             prev_high = highs[i - 1]
             today_low = lows[i]
@@ -1023,56 +1023,65 @@ def _detect_ep(
             vol_x = volumes[i] / avg_vol
             if vol_x < volume_spike_x:
                 continue
-
+ 
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
-
+ 
             for j in range(i + 1, min(i + max_consolidation + 1, n)):
                 if closes[j] < gap_lower:
                     ep_intact = False
                     break
                 consol_count += 1
-
+ 
             if not ep_intact:
                 continue
-            if consol_count < 0:
+            if consol_count < 3:
                 continue
             if consol_count >= max_consolidation:
                 continue
-
+ 
             last_idx = min(i + consol_count, n - 1)
+            ep_close = closes[i]
+            ep_5d_idx = min(i + 5, n - 1)
+            ep_5d_return = round((closes[ep_5d_idx] - ep_close) / ep_close * 100, 2) \
+                           if ep_5d_idx > i else ""
+            ep_return = round((closes[last_idx] - ep_close) / ep_close * 100, 2)
+ 
             signals.append({
-                "symbol"         : sym,
-                "ep_date"        : dates[i],
-                "gap_lower"      : round(gap_lower, 2),
-                "gap_pct"        : round(gap_pct, 2),
-                "vol_spike_x"    : round(vol_x, 1),
-                "ep_candle_high" : round(highs[i], 2),
-                "ep_candle_low"  : round(today_low, 2),
-                "last_close"     : round(closes[last_idx], 2),
-                "last_date"      : dates[last_idx],
-                "consolidation"  : consol_count,
-                "ep_type"        : "Delayed EP",
+                "symbol"          : sym,
+                "ep_date"         : dates[i],
+                "gap_lower"       : round(gap_lower, 2),
+                "gap_pct"         : round(gap_pct, 2),
+                "vol_spike_x"     : round(vol_x, 1),
+                "ep_candle_high"  : round(highs[i], 2),
+                "ep_candle_low"   : round(today_low, 2),
+                "ep_candle_close" : round(ep_close, 2),
+                "ep_return"       : ep_return,
+                "ep_5d_return"    : ep_5d_return,
+                "last_close"      : round(closes[last_idx], 2),
+                "last_date"       : dates[last_idx],
+                "consolidation"   : consol_count,
+                "ep_type"         : "Delayed EP",
             })
-
+ 
     seen: dict[str, dict] = {}
     for sig in signals:
         sym = sig["symbol"]
         if sym not in seen or sig["ep_date"] > seen[sym]["ep_date"]:
             seen[sym] = sig
-
+ 
     return list(seen.values())
-
-
+ 
+ 
 async def run_ep_scan() -> None:
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
         return
-
+ 
     log.info(f"━━━ EP Scan  {today} ━━━")
-
+ 
     async with httpx.AsyncClient() as client:
         log.info("Downloading OHLC chunks + screener + fundamentals…")
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
@@ -1081,7 +1090,7 @@ async def run_ep_scan() -> None:
             r2_download(client, "screener.json"),
             r2_download_fund(client),
         )
-
+ 
         all_data: dict = {}
         for i, res in enumerate(ohlc_results):
             if isinstance(res, Exception):
@@ -1089,7 +1098,7 @@ async def run_ep_scan() -> None:
             elif res and "stocks" in res:
                 all_data.update(res["stocks"])
         log.info(f"Loaded {len(all_data)} stocks")
-
+ 
         screener: dict = {}
         if isinstance(screener_raw, list):
             for row in screener_raw:
@@ -1124,17 +1133,21 @@ async def run_ep_scan() -> None:
                     "patterns" : "||".join(sorted(combined)),
                     "sector"   : row.get("SECTOR", ""),
                     "rs"       : row.get("RS Rating", ""),
+                    "ltp"      : row.get("LTP", ""),
                 }
         log.info(f"Screener loaded: {len(screener)} stocks")
-
-        # FIX 1: fund_raw is already normalized dict from r2_download_fund
-        fund_lookup: dict = fund_raw  # always {symbol: obj} now
+ 
+        fund_lookup: dict = {}
+        if isinstance(fund_raw, dict):
+            fund_lookup = fund_raw
+        elif isinstance(fund_raw, list):
+            fund_lookup = {d["symbol"]: d for d in fund_raw if d.get("symbol")}
         log.info(f"Fundamentals loaded: {len(fund_lookup)} stocks")
-
+ 
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
-
+ 
         for sig in signals:
             sym = sig["symbol"]
             sc = screener.get(sym, {})
@@ -1143,14 +1156,15 @@ async def run_ep_scan() -> None:
             sig["patterns"] = sc.get("patterns", "")
             sig["sector"]   = sc.get("sector", "")
             sig["rs"]       = sc.get("rs", "")
+            sig["ltp"]      = sc.get("ltp", "")
             fund = fund_lookup.get(sym, {})
             sig["q_name"] = fund.get("q1_period", "")
             vol_x = sig.pop("vol_spike_x", 1)
             sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
-
+ 
         count = len(signals)
         log.info(f"Found {count} Delayed EP signals")
-
+ 
         payload = json.dumps({"updated": today, "count": count, "signals": signals})
         await r2_upload(client, "ep_signals.json", payload)
     log.info("━━━ EP Scan complete ━━━")
