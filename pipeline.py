@@ -11,6 +11,7 @@ Usage:
   python pipeline.py fund_daily          # BSE result stocks update (4:30 PM IST, weekdays)
   python pipeline.py fund_weekly         # full 2300 stocks refresh (Sunday)
   python pipeline.py ep_scan             # EP formation scan        (4:15 PM IST, weekdays)
+  python pipeline.py hlr_scan            # Horizontal resistance scan (4:20 PM IST, weekdays)
 """
 
 import asyncio
@@ -889,7 +890,7 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 30,
+    max_consolidation: int = 20,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
@@ -931,7 +932,7 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 0:
+            if consol_count < 3:
                 continue
             if consol_count >= max_consolidation:
                 continue
@@ -1088,6 +1089,157 @@ async def run_ep_scan() -> None:
     log.info("━━━ EP Scan complete ━━━")
 
 
+
+
+# ══════════════════════════════════════════════════════════════
+# HORIZONTAL RESISTANCE (HLR) SCANNER
+# ══════════════════════════════════════════════════════════════
+
+def _detect_hlr(
+    all_data: dict,
+    swing_n: int        = 5,     # candles left+right for swing high
+    cluster_pct: float  = 2.0,   # swing highs within 2% = zone
+    near_pct: float     = 4.0,   # price within 4% below = Near HLR
+    consol_days: int    = 5,     # last N candles for consolidation
+    consol_pct: float   = 4.0,   # range < 4% = consolidating
+) -> list[dict]:
+
+    signals = []
+
+    for sym, s in all_data.items():
+        dates  = s["d"]
+        highs  = s["h"]
+        lows   = s["l"]
+        closes = s["c"]
+        n      = len(dates)
+        if n < swing_n * 2 + consol_days + 2:
+            continue
+
+        # ── Step 1: Find swing highs (price, date) ───────────
+        swing_highs = []
+        for i in range(swing_n, n - swing_n):
+            if (all(highs[i] >= highs[i - k] for k in range(1, swing_n + 1)) and
+                    all(highs[i] >= highs[i + k] for k in range(1, swing_n + 1))):
+                swing_highs.append((highs[i], dates[i]))
+
+        if not swing_highs:
+            continue
+
+        # ── Step 2: Cluster into resistance levels ────────────
+        swing_highs.sort(key=lambda x: x[0], reverse=True)
+        used   = [False] * len(swing_highs)
+        levels = []
+
+        for i, (h, d) in enumerate(swing_highs):
+            if used[i]:
+                continue
+            cluster = [(h, d)]
+            for j in range(i + 1, len(swing_highs)):
+                if not used[j] and abs(swing_highs[j][0] - h) / h * 100 <= cluster_pct:
+                    cluster.append(swing_highs[j])
+                    used[j] = True
+            used[i] = True
+
+            level    = max(c[0] for c in cluster)
+            zone_low = min(c[0] for c in cluster)
+            is_zone  = len(cluster) >= 2
+            touches  = len(cluster)
+            touch_pts = sorted(
+                [{"date": c[1], "price": round(c[0], 2)} for c in cluster],
+                key=lambda x: x["date"]
+            )
+            levels.append((level, zone_low, touches, is_zone, touch_pts))
+
+        # ── Step 3: Current price vs each level ───────────────
+        curr_close = closes[-1]
+        curr_date  = dates[-1]
+
+        # Consolidation check
+        if n >= consol_days:
+            recent_high = max(highs[-consol_days:])
+            recent_low  = min(lows[-consol_days:])
+            range_pct   = (recent_high - recent_low) / curr_close * 100
+            is_consol   = range_pct < consol_pct
+        else:
+            range_pct = 0
+            is_consol = False
+
+        for (level, zone_low, touches, is_zone, touch_pts) in levels:
+
+            dist_pct = (level - curr_close) / level * 100
+
+            # BO: close above resistance
+            if curr_close > level:
+                state = "BO"
+
+            # Near HLR: within 4% below
+            elif 0 <= dist_pct <= near_pct:
+                state = "Consolidating near HLR" if is_consol else "Near HLR"
+
+            # Too far — skip
+            else:
+                continue
+
+            signals.append({
+                "symbol"      : sym,
+                "state"       : state,
+                "resistance"  : round(level, 2),
+                "zone_low"    : round(zone_low, 2),
+                "is_zone"     : is_zone,
+                "touches"     : touches,
+                "touch_points": touch_pts,
+                "dist_pct"    : round(dist_pct, 2),
+                "last_close"  : round(curr_close, 2),
+                "last_date"   : curr_date,
+                "consol_range": round(range_pct, 2),
+            })
+
+    return signals
+
+
+async def run_hlr_scan() -> None:
+    """
+    Weekdays — scan all stocks for horizontal resistance signals.
+    States: Near HLR | Consolidating near HLR | BO
+    Uploads hlr_signals.json to R2.
+    """
+    today = today_ist()
+    if not is_trading_day(today):
+        log.info(f"⏭  {today} is not a trading day — exiting")
+        return
+
+    log.info(f"━━━ HLR Scan  {today} ━━━")
+
+    async with httpx.AsyncClient() as client:
+
+        log.info("Downloading OHLC chunks…")
+        all_data = await download_all_chunks(client)
+        log.info(f"Loaded {len(all_data)} stocks")
+
+        signals = _detect_hlr(all_data)
+
+        # Sort — BO first, then Consolidating, then Near
+        order = {"BO": 0, "Consolidating near HLR": 1, "Near HLR": 2}
+        signals.sort(key=lambda x: (order.get(x["state"], 9), -x["touches"]))
+
+        bo     = sum(1 for s in signals if s["state"] == "BO")
+        consol = sum(1 for s in signals if s["state"] == "Consolidating near HLR")
+        near   = sum(1 for s in signals if s["state"] == "Near HLR")
+
+        log.info(f"BO: {bo}  Consolidating: {consol}  Near: {near}  Total: {len(signals)}")
+
+        payload = json.dumps({
+            "updated"      : today,
+            "count"        : len(signals),
+            "bo"           : bo,
+            "consolidating": consol,
+            "near"         : near,
+            "signals"      : signals,
+        })
+        await r2_upload(client, "hlr_signals.json", payload)
+
+    log.info("━━━ HLR Scan complete ━━━")
+
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
@@ -1112,6 +1264,7 @@ if __name__ == "__main__":
         case "fund_weekly_9":  asyncio.run(run_fund_weekly(9))
         case "fund_weekly_10": asyncio.run(run_fund_weekly(10))
         case "ep_scan":        asyncio.run(run_ep_scan())
+        case "hlr_scan":       asyncio.run(run_hlr_scan())
         case _:
             print(__doc__)
             sys.exit(1)
