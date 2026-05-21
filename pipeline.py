@@ -1115,16 +1115,22 @@ def _detect_hlr(
         if n < swing_n * 2 + consol_days + 2:
             continue
 
-        # ── Step 1: Find swing highs — only UNBROKEN ones ──────
-        swing_highs = []
+        # ── Step 1: Find swing highs ─────────────────────────
+        # valid = unbroken resistance | bo = broken only today
+        swing_highs = []   # (price, date, tag)
         for i in range(swing_n, n - swing_n):
             if (all(highs[i] >= highs[i - k] for k in range(1, swing_n + 1)) and
                     all(highs[i] >= highs[i + k] for k in range(1, swing_n + 1))):
                 sh_price = highs[i]
-                # Skip if any candle after this swing high closed above it
-                broken = any(closes[j] > sh_price for j in range(i + 1, n))
-                if not broken:
-                    swing_highs.append((sh_price, dates[i]))
+                # Broken before today?
+                broken_before = any(closes[j] > sh_price for j in range(i + 1, n - 1))
+                broke_today   = closes[-1] > sh_price
+                if broken_before:
+                    continue   # already broken earlier — ignore
+                if broke_today:
+                    swing_highs.append((sh_price, dates[i], "BO"))
+                else:
+                    swing_highs.append((sh_price, dates[i], "valid"))
 
         if not swing_highs:
             continue
@@ -1134,10 +1140,10 @@ def _detect_hlr(
         used   = [False] * len(swing_highs)
         levels = []
 
-        for i, (h, d) in enumerate(swing_highs):
+        for i, (h, d, tag) in enumerate(swing_highs):
             if used[i]:
                 continue
-            cluster = [(h, d)]
+            cluster = [(h, d, tag)]
             for j in range(i + 1, len(swing_highs)):
                 if not used[j] and abs(swing_highs[j][0] - h) / h * 100 <= cluster_pct:
                     cluster.append(swing_highs[j])
@@ -1148,11 +1154,13 @@ def _detect_hlr(
             zone_low = min(c[0] for c in cluster)
             is_zone  = len(cluster) >= 2
             touches  = len(cluster)
+            # BO if any swing high in cluster broke today
+            cluster_tag = "BO" if any(c[2] == "BO" for c in cluster) else "valid"
             touch_pts = sorted(
                 [{"date": c[1], "price": round(c[0], 2)} for c in cluster],
                 key=lambda x: x["date"]
             )
-            levels.append((level, zone_low, touches, is_zone, touch_pts))
+            levels.append((level, zone_low, touches, is_zone, touch_pts, cluster_tag))
 
         # ── Step 3: Current price vs each level ───────────────
         curr_close = closes[-1]
@@ -1168,12 +1176,12 @@ def _detect_hlr(
             range_pct = 0
             is_consol = False
 
-        for (level, zone_low, touches, is_zone, touch_pts) in levels:
+        for (level, zone_low, touches, is_zone, touch_pts, cluster_tag) in levels:
 
             dist_pct = (level - curr_close) / level * 100
 
-            # BO: close above resistance
-            if curr_close > level:
+            # BO: broke today (cluster_tag == BO)
+            if cluster_tag == "BO":
                 state = "BO"
 
             # Near HLR: within 4% below
