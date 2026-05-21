@@ -1107,13 +1107,23 @@ def _detect_hlr(
     signals = []
 
     for sym, s in all_data.items():
-        dates  = s["d"]
-        highs  = s["h"]
-        lows   = s["l"]
-        closes = s["c"]
-        n      = len(dates)
+        dates   = s["d"]
+        highs   = s["h"]
+        lows    = s["l"]
+        closes  = s["c"]
+        volumes = s["v"]
+        n       = len(dates)
         if n < swing_n * 2 + consol_days + 2:
             continue
+
+        # 50-day avg volume for BO validation
+        vol_lookback = min(50, n - 1)
+        avg_vol_50   = sum(volumes[-vol_lookback-1:-1]) / vol_lookback if vol_lookback > 0 else 0
+        today_vol    = volumes[-1]
+        if avg_vol_50 > 0 and vol_lookback >= 20:
+            vol_spike = today_vol / avg_vol_50
+        else:
+            vol_spike = None   # insufficient history — skip volume filter
 
         # ── Step 1: Find swing highs ─────────────────────────
         # valid = unbroken resistance | bo = broken only today
@@ -1180,9 +1190,13 @@ def _detect_hlr(
 
             dist_pct = (level - curr_close) / level * 100
 
-            # BO: broke today (cluster_tag == BO)
+            # BO: broke today + volume >= 2x 50-day avg (skip if insufficient data)
             if cluster_tag == "BO":
-                state = "BO"
+                vol_ok = (vol_spike is None) or (vol_spike >= 2.0)
+                if vol_ok:
+                    state = "BO"
+                else:
+                    state = "Near HLR"   # broke but low volume — not confirmed
 
             # Near HLR: within 4% below
             elif 0 <= dist_pct <= near_pct:
@@ -1204,6 +1218,7 @@ def _detect_hlr(
                 "last_close"  : round(curr_close, 2),
                 "last_date"   : curr_date,
                 "consol_range": round(range_pct, 2),
+                "vol_spike"   : round(vol_spike, 1) if vol_spike is not None else None,
             })
 
     return signals
