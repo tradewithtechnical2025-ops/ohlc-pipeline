@@ -18,6 +18,13 @@ jobs:
 
       - run: pip install httpx
 
+      - name: Print UTC Time
+        run: |
+          echo "UTC Time:"
+          date -u
+          echo "Runner Local Time:"
+          date
+
       - name: Run EP Scan
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
