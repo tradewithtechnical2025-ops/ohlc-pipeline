@@ -891,7 +891,7 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 20,
+    max_consolidation: int = 30,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
@@ -933,7 +933,7 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 3:
+            if consol_count < 0:
                 continue
             if consol_count >= max_consolidation:
                 continue
@@ -978,6 +978,86 @@ def _detect_ep(
 
     return list(seen.values())
 
+
+
+def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
+    """
+    Calculate RS Rating (1-99) for all stocks.
+    Formula: (P63×2 + P126 + P189 + P252) / 5 → percentile rank
+    Returns: {sym: {"rs": 87, "history": [85, 86, 87, ...]}}
+    """
+    # For each historical day, calculate composite score
+    # history_days = how many past RS values to store
+
+    all_syms  = list(all_data.keys())
+    result    = {}
+
+    # Calculate RS for today + last history_days
+    day_scores = {}   # {sym: [score_day0, score_day1, ...]} oldest first
+
+    for sym, s in all_data.items():
+        closes = s["c"]
+        n      = len(closes)
+        scores = []
+
+        for day_offset in range(history_days, -1, -1):  # oldest → newest
+            idx = n - 1 - day_offset
+            if idx < 252:
+                scores.append(None)
+                continue
+
+            def ret(lookback):
+                prev_idx = idx - lookback
+                if prev_idx < 0: return None
+                prev = closes[prev_idx]
+                if prev == 0: return None
+                return (closes[idx] - prev) / prev * 100
+
+            p63  = ret(63)
+            p126 = ret(126)
+            p189 = ret(189)
+            p252 = ret(252)
+
+            if any(x is None for x in [p63, p126, p189, p252]):
+                scores.append(None)
+            else:
+                composite = (p63 * 2 + p126 + p189 + p252) / 5
+                scores.append(composite)
+
+        day_scores[sym] = scores
+
+    # Rank stocks for each day → RS 1-99
+    n_days = history_days + 1
+    rs_history = {sym: [] for sym in all_syms}
+
+    for d in range(n_days):
+        day_composites = {
+            sym: day_scores[sym][d]
+            for sym in all_syms
+            if day_scores[sym][d] is not None
+        }
+        if not day_composites:
+            for sym in all_syms:
+                rs_history[sym].append(None)
+            continue
+
+        sorted_syms = sorted(day_composites, key=lambda x: day_composites[x])
+        total = len(sorted_syms)
+        ranks = {sym: round((i + 1) / total * 99) for i, sym in enumerate(sorted_syms)}
+
+        for sym in all_syms:
+            rs_history[sym].append(ranks.get(sym))
+
+    # Build result
+    for sym in all_syms:
+        hist = rs_history[sym]
+        current_rs = next((v for v in reversed(hist) if v is not None), None)
+        result[sym] = {
+            "rs"     : current_rs,
+            "history": hist,   # list of history_days+1 values, oldest first
+        }
+
+    return result
 
 async def run_ep_scan() -> None:
     today = today_ist()
@@ -1085,8 +1165,27 @@ async def run_ep_scan() -> None:
         count = len(signals)
         log.info(f"Found {count} Delayed EP signals")
 
-        payload = json.dumps({"updated": today, "count": count, "signals": signals})
-        await r2_upload(client, "ep_signals.json", payload)
+        # Calculate RS ratings using already-downloaded OHLC
+        log.info("Calculating RS ratings…")
+        rs_data = _calculate_rs(all_data, history_days=30)
+
+        # Enrich EP signals with current RS
+        for sig in signals:
+            sig["rs_calc"] = rs_data.get(sig["symbol"], {}).get("rs")
+
+        # Upload both files in parallel
+        rs_payload = json.dumps({
+            "updated": today,
+            "count"  : len(rs_data),
+            "stocks" : rs_data,
+        })
+        ep_payload = json.dumps({"updated": today, "count": count, "signals": signals})
+
+        await asyncio.gather(
+            r2_upload(client, "ep_signals.json", ep_payload),
+            r2_upload(client, "rs_ratings.json", rs_payload),
+        )
+        log.info(f"✅ RS ratings uploaded ({len(rs_data)} stocks)")
     log.info("━━━ EP Scan complete ━━━")
 
 
