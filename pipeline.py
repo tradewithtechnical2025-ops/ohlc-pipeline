@@ -886,12 +886,27 @@ async def run_fund_weekly(part: int = 0) -> None:
 # EP FORMATION SCANNER
 # ══════════════════════════════════════════════════════════════
 
+
+def _check_liquidity(volumes, closes, n, min_turnover=3_00_00_000):
+    """
+    Returns True if stock passes liquidity filter.
+    50D avg volume × 50D avg price >= min_turnover
+    Falls back to 20D if 50D not available.
+    Skips filter if < 20D data available.
+    """
+    lookback = min(50, n)
+    if lookback < 20:
+        return True   # not enough data — skip filter
+    avg_vol   = sum(volumes[-lookback:]) / lookback
+    avg_price = sum(closes[-lookback:])  / lookback
+    return (avg_vol * avg_price) >= min_turnover
+
 def _detect_ep(
     all_data: dict,
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 30,
+    max_consolidation: int = 20,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
@@ -921,6 +936,10 @@ def _detect_ep(
             if vol_x < volume_spike_x:
                 continue
 
+            # Liquidity filter
+            if not _check_liquidity(volumes, closes, n):
+                continue
+
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
@@ -933,7 +952,7 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 0:
+            if consol_count < 3:
                 continue
             if consol_count >= max_consolidation:
                 continue
@@ -1048,16 +1067,47 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
         for sym in all_syms:
             rs_history[sym].append(ranks.get(sym))
 
-    # Build result
+    # Build result — rs_ratings format
     for sym in all_syms:
         hist = rs_history[sym]
         current_rs = next((v for v in reversed(hist) if v is not None), None)
         result[sym] = {
             "rs"     : current_rs,
-            "history": hist,   # list of history_days+1 values, oldest first
+            "history": hist,
         }
 
     return result
+
+
+def _build_rs_history_json(all_data: dict, rs_data: dict) -> list:
+    """
+    Build rs_history.json in screener's expected format:
+    [{"date": "2026-05-01", "stocks": {"INFY": 45, ...}}, ...]
+    """
+    # Get dates from any stock
+    sample_sym = next(iter(all_data))
+    dates = all_data[sample_sym]["d"]
+    n     = len(dates)
+
+    # history has history_days+1 entries, oldest first
+    # align with last N dates
+    history_len = len(next(iter(rs_data.values()))["history"])
+    start_idx   = n - history_len
+
+    snapshots = []
+    for i in range(history_len):
+        date_idx = start_idx + i
+        if date_idx < 0 or date_idx >= n:
+            continue
+        snap_date = dates[date_idx]
+        snap_stocks = {}
+        for sym, v in rs_data.items():
+            rs_val = v["history"][i]
+            if rs_val is not None:
+                snap_stocks[sym] = rs_val
+        snapshots.append({"date": snap_date, "stocks": snap_stocks})
+
+    return snapshots
 
 async def run_ep_scan() -> None:
     today = today_ist()
@@ -1174,18 +1224,19 @@ async def run_ep_scan() -> None:
             sig["rs_calc"] = rs_data.get(sig["symbol"], {}).get("rs")
 
         # Upload both files in parallel
-        rs_payload = json.dumps({
-            "updated": today,
-            "count"  : len(rs_data),
-            "stocks" : rs_data,
-        })
-        ep_payload = json.dumps({"updated": today, "count": count, "signals": signals})
+        # Build rs_history.json in screener format
+        rs_history_list = _build_rs_history_json(all_data, rs_data)
+
+        rs_payload         = json.dumps({"updated": today, "count": len(rs_data), "stocks": rs_data})
+        rs_history_payload = json.dumps(rs_history_list)
+        ep_payload         = json.dumps({"updated": today, "count": count, "signals": signals})
 
         await asyncio.gather(
-            r2_upload(client, "ep_signals.json", ep_payload),
-            r2_upload(client, "rs_ratings.json", rs_payload),
+            r2_upload(client, "ep_signals.json",  ep_payload),
+            r2_upload(client, "rs_ratings.json",  rs_payload),
+            r2_upload(client, "rs_history.json",  rs_history_payload),
         )
-        log.info(f"✅ RS ratings uploaded ({len(rs_data)} stocks)")
+        log.info(f"✅ RS ratings + history uploaded ({len(rs_data)} stocks, {len(rs_history_list)} days)")
     log.info("━━━ EP Scan complete ━━━")
 
 
@@ -1214,6 +1265,10 @@ def _detect_hlr(
         volumes = s["v"]
         n       = len(dates)
         if n < swing_n * 2 + consol_days + 2:
+            continue
+
+        # Liquidity filter
+        if not _check_liquidity(volumes, closes, n):
             continue
 
         # 50-day avg volume for BO validation
@@ -1410,6 +1465,10 @@ def _detect_patterns(
         n       = len(dates)
 
         if n < 10:
+            continue
+
+        # ── Liquidity filter (50D avg vol × price >= 3Cr) ──
+        if not _check_liquidity(volumes, closes, n):
             continue
 
         # ── Volume filter — today's volume ──────────────────
