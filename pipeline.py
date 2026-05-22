@@ -906,7 +906,7 @@ def _detect_ep(
     min_gap_pct: float     = 2.0,
     volume_spike_x: float  = 2.0,
     volume_lookback: int   = 20,
-    max_consolidation: int = 20,
+    max_consolidation: int = 30,
     max_ep_age_days: int   = 30,
 ) -> list[dict]:
     signals = []
@@ -952,7 +952,7 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 3:
+            if consol_count < 0:
                 continue
             if consol_count >= max_consolidation:
                 continue
@@ -1081,33 +1081,40 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
 
 def _build_rs_history_json(all_data: dict, rs_data: dict) -> list:
     """
-    Build rs_history.json in screener's expected format:
-    [{"date": "2026-05-01", "stocks": {"INFY": 45, ...}}, ...]
+    Build rs_history.json in screener wide format:
+    [{"Stock Name": "INFY", "07-Apr-26": 45, "08-Apr-26": 46, ...}, ...]
     """
-    # Get dates from any stock
-    sample_sym = next(iter(all_data))
-    dates = all_data[sample_sym]["d"]
-    n     = len(dates)
+    from datetime import date as dt
 
-    # history has history_days+1 entries, oldest first
-    # align with last N dates
+    # Get dates from any stock
+    sample_sym  = next(iter(all_data))
+    dates       = all_data[sample_sym]["d"]
+    n           = len(dates)
     history_len = len(next(iter(rs_data.values()))["history"])
     start_idx   = n - history_len
 
-    snapshots = []
+    # Build date labels in screener format: "07-Apr-26"
+    def fmt_date(d_str):
+        d = dt.fromisoformat(d_str)
+        return d.strftime("%-d-%b-%y")   # "7-Apr-26"
+
+    date_labels = []
     for i in range(history_len):
         date_idx = start_idx + i
-        if date_idx < 0 or date_idx >= n:
-            continue
-        snap_date = dates[date_idx]
-        snap_stocks = {}
-        for sym, v in rs_data.items():
+        if 0 <= date_idx < n:
+            date_labels.append((i, fmt_date(dates[date_idx])))
+
+    # Build wide format — one row per stock
+    rows = []
+    for sym, v in rs_data.items():
+        row = {"Stock Name": sym}
+        for i, label in date_labels:
             rs_val = v["history"][i]
             if rs_val is not None:
-                snap_stocks[sym] = rs_val
-        snapshots.append({"date": snap_date, "stocks": snap_stocks})
+                row[label] = rs_val
+        rows.append(row)
 
-    return snapshots
+    return rows
 
 async def run_ep_scan() -> None:
     today = today_ist()
