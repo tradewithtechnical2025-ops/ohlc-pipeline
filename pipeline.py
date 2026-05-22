@@ -1037,11 +1037,19 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
             p189 = ret(189)
             p252 = ret(252)
 
-            if any(x is None for x in [p63, p126, p189, p252]):
-                scores.append(None)
-            else:
+            # Graceful degradation for new listings
+            if p252 is not None and p189 is not None and p126 is not None and p63 is not None:
                 composite = (p63 * 2 + p126 + p189 + p252) / 5
-                scores.append(composite)
+            elif p189 is not None and p126 is not None and p63 is not None:
+                composite = (p63 * 2 + p126 + p189) / 4
+            elif p126 is not None and p63 is not None:
+                composite = (p63 * 2 + p126) / 3
+            elif p63 is not None:
+                composite = p63
+            else:
+                scores.append(None)
+                continue
+            scores.append(composite)
 
         day_scores[sym] = scores
 
@@ -1062,18 +1070,31 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
 
         sorted_syms = sorted(day_composites, key=lambda x: day_composites[x])
         total = len(sorted_syms)
-        ranks = {sym: round((i + 1) / total * 99) for i, sym in enumerate(sorted_syms)}
+        ranks    = {sym: round((i + 1) / total * 99) for i, sym in enumerate(sorted_syms)}
+        rank_pos = {sym: i + 1 for i, sym in enumerate(sorted_syms)}  # actual rank 1=worst
 
         for sym in all_syms:
             rs_history[sym].append(ranks.get(sym))
 
     # Build result — rs_ratings format
+    # Get final day ranks
+    final_composites = {
+        sym: day_scores[sym][-1]
+        for sym in all_syms
+        if day_scores[sym][-1] is not None
+    }
+    final_sorted  = sorted(final_composites, key=lambda x: final_composites[x])
+    final_total   = len(final_sorted)
+    final_rank_pos = {sym: i + 1 for i, sym in enumerate(final_sorted)}
+
     for sym in all_syms:
         hist = rs_history[sym]
         current_rs = next((v for v in reversed(hist) if v is not None), None)
         result[sym] = {
-            "rs"     : current_rs,
-            "history": hist,
+            "rs"      : current_rs,
+            "rs_rank" : final_rank_pos.get(sym),       # actual rank (1=worst)
+            "rs_total": final_total,                    # total ranked stocks
+            "history" : hist,
         }
 
     return result
@@ -1224,7 +1245,7 @@ async def run_ep_scan() -> None:
 
         # Calculate RS ratings using already-downloaded OHLC
         log.info("Calculating RS ratings…")
-        rs_data = _calculate_rs(all_data, history_days=30)
+        rs_data = _calculate_rs(all_data, history_days=60)
 
         # Enrich EP signals with current RS
         for sig in signals:
