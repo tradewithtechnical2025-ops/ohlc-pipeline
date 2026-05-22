@@ -1021,7 +1021,7 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
 
         for day_offset in range(history_days, -1, -1):  # oldest → newest
             idx = n - 1 - day_offset
-            if idx < 252:
+            if idx < 63:   # minimum 63 days needed
                 scores.append(None)
                 continue
 
