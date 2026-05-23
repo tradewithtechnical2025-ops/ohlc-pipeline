@@ -1137,6 +1137,80 @@ def _build_rs_history_json(all_data: dict, rs_data: dict) -> list:
 
     return rows
 
+
+def _calculate_mswing(all_data: dict, history_days: int = 60) -> dict:
+    """
+    Calculate MSwing = annualized momentum score for all stocks.
+    Formula: (close-20d_ago)/20d_ago*100/20 + (close-50d_ago)/50d_ago*100/50
+    Returns: {sym: {"mswing": val, "mswing_avg9": val, "mswing_history": [...]}}
+    """
+    result = {}
+
+    for sym, s in all_data.items():
+        closes = s["c"]
+        n      = len(closes)
+
+        history = []
+        for day_offset in range(history_days, -1, -1):  # oldest → newest
+            idx = n - 1 - day_offset
+            if idx < 51:
+                history.append(None)
+                continue
+            try:
+                ret_20 = (closes[idx] - closes[idx-20]) / closes[idx-20] * 100 / 20
+                ret_50 = (closes[idx] - closes[idx-50]) / closes[idx-50] * 100 / 50
+                history.append(round(ret_20 + ret_50, 4))
+            except ZeroDivisionError:
+                history.append(None)
+
+        # 9-day moving average of latest values
+        valid = [v for v in history[-9:] if v is not None]
+        avg9  = round(sum(valid) / len(valid), 4) if valid else None
+
+        result[sym] = {
+            "mswing"        : history[-1] if history else None,
+            "mswing_avg9"   : avg9,
+            "mswing_history": history,
+        }
+
+    return result
+
+
+def _build_mswing_json(all_data: dict, mswing_data: dict) -> list:
+    """
+    Build mswing.json in wide format (same as rs_history):
+    [{"Stock Name": "INFY", "12-May-26": 0.45, ...}, ...]
+    Appends new day column to existing data.
+    """
+    from datetime import date as dt
+
+    sample_sym  = next(iter(all_data))
+    dates       = all_data[sample_sym]["d"]
+    n           = len(dates)
+    history_len = len(next(iter(mswing_data.values()))["mswing_history"])
+    start_idx   = n - history_len
+
+    def fmt_date(d_str):
+        d = dt.fromisoformat(d_str)
+        return d.strftime("%-d-%b-%y")   # "12-May-26"
+
+    date_labels = []
+    for i in range(history_len):
+        date_idx = start_idx + i
+        if 0 <= date_idx < n:
+            date_labels.append((i, fmt_date(dates[date_idx])))
+
+    rows = []
+    for sym, v in mswing_data.items():
+        row = {"Stock Name": sym}
+        for i, label in date_labels:
+            val = v["mswing_history"][i]
+            if val is not None:
+                row[label] = val
+        rows.append(row)
+
+    return rows
+
 async def run_ep_scan() -> None:
     today = today_ist()
     if not is_trading_day(today):
@@ -1259,12 +1333,26 @@ async def run_ep_scan() -> None:
         rs_history_payload = json.dumps(rs_history_list)
         ep_payload         = json.dumps({"updated": today, "count": count, "signals": signals})
 
+        # Calculate MSwing
+        log.info("Calculating MSwing…")
+        mswing_data = _calculate_mswing(all_data, history_days=60)
+        mswing_list = _build_mswing_json(all_data, mswing_data)
+
+        # Enrich EP signals with mswing
+        for sig in signals:
+            sym = sig["symbol"]
+            sig["mswing"]      = mswing_data.get(sym, {}).get("mswing")
+            sig["mswing_avg9"] = mswing_data.get(sym, {}).get("mswing_avg9")
+
+        mswing_payload = json.dumps(mswing_list)
+
         await asyncio.gather(
             r2_upload(client, "ep_signals.json",  ep_payload),
             r2_upload(client, "rs_ratings.json",  rs_payload),
             r2_upload(client, "rs_history.json",  rs_history_payload),
+            r2_upload(client, "mswing.json",      mswing_payload),
         )
-        log.info(f"✅ RS ratings + history uploaded ({len(rs_data)} stocks, {len(rs_history_list)} days)")
+        log.info(f"✅ RS + MSwing uploaded ({len(rs_data)} stocks)")
     log.info("━━━ EP Scan complete ━━━")
 
 
