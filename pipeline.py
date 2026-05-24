@@ -43,11 +43,11 @@ V3_URL       = "https://api.upstox.com/v3/historical-candle/intraday"
 FUND_URL     = "https://api.upstox.com/v2/fundamentals"
 ROLLING_DAYS = 548
 R2_CHUNKS    = 8
-CONCURRENCY  = 5      # parallel Upstox calls
+CONCURRENCY  = 5
 FUND_CONCURRENCY = 1
 RETRY        = 3
 SLEEP_MS     = 3.0
-RATE_DELAY   = 0.5    # 500ms between requests = ~200 req/min
+RATE_DELAY   = 0.5
 
 HERE = Path(__file__).parent
 
@@ -62,6 +62,7 @@ UPSTOX_HEADERS = {
     "Accept": "application/json",
 }
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -112,7 +113,7 @@ async def fetch_ohlc(
 
     for attempt in range(RETRY):
         async with sem:
-            await asyncio.sleep(RATE_DELAY)   # ← rate limit guard
+            await asyncio.sleep(RATE_DELAY)
             try:
                 r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
             except httpx.RequestError as e:
@@ -160,7 +161,7 @@ async def fetch_today_candle(
 
     for attempt in range(RETRY):
         async with sem:
-            await asyncio.sleep(RATE_DELAY)   # ← rate limit guard
+            await asyncio.sleep(RATE_DELAY)
             try:
                 r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
             except httpx.RequestError:
@@ -186,6 +187,7 @@ async def fetch_today_candle(
                      "c": c[4], "v": c[5], "oi": c[6] if len(c) > 6 else 0}
 
     return sym, None
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -230,63 +232,115 @@ async def fetch_income_statement(client, sem, isin):
         stmt = d["data"].get("income_statement", [])
         full = d["data"].get("full_statement", [])
         rev  = next((s for s in stmt if s["category"] == "revenue"), None)
-        pbt_ = next((s for s in stmt if s["category"] == "operating_profit"), None)  # Upstox mislabel — actually PBT
         np_  = next((s for s in stmt if s["category"] == "net_profit"), None)
         if not rev and not np_:
             continue
 
-        src = rev or np_
-        n   = min(len(src["history"]), 4)
+        src      = rev or np_
+        n        = min(len(src["history"]), 4)
         quarters = [q["period"] for q in src["history"][:n]]
 
         def ex(arr, key="value"):
             return [(q.get(key) if q.get(key) is not None else "") for q in (arr or [])[:n]]
 
-        def exf(name):
-            return [(q["value"] if q.get("value") is not None else "")
-                    for q in (next((s for s in full if s.get("particular") == name), {})
-                              .get("history", []))[:1]]  # only first (most recent annual)
+        def full_hist(name):
+            return (next((s for s in full if s.get("particular") == name), {})
+                    .get("history", []))
 
-        # Shares derive karo: annual_PAT (Cr) * 1e7 / annual_EPS = shares
-        shares = None
-        try:
-            ann_pat = exf("Profit After Tax")
-            ann_eps = exf("EPS - Basic")
-            if ann_pat and ann_eps and ann_pat[0] != "" and ann_eps[0] != "":
-                shares = float(ann_pat[0]) * 1e7 / float(ann_eps[0])
-        except (TypeError, ValueError, ZeroDivisionError):
-            pass
+        # ── FIX 1: PBT — use profit_before_tax category ──────────────
+        # OLD BUG: "operating_profit" category = Operating Profit, NOT PBT
+        pbt_ = next((s for s in stmt if s["category"] == "profit_before_tax"), None)
+        if not pbt_:
+            pbt_h = full_hist("Profit Before Tax")
+            if pbt_h:
+                pbt_ = {"history": pbt_h}
 
-        # Quarterly PAT values
+        # ── FIX 2: EPS — robust shares derivation ─────────────────────
+        # Try API eps category first (most accurate)
+        eps_api = next((s for s in stmt
+                        if s["category"] in ("eps", "earnings_per_share", "basic_eps")), None)
+
+        if eps_api and eps_api.get("history"):
+            eps_vals   = ex(eps_api["history"])
+            eps_d_api  = next((s for s in stmt
+                               if s["category"] in ("diluted_eps", "eps_diluted")), None)
+            eps_d_vals = ex(eps_d_api["history"]) if eps_d_api else eps_vals[:]
+        else:
+            # Derive shares from quarterly PAT / quarterly EPS pairs
+            # OLD BUG: used annual PAT / annual EPS[0] → gave wrong single-quarter EPS
+            # FIX: use median of multiple quarterly pairs for robustness
+            eps_names  = ["EPS - Basic", "Basic EPS", "Earnings Per Share", "EPS(Basic)"]
+            eps_full_h = []
+            for name in eps_names:
+                eps_full_h = full_hist(name)
+                if eps_full_h:
+                    break
+
+            shares = None
+            if eps_full_h and np_ and np_.get("history"):
+                estimates = []
+                for i in range(min(4, len(eps_full_h), len(np_["history"]))):
+                    pat_v = np_["history"][i].get("value")
+                    eps_v = eps_full_h[i].get("value")
+                    if pat_v not in (None, "") and eps_v not in (None, "", 0):
+                        try:
+                            est = float(pat_v) * 1e7 / float(eps_v)
+                            if 1e6 < est < 1e10:  # sanity: 0.1 Cr to 1000 Cr shares
+                                estimates.append(est)
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            pass
+                if estimates:
+                    estimates.sort()
+                    shares = estimates[len(estimates) // 2]  # median
+                    log.info(f"  [{isin}] Shares: {shares/1e7:.2f} Cr (median of {len(estimates)} quarters)")
+
+            if not shares:
+                # Annual fallback
+                for eps_name in ["EPS - Basic", "Basic EPS", "Earnings Per Share"]:
+                    ann_eps_h = full_hist(eps_name)
+                    ann_pat_h = full_hist("Profit After Tax")
+                    if ann_eps_h and ann_pat_h:
+                        try:
+                            av = ann_eps_h[0].get("value")
+                            pv = ann_pat_h[0].get("value")
+                            if av not in (None, "", 0) and pv not in (None, ""):
+                                est = float(pv) * 1e7 / float(av)
+                                if 1e6 < est < 1e10:
+                                    shares = est
+                                    log.info(f"  [{isin}] Shares (annual fallback): {shares/1e7:.2f} Cr")
+                                    break
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            pass
+
+            # Calculate quarterly EPS from derived shares
+            eps_vals = []
+            pat_hist = np_["history"] if np_ else []
+            for i in range(n):
+                pv = pat_hist[i].get("value") if i < len(pat_hist) else None
+                if pv not in (None, "") and shares:
+                    try:
+                        eps_vals.append(round(float(pv) * 1e7 / shares, 2))
+                    except (TypeError, ValueError):
+                        eps_vals.append("")
+                else:
+                    eps_vals.append("")
+            eps_d_vals = eps_vals[:]
+
         pat_vals = ex(np_["history"] if np_ else [])
 
-        # Quarterly EPS = quarterly_PAT (Cr) * 1e7 / shares
-        def calc_eps(pat_arr):
-            result = []
-            for pat in pat_arr:
-                if pat != "" and pat is not None and shares:
-                    try:
-                        result.append(round(float(pat) * 1e7 / shares, 2))
-                    except:
-                        result.append("")
-                else:
-                    result.append("")
-            return result
-
-        eps_vals = calc_eps(pat_vals)
-
         return {
-            "quarters":  quarters,
-            "sales":     ex(rev["history"] if rev else []),
-            "sales_ch":  ex(rev["history"] if rev else [], "change"),
-            "pbt":       ex(pbt_["history"] if pbt_ else []),   # renamed from op
-            "pbt_ch":    ex(pbt_["history"] if pbt_ else [], "change"),
-            "pat":       pat_vals,
-            "pat_ch":    ex(np_["history"] if np_ else [], "change"),
-            "eps":       eps_vals,
-            "eps_d":     eps_vals,
+            "quarters": quarters,
+            "sales":    ex(rev["history"] if rev else []),
+            "sales_ch": ex(rev["history"] if rev else [], "change"),
+            "pbt":      ex(pbt_["history"] if pbt_ else []),
+            "pbt_ch":   ex(pbt_["history"] if pbt_ else [], "change"),
+            "pat":      pat_vals,
+            "pat_ch":   ex(np_["history"] if np_ else [], "change"),
+            "eps":      eps_vals[:n],
+            "eps_d":    eps_d_vals[:n],
         }
     return None
+
 
 async def fetch_key_ratios(client, sem, isin):
     d = await _upstox_get(client, sem, f"/{isin}/key-ratios")
@@ -468,6 +522,7 @@ async def fetch_one_fundamental(client, sem, sym, isin):
 
     if ca: obj.update(ca)
     return sym, obj
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -683,6 +738,7 @@ def upsert_candle(all_data: dict, sym: str, c: dict) -> None:
         for k in s:
             s[k].append(c[k])
         _sort_stock(s)
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -921,21 +977,15 @@ async def run_fund_weekly(part: int = 0) -> None:
     log.info(f"━━━ Weekly {label} complete — ✓{ok}  ✗{failed} ━━━")
 
 
+
 # ══════════════════════════════════════════════════════════════
 # EP FORMATION SCANNER
 # ══════════════════════════════════════════════════════════════
 
-
 def _check_liquidity(volumes, closes, n, min_turnover=3_00_00_000):
-    """
-    Returns True if stock passes liquidity filter.
-    50D avg volume × 50D avg price >= min_turnover
-    Falls back to 20D if 50D not available.
-    Skips filter if < 20D data available.
-    """
     lookback = min(50, n)
     if lookback < 20:
-        return True   # not enough data — skip filter
+        return True
     avg_vol   = sum(volumes[-lookback:]) / lookback
     avg_price = sum(closes[-lookback:])  / lookback
     return (avg_vol * avg_price) >= min_turnover
@@ -975,7 +1025,6 @@ def _detect_ep(
             if vol_x < volume_spike_x:
                 continue
 
-            # Liquidity filter
             if not _check_liquidity(volumes, closes, n):
                 continue
 
@@ -1003,7 +1052,6 @@ def _detect_ep(
                            if ep_5d_idx > i else ""
             ep_return = round((closes[last_idx] - ep_close) / ep_close * 100, 2)
 
-            # EP Pullback — no consolidation candle closed above EP high
             ep_high = highs[i]
             never_broke_high = all(
                 closes[j] <= ep_high
@@ -1037,30 +1085,19 @@ def _detect_ep(
     return list(seen.values())
 
 
-
 def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
-    """
-    Calculate RS Rating (1-99) for all stocks.
-    Formula: (P63×2 + P126 + P189 + P252) / 5 → percentile rank
-    Returns: {sym: {"rs": 87, "history": [85, 86, 87, ...]}}
-    """
-    # For each historical day, calculate composite score
-    # history_days = how many past RS values to store
-
     all_syms  = list(all_data.keys())
     result    = {}
-
-    # Calculate RS for today + last history_days
-    day_scores = {}   # {sym: [score_day0, score_day1, ...]} oldest first
+    day_scores = {}
 
     for sym, s in all_data.items():
         closes = s["c"]
         n      = len(closes)
         scores = []
 
-        for day_offset in range(history_days, -1, -1):  # oldest → newest
+        for day_offset in range(history_days, -1, -1):
             idx = n - 1 - day_offset
-            if idx < 63:   # minimum 63 days needed
+            if idx < 63:
                 scores.append(None)
                 continue
 
@@ -1076,7 +1113,6 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
             p189 = ret(189)
             p252 = ret(252)
 
-            # Graceful degradation for new listings
             if p252 is not None and p189 is not None and p126 is not None and p63 is not None:
                 composite = (p63 * 2 + p126 + p189 + p252) / 5
             elif p189 is not None and p126 is not None and p63 is not None:
@@ -1092,7 +1128,6 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
 
         day_scores[sym] = scores
 
-    # Rank stocks for each day → RS 1-99
     n_days = history_days + 1
     rs_history = {sym: [] for sym in all_syms}
 
@@ -1110,20 +1145,18 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
         sorted_syms = sorted(day_composites, key=lambda x: day_composites[x])
         total = len(sorted_syms)
         ranks    = {sym: round((i + 1) / total * 99) for i, sym in enumerate(sorted_syms)}
-        rank_pos = {sym: i + 1 for i, sym in enumerate(sorted_syms)}  # actual rank 1=worst
+        rank_pos = {sym: i + 1 for i, sym in enumerate(sorted_syms)}
 
         for sym in all_syms:
             rs_history[sym].append(ranks.get(sym))
 
-    # Build result — rs_ratings format
-    # Get final day ranks
     final_composites = {
         sym: day_scores[sym][-1]
         for sym in all_syms
         if day_scores[sym][-1] is not None
     }
-    final_sorted  = sorted(final_composites, key=lambda x: final_composites[x])
-    final_total   = len(final_sorted)
+    final_sorted   = sorted(final_composites, key=lambda x: final_composites[x])
+    final_total    = len(final_sorted)
     final_rank_pos = {sym: i + 1 for i, sym in enumerate(final_sorted)}
 
     for sym in all_syms:
@@ -1131,8 +1164,8 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
         current_rs = next((v for v in reversed(hist) if v is not None), None)
         result[sym] = {
             "rs"      : current_rs,
-            "rs_rank" : final_rank_pos.get(sym),       # actual rank (1=worst)
-            "rs_total": final_total,                    # total ranked stocks
+            "rs_rank" : final_rank_pos.get(sym),
+            "rs_total": final_total,
             "history" : hist,
         }
 
@@ -1140,23 +1173,17 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
 
 
 def _build_rs_history_json(all_data: dict, rs_data: dict) -> list:
-    """
-    Build rs_history.json in screener wide format:
-    [{"Stock Name": "INFY", "07-Apr-26": 45, "08-Apr-26": 46, ...}, ...]
-    """
     from datetime import date as dt
 
-    # Get dates from any stock
     sample_sym  = next(iter(all_data))
     dates       = all_data[sample_sym]["d"]
     n           = len(dates)
     history_len = len(next(iter(rs_data.values()))["history"])
     start_idx   = n - history_len
 
-    # Build date labels in screener format: "07-Apr-26"
     def fmt_date(d_str):
         d = dt.fromisoformat(d_str)
-        return d.strftime("%-d-%b-%y")   # "7-Apr-26"
+        return d.strftime("%-d-%b-%y")
 
     date_labels = []
     for i in range(history_len):
@@ -1164,7 +1191,6 @@ def _build_rs_history_json(all_data: dict, rs_data: dict) -> list:
         if 0 <= date_idx < n:
             date_labels.append((i, fmt_date(dates[date_idx])))
 
-    # Build wide format — one row per stock
     rows = []
     for sym, v in rs_data.items():
         row = {"Stock Name": sym}
@@ -1178,11 +1204,6 @@ def _build_rs_history_json(all_data: dict, rs_data: dict) -> list:
 
 
 def _calculate_mswing(all_data: dict, history_days: int = 60) -> dict:
-    """
-    Calculate MSwing = annualized momentum score for all stocks.
-    Formula: (close-20d_ago)/20d_ago*100/20 + (close-50d_ago)/50d_ago*100/50
-    Returns: {sym: {"mswing": val, "mswing_avg9": val, "mswing_history": [...]}}
-    """
     result = {}
 
     for sym, s in all_data.items():
@@ -1190,7 +1211,7 @@ def _calculate_mswing(all_data: dict, history_days: int = 60) -> dict:
         n      = len(closes)
 
         history = []
-        for day_offset in range(history_days, -1, -1):  # oldest → newest
+        for day_offset in range(history_days, -1, -1):
             idx = n - 1 - day_offset
             if idx < 51:
                 history.append(None)
@@ -1202,7 +1223,6 @@ def _calculate_mswing(all_data: dict, history_days: int = 60) -> dict:
             except ZeroDivisionError:
                 history.append(None)
 
-        # 9-day moving average of latest values
         valid = [v for v in history[-9:] if v is not None]
         avg9  = round(sum(valid) / len(valid), 4) if valid else None
 
@@ -1216,11 +1236,6 @@ def _calculate_mswing(all_data: dict, history_days: int = 60) -> dict:
 
 
 def _build_mswing_json(all_data: dict, mswing_data: dict) -> list:
-    """
-    Build mswing.json in wide format (same as rs_history):
-    [{"Stock Name": "INFY", "12-May-26": 0.45, ...}, ...]
-    Appends new day column to existing data.
-    """
     from datetime import date as dt
 
     sample_sym  = next(iter(all_data))
@@ -1231,7 +1246,7 @@ def _build_mswing_json(all_data: dict, mswing_data: dict) -> list:
 
     def fmt_date(d_str):
         d = dt.fromisoformat(d_str)
-        return d.strftime("%-d-%b-%y")   # "12-May-26"
+        return d.strftime("%-d-%b-%y")
 
     date_labels = []
     for i in range(history_len):
@@ -1249,6 +1264,7 @@ def _build_mswing_json(all_data: dict, mswing_data: dict) -> list:
         rows.append(row)
 
     return rows
+
 
 async def run_ep_scan() -> None:
     today = today_ist()
@@ -1334,7 +1350,6 @@ async def run_ep_scan() -> None:
             sig["rs"]       = sc.get("rs", "")
             sig["ltp"]      = sc.get("ltp", "")
             fund = fund_lookup.get(sym, {})
-            # Latest quarter — parse dates, order not guaranteed
             _MNUM = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
                      "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
             def _pq(q):
@@ -1356,28 +1371,22 @@ async def run_ep_scan() -> None:
         count = len(signals)
         log.info(f"Found {count} Delayed EP signals")
 
-        # Calculate RS ratings using already-downloaded OHLC
         log.info("Calculating RS ratings…")
         rs_data = _calculate_rs(all_data, history_days=60)
 
-        # Enrich EP signals with current RS
         for sig in signals:
             sig["rs_calc"] = rs_data.get(sig["symbol"], {}).get("rs")
 
-        # Upload both files in parallel
-        # Build rs_history.json in screener format
         rs_history_list = _build_rs_history_json(all_data, rs_data)
 
         rs_payload         = json.dumps({"updated": today, "count": len(rs_data), "stocks": rs_data})
         rs_history_payload = json.dumps(rs_history_list)
         ep_payload         = json.dumps({"updated": today, "count": count, "signals": signals})
 
-        # Calculate MSwing
         log.info("Calculating MSwing…")
         mswing_data = _calculate_mswing(all_data, history_days=60)
         mswing_list = _build_mswing_json(all_data, mswing_data)
 
-        # Enrich EP signals with mswing
         for sig in signals:
             sym = sig["symbol"]
             sig["mswing"]      = mswing_data.get(sym, {}).get("mswing")
@@ -1396,18 +1405,17 @@ async def run_ep_scan() -> None:
 
 
 
-
 # ══════════════════════════════════════════════════════════════
 # HORIZONTAL RESISTANCE (HLR) SCANNER
 # ══════════════════════════════════════════════════════════════
 
 def _detect_hlr(
     all_data: dict,
-    swing_n: int        = 5,     # candles left+right for swing high
-    cluster_pct: float  = 2.0,   # swing highs within 2% = zone
-    near_pct: float     = 4.0,   # price within 4% below = Near HLR
-    consol_days: int    = 5,     # last N candles for consolidation
-    consol_pct: float   = 4.0,   # range < 4% = consolidating
+    swing_n: int        = 5,
+    cluster_pct: float  = 2.0,
+    near_pct: float     = 4.0,
+    consol_days: int    = 5,
+    consol_pct: float   = 4.0,
 ) -> list[dict]:
 
     signals = []
@@ -1422,31 +1430,26 @@ def _detect_hlr(
         if n < swing_n * 2 + consol_days + 2:
             continue
 
-        # Liquidity filter
         if not _check_liquidity(volumes, closes, n):
             continue
 
-        # 50-day avg volume for BO validation
         vol_lookback = min(50, n - 1)
         avg_vol_50   = sum(volumes[-vol_lookback-1:-1]) / vol_lookback if vol_lookback > 0 else 0
         today_vol    = volumes[-1]
         if avg_vol_50 > 0 and vol_lookback >= 20:
             vol_spike = today_vol / avg_vol_50
         else:
-            vol_spike = None   # insufficient history — skip volume filter
+            vol_spike = None
 
-        # ── Step 1: Find swing highs ─────────────────────────
-        # valid = unbroken resistance | bo = broken only today
-        swing_highs = []   # (price, date, tag)
+        swing_highs = []
         for i in range(swing_n, n - swing_n):
             if (all(highs[i] >= highs[i - k] for k in range(1, swing_n + 1)) and
                     all(highs[i] >= highs[i + k] for k in range(1, swing_n + 1))):
                 sh_price = highs[i]
-                # Broken before today?
                 broken_before = any(closes[j] > sh_price for j in range(i + 1, n - 1))
                 broke_today   = closes[-1] > sh_price
                 if broken_before:
-                    continue   # already broken earlier — ignore
+                    continue
                 if broke_today:
                     swing_highs.append((sh_price, dates[i], "BO"))
                 else:
@@ -1455,7 +1458,6 @@ def _detect_hlr(
         if not swing_highs:
             continue
 
-        # ── Step 2: Cluster into resistance levels ────────────
         swing_highs.sort(key=lambda x: x[0], reverse=True)
         used   = [False] * len(swing_highs)
         levels = []
@@ -1470,23 +1472,20 @@ def _detect_hlr(
                     used[j] = True
             used[i] = True
 
-            level    = max(c[0] for c in cluster)
-            zone_low = min(c[0] for c in cluster)
-            is_zone  = len(cluster) >= 2
-            touches  = len(cluster)
-            # BO if any swing high in cluster broke today
+            level       = max(c[0] for c in cluster)
+            zone_low    = min(c[0] for c in cluster)
+            is_zone     = len(cluster) >= 2
+            touches     = len(cluster)
             cluster_tag = "BO" if any(c[2] == "BO" for c in cluster) else "valid"
-            touch_pts = sorted(
+            touch_pts   = sorted(
                 [{"date": c[1], "price": round(c[0], 2)} for c in cluster],
                 key=lambda x: x["date"]
             )
             levels.append((level, zone_low, touches, is_zone, touch_pts, cluster_tag))
 
-        # ── Step 3: Current price vs each level ───────────────
         curr_close = closes[-1]
         curr_date  = dates[-1]
 
-        # Consolidation check
         if n >= consol_days:
             recent_high = max(highs[-consol_days:])
             recent_low  = min(lows[-consol_days:])
@@ -1497,22 +1496,13 @@ def _detect_hlr(
             is_consol = False
 
         for (level, zone_low, touches, is_zone, touch_pts, cluster_tag) in levels:
-
             dist_pct = (level - curr_close) / level * 100
 
-            # BO: broke today + volume >= 2x 50-day avg (skip if insufficient data)
             if cluster_tag == "BO":
                 vol_ok = (vol_spike is None) or (vol_spike >= 2.0)
-                if vol_ok:
-                    state = "BO"
-                else:
-                    state = "Near HLR"   # broke but low volume — not confirmed
-
-            # Near HLR: within 4% below
+                state  = "BO" if vol_ok else "Near HLR"
             elif 0 <= dist_pct <= near_pct:
                 state = "Consolidating near HLR" if is_consol else "Near HLR"
-
-            # Too far — skip
             else:
                 continue
 
@@ -1535,11 +1525,6 @@ def _detect_hlr(
 
 
 async def run_hlr_scan() -> None:
-    """
-    Weekdays — scan all stocks for horizontal resistance signals.
-    States: Near HLR | Consolidating near HLR | BO
-    Uploads hlr_signals.json to R2.
-    """
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
@@ -1548,14 +1533,12 @@ async def run_hlr_scan() -> None:
     log.info(f"━━━ HLR Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
-
         log.info("Downloading OHLC chunks…")
         all_data = await download_all_chunks(client)
         log.info(f"Loaded {len(all_data)} stocks")
 
         signals = _detect_hlr(all_data)
 
-        # Sort — BO first, then Consolidating, then Near
         order = {"BO": 0, "Consolidating near HLR": 1, "Near HLR": 2}
         signals.sort(key=lambda x: (order.get(x["state"], 9), -x["touches"]))
 
@@ -1578,17 +1561,15 @@ async def run_hlr_scan() -> None:
     log.info("━━━ HLR Scan complete ━━━")
 
 
-
 # ══════════════════════════════════════════════════════════════
 # PATTERN SCANNER
 # ══════════════════════════════════════════════════════════════
 
 def _build_weekly(dates, opens, highs, lows, closes, volumes):
-    """Aggregate daily OHLC into weekly (Mon-Fri, ISO week)."""
     from datetime import date as dt
     weekly = {}
     for d, o, h, l, c, v in zip(dates, opens, highs, lows, closes, volumes):
-        key = dt.fromisoformat(d).isocalendar()[:2]  # (year, week)
+        key = dt.fromisoformat(d).isocalendar()[:2]
         if key not in weekly:
             weekly[key] = {"o": o, "h": h, "l": l, "c": c, "v": v, "d": d}
         else:
@@ -1601,7 +1582,7 @@ def _build_weekly(dates, opens, highs, lows, closes, volumes):
 
 def _detect_patterns(
     all_data: dict,
-    min_volume: int    = 2500,
+    min_volume: int      = 2500,
     coil_min_babies: int = 3,
     tight_close_weeks: int = 3,
     tight_close_pct: float = 2.0,
@@ -1621,73 +1602,51 @@ def _detect_patterns(
 
         if n < 10:
             continue
-
-        # ── Liquidity filter (50D avg vol × price >= 3Cr) ──
         if not _check_liquidity(volumes, closes, n):
             continue
-
-        # ── Volume filter — today's volume ──────────────────
         if volumes[-1] < min_volume:
             continue
 
         today = dates[-1]
 
-        # ══════════════════════════════════════════════════
-        # DAILY PATTERNS
-        # ══════════════════════════════════════════════════
-
-        # ── Inside Bar ───────────────────────────────────
-        if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2]):
+        # ── Inside Bar ────────────────────────────────────────
+        if highs[-1] <= highs[-2] and lows[-1] >= lows[-2]:
             signals.append({
-                "symbol"  : sym,
-                "pattern" : "Inside Bar",
-                "date"    : today,
-                "high"    : round(highs[-1], 2),
-                "low"     : round(lows[-1], 2),
-                "prev_high": round(highs[-2], 2),
-                "prev_low" : round(lows[-2], 2),
+                "symbol"  : sym, "pattern": "Inside Bar", "date": today,
+                "high"    : round(highs[-1], 2), "low": round(lows[-1], 2),
+                "prev_high": round(highs[-2], 2), "prev_low": round(lows[-2], 2),
             })
 
-        # ── Double Inside Bar ─────────────────────────────
+        # ── Double Inside Bar ─────────────────────────────────
         if n >= 3:
             if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2] and
                     highs[-2] <= highs[-3] and lows[-2] >= lows[-3]):
                 signals.append({
-                    "symbol"  : sym,
-                    "pattern" : "Double Inside Bar",
-                    "date"    : today,
-                    "high"    : round(highs[-1], 2),
-                    "low"     : round(lows[-1], 2),
-                    "mother_high": round(highs[-3], 2),
-                    "mother_low" : round(lows[-3], 2),
+                    "symbol"  : sym, "pattern": "Double Inside Bar", "date": today,
+                    "high"    : round(highs[-1], 2), "low": round(lows[-1], 2),
+                    "mother_high": round(highs[-3], 2), "mother_low": round(lows[-3], 2),
                 })
 
-        # ── NR7 ──────────────────────────────────────────
+        # ── NR7 ───────────────────────────────────────────────
         if n >= 7:
             today_range = highs[-1] - lows[-1]
             past_ranges = [highs[-i] - lows[-i] for i in range(2, 8)]
             if today_range <= min(past_ranges):
                 signals.append({
-                    "symbol"  : sym,
-                    "pattern" : "NR7",
-                    "date"    : today,
-                    "range"   : round(today_range, 2),
-                    "high"    : round(highs[-1], 2),
-                    "low"     : round(lows[-1], 2),
+                    "symbol": sym, "pattern": "NR7", "date": today,
+                    "range" : round(today_range, 2),
+                    "high"  : round(highs[-1], 2), "low": round(lows[-1], 2),
                 })
 
-        # ── Mini Coil (MCP) — Active + Nested ───────────────
+        # ── Mini Coil (MCP) ───────────────────────────────────
         seen_mothers = set()
         for m_idx in range(n - coil_min_babies - 1, max(0, n - 60), -1):
             m_high = highs[m_idx]
             m_low  = lows[m_idx]
-
-            # Skip duplicate mother levels (within 0.5%)
-            m_key = round(m_high * 200)
+            m_key  = round(m_high * 200)
             if m_key in seen_mothers:
                 continue
 
-            # Count consecutive babies inside mother
             baby_count = 0
             coil_state = "Coiling"
             for b in range(m_idx + 1, n):
@@ -1700,24 +1659,18 @@ def _detect_patterns(
                 else:
                     baby_count += 1
 
-            # Only active (Coiling) MCPs with min babies
             if baby_count >= coil_min_babies and coil_state == "Coiling":
                 seen_mothers.add(m_key)
                 signals.append({
                     "symbol"     : sym,
                     "pattern"    : f"{baby_count} Bar MCP" if baby_count <= 6 else "Mini Coil",
                     "date"       : today,
-                    "mcp_high"   : round(m_high, 2),
-                    "mcp_low"    : round(m_low, 2),
-                    "baby_count" : baby_count,
-                    "coil_state" : coil_state,
+                    "mcp_high"   : round(m_high, 2), "mcp_low": round(m_low, 2),
+                    "baby_count" : baby_count, "coil_state": coil_state,
                     "mother_date": dates[m_idx],
                 })
 
-        # ══════════════════════════════════════════════════
-        # WEEKLY PATTERNS
-        # ══════════════════════════════════════════════════
-
+        # ── Weekly Patterns ───────────────────────────────────
         weekly = _build_weekly(dates, opens, highs, lows, closes, volumes)
         if not weekly:
             continue
@@ -1728,61 +1681,44 @@ def _detect_patterns(
         if len(past_weeks) < 2:
             continue
 
-        lw  = weekly[past_weeks[-1]]   # last complete week
-        lw2 = weekly[past_weeks[-2]]   # 2 weeks ago
+        lw  = weekly[past_weeks[-1]]
+        lw2 = weekly[past_weeks[-2]]
 
-        # ── Weekly Inside Bar ─────────────────────────────
         if lw["h"] <= lw2["h"] and lw["l"] >= lw2["l"]:
             signals.append({
-                "symbol"   : sym,
-                "pattern"  : "Weekly IB",
-                "date"     : today,
-                "w_high"   : round(lw["h"], 2),
-                "w_low"    : round(lw["l"], 2),
-                "w_close"  : round(lw["c"], 2),
-                "prev_w_high": round(lw2["h"], 2),
-                "prev_w_low" : round(lw2["l"], 2),
+                "symbol": sym, "pattern": "Weekly IB", "date": today,
+                "w_high": round(lw["h"], 2), "w_low": round(lw["l"], 2),
+                "w_close": round(lw["c"], 2),
+                "prev_w_high": round(lw2["h"], 2), "prev_w_low": round(lw2["l"], 2),
             })
 
-            # ── Weekly Double Inside Bar ──────────────────
             if len(past_weeks) >= 3:
                 lw3 = weekly[past_weeks[-3]]
                 if lw2["h"] <= lw3["h"] and lw2["l"] >= lw3["l"]:
                     signals.append({
-                        "symbol"      : sym,
-                        "pattern"     : "Weekly Double IB",
-                        "date"        : today,
-                        "w_high"      : round(lw["h"], 2),
-                        "w_low"       : round(lw["l"], 2),
-                        "mother_w_high": round(lw3["h"], 2),
-                        "mother_w_low" : round(lw3["l"], 2),
+                        "symbol": sym, "pattern": "Weekly Double IB", "date": today,
+                        "w_high": round(lw["h"], 2), "w_low": round(lw["l"], 2),
+                        "mother_w_high": round(lw3["h"], 2), "mother_w_low": round(lw3["l"], 2),
                     })
 
-        # ── Weekly NR7 ────────────────────────────────────
         if len(past_weeks) >= 7:
             lw_range    = lw["h"] - lw["l"]
             past_ranges = [weekly[past_weeks[-i]]["h"] - weekly[past_weeks[-i]]["l"]
                            for i in range(2, 8)]
             if lw_range <= min(past_ranges):
                 signals.append({
-                    "symbol"  : sym,
-                    "pattern" : "Weekly NR7",
-                    "date"    : today,
-                    "w_range" : round(lw_range, 2),
-                    "w_high"  : round(lw["h"], 2),
-                    "w_low"   : round(lw["l"], 2),
+                    "symbol": sym, "pattern": "Weekly NR7", "date": today,
+                    "w_range": round(lw_range, 2),
+                    "w_high": round(lw["h"], 2), "w_low": round(lw["l"], 2),
                 })
 
-        # ── Weekly Tight Close ────────────────────────────
         if len(past_weeks) >= tight_close_weeks:
             last_n_closes = [weekly[past_weeks[-i]]["c"]
                              for i in range(1, tight_close_weeks + 1)]
             tc_range = (max(last_n_closes) - min(last_n_closes)) / min(last_n_closes) * 100
             if tc_range <= tight_close_pct:
                 signals.append({
-                    "symbol"   : sym,
-                    "pattern"  : "Weekly Tight Close",
-                    "date"     : today,
+                    "symbol"   : sym, "pattern": "Weekly Tight Close", "date": today,
                     "closes"   : [round(c, 2) for c in last_n_closes],
                     "range_pct": round(tc_range, 2),
                 })
@@ -1791,10 +1727,6 @@ def _detect_patterns(
 
 
 async def run_pattern_scan() -> None:
-    """
-    Weekdays — scan all stocks for price action patterns.
-    Uploads pattern_signals.json to R2.
-    """
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
@@ -1803,14 +1735,12 @@ async def run_pattern_scan() -> None:
     log.info(f"━━━ Pattern Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
-
         log.info("Downloading OHLC chunks…")
         all_data = await download_all_chunks(client)
         log.info(f"Loaded {len(all_data)} stocks")
 
         signals = _detect_patterns(all_data)
 
-        # Summary by pattern
         from collections import Counter
         counts = Counter(s["pattern"] for s in signals)
         for pat, cnt in sorted(counts.items()):
@@ -1826,6 +1756,7 @@ async def run_pattern_scan() -> None:
         await r2_upload(client, "pattern_signals.json", payload)
 
     log.info("━━━ Pattern Scan complete ━━━")
+
 
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
