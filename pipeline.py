@@ -229,25 +229,64 @@ async def fetch_income_statement(client, sem, isin):
             continue
         stmt = d["data"].get("income_statement", [])
         full = d["data"].get("full_statement", [])
-        rev = next((s for s in stmt if s["category"] == "revenue"), None)
-        op  = next((s for s in stmt if s["category"] == "operating_profit"), None)
-        np_ = next((s for s in stmt if s["category"] == "net_profit"), None)
+        rev  = next((s for s in stmt if s["category"] == "revenue"), None)
+        pbt_ = next((s for s in stmt if s["category"] == "operating_profit"), None)  # Upstox mislabel — actually PBT
+        np_  = next((s for s in stmt if s["category"] == "net_profit"), None)
         if not rev and not np_:
             continue
+
         src = rev or np_
-        n = min(len(src["history"]), 4)
+        n   = min(len(src["history"]), 4)
         quarters = [q["period"] for q in src["history"][:n]]
-        def ex(arr, key="value"): return [(q.get(key) if q.get(key) is not None else "") for q in (arr or [])[:n]]
-        def exf(name): return [(q["value"] if q.get("value") is not None else "") for q in (next((s for s in full if s.get("particular") == name), {}).get("history", []))[:n]]
+
+        def ex(arr, key="value"):
+            return [(q.get(key) if q.get(key) is not None else "") for q in (arr or [])[:n]]
+
+        def exf(name):
+            return [(q["value"] if q.get("value") is not None else "")
+                    for q in (next((s for s in full if s.get("particular") == name), {})
+                              .get("history", []))[:1]]  # only first (most recent annual)
+
+        # Shares derive karo: annual_PAT (Cr) * 1e7 / annual_EPS = shares
+        shares = None
+        try:
+            ann_pat = exf("Profit After Tax")
+            ann_eps = exf("EPS - Basic")
+            if ann_pat and ann_eps and ann_pat[0] != "" and ann_eps[0] != "":
+                shares = float(ann_pat[0]) * 1e7 / float(ann_eps[0])
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+        # Quarterly PAT values
+        pat_vals = ex(np_["history"] if np_ else [])
+
+        # Quarterly EPS = quarterly_PAT (Cr) * 1e7 / shares
+        def calc_eps(pat_arr):
+            result = []
+            for pat in pat_arr:
+                if pat != "" and pat is not None and shares:
+                    try:
+                        result.append(round(float(pat) * 1e7 / shares, 2))
+                    except:
+                        result.append("")
+                else:
+                    result.append("")
+            return result
+
+        eps_vals = calc_eps(pat_vals)
+
         return {
-            "quarters": quarters,
-            "sales": ex(rev["history"] if rev else []), "sales_ch": ex(rev["history"] if rev else [], "change"),
-            "op": ex(op["history"] if op else []),   "op_ch":    ex(op["history"] if op else [], "change"),
-            "pat": ex(np_["history"] if np_ else []), "pat_ch":   ex(np_["history"] if np_ else [], "change"),
-            "eps": exf("EPS - Basic"), "eps_d": exf("EPS - Diluted"),
+            "quarters":  quarters,
+            "sales":     ex(rev["history"] if rev else []),
+            "sales_ch":  ex(rev["history"] if rev else [], "change"),
+            "pbt":       ex(pbt_["history"] if pbt_ else []),   # renamed from op
+            "pbt_ch":    ex(pbt_["history"] if pbt_ else [], "change"),
+            "pat":       pat_vals,
+            "pat_ch":    ex(np_["history"] if np_ else [], "change"),
+            "eps":       eps_vals,
+            "eps_d":     eps_vals,
         }
     return None
-
 
 async def fetch_key_ratios(client, sem, isin):
     d = await _upstox_get(client, sem, f"/{isin}/key-ratios")
@@ -392,14 +431,14 @@ async def fetch_one_fundamental(client, sem, sym, isin):
         for i, q in enumerate(quarters[:4]):
             n = i + 1
             obj[f"q{n}_period"]   = q
-            obj[f"q{n}_sales"]    = income["sales"][i]    if i < len(income.get("sales",[]))    else ""
+            obj[f"q{n}_sales"]    = income["sales"][i]   if i < len(income.get("sales",[]))   else ""
             obj[f"q{n}_sales_ch"] = income["sales_ch"][i] if i < len(income.get("sales_ch",[])) else ""
-            obj[f"q{n}_op"]       = income["op"][i]       if i < len(income.get("op",[]))       else ""
-            obj[f"q{n}_op_ch"]    = income["op_ch"][i]    if i < len(income.get("op_ch",[]))    else ""
-            obj[f"q{n}_pat"]      = income["pat"][i]      if i < len(income.get("pat",[]))      else ""
-            obj[f"q{n}_pat_ch"]   = income["pat_ch"][i]   if i < len(income.get("pat_ch",[]))   else ""
-            obj[f"q{n}_eps"]      = income["eps"][i]      if i < len(income.get("eps",[]))      else ""
-            obj[f"q{n}_eps_d"]    = income["eps_d"][i]    if i < len(income.get("eps_d",[]))    else ""
+            obj[f"q{n}_pbt"]      = income["pbt"][i]     if i < len(income.get("pbt",[]))     else ""
+            obj[f"q{n}_pbt_ch"]   = income["pbt_ch"][i]  if i < len(income.get("pbt_ch",[]))  else ""
+            obj[f"q{n}_pat"]      = income["pat"][i]     if i < len(income.get("pat",[]))     else ""
+            obj[f"q{n}_pat_ch"]   = income["pat_ch"][i]  if i < len(income.get("pat_ch",[]))  else ""
+            obj[f"q{n}_eps"]      = income["eps"][i]     if i < len(income.get("eps",[]))     else ""
+            obj[f"q{n}_eps_d"]    = income["eps_d"][i]   if i < len(income.get("eps_d",[]))   else ""
 
     if bs:
         obj["bs_type"]  = bs.get("bs_type", "")
