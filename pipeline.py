@@ -1384,7 +1384,7 @@ async def run_ep_scan() -> None:
         ep_payload         = json.dumps({"updated": today, "count": count, "signals": signals})
 
         log.info("Calculating MSwing…")
-        mswing_data = _calculate_mswing(all_data, history_days=60)
+        mswing_data = _calculate_mswing(all_data, history_days=200)
         mswing_list = _build_mswing_json(all_data, mswing_data)
 
         for sig in signals:
