@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import asyncio
+import gzip
+import io
 import json
 import logging
 import os
@@ -11,6 +13,10 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -45,11 +51,8 @@ RATE_DELAY = 0.5
 HERE = Path(__file__).parent
 
 # =========================================================
-# LOAD BSE ISIN MAP
+# HEADERS
 # =========================================================
-
-with open(HERE / "bse_isin_map.json") as f:
-    BSE_ISIN_MAP = json.load(f)
 
 UPSTOX_HEADERS = {
     "Authorization": f"Bearer {UPSTOX_TOKEN}",
@@ -61,10 +64,11 @@ WORKER_HEADERS = {
 }
 
 # =========================================================
-# TRADING DAY
+# DATE UTILS
 # =========================================================
 
 def today_ist():
+
     return datetime.now(
         ZoneInfo("Asia/Kolkata")
     ).strftime("%Y-%m-%d")
@@ -90,6 +94,97 @@ def rolling_cutoff(anchor):
     ).isoformat()
 
 # =========================================================
+# DOWNLOAD BSE STOCK MASTER
+# =========================================================
+
+async def load_bse_isin_map():
+
+    url = (
+        "https://assets.upstox.com/"
+        "market-quote/instruments/"
+        "exchange/complete.json.gz"
+    )
+
+    async with httpx.AsyncClient(timeout=120) as client:
+
+        r = await client.get(url)
+
+        r.raise_for_status()
+
+        compressed = io.BytesIO(r.content)
+
+        with gzip.GzipFile(fileobj=compressed) as gz:
+
+            data = json.loads(
+                gz.read().decode()
+            )
+
+    mapping = {}
+
+    for row in data:
+
+        exchange = row.get("exchange")
+
+        instrument_type = row.get(
+            "instrument_type"
+        )
+
+        trading_symbol = row.get(
+            "trading_symbol",
+            ""
+        )
+
+        short_name = row.get(
+            "short_name",
+            ""
+        )
+
+        isin = row.get("isin")
+
+        if exchange != "BSE":
+            continue
+
+        if instrument_type != "EQ":
+            continue
+
+        if not isin:
+            continue
+
+        # Remove ETFs / Bonds / Funds
+        bad_words = [
+            "ETF",
+            "MF",
+            "FUND",
+            "GOLD",
+            "LIQUID",
+            "GSEC",
+            "GS",
+            "BOND",
+            "SDL",
+            "NCD",
+        ]
+
+        name_check = (
+            trading_symbol.upper()
+            + " "
+            + short_name.upper()
+        )
+
+        if any(
+            x in name_check
+            for x in bad_words
+        ):
+            continue
+
+        mapping[trading_symbol] = isin
+
+    log.info(
+        f"Loaded {len(mapping)} BSE stocks"
+    )
+
+    return mapping
+
+# =========================================================
 # LIQUIDITY FILTER
 # =========================================================
 
@@ -105,9 +200,13 @@ def passes_bse_liquidity_filter(
 
     recent = candles[-20:]
 
-    avg_close = sum(c["c"] for c in recent) / 20
+    avg_close = sum(
+        c["c"] for c in recent
+    ) / 20
 
-    avg_vol = sum(c["v"] for c in recent) / 20
+    avg_vol = sum(
+        c["v"] for c in recent
+    ) / 20
 
     turnover = avg_close * avg_vol
 
@@ -123,7 +222,7 @@ def passes_bse_liquidity_filter(
     return True
 
 # =========================================================
-# FETCH BSE OHLC
+# FETCH OHLC
 # =========================================================
 
 async def fetch_bse_ohlc(
@@ -135,7 +234,10 @@ async def fetch_bse_ohlc(
     to_date,
 ):
 
-    key = quote(f"BSE_EQ|{isin}", safe="")
+    key = quote(
+        f"BSE_EQ|{isin}",
+        safe=""
+    )
 
     url = (
         f"{BASE_URL}/{key}/day/"
@@ -146,7 +248,9 @@ async def fetch_bse_ohlc(
 
         async with sem:
 
-            await asyncio.sleep(RATE_DELAY)
+            await asyncio.sleep(
+                RATE_DELAY
+            )
 
             try:
 
@@ -158,19 +262,25 @@ async def fetch_bse_ohlc(
 
             except httpx.RequestError:
 
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(
+                    2 ** attempt
+                )
 
                 continue
 
         if r.status_code == 401:
 
-            log.error("TOKEN EXPIRED")
+            log.error(
+                "TOKEN EXPIRED"
+            )
 
             sys.exit(1)
 
         if r.status_code == 429:
 
-            log.warning(f"{sym}: 429")
+            log.warning(
+                f"{sym}: 429"
+            )
 
             await asyncio.sleep(10)
 
@@ -199,7 +309,11 @@ async def fetch_bse_ohlc(
                 "l": c[3],
                 "c": c[4],
                 "v": c[5],
-                "oi": c[6] if len(c) > 6 else 0
+                "oi": (
+                    c[6]
+                    if len(c) > 6
+                    else 0
+                )
             } for c in raw],
             key=lambda x: x["d"]
         )
@@ -231,18 +345,26 @@ def build_stock_obj(candles):
 # APPLY ROLLING WINDOW
 # =========================================================
 
-def apply_rolling_window(all_data, cutoff):
+def apply_rolling_window(
+    all_data,
+    cutoff
+):
 
     for s in all_data.values():
 
         keep = [
-            i for i, d in enumerate(s["d"])
+            i for i, d in enumerate(
+                s["d"]
+            )
             if d >= cutoff
         ]
 
         for k in s:
 
-            s[k] = [s[k][i] for i in keep]
+            s[k] = [
+                s[k][i]
+                for i in keep
+            ]
 
 # =========================================================
 # R2 UPLOAD
@@ -258,13 +380,17 @@ async def r2_upload(
 
         data = data.encode()
 
-    url = f"{WORKER_URL}?file={filename}"
+    url = (
+        f"{WORKER_URL}"
+        f"?file={filename}"
+    )
 
     r = await client.post(
         url,
         headers={
             **WORKER_HEADERS,
-            "Content-Type": "application/json"
+            "Content-Type":
+            "application/json"
         },
         content=data,
         timeout=90
@@ -276,7 +402,9 @@ async def r2_upload(
             f"Upload failed {filename}"
         )
 
-    log.info(f"Uploaded {filename}")
+    log.info(
+        f"Uploaded {filename}"
+    )
 
 # =========================================================
 # UPLOAD CHUNKS
@@ -288,7 +416,9 @@ async def upload_bse_chunks(
     today
 ):
 
-    symbols = sorted(all_data.keys())
+    symbols = sorted(
+        all_data.keys()
+    )
 
     n = len(symbols)
 
@@ -339,12 +469,21 @@ async def run_bse_daily():
     cutoff = rolling_cutoff(today)
 
     log.info(
-        f"BSE Daily {prev} → {today}"
+        f"BSE Daily "
+        f"{prev} → {today}"
     )
 
-    sem = asyncio.Semaphore(CONCURRENCY)
+    sem = asyncio.Semaphore(
+        CONCURRENCY
+    )
 
-    symbols = list(BSE_ISIN_MAP.keys())
+    BSE_ISIN_MAP = (
+        await load_bse_isin_map()
+    )
+
+    symbols = list(
+        BSE_ISIN_MAP.keys()
+    )
 
     async with httpx.AsyncClient() as client:
 
@@ -360,7 +499,9 @@ async def run_bse_daily():
             for sym in symbols
         ]
 
-        results = await asyncio.gather(*tasks)
+        results = await asyncio.gather(
+            *tasks
+        )
 
         fetched = {}
 
@@ -377,15 +518,18 @@ async def run_bse_daily():
             fetched[sym] = candles
 
         log.info(
-            f"Liquid stocks: {len(fetched)}"
+            f"Liquid stocks: "
+            f"{len(fetched)}"
         )
 
         all_data = {}
 
         for sym, candles in fetched.items():
 
-            all_data[sym] = build_stock_obj(
-                candles
+            all_data[sym] = (
+                build_stock_obj(
+                    candles
+                )
             )
 
         apply_rolling_window(
@@ -426,7 +570,9 @@ async def run_bse_daily():
             )
         )
 
-    log.info("BSE Pipeline Complete")
+    log.info(
+        "BSE Pipeline Complete"
+    )
 
 # =========================================================
 # ENTRY
