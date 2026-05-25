@@ -10,7 +10,7 @@ Usage:
   python pipeline.py status              # print R2 chunk summary
   python pipeline.py fund_daily          # BSE result stocks update (4:30 PM IST, weekdays)
   python pipeline.py fund_weekly         # full 2300 stocks refresh (Sunday)
-  python pipeline.py ep_scan             # EP formation scan        (4:15 PM IST, weekdays)
+  python pipeline.py ep_scan             # EP + Post-Result T+1 scan (4:35 PM IST, weekdays)
   python pipeline.py hlr_scan            # Horizontal resistance scan (4:20 PM IST, weekdays)
   python pipeline.py pattern_scan        # Price action pattern scan  (4:25 PM IST, weekdays)
 """
@@ -247,16 +247,12 @@ async def fetch_income_statement(client, sem, isin):
             return (next((s for s in full if s.get("particular") == name), {})
                     .get("history", []))
 
-        # ── FIX 1: PBT — use profit_before_tax category ──────────────
-        # OLD BUG: "operating_profit" category = Operating Profit, NOT PBT
         pbt_ = next((s for s in stmt if s["category"] == "profit_before_tax"), None)
         if not pbt_:
             pbt_h = full_hist("Profit Before Tax")
             if pbt_h:
                 pbt_ = {"history": pbt_h}
 
-        # ── FIX 2: EPS — robust shares derivation ─────────────────────
-        # Try API eps category first (most accurate)
         eps_api = next((s for s in stmt
                         if s["category"] in ("eps", "earnings_per_share", "basic_eps")), None)
 
@@ -266,9 +262,6 @@ async def fetch_income_statement(client, sem, isin):
                                if s["category"] in ("diluted_eps", "eps_diluted")), None)
             eps_d_vals = ex(eps_d_api["history"]) if eps_d_api else eps_vals[:]
         else:
-            # Derive shares from quarterly PAT / quarterly EPS pairs
-            # OLD BUG: used annual PAT / annual EPS[0] → gave wrong single-quarter EPS
-            # FIX: use median of multiple quarterly pairs for robustness
             eps_names  = ["EPS - Basic", "Basic EPS", "Earnings Per Share", "EPS(Basic)"]
             eps_full_h = []
             for name in eps_names:
@@ -285,17 +278,16 @@ async def fetch_income_statement(client, sem, isin):
                     if pat_v not in (None, "") and eps_v not in (None, "", 0):
                         try:
                             est = float(pat_v) * 1e7 / float(eps_v)
-                            if 1e6 < est < 1e10:  # sanity: 0.1 Cr to 1000 Cr shares
+                            if 1e6 < est < 1e10:
                                 estimates.append(est)
                         except (TypeError, ValueError, ZeroDivisionError):
                             pass
                 if estimates:
                     estimates.sort()
-                    shares = estimates[len(estimates) // 2]  # median
+                    shares = estimates[len(estimates) // 2]
                     log.info(f"  [{isin}] Shares: {shares/1e7:.2f} Cr (median of {len(estimates)} quarters)")
 
             if not shares:
-                # Annual fallback
                 for eps_name in ["EPS - Basic", "Basic EPS", "Earnings Per Share"]:
                     ann_eps_h = full_hist(eps_name)
                     ann_pat_h = full_hist("Profit After Tax")
@@ -312,7 +304,6 @@ async def fetch_income_statement(client, sem, isin):
                         except (TypeError, ValueError, ZeroDivisionError):
                             pass
 
-            # Calculate quarterly EPS from derived shares
             eps_vals = []
             pat_hist = np_["history"] if np_ else []
             for i in range(n):
@@ -661,6 +652,33 @@ async def r2_download(client: httpx.AsyncClient, filename: str) -> dict | None:
     return r.json()
 
 
+async def save_result_calendar(
+    client: httpx.AsyncClient,
+    symbols: list[str],
+    date_str: str,
+    keep_days: int = 60,
+) -> None:
+    """
+    Append today's BSE result symbols to the rolling result_calendar.json in R2.
+    Format: { "YYYY-MM-DD": ["SYM1", "SYM2", ...], ... }
+    Keeps last keep_days days of entries automatically.
+    """
+    try:
+        existing = await r2_download(client, "result_calendar.json")
+        cal: dict = existing if isinstance(existing, dict) else {}
+    except Exception:
+        cal = {}
+
+    cal[date_str] = symbols  # overwrite if re-run same day
+
+    # Prune entries older than keep_days
+    cutoff = (date.fromisoformat(date_str) - timedelta(days=keep_days)).isoformat()
+    cal = {d: v for d, v in cal.items() if d >= cutoff}
+
+    await r2_upload(client, "result_calendar.json", json.dumps(cal))
+    log.info(f"  📅 result_calendar.json — {len(cal)} days stored, {len(symbols)} stocks today")
+
+
 async def download_all_chunks(client: httpx.AsyncClient) -> dict:
     tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -911,6 +929,10 @@ async def run_fund_daily() -> None:
             log.info("No BSE results today — exiting")
             return
 
+        # Persist result symbols before fetching fundamentals so the
+        # calendar is saved even if the fundamentals fetch partially fails.
+        await save_result_calendar(client, symbols, today)
+
         log.info("Downloading fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
@@ -1008,6 +1030,10 @@ def _detect_ep(
         if n < volume_lookback + 2:
             continue
 
+        # Liquidity check once per stock, not per candle
+        if not _check_liquidity(volumes, closes, n):
+            continue
+
         scan_from = max(volume_lookback, n - max_ep_age_days)
 
         for i in range(scan_from, n):
@@ -1025,9 +1051,6 @@ def _detect_ep(
             if vol_x < volume_spike_x:
                 continue
 
-            if not _check_liquidity(volumes, closes, n):
-                continue
-
             gap_lower    = prev_high
             consol_count = 0
             ep_intact    = True
@@ -1040,8 +1063,6 @@ def _detect_ep(
 
             if not ep_intact:
                 continue
-            if consol_count < 0:
-                continue
             if consol_count >= max_consolidation:
                 continue
 
@@ -1050,14 +1071,15 @@ def _detect_ep(
             ep_5d_idx = min(i + 5, n - 1)
             ep_5d_return = round((closes[ep_5d_idx] - ep_close) / ep_close * 100, 2) \
                            if ep_5d_idx > i else ""
-            ep_return = round((closes[last_idx] - ep_close) / ep_close * 100, 2)
+            ep_return = round((closes[last_idx] - ep_close) / ep_close * 100, 2) \
+                        if ep_close else 0.0
 
             ep_high = highs[i]
             never_broke_high = all(
                 closes[j] <= ep_high
                 for j in range(i + 1, last_idx + 1)
             )
-            ep_type = "Consolidating below EP high" if never_broke_high else "Delayed EP"
+            ep_type = "Consolidating below EP high" if never_broke_high else "EP Follow-through"
 
             signals.append({
                 "symbol"          : sym,
@@ -1083,6 +1105,156 @@ def _detect_ep(
             seen[sym] = sig
 
     return list(seen.values())
+
+
+# ══════════════════════════════════════════════════════════════
+# POST-RESULT THRUST SCANNER
+# Catches earnings reactions WITHOUT a gap-up:
+#   Case A — AH result: stock flat on result day, T+1 is the primary move
+#   Case B — IH result: stock moved on result day, T+1 is follow-through
+# Requires result_calendar.json populated by run_fund_daily.
+# ══════════════════════════════════════════════════════════════
+
+def _detect_post_result_thrust(
+    all_data: dict,
+    result_calendar: dict,          # {"YYYY-MM-DD": ["SYM1", ...], ...}
+    min_price_ch_pct: float  = 1.5, # lower bar — date is confirmed from BSE
+    volume_spike_x: float    = 1.5,
+    close_position_min: float = 0.5, # close must be in top 50% of candle range
+    volume_lookback: int     = 20,
+    max_result_age_days: int = 30,   # ignore results older than this
+) -> list[dict]:
+    """
+    For every stock in result_calendar, look at T+1 (next trading day after
+    the result day) and check whether it moved positively without a gap-up.
+    Gap-ups on T+1 are excluded here — _detect_ep already handles those.
+
+    Fields in each signal:
+      result_date       — date BSE result was announced
+      result_day_ch     — % move on the result day itself
+      result_day_vol_x  — volume spike on result day vs 20-day avg
+      t1_date           — T+1 candle date
+      t1_*              — T+1 OHLC values
+      price_ch_pct      — T+1 % gain vs result-day close
+      vol_pct           — T+1 volume spike formatted as "+150%"
+      close_position    — where T+1 close sits within its candle range (0-100)
+      reaction_type     — "AH Result → T+1 Primary" or "IH Result → T+1 Follow-through"
+    """
+    today_str = today_ist()
+    cutoff    = (date.fromisoformat(today_str) - timedelta(days=max_result_age_days)).isoformat()
+
+    # Build sym → most-recent result date (within cutoff window)
+    sym_to_result_date: dict[str, str] = {}
+    for date_str, syms in result_calendar.items():
+        if date_str < cutoff:
+            continue
+        for sym in syms:
+            if sym not in sym_to_result_date or date_str > sym_to_result_date[sym]:
+                sym_to_result_date[sym] = date_str
+
+    signals = []
+
+    for sym, result_date in sym_to_result_date.items():
+        if sym not in all_data:
+            continue
+
+        s       = all_data[sym]
+        dates   = s["d"]
+        opens   = s["o"]
+        highs   = s["h"]
+        lows    = s["l"]
+        closes  = s["c"]
+        volumes = s["v"]
+        n       = len(dates)
+
+        if n < volume_lookback + 2:
+            continue
+
+        # Locate result day in OHLC
+        if result_date not in dates:
+            log.debug(f"  {sym}: result date {result_date} not in OHLC — skipped")
+            continue
+
+        ri = dates.index(result_date)   # result day index
+        ti = ri + 1                      # T+1 index
+
+        if ti >= n:
+            # T+1 candle not yet available (result day is the last candle)
+            log.debug(f"  {sym}: no T+1 candle yet for result date {result_date}")
+            continue
+
+        # Volume baseline from pre-result history (excludes result day itself)
+        lookback = min(volume_lookback, ri)
+        if lookback == 0:
+            continue
+        avg_vol = sum(volumes[ri - lookback : ri]) / lookback
+        if avg_vol == 0:
+            continue
+
+        # ── What happened on the result day (context only) ──
+        result_day_ch = (
+            round((closes[ri] - closes[ri - 1]) / closes[ri - 1] * 100, 2)
+            if ri > 0 and closes[ri - 1] else 0.0
+        )
+        result_day_vol_x = round(volumes[ri] / avg_vol, 1)
+
+        # ── Gate 1: T+1 must NOT be a gap-up (_detect_ep handles those) ──
+        if lows[ti] > highs[ri]:
+            continue
+
+        # ── Gate 2: Positive move on T+1 vs result-day close ──
+        prev_close = closes[ri]
+        if prev_close == 0:
+            continue
+        price_ch_pct = (closes[ti] - prev_close) / prev_close * 100
+        if price_ch_pct < min_price_ch_pct:
+            continue
+
+        # ── Gate 3: Volume spike on T+1 ──
+        vol_x = volumes[ti] / avg_vol
+        if vol_x < volume_spike_x:
+            continue
+
+        # ── Gate 4: Bullish close — must close in upper portion of T+1 candle ──
+        # Filters stocks that surged intraday but gave back all gains by close.
+        candle_range = highs[ti] - lows[ti]
+        close_pos    = (
+            (closes[ti] - lows[ti]) / candle_range
+            if candle_range > 0 else 1.0  # doji at high → treat as bullish
+        )
+        if close_pos < close_position_min:
+            continue
+
+        # ── Classify reaction type ──
+        # AH result  → result day was largely flat; T+1 is the real move
+        # IH result  → result day already had a big move; T+1 is follow-through
+        if abs(result_day_ch) < 1.5 and result_day_vol_x < 2.0:
+            reaction_type = "AH Result → T+1 Primary"
+        elif result_day_ch >= 1.5:
+            reaction_type = "IH Result → T+1 Follow-through"
+        else:
+            reaction_type = "Mixed"
+
+        signals.append({
+            "symbol"           : sym,
+            "result_date"      : result_date,
+            "result_day_ch"    : result_day_ch,
+            "result_day_vol_x" : result_day_vol_x,
+            "t1_date"          : dates[ti],
+            "t1_open"          : round(opens[ti], 2),
+            "t1_high"          : round(highs[ti], 2),
+            "t1_low"           : round(lows[ti], 2),
+            "t1_close"         : round(closes[ti], 2),
+            "price_ch_pct"     : round(price_ch_pct, 2),
+            "vol_pct"          : f"+{round((vol_x - 1) * 100)}%",
+            "close_position"   : round(close_pos * 100, 1),
+            "reaction_type"    : reaction_type,
+        })
+
+    # Sort: AH Primary first (more actionable), then by price change
+    order = {"AH Result → T+1 Primary": 0, "IH Result → T+1 Follow-through": 1, "Mixed": 2}
+    signals.sort(key=lambda x: (order.get(x["reaction_type"], 9), -x["price_ch_pct"]))
+    return signals
 
 
 def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
@@ -1272,15 +1444,17 @@ async def run_ep_scan() -> None:
         log.info(f"⏭  {today} is not a trading day — exiting")
         return
 
-    log.info(f"━━━ EP Scan  {today} ━━━")
+    log.info(f"━━━ EP + Post-Result Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
-        log.info("Downloading OHLC chunks + screener + fundamentals…")
+        log.info("Downloading OHLC chunks, screener, fundamentals, result calendar…")
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
-        ohlc_results, screener_raw, fund_raw = await asyncio.gather(
+
+        ohlc_results, screener_raw, fund_raw, cal_raw = await asyncio.gather(
             asyncio.gather(*ohlc_tasks, return_exceptions=True),
             r2_download(client, "screener.json"),
             r2_download_fund(client),
+            r2_download(client, "result_calendar.json"),
         )
 
         all_data: dict = {}
@@ -1336,13 +1510,29 @@ async def run_ep_scan() -> None:
             fund_lookup = {d["symbol"]: d for d in fund_raw if d.get("symbol")}
         log.info(f"Fundamentals loaded: {len(fund_lookup)} stocks")
 
+        result_calendar: dict = cal_raw if isinstance(cal_raw, dict) else {}
+        if result_calendar:
+            total_cal_entries = sum(len(v) for v in result_calendar.values())
+            log.info(f"Result calendar: {len(result_calendar)} days, {total_cal_entries} entries")
+        else:
+            log.warning("result_calendar.json not found or empty — Post-Result scan will be skipped")
+
+        # ── EP Formation Scan ─────────────────────────────────
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
 
+        _MNUM = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
+                 "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
+        def _pq(q):
+            try:
+                p = q.strip().split()
+                return (int(p[1]), _MNUM.get(p[0].lower()[:3], 0))
+            except: return (0, 0)
+
         for sig in signals:
             sym = sig["symbol"]
-            sc = screener.get(sym, {})
+            sc  = screener.get(sym, {})
             sig["sales_ch"] = sc.get("sales_ch", "")
             sig["eps_ch"]   = sc.get("eps_ch", "")
             sig["patterns"] = sc.get("patterns", "")
@@ -1350,13 +1540,6 @@ async def run_ep_scan() -> None:
             sig["rs"]       = sc.get("rs", "")
             sig["ltp"]      = sc.get("ltp", "")
             fund = fund_lookup.get(sym, {})
-            _MNUM = {"jan":1,"feb":2,"mar":3,"apr":4,"may":5,"jun":6,
-                     "jul":7,"aug":8,"sep":9,"oct":10,"nov":11,"dec":12}
-            def _pq(q):
-                try:
-                    p = q.strip().split()
-                    return (int(p[1]), _MNUM.get(p[0].lower()[:3], 0))
-                except: return (0, 0)
             q_name = ""
             _best = (0, 0)
             for _n in range(1, 5):
@@ -1368,40 +1551,94 @@ async def run_ep_scan() -> None:
             vol_x = sig.pop("vol_spike_x", 1)
             sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
 
-        count = len(signals)
-        log.info(f"Found {count} Delayed EP signals")
+        log.info(f"EP signals: {len(signals)}")
 
+        # ── Post-Result T+1 Thrust Scan ───────────────────────
+        pr_signals: list[dict] = []
+        if result_calendar:
+            log.info("Scanning for Post-Result T+1 thrusts…")
+            pr_signals = _detect_post_result_thrust(all_data, result_calendar)
+
+            # Enrich with screener and fundamentals context
+            for sig in pr_signals:
+                sym  = sig["symbol"]
+                sc   = screener.get(sym, {})
+                fund = fund_lookup.get(sym, {})
+                sig["sales_ch"] = sc.get("sales_ch", "")
+                sig["eps_ch"]   = sc.get("eps_ch", "")
+                sig["patterns"] = sc.get("patterns", "")
+                sig["sector"]   = sc.get("sector", "")
+                sig["rs"]       = sc.get("rs", "")
+                sig["ltp"]      = sc.get("ltp", "")
+                q_name = ""
+                _best  = (0, 0)
+                for _n in range(1, 5):
+                    _p = fund.get(f"q{_n}_period", "")
+                    if _p and _pq(_p) > _best:
+                        _best = _pq(_p)
+                        q_name = _p
+                sig["q_name"] = q_name
+
+            ah = sum(1 for s in pr_signals if "AH" in s["reaction_type"])
+            ih = sum(1 for s in pr_signals if "IH" in s["reaction_type"])
+            log.info(f"Post-Result signals: {len(pr_signals)}  (AH→T+1: {ah}  IH→T+1: {ih})")
+            for s in pr_signals:
+                log.info(
+                    f"  {'📈' if 'AH' in s['reaction_type'] else '↗️'} "
+                    f"{s['symbol']:12}  result:{s['result_date']}  "
+                    f"t1:{s['t1_date']}  {s['price_ch_pct']:+.1f}%  "
+                    f"vol:{s['vol_pct']}  [{s['reaction_type']}]"
+                )
+
+        # ── RS + MSwing ───────────────────────────────────────
         log.info("Calculating RS ratings…")
         rs_data = _calculate_rs(all_data, history_days=60)
 
         for sig in signals:
             sig["rs_calc"] = rs_data.get(sig["symbol"], {}).get("rs")
+        for sig in pr_signals:
+            sig["rs_calc"] = rs_data.get(sig["symbol"], {}).get("rs")
 
         rs_history_list = _build_rs_history_json(all_data, rs_data)
 
-        rs_payload         = json.dumps({"updated": today, "count": len(rs_data), "stocks": rs_data})
-        rs_history_payload = json.dumps(rs_history_list)
-        ep_payload         = json.dumps({"updated": today, "count": count, "signals": signals})
-
         log.info("Calculating MSwing…")
-        mswing_data = _calculate_mswing(all_data, history_days=200)
+        mswing_data = _calculate_mswing(all_data, history_days=ROLLING_DAYS - 50)
         mswing_list = _build_mswing_json(all_data, mswing_data)
 
         for sig in signals:
             sym = sig["symbol"]
             sig["mswing"]      = mswing_data.get(sym, {}).get("mswing")
             sig["mswing_avg9"] = mswing_data.get(sym, {}).get("mswing_avg9")
+        for sig in pr_signals:
+            sym = sig["symbol"]
+            sig["mswing"]      = mswing_data.get(sym, {}).get("mswing")
+            sig["mswing_avg9"] = mswing_data.get(sym, {}).get("mswing_avg9")
 
-        mswing_payload = json.dumps(mswing_list)
+        # ── Upload all ────────────────────────────────────────
+        ep_payload  = json.dumps({"updated": today, "count": len(signals), "signals": signals})
+        rs_payload  = json.dumps({"updated": today, "count": len(rs_data), "stocks": rs_data})
+        rs_hist_pay = json.dumps(rs_history_list)
+        mswing_pay  = json.dumps(mswing_list)
+        pr_payload  = json.dumps({
+            "updated"  : today,
+            "count"    : len(pr_signals),
+            "ah_count" : sum(1 for s in pr_signals if "AH" in s["reaction_type"]),
+            "ih_count" : sum(1 for s in pr_signals if "IH" in s["reaction_type"]),
+            "signals"  : pr_signals,
+        })
 
         await asyncio.gather(
-            r2_upload(client, "ep_signals.json",  ep_payload),
-            r2_upload(client, "rs_ratings.json",  rs_payload),
-            r2_upload(client, "rs_history.json",  rs_history_payload),
-            r2_upload(client, "mswing.json",      mswing_payload),
+            r2_upload(client, "ep_signals.json",          ep_payload),
+            r2_upload(client, "rs_ratings.json",          rs_payload),
+            r2_upload(client, "rs_history.json",          rs_hist_pay),
+            r2_upload(client, "mswing.json",              mswing_pay),
+            r2_upload(client, "post_result_signals.json", pr_payload),
         )
-        log.info(f"✅ RS + MSwing uploaded ({len(rs_data)} stocks)")
-    log.info("━━━ EP Scan complete ━━━")
+        log.info(
+            f"✅ Uploaded — EP:{len(signals)}  PostResult:{len(pr_signals)}  "
+            f"RS+MSwing:{len(rs_data)} stocks"
+        )
+    log.info("━━━ EP + Post-Result Scan complete ━━━")
 
 
 
