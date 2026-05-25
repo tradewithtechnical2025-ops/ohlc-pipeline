@@ -1532,7 +1532,7 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
 def _build_rs_history_json(all_data: dict, rs_data: dict) -> list:
     from datetime import date as dt
 
-    sample_sym  = next(iter(all_data))
+    sample_sym = max(all_data.keys(), key=lambda s: len(all_data[s].get("d", [])))
     dates       = all_data[sample_sym]["d"]
     n           = len(dates)
     history_len = len(next(iter(rs_data.values()))["history"])
@@ -1595,7 +1595,7 @@ def _calculate_mswing(all_data: dict, history_days: int = 60) -> dict:
 def _build_mswing_json(all_data: dict, mswing_data: dict) -> list:
     from datetime import date as dt
 
-    sample_sym  = next(iter(all_data))
+    sample_sym = max(all_data.keys(), key=lambda s: len(all_data[s].get("d", [])))
     dates       = all_data[sample_sym]["d"]
     n           = len(dates)
     history_len = len(next(iter(mswing_data.values()))["mswing_history"])
