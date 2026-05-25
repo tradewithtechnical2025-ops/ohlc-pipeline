@@ -94,7 +94,7 @@ def rolling_cutoff(anchor):
     ).isoformat()
 
 # =========================================================
-# DOWNLOAD BSE STOCK MASTER
+# DOWNLOAD BSE-ONLY STOCK MASTER
 # =========================================================
 
 async def load_bse_isin_map():
@@ -123,6 +123,57 @@ async def load_bse_isin_map():
                 gz.read().decode()
             )
 
+    # =====================================
+    # NSE ISIN SET
+    # =====================================
+
+    NSE_ISINS = set()
+
+    for row in data:
+
+        if row.get("segment") != "NSE_EQ":
+            continue
+
+        isin = row.get("isin")
+
+        if isin:
+            NSE_ISINS.add(isin)
+
+    log.info(
+        f"NSE ISINs: {len(NSE_ISINS)}"
+    )
+
+    # =====================================
+    # BSE ONLY
+    # =====================================
+
+    BSE_EQUITY = {
+        "A",
+        "B",
+        "T",
+        "XT",
+        "X",
+        "Z",
+        "ZP",
+        "E",
+        "R",
+        "P",
+        "G"
+    }
+
+    bad_words = [
+        "ETF",
+        "MF",
+        "FUND",
+        "GOLD",
+        "LIQUID",
+        "GSEC",
+        "GS",
+        "BOND",
+        "SDL",
+        "NCD",
+    ]
+
     mapping = {}
 
     for row in data:
@@ -132,15 +183,24 @@ async def load_bse_isin_map():
         ).upper()
 
         instrument_type = str(
-            row.get("instrument_type", "")
+            row.get(
+                "instrument_type",
+                ""
+            )
         ).upper()
 
         trading_symbol = str(
-            row.get("trading_symbol", "")
+            row.get(
+                "trading_symbol",
+                ""
+            )
         ).upper()
 
         short_name = str(
-            row.get("short_name", "")
+            row.get(
+                "short_name",
+                ""
+            )
         ).upper()
 
         isin = row.get("isin")
@@ -152,31 +212,22 @@ async def load_bse_isin_map():
         if segment != "BSE_EQ":
             continue
 
-        if instrument_type not in [
-            "EQ",
-            "BE"
-        ]:
+        if instrument_type not in BSE_EQUITY:
             continue
 
         if not isin:
             continue
 
         # =====================================
-        # REMOVE ETFs / MF / BONDS
+        # ONLY BSE-ONLY STOCKS
         # =====================================
 
-        bad_words = [
-            "ETF",
-            "MF",
-            "FUND",
-            "GOLD",
-            "LIQUID",
-            "GSEC",
-            "GS",
-            "BOND",
-            "SDL",
-            "NCD",
-        ]
+        if isin in NSE_ISINS:
+            continue
+
+        # =====================================
+        # REMOVE ETF / MF / BONDS
+        # =====================================
 
         name_check = (
             trading_symbol
@@ -195,7 +246,7 @@ async def load_bse_isin_map():
     log.info(
         f"Loaded "
         f"{len(mapping)} "
-        f"BSE stocks"
+        f"BSE-only stocks"
     )
 
     return mapping
