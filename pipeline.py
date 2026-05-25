@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 NSE OHLC + Fundamentals Pipeline — GitHub Actions
-Replaces Google Apps Script.
 
 Usage:
   python pipeline.py daily                # prev-day OHLC          (4:00 PM IST, weekdays)
@@ -9,9 +8,12 @@ Usage:
   python pipeline.py full                 # initial 1.5yr load      (manual, once)
   python pipeline.py status              # print R2 chunk summary
   python pipeline.py fund_daily          # BSE result stocks update (4:30 PM IST, weekdays)
-  python pipeline.py fund_weekly         # full stocks refresh      (Sunday, split in parts)
+  python pipeline.py fund_weekly         # NSE full fundamentals    (Sunday, split in parts)
+  python pipeline.py fund_weekly_1..10   # NSE fundamentals parts
+  python pipeline.py bse_profiles        # BSE-only profiles full   (manual / Sunday)
+  python pipeline.py bse_profiles_1..10  # BSE profiles parts
   python pipeline.py ep_scan             # EP + Post-Result T+1 scan (4:35 PM IST, weekdays)
-  python pipeline.py hlr_scan            # Horizontal resistance scan (4:20 PM IST, weekdays)
+  python pipeline.py hlr_scan            # HLR + Pullback scan       (4:20 PM IST, weekdays)
   python pipeline.py pattern_scan        # Price action pattern scan  (4:25 PM IST, weekdays)
 """
 
@@ -52,7 +54,6 @@ RATE_DELAY   = 0.5
 
 HERE = Path(__file__).parent
 
-# ── Instrument URLs ───────────────────────────────────────────
 NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 BSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
 
@@ -65,28 +66,16 @@ UPSTOX_HEADERS = {
 }
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
-# ── Global instrument maps (populated at runtime) ─────────────
-# NSE+BSE both listed stocks  →  { "RELIANCE": "INE002A01018" }
 ISIN_MAP:     dict[str, str] = {}
-# BSE-only stocks             →  { "XYZCO": "INE00XXXXX" }
 BSE_ISIN_MAP: dict[str, str] = {}
-# BSE ISIN → meta             →  { "INE00XXXXX": {"name": "...", "listing_date": "..."} }
 BSE_META:     dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════
-# INSTRUMENT MAP BUILDER  (replaces static isin_map.json)
+# INSTRUMENT MAP BUILDER
 # ══════════════════════════════════════════════════════════════
 
 async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
-    """
-    Download Upstox NSE + BSE instrument files and build maps.
-
-    Returns:
-      nse_map  : { symbol: isin }   — listed on BOTH NSE and BSE (use NSE OHLC)
-      bse_map  : { symbol: isin }   — listed on BSE only          (use BSE OHLC)
-      bse_meta : { isin: {name, listing_date} }
-    """
     log.info("Fetching instrument files from Upstox…")
     nse_r, bse_r = await asyncio.gather(
         client.get(NSE_INSTRUMENTS_URL, timeout=60),
@@ -96,7 +85,6 @@ async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
     nse_data: list = json.loads(gzip.decompress(nse_r.content))
     bse_data: list = json.loads(gzip.decompress(bse_r.content))
 
-    # ── NSE EQ  (NORMAL security only — no ETF/SME/etc.) ─────
     nse_stocks: dict[str, str] = {}
     for item in nse_data:
         if (item.get("instrument_type") == "EQ"
@@ -109,11 +97,8 @@ async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
             nse_stocks[sym] = isin
 
     nse_isins = set(nse_stocks.values())
-    # BSE equity category codes
-    # A/B/T/X/Z = regular equity groups
-    # XT = trade-to-trade, E = ETF (exclude), G = Govt Securities (exclude)
+
     BSE_EQUITY_TYPES = {"A", "B", "T", "XT", "X", "Z", "ZP", "R", "P"}
-    # Note: E (ETF) aur G (Govt Securities) deliberately exclude kiye hain
 
     bse_stocks: dict[str, str] = {}
     bse_meta:   dict[str, dict] = {}
@@ -130,10 +115,7 @@ async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
                 "listing_date": item.get("listing_date", ""),
             }
 
-    # NSE map  — all NSE EQ stocks (OHLC via NSE_EQ)
     nse_map = dict(nse_stocks)
-
-    # BSE-only — not in NSE at all
     bse_map = {
         sym: isin
         for sym, isin in bse_stocks.items()
@@ -187,7 +169,7 @@ async def fetch_ohlc(
     isin: str,
     from_date: str,
     to_date: str,
-    exchange: str = "NSE_EQ",       # NSE_EQ for NSE stocks, BSE_EQ for BSE-only
+    exchange: str = "NSE_EQ",
 ) -> tuple[str, list | None]:
     key = quote(f"{exchange}|{isin}", safe="")
     url = f"{BASE_URL}/{key}/day/{to_date}/{from_date}"
@@ -236,7 +218,7 @@ async def fetch_today_candle(
     sem: asyncio.Semaphore,
     sym: str,
     isin: str,
-    exchange: str = "NSE_EQ",       # NSE_EQ or BSE_EQ
+    exchange: str = "NSE_EQ",
 ) -> tuple[str, dict | None]:
     key = quote(f"{exchange}|{isin}", safe="")
     url = f"{V3_URL}/{key}/days/1"
@@ -306,11 +288,6 @@ async def _upstox_get(client: httpx.AsyncClient, sem: asyncio.Semaphore, endpoin
 
 
 async def fetch_company_profile(client, sem, isin):
-    """
-    Fetch company profile for any stock (NSE or BSE-only).
-    Returns: { profile_sector, profile_description }
-    For BSE-only stocks, also used standalone with listing_date from instruments file.
-    """
     d = await _upstox_get(client, sem, f"/{isin}/profile")
     if not d:
         return None
@@ -554,7 +531,6 @@ async def fetch_corporate_actions(client, sem, isin):
 
 
 async def fetch_one_fundamental(client, sem, sym, isin):
-    """Full fundamentals for NSE stocks — includes company profile."""
     income  = await fetch_income_statement(client, sem, isin)
     ratios  = await fetch_key_ratios(client, sem, isin)
     sh      = await fetch_shareholding(client, sem, isin)
@@ -568,7 +544,6 @@ async def fetch_one_fundamental(client, sem, sym, isin):
 
     obj = {"symbol": sym, "updated": today_ist()}
 
-    # ── Company Profile ───────────────────────────────────────
     if profile:
         obj["profile_sector"]      = profile.get("profile_sector", "")
         obj["profile_description"] = profile.get("profile_description", "")
@@ -621,10 +596,8 @@ async def fetch_one_fundamental(client, sem, sym, isin):
 
 
 async def fetch_one_bse_profile(client, sem, sym, isin, meta: dict):
-    """
-    Lightweight profile fetch for BSE-only stocks.
-    Combines instruments file meta (name, listing_date) with /profile API data.
-    """
+    """BSE-only stocks ke liye sirf profile fetch karo."""
+    await asyncio.sleep(2.0)  # extra delay — BSE profile rate limit tight hai
     profile = await fetch_company_profile(client, sem, isin)
     obj = {
         "symbol"             : sym,
@@ -786,7 +759,6 @@ async def save_result_calendar(
         cal = {}
 
     cal[date_str] = symbols
-
     cutoff = (date.fromisoformat(date_str) - timedelta(days=keep_days)).isoformat()
     cal = {d: v for d, v in cal.items() if d >= cutoff}
 
@@ -916,7 +888,6 @@ async def run_daily() -> None:
         log.info("Downloading master chunks…")
         all_data = await download_all_chunks(client)
 
-        # Prune delisted — remove stocks not in either map
         live   = set(ISIN_MAP) | set(BSE_ISIN_MAP)
         pruned = [s for s in list(all_data) if s not in live]
         for s in pruned:
@@ -1008,7 +979,6 @@ async def run_full() -> None:
     all_data: dict = {}
     failed: list[str] = []
 
-    # Combine both maps: sym → (isin, exchange)
     all_sym_map: dict[str, tuple[str, str]] = {
         sym: (isin, "NSE_EQ") for sym, isin in ISIN_MAP.items()
     }
@@ -1033,8 +1003,14 @@ async def run_full() -> None:
                         all_data[sym] = build_stock_obj(filtered)
                 else:
                     failed.append(sym)
+
             pct = min(i + batch, len(symbols))
             log.info(f"  {pct}/{len(symbols)}  OK:{len(all_data)}  Failed:{len(failed)}")
+
+            # Checkpoint har 500 stocks pe
+            if pct % 500 == 0:
+                log.info(f"  💾 Checkpoint upload at {pct} stocks…")
+                await upload_all_chunks(client, all_data, today)
 
         log.info(f"✓ {len(all_data)} loaded  ✗ {len(failed)} failed")
         if failed:
@@ -1117,14 +1093,14 @@ async def run_fund_daily() -> None:
 
 
 async def run_fund_weekly(part: int = 0) -> None:
-    today   = today_ist()
+    """NSE stocks ke liye full fundamentals — BSE profiles alag run_bse_profiles se."""
+    today       = today_ist()
     TOTAL_PARTS = 10
 
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
 
-        # ── NSE Fundamentals ──────────────────────────────────
         nse_symbols = list(ISIN_MAP.keys())
         total       = len(nse_symbols)
         part_size   = (total + TOTAL_PARTS - 1) // TOTAL_PARTS
@@ -1138,14 +1114,13 @@ async def run_fund_weekly(part: int = 0) -> None:
             label     = f"Part {part}/{TOTAL_PARTS}"
 
         nse_chunk = nse_symbols[start_idx:end_idx]
-        log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(nse_chunk)} NSE + {len(BSE_ISIN_MAP)} BSE-only) ━━━")
+        log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(nse_chunk)} NSE stocks) ━━━")
 
         sem = asyncio.Semaphore(FUND_CONCURRENCY)
 
         log.info("Downloading existing fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
-        # NSE stocks — full fundamentals
         batch_size = 50
         ok = 0
         failed = 0
@@ -1165,45 +1140,88 @@ async def run_fund_weekly(part: int = 0) -> None:
                 log.info("  Checkpoint upload…")
                 await r2_upload_fund(client, fund_data)
 
-        # ── BSE-only stocks — profile only ────────────────────
-        # Only run on full refresh (part == 0) or part 1 to avoid redundant calls
-        if part in (0, 1):
-            log.info(f"Downloading existing bse_profiles.json…")
-            bse_raw  = await r2_download(client, "bse_profiles.json")
-            bse_fund: dict = {}
-            if isinstance(bse_raw, list):
-                bse_fund = {d["symbol"]: d for d in bse_raw if d.get("symbol")}
-            elif isinstance(bse_raw, dict):
-                bse_fund = bse_raw
+    log.info(f"━━━ Weekly {label} complete — ✓{ok} ✗{failed} ━━━")
 
-            log.info(f"Fetching profiles for {len(BSE_ISIN_MAP)} BSE-only stocks…")
-            bse_ok = 0
-            bse_fail = 0
-            bse_syms = list(BSE_ISIN_MAP.keys())
 
-            for i in range(0, len(bse_syms), batch_size):
-                batch = bse_syms[i : i + batch_size]
-                tasks = [
-                    fetch_one_bse_profile(
-                        client, sem, sym, BSE_ISIN_MAP[sym],
-                        BSE_META.get(BSE_ISIN_MAP[sym], {})
-                    )
-                    for sym in batch
-                ]
-                results = await asyncio.gather(*tasks)
-                for sym, data in results:
-                    if data:
-                        bse_fund[sym] = data
-                        bse_ok += 1
-                    else:
-                        bse_fail += 1
-                pct = min(i + batch_size, len(bse_syms))
-                log.info(f"  BSE {pct}/{len(bse_syms)}  ✓{bse_ok}  ✗{bse_fail}")
+# ══════════════════════════════════════════════════════════════
+# BSE PROFILES — ALAG SLOW PIPELINE
+# ══════════════════════════════════════════════════════════════
 
-            await r2_upload(client, "bse_profiles.json", json.dumps(list(bse_fund.values())))
-            log.info(f"✅ bse_profiles.json uploaded — {bse_ok} stocks")
+async def run_bse_profiles(part: int = 0) -> None:
+    """
+    BSE-only stocks ke liye sirf company profiles fetch karo.
+    Alag pipeline — rate limit ke liye slow aur checkpoint wala.
+    Parts mein chalao: bse_profiles_1 se bse_profiles_10 tak.
+    """
+    today       = today_ist()
+    TOTAL_PARTS = 10
 
-    log.info(f"━━━ Weekly {label} complete — NSE ✓{ok} ✗{failed} ━━━")
+    async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+
+        bse_syms  = list(BSE_ISIN_MAP.keys())
+        total     = len(bse_syms)
+        part_size = (total + TOTAL_PARTS - 1) // TOTAL_PARTS
+
+        if part == 0:
+            start_idx, end_idx = 0, total
+            label = "Full"
+        else:
+            start_idx = (part - 1) * part_size
+            end_idx   = min(part * part_size, total)
+            label     = f"Part {part}/{TOTAL_PARTS}"
+
+        chunk = bse_syms[start_idx:end_idx]
+        log.info(f"━━━ BSE Profiles {label}  {today}  ({len(chunk)} stocks) ━━━")
+
+        # Download existing — skip already fetched
+        bse_raw  = await r2_download(client, "bse_profiles.json")
+        bse_fund: dict = {}
+        if isinstance(bse_raw, list):
+            bse_fund = {d["symbol"]: d for d in bse_raw if d.get("symbol")}
+        elif isinstance(bse_raw, dict):
+            bse_fund = bse_raw
+
+        # Sirf missing stocks fetch karo
+        missing = [sym for sym in chunk if sym not in bse_fund]
+        log.info(f"Already fetched: {len(chunk) - len(missing)}  Missing: {len(missing)}")
+
+        if not missing:
+            log.info("✅ All stocks already fetched — nothing to do")
+            return
+
+        sem        = asyncio.Semaphore(1)  # strictly 1 at a time
+        batch_size = 20                    # small batches + checkpoint upload
+        ok         = 0
+        fail       = 0
+
+        for i in range(0, len(missing), batch_size):
+            batch   = missing[i : i + batch_size]
+            tasks   = [
+                fetch_one_bse_profile(
+                    client, sem, sym, BSE_ISIN_MAP[sym],
+                    BSE_META.get(BSE_ISIN_MAP[sym], {})
+                )
+                for sym in batch
+            ]
+            results = await asyncio.gather(*tasks)
+            for sym, data in results:
+                if data:
+                    bse_fund[sym] = data
+                    ok += 1
+                else:
+                    fail += 1
+
+            pct = min(i + batch_size, len(missing))
+            log.info(f"  {pct}/{len(missing)}  ✓{ok}  ✗{fail}")
+
+            # Checkpoint har 20 stocks pe — agar fail bhi ho toh progress save hoga
+            await r2_upload(client, "bse_profiles.json",
+                            json.dumps(list(bse_fund.values())))
+            log.info(f"  💾 Checkpoint saved ({len(bse_fund)} total)")
+
+    log.info(f"━━━ BSE Profiles {label} complete — ✓{ok}  ✗{fail} ━━━")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1484,7 +1502,7 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
 
         sorted_syms = sorted(day_composites, key=lambda x: day_composites[x])
         total = len(sorted_syms)
-        ranks    = {sym: round((i + 1) / total * 99) for i, sym in enumerate(sorted_syms)}
+        ranks = {sym: round((i + 1) / total * 99) for i, sym in enumerate(sorted_syms)}
 
         for sym in all_syms:
             rs_history[sym].append(ranks.get(sym))
@@ -1792,13 +1810,198 @@ async def run_ep_scan() -> None:
             r2_upload(client, "mswing.json",              mswing_pay),
             r2_upload(client, "post_result_signals.json", pr_payload),
         )
-        log.info(f"✅ Uploaded — EP:{len(signals)}  PostResult:{len(pr_signals)}  RS+MSwing:{len(rs_data)} stocks")
+        log.info(
+            f"✅ Uploaded — EP:{len(signals)}  PostResult:{len(pr_signals)}  "
+            f"RS+MSwing:{len(rs_data)} stocks"
+        )
     log.info("━━━ EP + Post-Result Scan complete ━━━")
 
 
 # ══════════════════════════════════════════════════════════════
-# HORIZONTAL RESISTANCE (HLR) SCANNER
+# HORIZONTAL RESISTANCE (HLR) + PULLBACK SCANNER
 # ══════════════════════════════════════════════════════════════
+
+def _calc_ema(closes: list, period: int) -> list:
+    """Simple EMA calculation."""
+    if len(closes) < period:
+        return [None] * len(closes)
+    ema = [None] * len(closes)
+    k = 2 / (period + 1)
+    # seed with SMA
+    ema[period - 1] = sum(closes[:period]) / period
+    for i in range(period, len(closes)):
+        ema[i] = closes[i] * k + ema[i - 1] * (1 - k)
+    return ema
+
+
+def _detect_pullback(
+    all_data: dict,
+    length_pull: int           = 4,
+    min_swing_range_pct: float = 10.0,
+    min_pullback_pct: float    = 5.0,
+    ema_proximity_pct: float   = 1.0,
+    max_candle_range_pct: float = 6.0,
+) -> list[dict]:
+    """
+    Pullback scanner — Pine Script logic ka Python translation.
+
+    Conditions:
+    1. Swing High then Swing Low (uptrend sequence)
+    2. Swing range >= min_swing_range_pct
+    3. Pullback from swing high >= min_pullback_pct
+    4. Price near EMA10 or EMA21 (within ema_proximity_pct) OR reversal from EMA
+    5. EMA alignment: EMA21 > EMA50, EMA10 > EMA50, close > EMA21
+    6. EMA50 rising (last 5 bars)
+    7. Candle range < max_candle_range_pct
+    8. MACD: macd line >= signal line
+    """
+    signals = []
+
+    for sym, s in all_data.items():
+        dates   = s["d"]
+        highs   = s["h"]
+        lows    = s["l"]
+        closes  = s["c"]
+        volumes = s["v"]
+        n       = len(dates)
+
+        if n < 60:
+            continue
+        if not _check_liquidity(volumes, closes, n):
+            continue
+
+        # ── EMAs ──────────────────────────────────────────────
+        ema10 = _calc_ema(closes, 10)
+        ema21 = _calc_ema(closes, 21)
+        ema50 = _calc_ema(closes, 50)
+
+        if any(v is None for v in [ema10[-1], ema21[-1], ema50[-1]]):
+            continue
+
+        # ── MACD ──────────────────────────────────────────────
+        ema12 = _calc_ema(closes, 12)
+        ema26 = _calc_ema(closes, 26)
+        macd_line = [
+            (ema12[i] - ema26[i]) if ema12[i] is not None and ema26[i] is not None else None
+            for i in range(n)
+        ]
+        macd_valid = [v for v in macd_line if v is not None]
+        if len(macd_valid) < 9:
+            continue
+        # signal line = EMA9 of macd_line (only valid values)
+        macd_arr = [v if v is not None else 0.0 for v in macd_line]
+        macd_signal = _calc_ema(macd_arr, 9)
+
+        # ── Pivot High/Low detection ───────────────────────────
+        # ta.pivothigh(length, length) — high is highest in window
+        last_swing_high_price = None
+        last_swing_high_bar   = None
+        last_swing_low_price  = None
+        last_swing_low_bar    = None
+
+        for i in range(length_pull, n - length_pull):
+            # Pivot High
+            if all(highs[i] >= highs[i - k] for k in range(1, length_pull + 1)) and \
+               all(highs[i] >= highs[i + k] for k in range(1, length_pull + 1)):
+                last_swing_high_price = highs[i]
+                last_swing_high_bar   = i
+
+            # Pivot Low
+            if all(lows[i] <= lows[i - k] for k in range(1, length_pull + 1)) and \
+               all(lows[i] <= lows[i + k] for k in range(1, length_pull + 1)):
+                last_swing_low_price = lows[i]
+                last_swing_low_bar   = i
+
+        if last_swing_high_price is None or last_swing_low_price is None:
+            continue
+
+        # ── Current bar (last candle) ──────────────────────────
+        i = n - 1
+
+        # Gate 1: Swing sequence — high bar must come AFTER low bar
+        if last_swing_high_bar is None or last_swing_low_bar is None:
+            continue
+        if last_swing_high_bar <= last_swing_low_bar:
+            continue
+
+        # Gate 2: Swing range
+        swing_range_pct = (last_swing_high_price - last_swing_low_price) / last_swing_low_price * 100
+        if swing_range_pct < min_swing_range_pct:
+            continue
+
+        # Gate 3: Pullback from swing high
+        pullback_pct = (last_swing_high_price - lows[i]) / last_swing_high_price * 100
+        if pullback_pct < min_pullback_pct:
+            continue
+
+        # Gate 4: Near EMA10 or EMA21 OR reversal wick
+        e10 = ema10[i]
+        e21 = ema21[i]
+        near_ema10 = (
+            abs(lows[i]   - e10) / e10 * 100 <= ema_proximity_pct or
+            abs(closes[i] - e10) / e10 * 100 <= ema_proximity_pct
+        )
+        near_ema21 = (
+            abs(lows[i]   - e21) / e21 * 100 <= ema_proximity_pct or
+            abs(closes[i] - e21) / e21 * 100 <= ema_proximity_pct
+        )
+        reversal_ema10 = lows[i] < e10 and closes[i] > e10
+        reversal_ema21 = lows[i] < e21 and closes[i] > e21
+        pullback_proximity = near_ema10 or near_ema21 or reversal_ema10 or reversal_ema21
+        if not pullback_proximity:
+            continue
+
+        # Gate 5: EMA alignment
+        e50 = ema50[i]
+        ema_alignment = e21 > e50 and e10 > e50 and closes[i] > e21
+        if not ema_alignment:
+            continue
+
+        # Gate 6: EMA50 rising last 5 bars
+        if i < 5 or any(ema50[i - k] is None for k in range(6)):
+            continue
+        ema50_rising = all(ema50[i - k] > ema50[i - k - 1] for k in range(5))
+        if not ema50_rising:
+            continue
+
+        # Gate 7: Candle range
+        candle_range_pct = (highs[i] - lows[i]) / lows[i] * 100 if lows[i] > 0 else 0
+        if candle_range_pct >= max_candle_range_pct:
+            continue
+
+        # Gate 8: MACD >= Signal
+        if macd_line[i] is None or macd_signal[i] is None:
+            continue
+        if macd_line[i] < macd_signal[i]:
+            continue
+
+        # ── EMA proximity type ─────────────────────────────────
+        if reversal_ema10 or reversal_ema21:
+            ema_touch = "Reversal"
+        elif near_ema10:
+            ema_touch = "Near EMA10"
+        else:
+            ema_touch = "Near EMA21"
+
+        signals.append({
+            "symbol"           : sym,
+            "date"             : dates[i],
+            "close"            : round(closes[i], 2),
+            "swing_high"       : round(last_swing_high_price, 2),
+            "swing_low"        : round(last_swing_low_price, 2),
+            "swing_range_pct"  : round(swing_range_pct, 2),
+            "pullback_pct"     : round(pullback_pct, 2),
+            "ema10"            : round(e10, 2),
+            "ema21"            : round(e21, 2),
+            "ema50"            : round(e50, 2),
+            "ema_touch"        : ema_touch,
+            "candle_range_pct" : round(candle_range_pct, 2),
+            "macd"             : round(macd_line[i], 4),
+            "macd_signal"      : round(macd_signal[i], 4),
+        })
+
+    return signals
+
 
 def _detect_hlr(
     all_data: dict,
@@ -1921,7 +2124,7 @@ async def run_hlr_scan() -> None:
         log.info(f"⏭  {today} is not a trading day — exiting")
         return
 
-    log.info(f"━━━ HLR Scan  {today} ━━━")
+    log.info(f"━━━ HLR + Pullback Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
@@ -1931,28 +2134,43 @@ async def run_hlr_scan() -> None:
         all_data = await download_all_chunks(client)
         log.info(f"Loaded {len(all_data)} stocks")
 
-        signals = _detect_hlr(all_data)
-
+        # ── HLR Scan ──────────────────────────────────────────
+        hlr_signals = _detect_hlr(all_data)
         order = {"BO": 0, "Consolidating near HLR": 1, "Near HLR": 2}
-        signals.sort(key=lambda x: (order.get(x["state"], 9), -x["touches"]))
+        hlr_signals.sort(key=lambda x: (order.get(x["state"], 9), -x["touches"]))
 
-        bo     = sum(1 for s in signals if s["state"] == "BO")
-        consol = sum(1 for s in signals if s["state"] == "Consolidating near HLR")
-        near   = sum(1 for s in signals if s["state"] == "Near HLR")
+        bo     = sum(1 for s in hlr_signals if s["state"] == "BO")
+        consol = sum(1 for s in hlr_signals if s["state"] == "Consolidating near HLR")
+        near   = sum(1 for s in hlr_signals if s["state"] == "Near HLR")
+        log.info(f"HLR — BO: {bo}  Consolidating: {consol}  Near: {near}  Total: {len(hlr_signals)}")
 
-        log.info(f"BO: {bo}  Consolidating: {consol}  Near: {near}  Total: {len(signals)}")
+        # ── Pullback Scan ─────────────────────────────────────
+        log.info("Scanning for Pullbacks…")
+        pb_signals = _detect_pullback(all_data)
+        pb_signals.sort(key=lambda x: x["pullback_pct"], reverse=True)
+        log.info(f"Pullback signals: {len(pb_signals)}")
 
-        payload = json.dumps({
+        hlr_payload = json.dumps({
             "updated"      : today,
-            "count"        : len(signals),
+            "count"        : len(hlr_signals),
             "bo"           : bo,
             "consolidating": consol,
             "near"         : near,
-            "signals"      : signals,
+            "signals"      : hlr_signals,
         })
-        await r2_upload(client, "hlr_signals.json", payload)
+        pb_payload = json.dumps({
+            "updated": today,
+            "count"  : len(pb_signals),
+            "signals": pb_signals,
+        })
 
-    log.info("━━━ HLR Scan complete ━━━")
+        await asyncio.gather(
+            r2_upload(client, "hlr_signals.json",      hlr_payload),
+            r2_upload(client, "pullback_signals.json", pb_payload),
+        )
+        log.info(f"✅ Uploaded — HLR:{len(hlr_signals)}  Pullback:{len(pb_signals)}")
+
+    log.info("━━━ HLR + Pullback Scan complete ━━━")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1976,8 +2194,8 @@ def _build_weekly(dates, opens, highs, lows, closes, volumes):
 
 def _detect_patterns(
     all_data: dict,
-    min_volume: int      = 2500,
-    coil_min_babies: int = 3,
+    min_volume: int        = 2500,
+    coil_min_babies: int   = 3,
     tight_close_weeks: int = 3,
     tight_close_pct: float = 2.0,
 ) -> list[dict]:
@@ -2005,8 +2223,8 @@ def _detect_patterns(
 
         if highs[-1] <= highs[-2] and lows[-1] >= lows[-2]:
             signals.append({
-                "symbol"  : sym, "pattern": "Inside Bar", "date": today,
-                "high"    : round(highs[-1], 2), "low": round(lows[-1], 2),
+                "symbol"   : sym, "pattern": "Inside Bar", "date": today,
+                "high"     : round(highs[-1], 2), "low": round(lows[-1], 2),
                 "prev_high": round(highs[-2], 2), "prev_low": round(lows[-2], 2),
             })
 
@@ -2014,8 +2232,8 @@ def _detect_patterns(
             if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2] and
                     highs[-2] <= highs[-3] and lows[-2] >= lows[-3]):
                 signals.append({
-                    "symbol"  : sym, "pattern": "Double Inside Bar", "date": today,
-                    "high"    : round(highs[-1], 2), "low": round(lows[-1], 2),
+                    "symbol"     : sym, "pattern": "Double Inside Bar", "date": today,
+                    "high"       : round(highs[-1], 2), "low": round(lows[-1], 2),
                     "mother_high": round(highs[-3], 2), "mother_low": round(lows[-3], 2),
                 })
 
@@ -2075,9 +2293,9 @@ def _detect_patterns(
 
         if lw["h"] <= lw2["h"] and lw["l"] >= lw2["l"]:
             signals.append({
-                "symbol": sym, "pattern": "Weekly IB", "date": today,
-                "w_high": round(lw["h"], 2), "w_low": round(lw["l"], 2),
-                "w_close": round(lw["c"], 2),
+                "symbol"     : sym, "pattern": "Weekly IB", "date": today,
+                "w_high"     : round(lw["h"], 2), "w_low": round(lw["l"], 2),
+                "w_close"    : round(lw["c"], 2),
                 "prev_w_high": round(lw2["h"], 2), "prev_w_low": round(lw2["l"], 2),
             })
 
@@ -2085,8 +2303,8 @@ def _detect_patterns(
                 lw3 = weekly[past_weeks[-3]]
                 if lw2["h"] <= lw3["h"] and lw2["l"] >= lw3["l"]:
                     signals.append({
-                        "symbol": sym, "pattern": "Weekly Double IB", "date": today,
-                        "w_high": round(lw["h"], 2), "w_low": round(lw["l"], 2),
+                        "symbol"       : sym, "pattern": "Weekly Double IB", "date": today,
+                        "w_high"       : round(lw["h"], 2), "w_low": round(lw["l"], 2),
                         "mother_w_high": round(lw3["h"], 2), "mother_w_low": round(lw3["l"], 2),
                     })
 
@@ -2096,9 +2314,9 @@ def _detect_patterns(
                            for i in range(2, 8)]
             if lw_range <= min(past_ranges):
                 signals.append({
-                    "symbol": sym, "pattern": "Weekly NR7", "date": today,
+                    "symbol" : sym, "pattern": "Weekly NR7", "date": today,
                     "w_range": round(lw_range, 2),
-                    "w_high": round(lw["h"], 2), "w_low": round(lw["l"], 2),
+                    "w_high" : round(lw["h"], 2), "w_low": round(lw["l"], 2),
                 })
 
         if len(past_weeks) >= tight_close_weeks:
@@ -2157,25 +2375,36 @@ async def run_pattern_scan() -> None:
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     match mode:
-        case "daily":          asyncio.run(run_daily())
-        case "today":          asyncio.run(run_today())
-        case "full":           asyncio.run(run_full())
-        case "status":         asyncio.run(run_status())
-        case "fund_daily":     asyncio.run(run_fund_daily())
-        case "fund_weekly":    asyncio.run(run_fund_weekly(0))
-        case "fund_weekly_1":  asyncio.run(run_fund_weekly(1))
-        case "fund_weekly_2":  asyncio.run(run_fund_weekly(2))
-        case "fund_weekly_3":  asyncio.run(run_fund_weekly(3))
-        case "fund_weekly_4":  asyncio.run(run_fund_weekly(4))
-        case "fund_weekly_5":  asyncio.run(run_fund_weekly(5))
-        case "fund_weekly_6":  asyncio.run(run_fund_weekly(6))
-        case "fund_weekly_7":  asyncio.run(run_fund_weekly(7))
-        case "fund_weekly_8":  asyncio.run(run_fund_weekly(8))
-        case "fund_weekly_9":  asyncio.run(run_fund_weekly(9))
-        case "fund_weekly_10": asyncio.run(run_fund_weekly(10))
-        case "ep_scan":        asyncio.run(run_ep_scan())
-        case "hlr_scan":       asyncio.run(run_hlr_scan())
-        case "pattern_scan":   asyncio.run(run_pattern_scan())
+        case "daily":           asyncio.run(run_daily())
+        case "today":           asyncio.run(run_today())
+        case "full":            asyncio.run(run_full())
+        case "status":          asyncio.run(run_status())
+        case "fund_daily":      asyncio.run(run_fund_daily())
+        case "fund_weekly":     asyncio.run(run_fund_weekly(0))
+        case "fund_weekly_1":   asyncio.run(run_fund_weekly(1))
+        case "fund_weekly_2":   asyncio.run(run_fund_weekly(2))
+        case "fund_weekly_3":   asyncio.run(run_fund_weekly(3))
+        case "fund_weekly_4":   asyncio.run(run_fund_weekly(4))
+        case "fund_weekly_5":   asyncio.run(run_fund_weekly(5))
+        case "fund_weekly_6":   asyncio.run(run_fund_weekly(6))
+        case "fund_weekly_7":   asyncio.run(run_fund_weekly(7))
+        case "fund_weekly_8":   asyncio.run(run_fund_weekly(8))
+        case "fund_weekly_9":   asyncio.run(run_fund_weekly(9))
+        case "fund_weekly_10":  asyncio.run(run_fund_weekly(10))
+        case "bse_profiles":    asyncio.run(run_bse_profiles(0))
+        case "bse_profiles_1":  asyncio.run(run_bse_profiles(1))
+        case "bse_profiles_2":  asyncio.run(run_bse_profiles(2))
+        case "bse_profiles_3":  asyncio.run(run_bse_profiles(3))
+        case "bse_profiles_4":  asyncio.run(run_bse_profiles(4))
+        case "bse_profiles_5":  asyncio.run(run_bse_profiles(5))
+        case "bse_profiles_6":  asyncio.run(run_bse_profiles(6))
+        case "bse_profiles_7":  asyncio.run(run_bse_profiles(7))
+        case "bse_profiles_8":  asyncio.run(run_bse_profiles(8))
+        case "bse_profiles_9":  asyncio.run(run_bse_profiles(9))
+        case "bse_profiles_10": asyncio.run(run_bse_profiles(10))
+        case "ep_scan":         asyncio.run(run_ep_scan())
+        case "hlr_scan":        asyncio.run(run_hlr_scan())
+        case "pattern_scan":    asyncio.run(run_pattern_scan())
         case _:
             print(__doc__)
             sys.exit(1)
