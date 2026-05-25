@@ -127,23 +127,25 @@ async def load_bse_isin_map():
 
     for row in data:
 
-        exchange = row.get("exchange")
+        segment = str(
+            row.get("segment", "")
+        ).upper()
 
-        instrument_type = row.get(
-            "instrument_type"
-        )
+        instrument_type = str(
+            row.get("instrument_type", "")
+        ).upper()
 
-        trading_symbol = row.get(
-            "trading_symbol",
-            ""
-        )
+        trading_symbol = str(
+            row.get("trading_symbol", "")
+        ).upper()
 
-        short_name = row.get(
-            "short_name",
-            ""
-        )
+        short_name = str(
+            row.get("short_name", "")
+        ).upper()
 
         isin = row.get("isin")
+
+   
 
         # =====================================
         # ONLY BSE EQUITY
