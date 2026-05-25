@@ -1,0 +1,23 @@
+name: OHLC Full Load
+
+on:
+  workflow_dispatch:   # manual trigger only — run once for initial setup
+
+jobs:
+  ohlc-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install httpx
+      - name: Run full OHLC pipeline
+        run: python pipeline.py full
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
