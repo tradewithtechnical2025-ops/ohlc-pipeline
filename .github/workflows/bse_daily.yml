@@ -1,0 +1,42 @@
+name: BSE Daily Pipeline
+
+on:
+
+  workflow_dispatch:
+
+  schedule:
+    # 5:10 PM IST
+    - cron: "40 11 * * 1-5"
+
+jobs:
+
+  run-bse-pipeline:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 360
+
+    steps:
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install httpx
+
+      - name: Run BSE Pipeline
+
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+
+        run: |
+          python bse_pipeline.py
