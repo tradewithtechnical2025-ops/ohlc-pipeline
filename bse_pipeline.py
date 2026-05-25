@@ -105,7 +105,9 @@ async def load_bse_isin_map():
         "exchange/complete.json.gz"
     )
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(
+        timeout=120
+    ) as client:
 
         r = await client.get(url)
 
@@ -113,7 +115,9 @@ async def load_bse_isin_map():
 
         compressed = io.BytesIO(r.content)
 
-        with gzip.GzipFile(fileobj=compressed) as gz:
+        with gzip.GzipFile(
+            fileobj=compressed
+        ) as gz:
 
             data = json.loads(
                 gz.read().decode()
@@ -141,16 +145,26 @@ async def load_bse_isin_map():
 
         isin = row.get("isin")
 
-        if exchange != "BSE":
+        # =====================================
+        # ONLY BSE EQUITY
+        # =====================================
+
+        if exchange != "BSE_EQ":
             continue
 
-        if instrument_type != "EQ":
+        if instrument_type not in [
+            "EQ",
+            "BE"
+        ]:
             continue
 
         if not isin:
             continue
 
-        # Remove ETFs / Bonds / Funds
+        # =====================================
+        # REMOVE MF / ETF / BONDS
+        # =====================================
+
         bad_words = [
             "ETF",
             "MF",
@@ -179,7 +193,9 @@ async def load_bse_isin_map():
         mapping[trading_symbol] = isin
 
     log.info(
-        f"Loaded {len(mapping)} BSE stocks"
+        f"Loaded "
+        f"{len(mapping)} "
+        f"BSE stocks"
     )
 
     return mapping
@@ -399,7 +415,8 @@ async def r2_upload(
     if r.status_code != 200:
 
         raise RuntimeError(
-            f"Upload failed {filename}"
+            f"Upload failed "
+            f"{filename}"
         )
 
     log.info(
