@@ -109,16 +109,19 @@ async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
             nse_stocks[sym] = isin
 
     nse_isins = set(nse_stocks.values())
+    # BSE equity category codes
+    # A/B/T/X/Z = regular equity groups
+    # XT = trade-to-trade, E = ETF (exclude), G = Govt Securities (exclude)
+    BSE_EQUITY_TYPES = {"A", "B", "T", "XT", "X", "Z", "ZP", "R", "P"}
+    # Note: E (ETF) aur G (Govt Securities) deliberately exclude kiye hain
 
-    # ── BSE EQ  (NORMAL only — excludes GS, MF, bonds, ETF) ─
     bse_stocks: dict[str, str] = {}
     bse_meta:   dict[str, dict] = {}
     for item in bse_data:
-        if (item.get("instrument_type") == "EQ"
-                and item.get("segment") == "BSE_EQ"
+        if (item.get("segment") == "BSE_EQ"
+                and str(item.get("instrument_type", "")).upper() in BSE_EQUITY_TYPES
                 and item.get("isin")
-                and item.get("trading_symbol")
-                and str(item.get("security_type", "")).upper() == "NORMAL"):
+                and item.get("trading_symbol")):
             sym  = item["trading_symbol"].strip().upper()
             isin = item["isin"].strip()
             bse_stocks[sym] = isin
