@@ -145,13 +145,11 @@ async def load_bse_isin_map():
 
         isin = row.get("isin")
 
-   
-
         # =====================================
-        # ONLY BSE EQUITY
+        # ONLY BSE CASH MARKET
         # =====================================
 
-        if exchange != "BSE_EQ":
+        if segment != "BSE_EQ":
             continue
 
         if instrument_type not in [
@@ -164,7 +162,7 @@ async def load_bse_isin_map():
             continue
 
         # =====================================
-        # REMOVE MF / ETF / BONDS
+        # REMOVE ETFs / MF / BONDS
         # =====================================
 
         bad_words = [
@@ -181,9 +179,9 @@ async def load_bse_isin_map():
         ]
 
         name_check = (
-            trading_symbol.upper()
+            trading_symbol
             + " "
-            + short_name.upper()
+            + short_name
         )
 
         if any(
