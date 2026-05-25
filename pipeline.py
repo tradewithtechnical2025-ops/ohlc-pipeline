@@ -9,13 +9,14 @@ Usage:
   python pipeline.py full                 # initial 1.5yr load      (manual, once)
   python pipeline.py status              # print R2 chunk summary
   python pipeline.py fund_daily          # BSE result stocks update (4:30 PM IST, weekdays)
-  python pipeline.py fund_weekly         # full 2300 stocks refresh (Sunday)
+  python pipeline.py fund_weekly         # full stocks refresh      (Sunday, split in parts)
   python pipeline.py ep_scan             # EP + Post-Result T+1 scan (4:35 PM IST, weekdays)
   python pipeline.py hlr_scan            # Horizontal resistance scan (4:20 PM IST, weekdays)
   python pipeline.py pattern_scan        # Price action pattern scan  (4:25 PM IST, weekdays)
 """
 
 import asyncio
+import gzip
 import json
 import logging
 import os
@@ -51,8 +52,9 @@ RATE_DELAY   = 0.5
 
 HERE = Path(__file__).parent
 
-with open(HERE / "isin_map.json") as f:
-    ISIN_MAP: dict[str, str] = json.load(f)
+# ── Instrument URLs ───────────────────────────────────────────
+NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+BSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
 
 with open(HERE / "nse_holidays.json") as f:
     NSE_HOLIDAYS: set[str] = set(json.load(f))
@@ -63,6 +65,81 @@ UPSTOX_HEADERS = {
 }
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
+# ── Global instrument maps (populated at runtime) ─────────────
+# NSE+BSE both listed stocks  →  { "RELIANCE": "INE002A01018" }
+ISIN_MAP:     dict[str, str] = {}
+# BSE-only stocks             →  { "XYZCO": "INE00XXXXX" }
+BSE_ISIN_MAP: dict[str, str] = {}
+# BSE ISIN → meta             →  { "INE00XXXXX": {"name": "...", "listing_date": "..."} }
+BSE_META:     dict[str, dict] = {}
+
+
+# ══════════════════════════════════════════════════════════════
+# INSTRUMENT MAP BUILDER  (replaces static isin_map.json)
+# ══════════════════════════════════════════════════════════════
+
+async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
+    """
+    Download Upstox NSE + BSE instrument files and build maps.
+
+    Returns:
+      nse_map  : { symbol: isin }   — listed on BOTH NSE and BSE (use NSE OHLC)
+      bse_map  : { symbol: isin }   — listed on BSE only          (use BSE OHLC)
+      bse_meta : { isin: {name, listing_date} }
+    """
+    log.info("Fetching instrument files from Upstox…")
+    nse_r, bse_r = await asyncio.gather(
+        client.get(NSE_INSTRUMENTS_URL, timeout=60),
+        client.get(BSE_INSTRUMENTS_URL, timeout=60),
+    )
+
+    nse_data: list = json.loads(gzip.decompress(nse_r.content))
+    bse_data: list = json.loads(gzip.decompress(bse_r.content))
+
+    # ── NSE EQ  (NORMAL security only — no ETF/SME/etc.) ─────
+    nse_stocks: dict[str, str] = {}
+    for item in nse_data:
+        if (item.get("instrument_type") == "EQ"
+                and item.get("segment") == "NSE_EQ"
+                and item.get("isin")
+                and item.get("trading_symbol")
+                and str(item.get("security_type", "")).upper() == "NORMAL"):
+            sym  = item["trading_symbol"].strip().upper()
+            isin = item["isin"].strip()
+            nse_stocks[sym] = isin
+
+    nse_isins = set(nse_stocks.values())
+
+    # ── BSE EQ  (NORMAL only — excludes GS, MF, bonds, ETF) ─
+    bse_stocks: dict[str, str] = {}
+    bse_meta:   dict[str, dict] = {}
+    for item in bse_data:
+        if (item.get("instrument_type") == "EQ"
+                and item.get("segment") == "BSE_EQ"
+                and item.get("isin")
+                and item.get("trading_symbol")
+                and str(item.get("security_type", "")).upper() == "NORMAL"):
+            sym  = item["trading_symbol"].strip().upper()
+            isin = item["isin"].strip()
+            bse_stocks[sym] = isin
+            bse_meta[isin]  = {
+                "name"        : item.get("name", ""),
+                "listing_date": item.get("listing_date", ""),
+            }
+
+    # NSE map  — all NSE EQ stocks (OHLC via NSE_EQ)
+    nse_map = dict(nse_stocks)
+
+    # BSE-only — not in NSE at all
+    bse_map = {
+        sym: isin
+        for sym, isin in bse_stocks.items()
+        if isin not in nse_isins
+    }
+
+    log.info(f"✓ NSE stocks : {len(nse_map)}")
+    log.info(f"✓ BSE-only   : {len(bse_map)}")
+    return nse_map, bse_map, bse_meta
 
 
 # ══════════════════════════════════════════════════════════════
@@ -107,8 +184,9 @@ async def fetch_ohlc(
     isin: str,
     from_date: str,
     to_date: str,
+    exchange: str = "NSE_EQ",       # NSE_EQ for NSE stocks, BSE_EQ for BSE-only
 ) -> tuple[str, list | None]:
-    key = quote(f"NSE_EQ|{isin}", safe="")
+    key = quote(f"{exchange}|{isin}", safe="")
     url = f"{BASE_URL}/{key}/day/{to_date}/{from_date}"
 
     for attempt in range(RETRY):
@@ -155,8 +233,9 @@ async def fetch_today_candle(
     sem: asyncio.Semaphore,
     sym: str,
     isin: str,
+    exchange: str = "NSE_EQ",       # NSE_EQ or BSE_EQ
 ) -> tuple[str, dict | None]:
-    key = quote(f"NSE_EQ|{isin}", safe="")
+    key = quote(f"{exchange}|{isin}", safe="")
     url = f"{V3_URL}/{key}/days/1"
 
     for attempt in range(RETRY):
@@ -187,7 +266,6 @@ async def fetch_today_candle(
                      "c": c[4], "v": c[5], "oi": c[6] if len(c) > 6 else 0}
 
     return sym, None
-
 
 
 # ══════════════════════════════════════════════════════════════
@@ -222,6 +300,22 @@ async def _upstox_get(client: httpx.AsyncClient, sem: asyncio.Semaphore, endpoin
             d = r.json()
             return d if d.get("status") == "success" else None
     return None
+
+
+async def fetch_company_profile(client, sem, isin):
+    """
+    Fetch company profile for any stock (NSE or BSE-only).
+    Returns: { profile_sector, profile_description }
+    For BSE-only stocks, also used standalone with listing_date from instruments file.
+    """
+    d = await _upstox_get(client, sem, f"/{isin}/profile")
+    if not d:
+        return None
+    data = d.get("data", {})
+    return {
+        "profile_sector"     : data.get("sector", ""),
+        "profile_description": data.get("company_profile", ""),
+    }
 
 
 async def fetch_income_statement(client, sem, isin):
@@ -457,16 +551,24 @@ async def fetch_corporate_actions(client, sem, isin):
 
 
 async def fetch_one_fundamental(client, sem, sym, isin):
-    income = await fetch_income_statement(client, sem, isin)
-    ratios = await fetch_key_ratios(client, sem, isin)
-    sh     = await fetch_shareholding(client, sem, isin)
-    bs     = await fetch_balance_sheet(client, sem, isin)
-    cf     = await fetch_cash_flow(client, sem, isin)
-    ca     = await fetch_corporate_actions(client, sem, isin)
+    """Full fundamentals for NSE stocks — includes company profile."""
+    income  = await fetch_income_statement(client, sem, isin)
+    ratios  = await fetch_key_ratios(client, sem, isin)
+    sh      = await fetch_shareholding(client, sem, isin)
+    bs      = await fetch_balance_sheet(client, sem, isin)
+    cf      = await fetch_cash_flow(client, sem, isin)
+    ca      = await fetch_corporate_actions(client, sem, isin)
+    profile = await fetch_company_profile(client, sem, isin)
+
     if not any([income, ratios, sh, bs, cf]):
         return sym, None
 
     obj = {"symbol": sym, "updated": today_ist()}
+
+    # ── Company Profile ───────────────────────────────────────
+    if profile:
+        obj["profile_sector"]      = profile.get("profile_sector", "")
+        obj["profile_description"] = profile.get("profile_description", "")
 
     if ratios: obj.update(ratios)
     if sh: obj.update({k: sh[k] for k in sh})
@@ -476,28 +578,28 @@ async def fetch_one_fundamental(client, sem, sym, isin):
         for i, q in enumerate(quarters[:4]):
             n = i + 1
             obj[f"q{n}_period"]   = q
-            obj[f"q{n}_sales"]    = income["sales"][i]   if i < len(income.get("sales",[]))   else ""
+            obj[f"q{n}_sales"]    = income["sales"][i]    if i < len(income.get("sales",[]))    else ""
             obj[f"q{n}_sales_ch"] = income["sales_ch"][i] if i < len(income.get("sales_ch",[])) else ""
-            obj[f"q{n}_pbt"]      = income["pbt"][i]     if i < len(income.get("pbt",[]))     else ""
-            obj[f"q{n}_pbt_ch"]   = income["pbt_ch"][i]  if i < len(income.get("pbt_ch",[]))  else ""
-            obj[f"q{n}_pat"]      = income["pat"][i]     if i < len(income.get("pat",[]))     else ""
-            obj[f"q{n}_pat_ch"]   = income["pat_ch"][i]  if i < len(income.get("pat_ch",[]))  else ""
-            obj[f"q{n}_eps"]      = income["eps"][i]     if i < len(income.get("eps",[]))     else ""
-            obj[f"q{n}_eps_d"]    = income["eps_d"][i]   if i < len(income.get("eps_d",[]))   else ""
+            obj[f"q{n}_pbt"]      = income["pbt"][i]      if i < len(income.get("pbt",[]))      else ""
+            obj[f"q{n}_pbt_ch"]   = income["pbt_ch"][i]   if i < len(income.get("pbt_ch",[]))   else ""
+            obj[f"q{n}_pat"]      = income["pat"][i]      if i < len(income.get("pat",[]))      else ""
+            obj[f"q{n}_pat_ch"]   = income["pat_ch"][i]   if i < len(income.get("pat_ch",[]))   else ""
+            obj[f"q{n}_eps"]      = income["eps"][i]      if i < len(income.get("eps",[]))      else ""
+            obj[f"q{n}_eps_d"]    = income["eps_d"][i]    if i < len(income.get("eps_d",[]))    else ""
 
     if bs:
         obj["bs_type"]  = bs.get("bs_type", "")
         obj["bs_units"] = bs.get("bs_units", "crore")
         for i in range(4):
             n = i + 1
-            obj[f"bs_y{n}_period"]        = bs["bs_periods"][i]        if i < len(bs.get("bs_periods",[]))        else ""
-            obj[f"bs_y{n}_assets"]        = bs["bs_assets"][i]         if i < len(bs.get("bs_assets",[]))         else ""
-            obj[f"bs_y{n}_liab"]          = bs["bs_liab"][i]           if i < len(bs.get("bs_liab",[]))           else ""
-            obj[f"bs_y{n}_equity"]        = bs["bs_equity"][i]         if i < len(bs.get("bs_equity",[]))         else ""
-            obj[f"bs_y{n}_cur_assets"]    = bs["bs_cur_assets"][i]     if i < len(bs.get("bs_cur_assets",[]))     else ""
-            obj[f"bs_y{n}_noncur_assets"] = bs["bs_noncur_assets"][i]  if i < len(bs.get("bs_noncur_assets",[])) else ""
-            obj[f"bs_y{n}_cur_liab"]      = bs["bs_cur_liab"][i]       if i < len(bs.get("bs_cur_liab",[]))       else ""
-            obj[f"bs_y{n}_noncur_liab"]   = bs["bs_noncur_liab"][i]    if i < len(bs.get("bs_noncur_liab",[]))    else ""
+            obj[f"bs_y{n}_period"]        = bs["bs_periods"][i]       if i < len(bs.get("bs_periods",[]))       else ""
+            obj[f"bs_y{n}_assets"]        = bs["bs_assets"][i]        if i < len(bs.get("bs_assets",[]))        else ""
+            obj[f"bs_y{n}_liab"]          = bs["bs_liab"][i]          if i < len(bs.get("bs_liab",[]))          else ""
+            obj[f"bs_y{n}_equity"]        = bs["bs_equity"][i]        if i < len(bs.get("bs_equity",[]))        else ""
+            obj[f"bs_y{n}_cur_assets"]    = bs["bs_cur_assets"][i]    if i < len(bs.get("bs_cur_assets",[]))    else ""
+            obj[f"bs_y{n}_noncur_assets"] = bs["bs_noncur_assets"][i] if i < len(bs.get("bs_noncur_assets",[])) else ""
+            obj[f"bs_y{n}_cur_liab"]      = bs["bs_cur_liab"][i]      if i < len(bs.get("bs_cur_liab",[]))      else ""
+            obj[f"bs_y{n}_noncur_liab"]   = bs["bs_noncur_liab"][i]   if i < len(bs.get("bs_noncur_liab",[]))   else ""
 
     if cf:
         obj["cf_type"]  = cf.get("cf_type", "")
@@ -514,6 +616,22 @@ async def fetch_one_fundamental(client, sem, sym, isin):
     if ca: obj.update(ca)
     return sym, obj
 
+
+async def fetch_one_bse_profile(client, sem, sym, isin, meta: dict):
+    """
+    Lightweight profile fetch for BSE-only stocks.
+    Combines instruments file meta (name, listing_date) with /profile API data.
+    """
+    profile = await fetch_company_profile(client, sem, isin)
+    obj = {
+        "symbol"             : sym,
+        "updated"            : today_ist(),
+        "name"               : meta.get("name", ""),
+        "listing_date"       : meta.get("listing_date", ""),
+        "profile_sector"     : profile.get("profile_sector", "")      if profile else "",
+        "profile_description": profile.get("profile_description", "") if profile else "",
+    }
+    return sym, obj
 
 
 # ══════════════════════════════════════════════════════════════
@@ -658,20 +776,14 @@ async def save_result_calendar(
     date_str: str,
     keep_days: int = 60,
 ) -> None:
-    """
-    Append today's BSE result symbols to the rolling result_calendar.json in R2.
-    Format: { "YYYY-MM-DD": ["SYM1", "SYM2", ...], ... }
-    Keeps last keep_days days of entries automatically.
-    """
     try:
         existing = await r2_download(client, "result_calendar.json")
         cal: dict = existing if isinstance(existing, dict) else {}
     except Exception:
         cal = {}
 
-    cal[date_str] = symbols  # overwrite if re-run same day
+    cal[date_str] = symbols
 
-    # Prune entries older than keep_days
     cutoff = (date.fromisoformat(date_str) - timedelta(days=keep_days)).isoformat()
     cal = {d: v for d, v in cal.items() if d >= cutoff}
 
@@ -758,7 +870,6 @@ def upsert_candle(all_data: dict, sym: str, c: dict) -> None:
         _sort_stock(s)
 
 
-
 # ══════════════════════════════════════════════════════════════
 # PIPELINE MODES — OHLC
 # ══════════════════════════════════════════════════════════════
@@ -773,21 +884,37 @@ async def run_daily() -> None:
     cutoff = rolling_cutoff(today)
     log.info(f"━━━ Daily  {prev} → {today}  cutoff {cutoff} ━━━")
 
-    sem     = asyncio.Semaphore(CONCURRENCY)
-    symbols = list(ISIN_MAP.keys())
+    sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient() as client:
-        log.info(f"Fetching {len(symbols)} stocks (v2)…")
-        tasks   = [fetch_ohlc(client, sem, sym, ISIN_MAP[sym], prev, today) for sym in symbols]
-        results = await asyncio.gather(*tasks)
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
 
-        fetched = {sym: c for sym, c in results if c}
-        log.info(f"✓ {len(fetched)} fetched  ✗ {len(symbols)-len(fetched)} no data")
+        log.info(f"Fetching {len(ISIN_MAP)} NSE + {len(BSE_ISIN_MAP)} BSE-only stocks…")
+
+        nse_tasks = [
+            fetch_ohlc(client, sem, sym, ISIN_MAP[sym], prev, today, "NSE_EQ")
+            for sym in ISIN_MAP
+        ]
+        bse_tasks = [
+            fetch_ohlc(client, sem, sym, BSE_ISIN_MAP[sym], prev, today, "BSE_EQ")
+            for sym in BSE_ISIN_MAP
+        ]
+
+        nse_results, bse_results = await asyncio.gather(
+            asyncio.gather(*nse_tasks),
+            asyncio.gather(*bse_tasks),
+        )
+
+        fetched = {sym: c for sym, c in [*nse_results, *bse_results] if c}
+        total   = len(ISIN_MAP) + len(BSE_ISIN_MAP)
+        log.info(f"✓ {len(fetched)} fetched  ✗ {total - len(fetched)} no data")
 
         log.info("Downloading master chunks…")
         all_data = await download_all_chunks(client)
 
-        live   = set(ISIN_MAP)
+        # Prune delisted — remove stocks not in either map
+        live   = set(ISIN_MAP) | set(BSE_ISIN_MAP)
         pruned = [s for s in list(all_data) if s not in live]
         for s in pruned:
             del all_data[s]
@@ -821,15 +948,29 @@ async def run_today() -> None:
         return
 
     log.info(f"━━━ Today (v3 intraday)  {today} ━━━")
-    sem     = asyncio.Semaphore(CONCURRENCY)
-    symbols = list(ISIN_MAP.keys())
+    sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient() as client:
-        log.info(f"Fetching {len(symbols)} stocks (v3)…")
-        tasks   = [fetch_today_candle(client, sem, sym, ISIN_MAP[sym]) for sym in symbols]
-        results = await asyncio.gather(*tasks)
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
 
-        fetched = {sym: c for sym, c in results if c}
+        log.info(f"Fetching {len(ISIN_MAP)} NSE + {len(BSE_ISIN_MAP)} BSE-only stocks (v3)…")
+
+        nse_tasks = [
+            fetch_today_candle(client, sem, sym, ISIN_MAP[sym], "NSE_EQ")
+            for sym in ISIN_MAP
+        ]
+        bse_tasks = [
+            fetch_today_candle(client, sem, sym, BSE_ISIN_MAP[sym], "BSE_EQ")
+            for sym in BSE_ISIN_MAP
+        ]
+
+        nse_results, bse_results = await asyncio.gather(
+            asyncio.gather(*nse_tasks),
+            asyncio.gather(*bse_tasks),
+        )
+
+        fetched = {sym: c for sym, c in [*nse_results, *bse_results] if c}
         log.info(f"✓ {len(fetched)} have today's candle")
 
         log.info("Downloading master chunks…")
@@ -838,8 +979,8 @@ async def run_today() -> None:
         for sym, c in fetched.items():
             upsert_candle(all_data, sym, c)
 
-        log.info("Uploading…")
         delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
+        log.info("Uploading…")
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
             r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
@@ -852,18 +993,35 @@ async def run_full() -> None:
     today  = last_trading_day()
     start  = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
     cutoff = start
-    log.info(f"━━━ Full Load  {start} → {today}  ({len(ISIN_MAP)} stocks) ━━━")
+
+    async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+
+    total_stocks = len(ISIN_MAP) + len(BSE_ISIN_MAP)
+    log.info(f"━━━ Full Load  {start} → {today}  ({total_stocks} stocks) ━━━")
 
     sem      = asyncio.Semaphore(CONCURRENCY)
     all_data: dict = {}
     failed: list[str] = []
 
+    # Combine both maps: sym → (isin, exchange)
+    all_sym_map: dict[str, tuple[str, str]] = {
+        sym: (isin, "NSE_EQ") for sym, isin in ISIN_MAP.items()
+    }
+    all_sym_map.update({
+        sym: (isin, "BSE_EQ") for sym, isin in BSE_ISIN_MAP.items()
+    })
+
     async with httpx.AsyncClient() as client:
-        symbols = list(ISIN_MAP.keys())
+        symbols = list(all_sym_map.keys())
         batch   = 50
         for i in range(0, len(symbols), batch):
             chunk_syms = symbols[i : i + batch]
-            tasks   = [fetch_ohlc(client, sem, sym, ISIN_MAP[sym], start, today) for sym in chunk_syms]
+            tasks = [
+                fetch_ohlc(client, sem, sym, all_sym_map[sym][0], start, today, all_sym_map[sym][1])
+                for sym in chunk_syms
+            ]
             results = await asyncio.gather(*tasks)
             for sym, candles in results:
                 if candles:
@@ -924,19 +1082,20 @@ async def run_fund_daily() -> None:
     sem = asyncio.Semaphore(FUND_CONCURRENCY)
 
     async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+
         symbols = await get_bse_result_symbols(client)
         if not symbols:
             log.info("No BSE results today — exiting")
             return
 
-        # Persist result symbols before fetching fundamentals so the
-        # calendar is saved even if the fundamentals fetch partially fails.
         await save_result_calendar(client, symbols, today)
 
         log.info("Downloading fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
-        log.info(f"Fetching fundamentals for {len(symbols)} stocks…")
+        log.info(f"Fetching fundamentals for {len(symbols)} NSE stocks…")
         tasks   = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in symbols if sym in ISIN_MAP]
         results = await asyncio.gather(*tasks)
 
@@ -950,38 +1109,45 @@ async def run_fund_daily() -> None:
                 log.warning(f"  ✗ {sym}: no data")
 
         log.info(f"Updated {ok}/{len(symbols)} stocks")
-        log.info("Uploading fundamentals.json…")
         await r2_upload_fund(client, fund_data)
     log.info("━━━ Fundamentals Daily complete ━━━")
 
 
 async def run_fund_weekly(part: int = 0) -> None:
     today   = today_ist()
-    symbols = list(ISIN_MAP.keys())
-    total   = len(symbols)
     TOTAL_PARTS = 10
-    part_size = (total + TOTAL_PARTS - 1) // TOTAL_PARTS
-    if part == 0:
-        start_idx, end_idx = 0, total
-        label = "Full"
-    else:
-        start_idx = (part - 1) * part_size
-        end_idx   = min(part * part_size, total)
-        label     = f"Part {part}/{TOTAL_PARTS}"
 
-    chunk = symbols[start_idx:end_idx]
-    log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(chunk)} stocks) ━━━")
-
-    sem = asyncio.Semaphore(FUND_CONCURRENCY)
     async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+
+        # ── NSE Fundamentals ──────────────────────────────────
+        nse_symbols = list(ISIN_MAP.keys())
+        total       = len(nse_symbols)
+        part_size   = (total + TOTAL_PARTS - 1) // TOTAL_PARTS
+
+        if part == 0:
+            start_idx, end_idx = 0, total
+            label = "Full"
+        else:
+            start_idx = (part - 1) * part_size
+            end_idx   = min(part * part_size, total)
+            label     = f"Part {part}/{TOTAL_PARTS}"
+
+        nse_chunk = nse_symbols[start_idx:end_idx]
+        log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(nse_chunk)} NSE + {len(BSE_ISIN_MAP)} BSE-only) ━━━")
+
+        sem = asyncio.Semaphore(FUND_CONCURRENCY)
+
         log.info("Downloading existing fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
+        # NSE stocks — full fundamentals
         batch_size = 50
         ok = 0
         failed = 0
-        for i in range(0, len(chunk), batch_size):
-            batch = chunk[i : i + batch_size]
+        for i in range(0, len(nse_chunk), batch_size):
+            batch = nse_chunk[i : i + batch_size]
             tasks = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in batch]
             results = await asyncio.gather(*tasks)
             for sym, data in results:
@@ -990,14 +1156,51 @@ async def run_fund_weekly(part: int = 0) -> None:
                     ok += 1
                 else:
                     failed += 1
-            pct = min(i + batch_size, len(chunk))
-            log.info(f"  {pct}/{len(chunk)}  ✓{ok}  ✗{failed}")
-            if pct % 200 == 0 or pct == len(chunk):
+            pct = min(i + batch_size, len(nse_chunk))
+            log.info(f"  NSE {pct}/{len(nse_chunk)}  ✓{ok}  ✗{failed}")
+            if pct % 200 == 0 or pct == len(nse_chunk):
                 log.info("  Checkpoint upload…")
                 await r2_upload_fund(client, fund_data)
 
-    log.info(f"━━━ Weekly {label} complete — ✓{ok}  ✗{failed} ━━━")
+        # ── BSE-only stocks — profile only ────────────────────
+        # Only run on full refresh (part == 0) or part 1 to avoid redundant calls
+        if part in (0, 1):
+            log.info(f"Downloading existing bse_profiles.json…")
+            bse_raw  = await r2_download(client, "bse_profiles.json")
+            bse_fund: dict = {}
+            if isinstance(bse_raw, list):
+                bse_fund = {d["symbol"]: d for d in bse_raw if d.get("symbol")}
+            elif isinstance(bse_raw, dict):
+                bse_fund = bse_raw
 
+            log.info(f"Fetching profiles for {len(BSE_ISIN_MAP)} BSE-only stocks…")
+            bse_ok = 0
+            bse_fail = 0
+            bse_syms = list(BSE_ISIN_MAP.keys())
+
+            for i in range(0, len(bse_syms), batch_size):
+                batch = bse_syms[i : i + batch_size]
+                tasks = [
+                    fetch_one_bse_profile(
+                        client, sem, sym, BSE_ISIN_MAP[sym],
+                        BSE_META.get(BSE_ISIN_MAP[sym], {})
+                    )
+                    for sym in batch
+                ]
+                results = await asyncio.gather(*tasks)
+                for sym, data in results:
+                    if data:
+                        bse_fund[sym] = data
+                        bse_ok += 1
+                    else:
+                        bse_fail += 1
+                pct = min(i + batch_size, len(bse_syms))
+                log.info(f"  BSE {pct}/{len(bse_syms)}  ✓{bse_ok}  ✗{bse_fail}")
+
+            await r2_upload(client, "bse_profiles.json", json.dumps(list(bse_fund.values())))
+            log.info(f"✅ bse_profiles.json uploaded — {bse_ok} stocks")
+
+    log.info(f"━━━ Weekly {label} complete — NSE ✓{ok} ✗{failed} ━━━")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1030,7 +1233,6 @@ def _detect_ep(
         if n < volume_lookback + 2:
             continue
 
-        # Liquidity check once per stock, not per candle
         if not _check_liquidity(volumes, closes, n):
             continue
 
@@ -1109,41 +1311,20 @@ def _detect_ep(
 
 # ══════════════════════════════════════════════════════════════
 # POST-RESULT THRUST SCANNER
-# Catches earnings reactions WITHOUT a gap-up:
-#   Case A — AH result: stock flat on result day, T+1 is the primary move
-#   Case B — IH result: stock moved on result day, T+1 is follow-through
-# Requires result_calendar.json populated by run_fund_daily.
 # ══════════════════════════════════════════════════════════════
 
 def _detect_post_result_thrust(
     all_data: dict,
-    result_calendar: dict,          # {"YYYY-MM-DD": ["SYM1", ...], ...}
-    min_price_ch_pct: float  = 1.5, # lower bar — date is confirmed from BSE
+    result_calendar: dict,
+    min_price_ch_pct: float  = 1.5,
     volume_spike_x: float    = 1.5,
-    close_position_min: float = 0.5, # close must be in top 50% of candle range
+    close_position_min: float = 0.5,
     volume_lookback: int     = 20,
-    max_result_age_days: int = 30,   # ignore results older than this
+    max_result_age_days: int = 30,
 ) -> list[dict]:
-    """
-    For every stock in result_calendar, look at T+1 (next trading day after
-    the result day) and check whether it moved positively without a gap-up.
-    Gap-ups on T+1 are excluded here — _detect_ep already handles those.
-
-    Fields in each signal:
-      result_date       — date BSE result was announced
-      result_day_ch     — % move on the result day itself
-      result_day_vol_x  — volume spike on result day vs 20-day avg
-      t1_date           — T+1 candle date
-      t1_*              — T+1 OHLC values
-      price_ch_pct      — T+1 % gain vs result-day close
-      vol_pct           — T+1 volume spike formatted as "+150%"
-      close_position    — where T+1 close sits within its candle range (0-100)
-      reaction_type     — "AH Result → T+1 Primary" or "IH Result → T+1 Follow-through"
-    """
     today_str = today_ist()
     cutoff    = (date.fromisoformat(today_str) - timedelta(days=max_result_age_days)).isoformat()
 
-    # Build sym → most-recent result date (within cutoff window)
     sym_to_result_date: dict[str, str] = {}
     for date_str, syms in result_calendar.items():
         if date_str < cutoff:
@@ -1169,21 +1350,15 @@ def _detect_post_result_thrust(
 
         if n < volume_lookback + 2:
             continue
-
-        # Locate result day in OHLC
         if result_date not in dates:
-            log.debug(f"  {sym}: result date {result_date} not in OHLC — skipped")
             continue
 
-        ri = dates.index(result_date)   # result day index
-        ti = ri + 1                      # T+1 index
+        ri = dates.index(result_date)
+        ti = ri + 1
 
         if ti >= n:
-            # T+1 candle not yet available (result day is the last candle)
-            log.debug(f"  {sym}: no T+1 candle yet for result date {result_date}")
             continue
 
-        # Volume baseline from pre-result history (excludes result day itself)
         lookback = min(volume_lookback, ri)
         if lookback == 0:
             continue
@@ -1191,18 +1366,15 @@ def _detect_post_result_thrust(
         if avg_vol == 0:
             continue
 
-        # ── What happened on the result day (context only) ──
         result_day_ch = (
             round((closes[ri] - closes[ri - 1]) / closes[ri - 1] * 100, 2)
             if ri > 0 and closes[ri - 1] else 0.0
         )
         result_day_vol_x = round(volumes[ri] / avg_vol, 1)
 
-        # ── Gate 1: T+1 must NOT be a gap-up (_detect_ep handles those) ──
         if lows[ti] > highs[ri]:
             continue
 
-        # ── Gate 2: Positive move on T+1 vs result-day close ──
         prev_close = closes[ri]
         if prev_close == 0:
             continue
@@ -1210,24 +1382,18 @@ def _detect_post_result_thrust(
         if price_ch_pct < min_price_ch_pct:
             continue
 
-        # ── Gate 3: Volume spike on T+1 ──
         vol_x = volumes[ti] / avg_vol
         if vol_x < volume_spike_x:
             continue
 
-        # ── Gate 4: Bullish close — must close in upper portion of T+1 candle ──
-        # Filters stocks that surged intraday but gave back all gains by close.
         candle_range = highs[ti] - lows[ti]
         close_pos    = (
             (closes[ti] - lows[ti]) / candle_range
-            if candle_range > 0 else 1.0  # doji at high → treat as bullish
+            if candle_range > 0 else 1.0
         )
         if close_pos < close_position_min:
             continue
 
-        # ── Classify reaction type ──
-        # AH result  → result day was largely flat; T+1 is the real move
-        # IH result  → result day already had a big move; T+1 is follow-through
         if abs(result_day_ch) < 1.5 and result_day_vol_x < 2.0:
             reaction_type = "AH Result → T+1 Primary"
         elif result_day_ch >= 1.5:
@@ -1251,7 +1417,6 @@ def _detect_post_result_thrust(
             "reaction_type"    : reaction_type,
         })
 
-    # Sort: AH Primary first (more actionable), then by price change
     order = {"AH Result → T+1 Primary": 0, "IH Result → T+1 Follow-through": 1, "Mixed": 2}
     signals.sort(key=lambda x: (order.get(x["reaction_type"], 9), -x["price_ch_pct"]))
     return signals
@@ -1317,7 +1482,6 @@ def _calculate_rs(all_data: dict, history_days: int = 30) -> dict:
         sorted_syms = sorted(day_composites, key=lambda x: day_composites[x])
         total = len(sorted_syms)
         ranks    = {sym: round((i + 1) / total * 99) for i, sym in enumerate(sorted_syms)}
-        rank_pos = {sym: i + 1 for i, sym in enumerate(sorted_syms)}
 
         for sym in all_syms:
             rs_history[sym].append(ranks.get(sym))
@@ -1447,6 +1611,9 @@ async def run_ep_scan() -> None:
     log.info(f"━━━ EP + Post-Result Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+
         log.info("Downloading OHLC chunks, screener, fundamentals, result calendar…")
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
 
@@ -1517,7 +1684,6 @@ async def run_ep_scan() -> None:
         else:
             log.warning("result_calendar.json not found or empty — Post-Result scan will be skipped")
 
-        # ── EP Formation Scan ─────────────────────────────────
         log.info("Scanning for EP formations…")
         signals = _detect_ep(all_data)
         signals.sort(key=lambda x: (x["ep_date"], x["gap_pct"]), reverse=True)
@@ -1553,13 +1719,11 @@ async def run_ep_scan() -> None:
 
         log.info(f"EP signals: {len(signals)}")
 
-        # ── Post-Result T+1 Thrust Scan ───────────────────────
         pr_signals: list[dict] = []
         if result_calendar:
             log.info("Scanning for Post-Result T+1 thrusts…")
             pr_signals = _detect_post_result_thrust(all_data, result_calendar)
 
-            # Enrich with screener and fundamentals context
             for sig in pr_signals:
                 sym  = sig["symbol"]
                 sc   = screener.get(sym, {})
@@ -1582,15 +1746,7 @@ async def run_ep_scan() -> None:
             ah = sum(1 for s in pr_signals if "AH" in s["reaction_type"])
             ih = sum(1 for s in pr_signals if "IH" in s["reaction_type"])
             log.info(f"Post-Result signals: {len(pr_signals)}  (AH→T+1: {ah}  IH→T+1: {ih})")
-            for s in pr_signals:
-                log.info(
-                    f"  {'📈' if 'AH' in s['reaction_type'] else '↗️'} "
-                    f"{s['symbol']:12}  result:{s['result_date']}  "
-                    f"t1:{s['t1_date']}  {s['price_ch_pct']:+.1f}%  "
-                    f"vol:{s['vol_pct']}  [{s['reaction_type']}]"
-                )
 
-        # ── RS + MSwing ───────────────────────────────────────
         log.info("Calculating RS ratings…")
         rs_data = _calculate_rs(all_data, history_days=60)
 
@@ -1614,7 +1770,6 @@ async def run_ep_scan() -> None:
             sig["mswing"]      = mswing_data.get(sym, {}).get("mswing")
             sig["mswing_avg9"] = mswing_data.get(sym, {}).get("mswing_avg9")
 
-        # ── Upload all ────────────────────────────────────────
         ep_payload  = json.dumps({"updated": today, "count": len(signals), "signals": signals})
         rs_payload  = json.dumps({"updated": today, "count": len(rs_data), "stocks": rs_data})
         rs_hist_pay = json.dumps(rs_history_list)
@@ -1634,12 +1789,8 @@ async def run_ep_scan() -> None:
             r2_upload(client, "mswing.json",              mswing_pay),
             r2_upload(client, "post_result_signals.json", pr_payload),
         )
-        log.info(
-            f"✅ Uploaded — EP:{len(signals)}  PostResult:{len(pr_signals)}  "
-            f"RS+MSwing:{len(rs_data)} stocks"
-        )
+        log.info(f"✅ Uploaded — EP:{len(signals)}  PostResult:{len(pr_signals)}  RS+MSwing:{len(rs_data)} stocks")
     log.info("━━━ EP + Post-Result Scan complete ━━━")
-
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1770,6 +1921,9 @@ async def run_hlr_scan() -> None:
     log.info(f"━━━ HLR Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+
         log.info("Downloading OHLC chunks…")
         all_data = await download_all_chunks(client)
         log.info(f"Loaded {len(all_data)} stocks")
@@ -1846,7 +2000,6 @@ def _detect_patterns(
 
         today = dates[-1]
 
-        # ── Inside Bar ────────────────────────────────────────
         if highs[-1] <= highs[-2] and lows[-1] >= lows[-2]:
             signals.append({
                 "symbol"  : sym, "pattern": "Inside Bar", "date": today,
@@ -1854,7 +2007,6 @@ def _detect_patterns(
                 "prev_high": round(highs[-2], 2), "prev_low": round(lows[-2], 2),
             })
 
-        # ── Double Inside Bar ─────────────────────────────────
         if n >= 3:
             if (highs[-1] <= highs[-2] and lows[-1] >= lows[-2] and
                     highs[-2] <= highs[-3] and lows[-2] >= lows[-3]):
@@ -1864,7 +2016,6 @@ def _detect_patterns(
                     "mother_high": round(highs[-3], 2), "mother_low": round(lows[-3], 2),
                 })
 
-        # ── NR7 ───────────────────────────────────────────────
         if n >= 7:
             today_range = highs[-1] - lows[-1]
             past_ranges = [highs[-i] - lows[-i] for i in range(2, 8)]
@@ -1875,7 +2026,6 @@ def _detect_patterns(
                     "high"  : round(highs[-1], 2), "low": round(lows[-1], 2),
                 })
 
-        # ── Mini Coil (MCP) ───────────────────────────────────
         seen_mothers = set()
         for m_idx in range(n - coil_min_babies - 1, max(0, n - 60), -1):
             m_high = highs[m_idx]
@@ -1907,7 +2057,6 @@ def _detect_patterns(
                     "mother_date": dates[m_idx],
                 })
 
-        # ── Weekly Patterns ───────────────────────────────────
         weekly = _build_weekly(dates, opens, highs, lows, closes, volumes)
         if not weekly:
             continue
@@ -1972,6 +2121,9 @@ async def run_pattern_scan() -> None:
     log.info(f"━━━ Pattern Scan  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+
         log.info("Downloading OHLC chunks…")
         all_data = await download_all_chunks(client)
         log.info(f"Loaded {len(all_data)} stocks")
