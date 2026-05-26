@@ -1,4 +1,4 @@
-name: Debug Finedge Endpoints
+name: Debug Finedge Token Format
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ env:
   FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
 
 jobs:
-  debug_finedge:
-    name: Debug failed endpoints
+  debug_token:
+    name: Test token formats
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,7 +18,7 @@ jobs:
           cache: pip
       - run: pip install httpx
 
-      - name: Debug endpoints
+      - name: Test token formats
         run: |
           python - <<'EOF'
           import asyncio
@@ -29,46 +29,41 @@ jobs:
           BASE   = "https://data.finedgeapi.com/api/v1"
           SYMBOL = "ITC"
 
-          async def debug(client, name, url):
-              r = await client.get(url, timeout=15)
+          async def test(client, name, url, headers={}):
+              r = await client.get(url, headers=headers, timeout=15)
               print(f"\n{'='*50}")
               print(f"  {name}")
-              print(f"  Status  : {r.status_code}")
-              print(f"  Headers : {dict(r.headers)}")
-              print(f"  Body    : {r.text[:500]}")
+              print(f"  Status : {r.status_code}")
+              print(f"  Body   : {r.text[:300] or '(empty)'}")
 
           async def main():
               async with httpx.AsyncClient() as client:
-                  tests = [
-                      # Try different URL formats for OHLC
-                      ("OHLC v1",          f"{BASE}/historical-adjusted-price/{SYMBOL}?token={TOKEN}"),
-                      ("OHLC v2",          f"{BASE}/price/historical-adjusted/{SYMBOL}?token={TOKEN}"),
-                      ("OHLC v3",          f"{BASE}/stock/historical-price/{SYMBOL}?token={TOKEN}"),
+                  url = f"{BASE}/historical-adjusted-price/{SYMBOL}"
+                  await test(client, "Token as query ?token=",
+                      f"{url}?token={TOKEN}")
 
-                      # Try different URL formats for profile
-                      ("Profile v1",       f"{BASE}/company/{SYMBOL}?token={TOKEN}"),
-                      ("Profile v2",       f"{BASE}/company/profile/{SYMBOL}?token={TOKEN}"),
-                      ("Profile v3",       f"{BASE}/stock-search?group=symbol&value={SYMBOL}&token={TOKEN}"),
+                  await test(client, "Token as Bearer header",
+                      url, {"Authorization": f"Bearer {TOKEN}"})
 
-                      # Try different URL formats for ratios
-                      ("Ratios v1",        f"{BASE}/financial-ratios/{SYMBOL}?token={TOKEN}"),
-                      ("Ratios v2",        f"{BASE}/financials/ratios/{SYMBOL}?token={TOKEN}"),
-                      ("Ratios v3",        f"{BASE}/ratios/{SYMBOL}?token={TOKEN}"),
+                  await test(client, "Token as X-API-Key header",
+                      url, {"X-API-Key": TOKEN})
 
-                      # Try different URL formats for calendar
-                      ("Results Cal v1",   f"{BASE}/exchange/results-calendar?token={TOKEN}"),
-                      ("Results Cal v2",   f"{BASE}/results-calendar?token={TOKEN}"),
-                      ("Holiday Cal v1",   f"{BASE}/exchange/holiday-calendar?token={TOKEN}"),
-                      ("Holiday Cal v2",   f"{BASE}/holiday-calendar?token={TOKEN}"),
+                  await test(client, "Token as api-key header",
+                      url, {"api-key": TOKEN})
 
-                      # Shareholding
-                      ("Shareholding v1",  f"{BASE}/shareholdings/{SYMBOL}?token={TOKEN}"),
-                      ("Shareholding v2",  f"{BASE}/shareholding/{SYMBOL}?token={TOKEN}"),
-                  ]
+                  await test(client, "Token as x-api-token header",
+                      url, {"x-api-token": TOKEN})
 
-                  for name, url in tests:
-                      await debug(client, name, url)
-                      await asyncio.sleep(0.3)
+                  await test(client, "Token as apikey header",
+                      url, {"apikey": TOKEN})
+
+                  # Also test results calendar with header
+                  rc_url = f"{BASE}/results-calendar"
+                  await test(client, "Results calendar + Bearer",
+                      rc_url, {"Authorization": f"Bearer {TOKEN}"})
+
+                  await test(client, "Results calendar + X-API-Key",
+                      rc_url, {"X-API-Key": TOKEN})
 
           asyncio.run(main())
           EOF
