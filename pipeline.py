@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-NSE OHLC + Fundamentals Pipeline — GitHub Actions
+NSE OHLC + Fundamentals Pipeline — GitHub Actions (Finedge powered)
 
 Usage:
-  python pipeline.py daily                # prev-day OHLC          (4:00 PM IST, weekdays)
-  python pipeline.py today                # T+0 intraday candle     (4:50 PM IST, weekdays)
-  python pipeline.py full                 # initial 1.5yr load      (manual, once)
-  python pipeline.py status              # print R2 chunk summary
-  python pipeline.py fund_daily          # BSE result stocks update (4:30 PM IST, weekdays)
-  python pipeline.py fund_weekly         # NSE full fundamentals    (Sunday, split in parts)
-  python pipeline.py fund_weekly_1..10   # NSE fundamentals parts
-  python pipeline.py bse_profiles        # BSE-only profiles full   (manual / Sunday)
-  python pipeline.py bse_profiles_1..10  # BSE profiles parts
-  python pipeline.py ep_scan             # EP + Post-Result T+1 scan (4:35 PM IST, weekdays)
-  python pipeline.py hlr_scan            # HLR + Pullback scan       (4:20 PM IST, weekdays)
-  python pipeline.py pattern_scan        # Price action pattern scan  (4:25 PM IST, weekdays)
+  python pipeline.py daily                # prev-day OHLC           (4:00 PM IST, weekdays)
+  python pipeline.py today                # T+0 intraday candle      (4:50 PM IST, weekdays)
+  python pipeline.py full                 # initial 1.5yr OHLC load  (manual, once)
+  python pipeline.py status               # print R2 chunk summary
+  python pipeline.py fund_daily           # result stocks update      (4:30 PM IST, weekdays)
+  python pipeline.py fund_full            # one-time full load        (manual)
+  python pipeline.py fund_full_1..10      # one-time full load parts  (250 stocks each)
+  python pipeline.py bse_profiles         # BSE-only profiles full    (manual / Sunday)
+  python pipeline.py bse_profiles_1..10   # BSE profiles parts
+  python pipeline.py ep_scan              # EP + Post-Result T+1 scan (4:35 PM IST, weekdays)
+  python pipeline.py hlr_scan             # HLR + Pullback scan        (4:20 PM IST, weekdays)
+  python pipeline.py pattern_scan         # Price action pattern scan   (4:25 PM IST, weekdays)
 """
 
 import asyncio
@@ -36,20 +36,22 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-UPSTOX_TOKEN = os.environ["UPSTOX_TOKEN"]
-WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
-WORKER_TOKEN = os.environ["WORKER_TOKEN"]
+UPSTOX_TOKEN  = os.environ["UPSTOX_TOKEN"]
+WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
+FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 
-BASE_URL     = "https://api.upstox.com/v2/historical-candle"
-V3_URL       = "https://api.upstox.com/v3/historical-candle/intraday"
-FUND_URL     = "https://api.upstox.com/v2/fundamentals"
-ROLLING_DAYS = 548
-R2_CHUNKS    = 8
-CONCURRENCY  = 5
-FUND_CONCURRENCY = 1
-RETRY        = 3
-SLEEP_MS     = 3.0
-RATE_DELAY   = 0.5
+BASE_URL      = "https://api.upstox.com/v2/historical-candle"
+V3_URL        = "https://api.upstox.com/v3/historical-candle/intraday"
+FINEDGE_BASE  = "https://data.finedgeapi.com/api/v1"
+
+ROLLING_DAYS     = 548
+R2_CHUNKS        = 8
+CONCURRENCY      = 5
+FUND_CONCURRENCY = 4       # Finedge 300/min — 4 concurrent safe
+RETRY            = 3
+RATE_DELAY       = 0.5
+FINEDGE_DELAY    = 0.25    # 4 concurrent × 0.25s ≈ 16 req/s → well under 300/min
 
 HERE = Path(__file__).parent
 
@@ -237,432 +239,348 @@ async def fetch_today_candle(
 
 
 # ══════════════════════════════════════════════════════════════
-# UPSTOX FUNDAMENTALS API
+# FINEDGE API — BASE HELPER
 # ══════════════════════════════════════════════════════════════
 
-async def _upstox_get(client: httpx.AsyncClient, sem: asyncio.Semaphore, endpoint: str) -> dict | None:
-    url = f"{FUND_URL}{endpoint}"
-    await asyncio.sleep(SLEEP_MS)
+async def _finedge_get(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    path: str,
+    params: dict,
+) -> dict | list | None:
+    params["token"] = FINEDGE_TOKEN
+    url = f"{FINEDGE_BASE}/{path}"
+
     async with sem:
         for attempt in range(RETRY):
+            await asyncio.sleep(FINEDGE_DELAY)
             try:
-                r = await client.get(url, headers=UPSTOX_HEADERS, timeout=30)
+                r = await client.get(url, params=params, timeout=30)
             except httpx.RequestError as e:
-                log.warning(f"  Fund network error: {e}, retry {attempt+1}")
+                log.warning(f"  Finedge network error: {e}, retry {attempt+1}")
                 await asyncio.sleep(2 ** attempt)
                 continue
 
             if r.status_code == 401:
-                log.error("❌ TOKEN EXPIRED")
+                log.error("❌ FINEDGE TOKEN INVALID — check FINEDGE_TOKEN secret!")
                 sys.exit(1)
             if r.status_code == 429:
-                if attempt < RETRY - 1:
-                    log.warning("  Rate limited — waiting 30s")
-                    await asyncio.sleep(30)
-                    continue
-                else:
-                    log.warning("  Rate limited after all retries — skipping")
-                    return None
-            if r.status_code != 200:
+                log.warning("  Finedge rate limit — waiting 20s")
+                await asyncio.sleep(20)
+                continue
+            if r.status_code != 200 or not r.text.strip():
                 return None
-            d = r.json()
-            return d if d.get("status") == "success" else None
+            try:
+                return r.json()
+            except Exception:
+                return None
     return None
 
 
-async def fetch_company_profile(client, sem, isin):
-    d = await _upstox_get(client, sem, f"/{isin}/profile")
-    if not d:
-        return None
-    data = d.get("data", {})
-    return {
-        "profile_sector"     : data.get("sector", ""),
-        "profile_description": data.get("company_profile", ""),
-    }
+# ══════════════════════════════════════════════════════════════
+# FINEDGE FUNDAMENTAL FETCHERS
+# ══════════════════════════════════════════════════════════════
 
-
-async def fetch_income_statement(client, sem, isin):
-    for typ in ["consolidated", "standalone"]:
-        d = await _upstox_get(client, sem, f"/{isin}/income-statement?type={typ}&time_period=quarterly&fs=true")
-        if not d:
-            continue
-        stmt = d["data"].get("income_statement", [])
-        full = d["data"].get("full_statement", [])
-        rev  = next((s for s in stmt if s["category"] == "revenue"), None)
-        np_  = next((s for s in stmt if s["category"] == "net_profit"), None)
-        if not rev and not np_:
-            continue
-
-        src      = rev or np_
-        n        = min(len(src["history"]), 4)
-        quarters = [q["period"] for q in src["history"][:n]]
-
-        def ex(arr, key="value"):
-            return [(q.get(key) if q.get(key) is not None else "") for q in (arr or [])[:n]]
-
-        def full_hist(name):
-            return (next((s for s in full if s.get("particular") == name), {})
-                    .get("history", []))
-
-        pbt_ = next((s for s in stmt if s["category"] == "profit_before_tax"), None)
-        if not pbt_:
-            pbt_h = full_hist("Profit Before Tax")
-            if pbt_h:
-                pbt_ = {"history": pbt_h}
-
-        eps_api = next((s for s in stmt
-                        if s["category"] in ("eps", "earnings_per_share", "basic_eps")), None)
-
-        if eps_api and eps_api.get("history"):
-            eps_vals   = ex(eps_api["history"])
-            eps_d_api  = next((s for s in stmt
-                               if s["category"] in ("diluted_eps", "eps_diluted")), None)
-            eps_d_vals = ex(eps_d_api["history"]) if eps_d_api else eps_vals[:]
-        else:
-            eps_names  = ["EPS - Basic", "Basic EPS", "Earnings Per Share", "EPS(Basic)"]
-            eps_full_h = []
-            for name in eps_names:
-                eps_full_h = full_hist(name)
-                if eps_full_h:
-                    break
-
-            shares = None
-            if eps_full_h and np_ and np_.get("history"):
-                estimates = []
-                for i in range(min(4, len(eps_full_h), len(np_["history"]))):
-                    pat_v = np_["history"][i].get("value")
-                    eps_v = eps_full_h[i].get("value")
-                    if pat_v not in (None, "") and eps_v not in (None, "", 0):
-                        try:
-                            est = float(pat_v) * 1e7 / float(eps_v)
-                            if 1e6 < est < 1e10:
-                                estimates.append(est)
-                        except (TypeError, ValueError, ZeroDivisionError):
-                            pass
-                if estimates:
-                    estimates.sort()
-                    shares = estimates[len(estimates) // 2]
-                    log.info(f"  [{isin}] Shares: {shares/1e7:.2f} Cr (median of {len(estimates)} quarters)")
-
-            if not shares:
-                for eps_name in ["EPS - Basic", "Basic EPS", "Earnings Per Share"]:
-                    ann_eps_h = full_hist(eps_name)
-                    ann_pat_h = full_hist("Profit After Tax")
-                    if ann_eps_h and ann_pat_h:
-                        try:
-                            av = ann_eps_h[0].get("value")
-                            pv = ann_pat_h[0].get("value")
-                            if av not in (None, "", 0) and pv not in (None, ""):
-                                est = float(pv) * 1e7 / float(av)
-                                if 1e6 < est < 1e10:
-                                    shares = est
-                                    log.info(f"  [{isin}] Shares (annual fallback): {shares/1e7:.2f} Cr")
-                                    break
-                        except (TypeError, ValueError, ZeroDivisionError):
-                            pass
-
-            eps_vals = []
-            pat_hist = np_["history"] if np_ else []
-            for i in range(n):
-                pv = pat_hist[i].get("value") if i < len(pat_hist) else None
-                if pv not in (None, "") and shares:
-                    try:
-                        eps_vals.append(round(float(pv) * 1e7 / shares, 2))
-                    except (TypeError, ValueError):
-                        eps_vals.append("")
-                else:
-                    eps_vals.append("")
-            eps_d_vals = eps_vals[:]
-
-        pat_vals = ex(np_["history"] if np_ else [])
-
-        return {
-            "quarters": quarters,
-            "sales":    ex(rev["history"] if rev else []),
-            "sales_ch": ex(rev["history"] if rev else [], "change"),
-            "pbt":      ex(pbt_["history"] if pbt_ else []),
-            "pbt_ch":   ex(pbt_["history"] if pbt_ else [], "change"),
-            "pat":      pat_vals,
-            "pat_ch":   ex(np_["history"] if np_ else [], "change"),
-            "eps":      eps_vals[:n],
-            "eps_d":    eps_d_vals[:n],
-        }
-    return None
-
-
-async def fetch_key_ratios(client, sem, isin):
-    d = await _upstox_get(client, sem, f"/{isin}/key-ratios")
-    if not d:
-        return None
-    ratios = d.get("data", [])
-    def gn(name, field="company_value"):
-        r = next((x for x in ratios if x["name"] == name), None)
-        if not r or not r.get(field):
-            return None
-        try: return float(str(r[field]).replace("%", ""))
-        except: return None
-    return {
-        "pe": gn("P/E"), "pb": gn("P/B"), "roe": gn("ROE"), "roce": gn("ROCE"),
-        "roa": gn("ROA"), "ev_ebitda": gn("EV/EBITDA"),
-        "sec_pe": gn("P/E","sector_value"), "sec_pb": gn("P/B","sector_value"),
-        "sec_roe": gn("ROE","sector_value"), "sec_roce": gn("ROCE","sector_value"),
-        "sec_roa": gn("ROA","sector_value"), "sec_ev_ebitda": gn("EV/EBITDA","sector_value"),
-    }
-
-
-async def fetch_shareholding(client, sem, isin):
-    d = await _upstox_get(client, sem, f"/{isin}/share-holdings")
-    if not d:
-        return None
-    holdings = d.get("data", [])
-    if not holdings:
-        return None
-    def gh(cat): return next((h for h in holdings if h["category"] == cat), {}).get("history", [])
-    def gv(arr, i): return arr[i]["value"] if i < len(arr) else None
-    def gp(arr, i): return arr[i]["period"] if i < len(arr) else ""
-    pH, fH, mH, dH, rH = gh("promoters"), gh("fii"), gh("mutual_funds"), gh("other_dii"), gh("retail_and_other")
-    pr, prp = gv(pH,0), gv(pH,1)
-    return {
-        "promoter": pr, "fii": gv(fH,0), "mutual_fund": gv(mH,0),
-        "dii": gv(dH,0), "public": gv(rH,0),
-        "promoter_ch": round(pr - prp, 2) if pr is not None and prp is not None else None,
-        "sh_quarter": gp(pH,0),
-        "sh_qtrs": [gp(pH,i) for i in range(4) if gp(pH,i)],
-        **{f"sh_promoter_q{i+1}": gv(pH,i) for i in range(4)},
-        **{f"sh_fii_q{i+1}": gv(fH,i) for i in range(4)},
-        **{f"sh_mf_q{i+1}": gv(mH,i) for i in range(4)},
-        **{f"sh_dii_q{i+1}": gv(dH,i) for i in range(4)},
-        **{f"sh_public_q{i+1}": gv(rH,i) for i in range(4)},
-    }
-
-
-async def fetch_balance_sheet(client, sem, isin):
-    for typ in ["consolidated", "standalone"]:
-        d = await _upstox_get(client, sem, f"/{isin}/balance-sheet?type={typ}&time_period=annual&fs=true")
-        if not d:
-            continue
-        history = d["data"].get("history", [])
-        if not history:
-            continue
-        fs = d["data"].get("full_statement", [])
-        n = min(len(history), 4)
-        def gfs(name): return [r["value"] for r in (next((x for x in fs if x.get("particular") == name), {}).get("history", []))[:n]]
-        return {
-            "bs_type": typ, "bs_units": d["data"].get("units_in","crore"),
-            "bs_periods": [h["period"] for h in history[:n]],
-            "bs_assets":  [h.get("total_asset") for h in history[:n]],
-            "bs_liab":    [h.get("total_liability") for h in history[:n]],
-            "bs_equity":  [round(h["total_asset"]-h["total_liability"],2) if h.get("total_asset") and h.get("total_liability") else None for h in history[:n]],
-            "bs_cur_assets":    gfs("Current Assets"),
-            "bs_noncur_assets": gfs("Non-Current Assets"),
-            "bs_cur_liab":      gfs("Current Liabilities"),
-            "bs_noncur_liab":   gfs("Non-Current Liabilities"),
-        }
-    return None
-
-
-async def fetch_cash_flow(client, sem, isin):
-    for typ in ["consolidated", "standalone"]:
-        d = await _upstox_get(client, sem, f"/{isin}/cash-flow?type={typ}&time_period=annual")
-        if not d:
-            continue
-        flows = d["data"].get("cash_flow", [])
-        if not flows:
-            continue
-        def gf(cat): return next((f for f in flows if f["category"] == cat), None)
-        op, inv, fin = gf("operating"), gf("investing"), gf("financing")
-        src = op or inv or fin
-        if not src or not src.get("history"):
-            continue
-        n = min(len(src["history"]), 4)
-        def ev(x): return [(h.get("value") or "") for h in (x or {}).get("history",[])][:n]
-        def ec(x): return [(h.get("change") or "") for h in (x or {}).get("history",[])][:n]
-        opv, invv = ev(op), ev(inv)
-        return {
-            "cf_type": typ, "cf_units": d["data"].get("units_in","crore"),
-            "cf_periods": [h["period"] for h in src["history"][:n]],
-            "cf_op": opv, "cf_op_ch": ec(op),
-            "cf_inv": invv, "cf_inv_ch": ec(inv),
-            "cf_fin": ev(fin), "cf_fin_ch": ec(fin),
-            "cf_fcf": [round(o+i,2) if o!="" and i!="" else "" for o,i in zip(opv,invv)],
-        }
-    return None
-
-
-async def fetch_corporate_actions(client, sem, isin):
-    d = await _upstox_get(client, sem, f"/{isin}/corporate-actions")
-    if not d:
-        return None
-    actions = d.get("data", []) if isinstance(d.get("data"), list) else []
-    if not actions:
-        return None
-    result = {"ca_count": len(actions)}
-    for i, a in enumerate(actions[:5]):
-        n = i + 1
-        dets = a.get("event_details", []) if isinstance(a.get("event_details"), list) else []
-        def gd(key): return next((x["value"] for x in dets if x["name"] == key), "")
-        result.update({
-            f"ca{n}_name": a.get("name",""), f"ca{n}_date": a.get("expiry_date",""),
-            f"ca{n}_amount": a.get("amount",""), f"ca{n}_ratio": a.get("ratio",""),
-            f"ca{n}_type": gd("Dividend type"), f"ca{n}_record_date": gd("Record date"),
+async def _finedge_financials(client, sem, sym, code, period) -> list | None:
+    """Consolidated first, fallback to standalone."""
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"financials/{sym}", {
+            "statement_type": stype, "statement_code": code, "period": period,
         })
-    ld = next((a for a in actions if a.get("name") == "Dividend"), None)
-    if ld:
-        result["latest_div_amount"] = ld.get("amount","")
-        result["latest_div_date"]   = ld.get("expiry_date","")
-    return result
+        rows = (d or {}).get("financials", [])
+        if rows:
+            return rows
+    return None
 
 
-async def fetch_one_fundamental(client, sem, sym, isin):
-    income  = await fetch_income_statement(client, sem, isin)
-    ratios  = await fetch_key_ratios(client, sem, isin)
-    sh      = await fetch_shareholding(client, sem, isin)
-    bs      = await fetch_balance_sheet(client, sem, isin)
-    cf      = await fetch_cash_flow(client, sem, isin)
-    ca      = await fetch_corporate_actions(client, sem, isin)
-    profile = await fetch_company_profile(client, sem, isin)
+async def _finedge_basic(client, sem, sym) -> list | None:
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"basic-financials/{sym}", {
+            "statement_type": stype, "statement_code": "pl",
+        })
+        rows = (d or {}).get("ratios", [])
+        if rows:
+            return rows
+    return None
 
-    if not any([income, ratios, sh, bs, cf]):
+
+async def _finedge_ratios_pr(client, sem, sym) -> list | None:
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}", {
+            "statement_type": stype, "ratio_type": "pr",
+        })
+        rows = (d or {}).get("ratios", [])
+        if rows:
+            return rows
+    return None
+
+
+async def _finedge_shareholding(client, sem, sym) -> dict | None:
+    d = await _finedge_get(client, sem, f"shareholdings/pattern/{sym}", {"period": "quarterly"})
+    if not d:
+        return None
+    columns = d.get("columns", [])
+    rows    = d.get("rows", [])
+    if not columns or not rows:
+        return None
+    n_qtrs = min(8, len(columns))
+    qtrs   = columns[:n_qtrs]
+
+    def get_row(name):
+        r = next((x for x in rows if name.lower() in x.get("category", "").lower()), None)
+        return r.get("data", [])[:n_qtrs] if r else []
+
+    promoter = get_row("promoter")
+    fii      = get_row("fii") or get_row("foreign")
+    dii      = get_row("dii") or get_row("domestic")
+    public   = get_row("public") or get_row("retail")
+
+    return {
+        "sh_quarters" : qtrs,
+        "sh_promoter" : promoter,
+        "sh_fii"      : fii,
+        "sh_dii"      : dii,
+        "sh_public"   : public,
+        "promoter"    : promoter[0] if promoter else None,
+        "fii"         : fii[0]      if fii      else None,
+        "dii"         : dii[0]      if dii      else None,
+        "public"      : public[0]   if public   else None,
+        "promoter_ch" : round(promoter[0] - promoter[1], 2)
+                        if len(promoter) >= 2 and None not in (promoter[0], promoter[1])
+                        else None,
+    }
+
+
+async def _finedge_profile(client, sem, sym) -> dict | None:
+    d = await _finedge_get(client, sem, f"company-profile/{sym}", {})
+    if not d:
+        return None
+    return {
+        "name"        : d.get("name", ""),
+        "sector"      : d.get("sector", ""),
+        "industry"    : d.get("industry", ""),
+        "sub_industry": d.get("sub_industry", ""),
+        "macro_sector": d.get("macro_sector", ""),
+        "market_cap"  : d.get("market_cap"),
+        "bse_code"    : d.get("bse_code", ""),
+        "description" : d.get("description", ""),
+        "website"     : d.get("website", ""),
+    }
+
+
+async def fetch_one_fundamental(
+    client: httpx.AsyncClient,
+    sem: asyncio.Semaphore,
+    sym: str,
+    isin: str = "",   # kept for backward compat, unused
+) -> tuple[str, dict | None]:
+    """
+    Fetch complete fundamentals for one NSE stock from Finedge.
+    8 concurrent API calls per stock:
+      1. P&L quarterly (12 qtrs)   2. P&L annual (5 yrs)
+      3. BS annual (5 yrs)         4. CF annual (5 yrs)
+      5. Basic financials (TTM)    6. Profitability ratios (5 yrs)
+      7. Shareholding (8 qtrs)     8. Company profile
+    """
+    pl_qtr, pl_ann, bs_ann, cf_ann, basic, prof_ratios, sh, profile = await asyncio.gather(
+        _finedge_financials(client, sem, sym, "pl", "quarterly"),
+        _finedge_financials(client, sem, sym, "pl", "annual"),
+        _finedge_financials(client, sem, sym, "bs", "annual"),
+        _finedge_financials(client, sem, sym, "cf", "annual"),
+        _finedge_basic(client, sem, sym),
+        _finedge_ratios_pr(client, sem, sym),
+        _finedge_shareholding(client, sem, sym),
+        _finedge_profile(client, sem, sym),
+    )
+
+    if not any([pl_qtr, pl_ann, bs_ann, cf_ann]):
         return sym, None
 
-    obj = {"symbol": sym, "updated": today_ist()}
+    obj: dict = {"symbol": sym, "updated": today_ist(), "source": "finedge"}
 
+    # ── Company Profile ────────────────────────────────────────
     if profile:
-        obj["profile_sector"]      = profile.get("profile_sector", "")
-        obj["profile_description"] = profile.get("profile_description", "")
+        obj.update({
+            "name"        : profile.get("name", ""),
+            "sector"      : profile.get("sector", ""),
+            "industry"    : profile.get("industry", ""),
+            "sub_industry": profile.get("sub_industry", ""),
+            "macro_sector": profile.get("macro_sector", ""),
+            "market_cap"  : profile.get("market_cap"),
+            "bse_code"    : profile.get("bse_code", ""),
+            "description" : profile.get("description", ""),
+            "website"     : profile.get("website", ""),
+        })
 
-    if ratios: obj.update(ratios)
-    if sh: obj.update({k: sh[k] for k in sh})
+    # ── Basic Financials TTM ───────────────────────────────────
+    if basic:
+        ttm = basic[0] if basic else {}
+        obj.update({
+            "ebit"              : ttm.get("ebit"),
+            "ebitda"            : ttm.get("ebitda"),
+            "operating_revenue" : ttm.get("operatingRevenue"),
+            "operating_profit"  : ttm.get("operatingProfit"),
+            "eps_diluted"       : ttm.get("dilutedEps"),
+            "shares_outstanding": ttm.get("dilutedSharesOutstanding"),
+            "book_value_ps"     : ttm.get("bookValuepershare"),
+            "net_debt"          : ttm.get("netDebt"),
+        })
 
-    if income:
-        quarters = income.get("quarters", [])
-        for i, q in enumerate(quarters[:4]):
-            n = i + 1
-            obj[f"q{n}_period"]   = q
-            obj[f"q{n}_sales"]    = income["sales"][i]    if i < len(income.get("sales",[]))    else ""
-            obj[f"q{n}_sales_ch"] = income["sales_ch"][i] if i < len(income.get("sales_ch",[])) else ""
-            obj[f"q{n}_pbt"]      = income["pbt"][i]      if i < len(income.get("pbt",[]))      else ""
-            obj[f"q{n}_pbt_ch"]   = income["pbt_ch"][i]   if i < len(income.get("pbt_ch",[]))   else ""
-            obj[f"q{n}_pat"]      = income["pat"][i]      if i < len(income.get("pat",[]))      else ""
-            obj[f"q{n}_pat_ch"]   = income["pat_ch"][i]   if i < len(income.get("pat_ch",[]))   else ""
-            obj[f"q{n}_eps"]      = income["eps"][i]      if i < len(income.get("eps",[]))      else ""
-            obj[f"q{n}_eps_d"]    = income["eps_d"][i]    if i < len(income.get("eps_d",[]))    else ""
+    # ── P&L Quarterly — 12 quarters ───────────────────────────
+    if pl_qtr:
+        obj["pl_quarterly"] = [
+            {
+                "header"       : q.get("header", ""),
+                "period_end"   : q.get("period_end"),
+                "sales"        : q.get("revenueFromOperations"),
+                "expenses"     : q.get("expenses"),
+                "pbt"          : q.get("profitBeforeTax"),
+                "pat"          : q.get("profitLossForPeriod"),
+                "eps"          : q.get("eps"),
+                "depreciation" : q.get("depreciationAndAmortisation"),
+                "finance_costs": q.get("financeCosts"),
+                "tax"          : q.get("taxExpense"),
+            }
+            for q in pl_qtr[:12]
+        ]
 
-    if bs:
-        obj["bs_type"]  = bs.get("bs_type", "")
-        obj["bs_units"] = bs.get("bs_units", "crore")
-        for i in range(4):
-            n = i + 1
-            obj[f"bs_y{n}_period"]        = bs["bs_periods"][i]       if i < len(bs.get("bs_periods",[]))       else ""
-            obj[f"bs_y{n}_assets"]        = bs["bs_assets"][i]        if i < len(bs.get("bs_assets",[]))        else ""
-            obj[f"bs_y{n}_liab"]          = bs["bs_liab"][i]          if i < len(bs.get("bs_liab",[]))          else ""
-            obj[f"bs_y{n}_equity"]        = bs["bs_equity"][i]        if i < len(bs.get("bs_equity",[]))        else ""
-            obj[f"bs_y{n}_cur_assets"]    = bs["bs_cur_assets"][i]    if i < len(bs.get("bs_cur_assets",[]))    else ""
-            obj[f"bs_y{n}_noncur_assets"] = bs["bs_noncur_assets"][i] if i < len(bs.get("bs_noncur_assets",[])) else ""
-            obj[f"bs_y{n}_cur_liab"]      = bs["bs_cur_liab"][i]      if i < len(bs.get("bs_cur_liab",[]))      else ""
-            obj[f"bs_y{n}_noncur_liab"]   = bs["bs_noncur_liab"][i]   if i < len(bs.get("bs_noncur_liab",[]))   else ""
+    # ── P&L Annual — 5 years ──────────────────────────────────
+    if pl_ann:
+        obj["pl_annual"] = [
+            {
+                "header"          : q.get("header", ""),
+                "year"            : q.get("year"),
+                "sales"           : q.get("revenueFromOperations"),
+                "expenses"        : q.get("expenses"),
+                "pbt"             : q.get("profitBeforeTax"),
+                "pat"             : q.get("profitLossForPeriod"),
+                "eps"             : q.get("eps"),
+                "depreciation"    : q.get("depreciationAndAmortisation"),
+                "finance_costs"   : q.get("financeCosts"),
+                "dividend_payout" : q.get("dividendPayout"),
+            }
+            for q in pl_ann[:5]
+        ]
 
-    if cf:
-        obj["cf_type"]  = cf.get("cf_type", "")
-        obj["cf_units"] = cf.get("cf_units", "crore")
-        for i in range(4):
-            n = i + 1
-            obj[f"cf_y{n}_period"] = cf["cf_periods"][i] if i < len(cf.get("cf_periods",[])) else ""
-            obj[f"cf_y{n}_op"]     = cf["cf_op"][i]      if i < len(cf.get("cf_op",[]))      else ""
-            obj[f"cf_y{n}_op_ch"]  = cf["cf_op_ch"][i]   if i < len(cf.get("cf_op_ch",[]))   else ""
-            obj[f"cf_y{n}_inv"]    = cf["cf_inv"][i]     if i < len(cf.get("cf_inv",[]))     else ""
-            obj[f"cf_y{n}_fin"]    = cf["cf_fin"][i]     if i < len(cf.get("cf_fin",[]))     else ""
-            obj[f"cf_y{n}_fcf"]    = cf["cf_fcf"][i]     if i < len(cf.get("cf_fcf",[]))     else ""
+    # ── Balance Sheet Annual — 5 years ────────────────────────
+    if bs_ann:
+        obj["bs_annual"] = [
+            {
+                "header"               : q.get("header", ""),
+                "year"                 : q.get("year"),
+                "total_assets"         : q.get("assets"),
+                "equity_capital"       : q.get("equityCapital"),
+                "reserves"             : q.get("reserves"),
+                "borrowings_current"   : q.get("borrowingsCurrent"),
+                "borrowings_noncurrent": q.get("borrowingsNoncurrent"),
+                "borrowings_total"     : (q.get("borrowingsCurrent") or 0) + (q.get("borrowingsNoncurrent") or 0),
+                "cash"                 : q.get("cashAndCashEquivalents"),
+                "current_assets"       : q.get("currentAssets"),
+                "current_liabilities"  : q.get("currentLiabilities"),
+                "fixed_assets"         : q.get("propertyPlantAndEquipmentNet"),
+                "investments"          : q.get("investments"),
+            }
+            for q in bs_ann[:5]
+        ]
 
-    if ca: obj.update(ca)
+    # ── Cash Flow Annual — 5 years ────────────────────────────
+    if cf_ann:
+        obj["cf_annual"] = [
+            {
+                "header": q.get("header", ""),
+                "year"  : q.get("year"),
+                "cfo"   : q.get("netCashFromOperatingActivities"),
+                "cfi"   : q.get("netCashFromInvestingActivities"),
+                "cff"   : q.get("netCashFromFinancingActivities"),
+                "net_cf": q.get("netIncreaseDecreaseInCash"),
+                "capex" : q.get("purchaseOfPropertyPlantAndEquipment"),
+                "fcf"   : (
+                    (q.get("netCashFromOperatingActivities") or 0) +
+                    (q.get("purchaseOfPropertyPlantAndEquipment") or 0)
+                ) if q.get("netCashFromOperatingActivities") is not None else None,
+            }
+            for q in cf_ann[:5]
+        ]
+
+    # ── Profitability Ratios — 5 years ────────────────────────
+    if prof_ratios:
+        obj["ratios_annual"] = [
+            {
+                "header"          : r.get("header", ""),
+                "year"            : r.get("year"),
+                "gross_margin"    : r.get("grossMargin"),
+                "ebit_margin"     : r.get("ebitMargin"),
+                "ebitda_margin"   : r.get("ebitdaMargin"),
+                "net_margin"      : r.get("netMargin"),
+                "operating_margin": r.get("operatingMargin"),
+                "roe"             : r.get("returnOnEquity"),
+                "roa"             : r.get("returnOnAsset"),
+                "roce"            : r.get("returnOnCapital"),
+                "pretax_margin"   : r.get("preTaxMargin"),
+                "tax_rate"        : r.get("effectiveTaxRate"),
+            }
+            for r in prof_ratios[:5]
+        ]
+
+    # ── Shareholding — 8 quarters ─────────────────────────────
+    if sh:
+        obj.update({
+            "promoter"    : sh.get("promoter"),
+            "fii"         : sh.get("fii"),
+            "dii"         : sh.get("dii"),
+            "public"      : sh.get("public"),
+            "promoter_ch" : sh.get("promoter_ch"),
+            "sh_quarters" : sh.get("sh_quarters", []),
+            "sh_promoter" : sh.get("sh_promoter", []),
+            "sh_fii"      : sh.get("sh_fii", []),
+            "sh_dii"      : sh.get("sh_dii", []),
+            "sh_public"   : sh.get("sh_public", []),
+        })
+
     return sym, obj
 
 
 async def fetch_one_bse_profile(client, sem, sym, isin, meta: dict):
-    """BSE-only stocks ke liye sirf profile fetch karo."""
-    await asyncio.sleep(2.0)
-    profile = await fetch_company_profile(client, sem, isin)
+    """BSE-only stocks ke liye sirf company profile fetch karo via Finedge."""
+    profile = await _finedge_profile(client, sem, sym)
     obj = {
-        "symbol"             : sym,
-        "updated"            : today_ist(),
-        "name"               : meta.get("name", ""),
-        "profile_sector"     : profile.get("profile_sector", "")      if profile else "",
-        "profile_description": profile.get("profile_description", "") if profile else "",
+        "symbol"     : sym,
+        "updated"    : today_ist(),
+        "name"       : meta.get("name", ""),
+        "sector"     : profile.get("sector", "")      if profile else "",
+        "industry"   : profile.get("industry", "")    if profile else "",
+        "description": profile.get("description", "") if profile else "",
+        "market_cap" : profile.get("market_cap")      if profile else None,
     }
     return sym, obj
 
 
 # ══════════════════════════════════════════════════════════════
-# BSE RESULT FETCHER
+# FINEDGE RESULTS CALENDAR
 # ══════════════════════════════════════════════════════════════
 
-async def get_bse_result_symbols(client: httpx.AsyncClient) -> list[str]:
+async def get_result_symbols_finedge(client: httpx.AsyncClient) -> list[str]:
+    """Finedge results-calendar se aaj ke result wale NSE stocks fetch karo."""
     today = today_ist()
-    next_day = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
-    url = (f"https://api.bseindia.com/BseIndiaAPI/api/DownloadCSV1/w"
-           f"?fromdate={today}&todate={next_day}&scripcode=")
-    req_headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bseindia.com/"}
-    try:
-        r = await client.get(url, headers=req_headers, timeout=30)
-        if r.status_code != 200:
-            log.warning(f"BSE API returned {r.status_code}")
-            return []
-    except Exception as e:
-        log.warning(f"BSE API error: {e}")
-        return []
+    next7 = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
 
-    lines = r.text.strip().splitlines()
-    if len(lines) < 2:
-        log.info("BSE CSV empty — no results today")
-        return []
-
-    headers_row = [h.strip().strip('"') for h in lines[0].split(",")]
-    log.info(f"BSE CSV headers: {headers_row}")
-    date_idx = next((i for i,h in enumerate(headers_row) if "DATE" in h.upper() or "RESULT" in h.upper()), -1)
-    name_idx = next((i for i,h in enumerate(headers_row) if "SECURITY" in h.upper() and "NAME" in h.upper()), -1)
-    if name_idx == -1:
-        name_idx = next((i for i,h in enumerate(headers_row) if "NAME" in h.upper()), -1)
-    if date_idx == -1 or name_idx == -1:
-        log.warning(f"BSE CSV column not found — headers: {headers_row}")
+    sem = asyncio.Semaphore(1)
+    d = await _finedge_get(client, sem, "results-calendar", {
+        "from_date": today,
+        "to_date"  : next7,
+    })
+    if not d or not isinstance(d, list):
+        log.warning("Finedge results calendar — empty or error")
         return []
 
     isin_symbols = set(ISIN_MAP.keys())
-
-    def normalize_date(val):
-        import re
-        val = val.strip()
-        MONTHS = {"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
-                  "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}
-        m = re.match(r'^(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})$', val)
-        if m:
-            mon = MONTHS.get(m.group(2)[:3].lower())
-            if mon: return f"{m.group(3)}-{mon}-{m.group(1).zfill(2)}"
-        m2 = re.match(r'^(\d{2})-(\d{2})-(\d{4})$', val)
-        if m2: return f"{m2.group(3)}-{m2.group(2)}-{m2.group(1)}"
-        if re.match(r'\d{4}-\d{2}-\d{2}', val): return val[:10]
-        return val
-
-    matched = []
-    for line in lines[1:]:
-        cols = [c.strip().strip('"') for c in line.split(",")]
-        if len(cols) <= max(name_idx, date_idx):
-            continue
-        raw_date = cols[date_idx] if date_idx < len(cols) else ""
-        if not raw_date:
-            continue
-        if normalize_date(raw_date) != today:
-            continue
-        bse_name = cols[name_idx].strip().upper() if name_idx < len(cols) else ""
-        if bse_name in isin_symbols:
-            matched.append(bse_name)
-            continue
-        for sym in isin_symbols:
-            if sym in bse_name or bse_name.startswith(sym[:5]):
-                matched.append(sym)
-                break
-
-    matched = list(set(matched))
-    log.info(f"BSE results today ({today}): {len(matched)} stocks — {', '.join(matched) or 'none'}")
+    matched = list({
+        item["symbol"]
+        for item in d
+        if item.get("symbol") in isin_symbols
+        and item.get("expected_result_date") == today
+    })
+    log.info(f"Finedge results today ({today}): {len(matched)} stocks — {', '.join(matched) or 'none'}")
     return matched
 
 
@@ -1029,25 +947,28 @@ async def run_status() -> None:
 
 
 # ══════════════════════════════════════════════════════════════
-# PIPELINE MODES — FUNDAMENTALS
+# PIPELINE MODES — FUNDAMENTALS (Finedge)
 # ══════════════════════════════════════════════════════════════
 
 async def run_fund_daily() -> None:
+    """
+    Roz 4:30 PM — Finedge results calendar se aaj ke result wale
+    NSE stocks ke fundamentals update karo.
+    """
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} is not a trading day — exiting")
         return
 
-    log.info(f"━━━ Fundamentals Daily  {today} ━━━")
-    sem = asyncio.Semaphore(FUND_CONCURRENCY)
+    log.info(f"━━━ Fundamentals Daily (Finedge)  {today} ━━━")
 
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
 
-        symbols = await get_bse_result_symbols(client)
+        symbols = await get_result_symbols_finedge(client)
         if not symbols:
-            log.info("No BSE results today — exiting")
+            log.info("No results today — exiting")
             return
 
         await save_result_calendar(client, symbols, today)
@@ -1055,8 +976,9 @@ async def run_fund_daily() -> None:
         log.info("Downloading fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
-        log.info(f"Fetching fundamentals for {len(symbols)} NSE stocks…")
-        tasks   = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in symbols if sym in ISIN_MAP]
+        sem     = asyncio.Semaphore(FUND_CONCURRENCY)
+        log.info(f"Fetching fundamentals for {len(symbols)} stocks…")
+        tasks   = [fetch_one_fundamental(client, sem, sym) for sym in symbols if sym in ISIN_MAP]
         results = await asyncio.gather(*tasks)
 
         ok = 0
@@ -1073,9 +995,15 @@ async def run_fund_daily() -> None:
     log.info("━━━ Fundamentals Daily complete ━━━")
 
 
-async def run_fund_weekly(part: int = 0) -> None:
-    today       = today_ist()
+async def run_fund_full(part: int = 0) -> None:
+    """
+    One-time full load — sabhi NSE stocks ke fundamentals.
+    10 parts mein chalao: fund_full_1 se fund_full_10.
+    Har part ~250 stocks × 8 calls = ~2000 calls (~7-10 min).
+    Already fetched stocks skip ho jaate hain (checkpoint safe).
+    """
     TOTAL_PARTS = 10
+    BATCH_SIZE  = 25   # 25 stocks × 8 concurrent calls per stock
 
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
@@ -1093,35 +1021,47 @@ async def run_fund_weekly(part: int = 0) -> None:
             end_idx   = min(part * part_size, total)
             label     = f"Part {part}/{TOTAL_PARTS}"
 
-        nse_chunk = nse_symbols[start_idx:end_idx]
-        log.info(f"━━━ Fundamentals Weekly {label}  {today}  ({len(nse_chunk)} NSE stocks) ━━━")
-
-        sem = asyncio.Semaphore(FUND_CONCURRENCY)
+        chunk = nse_symbols[start_idx:end_idx]
+        log.info(f"━━━ Fund Full {label}  ({len(chunk)} NSE stocks) ━━━")
 
         log.info("Downloading existing fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
-        batch_size = 50
-        ok = 0
+        # Skip already fetched
+        missing = [sym for sym in chunk if sym not in fund_data]
+        already = len(chunk) - len(missing)
+        log.info(f"Already done: {already}  Remaining: {len(missing)}")
+
+        if not missing:
+            log.info("✅ All stocks in this part already fetched!")
+            return
+
+        sem    = asyncio.Semaphore(FUND_CONCURRENCY)
+        ok     = 0
         failed = 0
-        for i in range(0, len(nse_chunk), batch_size):
-            batch = nse_chunk[i : i + batch_size]
-            tasks = [fetch_one_fundamental(client, sem, sym, ISIN_MAP[sym]) for sym in batch]
+
+        for i in range(0, len(missing), BATCH_SIZE):
+            batch   = missing[i : i + BATCH_SIZE]
+            tasks   = [fetch_one_fundamental(client, sem, sym) for sym in batch]
             results = await asyncio.gather(*tasks)
+
             for sym, data in results:
                 if data:
                     fund_data[sym] = data
                     ok += 1
                 else:
                     failed += 1
-            pct = min(i + batch_size, len(nse_chunk))
-            log.info(f"  NSE {pct}/{len(nse_chunk)}  ✓{ok}  ✗{failed}")
-            if pct % 200 == 0 or pct == len(nse_chunk):
-                log.info("  Checkpoint upload…")
+                    log.warning(f"  ✗ {sym}: no data")
+
+            pct = min(i + BATCH_SIZE, len(missing))
+            log.info(f"  {pct}/{len(missing)}  ✓{ok}  ✗{failed}")
+
+            # Checkpoint har 100 stocks pe
+            if pct % 100 == 0 or pct == len(missing):
+                log.info("  💾 Checkpoint upload…")
                 await r2_upload_fund(client, fund_data)
 
-    log.info(f"━━━ Weekly {label} complete — ✓{ok} ✗{failed} ━━━")
-
+    log.info(f"━━━ Fund Full {label} complete — ✓{ok}  ✗{failed} ━━━")
 
 # ══════════════════════════════════════════════════════════════
 # BSE PROFILES — ALAG SLOW PIPELINE
@@ -1607,6 +1547,12 @@ async def run_ep_scan() -> None:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
 
+        # Finedge se aaj ke results fetch + calendar update
+        today_symbols = await get_result_symbols_finedge(client)
+        if today_symbols:
+            await save_result_calendar(client, today_symbols, today)
+            log.info(f"Result calendar updated: {len(today_symbols)} stocks")
+
         log.info("Downloading OHLC chunks, screener, fundamentals, result calendar…")
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
 
@@ -1699,14 +1645,8 @@ async def run_ep_scan() -> None:
             sig["rs"]       = sc.get("rs", "")
             sig["ltp"]      = sc.get("ltp", "")
             fund = fund_lookup.get(sym, {})
-            q_name = ""
-            _best = (0, 0)
-            for _n in range(1, 5):
-                _p = fund.get(f"q{_n}_period", "")
-                if _p and _pq(_p) > _best:
-                    _best = _pq(_p)
-                    q_name = _p
-            sig["q_name"] = q_name
+            pl_qtr = fund.get("pl_quarterly", [])
+            sig["q_name"] = pl_qtr[0].get("header", "") if pl_qtr else ""
             vol_x = sig.pop("vol_spike_x", 1)
             sig["vol_pct"] = f"+{round((vol_x - 1) * 100)}%"
 
@@ -1727,14 +1667,8 @@ async def run_ep_scan() -> None:
                 sig["sector"]   = sc.get("sector", "")
                 sig["rs"]       = sc.get("rs", "")
                 sig["ltp"]      = sc.get("ltp", "")
-                q_name = ""
-                _best  = (0, 0)
-                for _n in range(1, 5):
-                    _p = fund.get(f"q{_n}_period", "")
-                    if _p and _pq(_p) > _best:
-                        _best = _pq(_p)
-                        q_name = _p
-                sig["q_name"] = q_name
+                pl_qtr = fund.get("pl_quarterly", [])
+                sig["q_name"] = pl_qtr[0].get("header", "") if pl_qtr else ""
 
             ah = sum(1 for s in pr_signals if "AH" in s["reaction_type"])
             ih = sum(1 for s in pr_signals if "IH" in s["reaction_type"])
@@ -2318,17 +2252,17 @@ if __name__ == "__main__":
         case "full":            asyncio.run(run_full())
         case "status":          asyncio.run(run_status())
         case "fund_daily":      asyncio.run(run_fund_daily())
-        case "fund_weekly":     asyncio.run(run_fund_weekly(0))
-        case "fund_weekly_1":   asyncio.run(run_fund_weekly(1))
-        case "fund_weekly_2":   asyncio.run(run_fund_weekly(2))
-        case "fund_weekly_3":   asyncio.run(run_fund_weekly(3))
-        case "fund_weekly_4":   asyncio.run(run_fund_weekly(4))
-        case "fund_weekly_5":   asyncio.run(run_fund_weekly(5))
-        case "fund_weekly_6":   asyncio.run(run_fund_weekly(6))
-        case "fund_weekly_7":   asyncio.run(run_fund_weekly(7))
-        case "fund_weekly_8":   asyncio.run(run_fund_weekly(8))
-        case "fund_weekly_9":   asyncio.run(run_fund_weekly(9))
-        case "fund_weekly_10":  asyncio.run(run_fund_weekly(10))
+        case "fund_full":       asyncio.run(run_fund_full(0))
+        case "fund_full_1":     asyncio.run(run_fund_full(1))
+        case "fund_full_2":     asyncio.run(run_fund_full(2))
+        case "fund_full_3":     asyncio.run(run_fund_full(3))
+        case "fund_full_4":     asyncio.run(run_fund_full(4))
+        case "fund_full_5":     asyncio.run(run_fund_full(5))
+        case "fund_full_6":     asyncio.run(run_fund_full(6))
+        case "fund_full_7":     asyncio.run(run_fund_full(7))
+        case "fund_full_8":     asyncio.run(run_fund_full(8))
+        case "fund_full_9":     asyncio.run(run_fund_full(9))
+        case "fund_full_10":    asyncio.run(run_fund_full(10))
         case "bse_profiles":    asyncio.run(run_bse_profiles(0))
         case "bse_profiles_1":  asyncio.run(run_bse_profiles(1))
         case "bse_profiles_2":  asyncio.run(run_bse_profiles(2))
