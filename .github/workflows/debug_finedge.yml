@@ -1,14 +1,11 @@
-name: Debug Finedge Token Format
-
+name: Debug Finedge CF Fields
 on:
   workflow_dispatch:
-
 env:
   FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-
 jobs:
-  debug_token:
-    name: Test token formats
+  debug_cf:
+    name: Dump CF field names
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,53 +14,66 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install httpx
-
-      - name: Test token formats
+      - name: Fetch CF + BS + basic-financials raw response
         run: |
           python - <<'EOF'
-          import asyncio
-          import httpx
-          import os
+          import asyncio, httpx, os, json
 
           TOKEN  = os.environ["FINEDGE_TOKEN"]
           BASE   = "https://data.finedgeapi.com/api/v1"
           SYMBOL = "ITC"
 
-          async def test(client, name, url, headers={}):
-              r = await client.get(url, headers=headers, timeout=15)
-              print(f"\n{'='*50}")
-              print(f"  {name}")
-              print(f"  Status : {r.status_code}")
-              print(f"  Body   : {r.text[:300] or '(empty)'}")
+          async def get(client, path, extra_params={}):
+              params = {"token": TOKEN, **extra_params}
+              r = await client.get(f"{BASE}/{path}", params=params, timeout=20)
+              print(f"\n{'='*60}")
+              print(f"  GET /{path}  params={extra_params}  → {r.status_code}")
+              if r.status_code == 200 and r.text.strip():
+                  try:
+                      d = r.json()
+                      # financials endpoint
+                      rows = d.get("financials") or d.get("ratios") or []
+                      if rows:
+                          print(f"  rows count : {len(rows)}")
+                          print(f"  keys       : {sorted(rows[0].keys())}")
+                          # Print first row values (non-null)
+                          sample = {k: v for k, v in rows[0].items() if v is not None}
+                          print(f"  non-null   : {json.dumps(sample, indent=4)[:800]}")
+                      else:
+                          print(f"  top keys   : {sorted(d.keys())}")
+                          print(f"  body       : {json.dumps(d)[:400]}")
+                  except Exception as e:
+                      print(f"  parse err  : {e}")
+                      print(f"  raw        : {r.text[:400]}")
+              else:
+                  print(f"  body       : {r.text[:300] or '(empty)'}")
 
           async def main():
               async with httpx.AsyncClient() as client:
-                  url = f"{BASE}/historical-adjusted-price/{SYMBOL}"
-                  await test(client, "Token as query ?token=",
-                      f"{url}?token={TOKEN}")
 
-                  await test(client, "Token as Bearer header",
-                      url, {"Authorization": f"Bearer {TOKEN}"})
+                  # ── 1. CF consolidated ─────────────────────────────────
+                  await get(client, f"financials/{SYMBOL}",
+                            {"statement_type": "c", "statement_code": "cf", "period": "annual"})
 
-                  await test(client, "Token as X-API-Key header",
-                      url, {"X-API-Key": TOKEN})
+                  # ── 2. CF standalone (fallback) ────────────────────────
+                  await get(client, f"financials/{SYMBOL}",
+                            {"statement_type": "s", "statement_code": "cf", "period": "annual"})
 
-                  await test(client, "Token as api-key header",
-                      url, {"api-key": TOKEN})
+                  # ── 3. CF quarterly ────────────────────────────────────
+                  await get(client, f"financials/{SYMBOL}",
+                            {"statement_type": "c", "statement_code": "cf", "period": "quarterly"})
 
-                  await test(client, "Token as x-api-token header",
-                      url, {"x-api-token": TOKEN})
+                  # ── 4. basic-financials (check eps/bvps/netDebt keys) ──
+                  await get(client, f"basic-financials/{SYMBOL}",
+                            {"statement_type": "c", "statement_code": "pl"})
 
-                  await test(client, "Token as apikey header",
-                      url, {"apikey": TOKEN})
+                  # ── 5. BS — verify book value fields ──────────────────
+                  await get(client, f"financials/{SYMBOL}",
+                            {"statement_type": "c", "statement_code": "bs", "period": "annual"})
 
-                  # Also test results calendar with header
-                  rc_url = f"{BASE}/results-calendar"
-                  await test(client, "Results calendar + Bearer",
-                      rc_url, {"Authorization": f"Bearer {TOKEN}"})
-
-                  await test(client, "Results calendar + X-API-Key",
-                      rc_url, {"X-API-Key": TOKEN})
+                  # ── 6. Shareholding — verify category names ────────────
+                  await get(client, f"shareholdings/pattern/{SYMBOL}",
+                            {"period": "quarterly"})
 
           asyncio.run(main())
           EOF
