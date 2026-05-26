@@ -1,4 +1,4 @@
-name: Test Finedge With Correct Params
+name: Test Finedge Final
 
 on:
   workflow_dispatch:
@@ -7,8 +7,8 @@ env:
   FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
 
 jobs:
-  test_params:
-    name: Test with correct params
+  test_final:
+    name: Final test all endpoints
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,71 +18,115 @@ jobs:
           cache: pip
       - run: pip install httpx
 
-      - name: Test with correct params
+      - name: Test all with correct params
         run: |
           python - <<'EOF'
           import asyncio
           import httpx
           import os
+          import json
           from datetime import date, timedelta
 
-          TOKEN  = os.environ["FINEDGE_TOKEN"]
-          BASE   = "https://data.finedgeapi.com/api/v1"
-          SYMBOL = "ITC"
-          TODAY  = date.today().isoformat()
-          MONTH_AGO = (date.today() - timedelta(days=30)).isoformat()
+          TOKEN    = os.environ["FINEDGE_TOKEN"]
+          BASE     = "https://data.finedgeapi.com/api/v1"
+          SYMBOL   = "ITC"
+          TODAY    = date.today().isoformat()
+          NEXT30   = (date.today() + timedelta(days=30)).isoformat()
+          PREV7    = (date.today() - timedelta(days=7)).isoformat()
+          MONTH_AGO= (date.today() - timedelta(days=30)).isoformat()
 
           async def test(client, name, url):
-              r = await client.get(url, timeout=15)
+              r = await client.get(url, timeout=20)
               status = r.status_code
-              body   = r.text[:300] or "(empty)"
-              icon   = "✅" if (r.status_code == 200 and r.text.strip()) else "❌"
+              has_data = r.status_code == 200 and r.text.strip()
+              icon = "✅" if has_data else "❌"
               print(f"{icon} [{status}] {name}")
-              if r.status_code != 200 or not r.text.strip():
-                  print(f"       {body}")
+              if has_data:
+                  try:
+                      d = r.json()
+                      if isinstance(d, dict):
+                          keys = list(d.keys())
+                          print(f"       Keys: {keys}")
+                          for k in keys:
+                              if isinstance(d[k], list):
+                                  print(f"       [{k}] count={len(d[k])}")
+                                  if len(d[k]) > 0:
+                                      print(f"       sample: {json.dumps(d[k][0])[:200]}")
+                                  break
+                      elif isinstance(d, list):
+                          print(f"       array count={len(d)}")
+                          if len(d) > 0:
+                              print(f"       sample: {json.dumps(d[0])[:200]}")
+                  except:
+                      print(f"       {r.text[:200]}")
               else:
-                  print(f"       Keys: {list(__import__('json').loads(r.text).keys()) if r.text.startswith('{') else 'array len=' + str(len(__import__('json').loads(r.text)))}")
+                  print(f"       {r.text[:200] or '(empty)'}")
 
           async def main():
               async with httpx.AsyncClient() as client:
                   tests = [
-                      # Ratios/Metrics need period param?
-                      ("Ratios annual",            f"{BASE}/ratios/{SYMBOL}?period=annual&token={TOKEN}"),
-                      ("Ratios quarterly",         f"{BASE}/ratios/{SYMBOL}?period=quarterly&token={TOKEN}"),
-                      ("Ratios ttm",               f"{BASE}/ratios/{SYMBOL}?period=ttm&token={TOKEN}"),
-                      ("Financial Metrics annual", f"{BASE}/financial-metrics/{SYMBOL}?period=annual&token={TOKEN}"),
-                      ("Financial Metrics qtr",    f"{BASE}/financial-metrics/{SYMBOL}?period=quarterly&token={TOKEN}"),
-                      ("Basic Financials annual",  f"{BASE}/basic-financials/{SYMBOL}?period=annual&token={TOKEN}"),
-                      ("Basic Financials qtr",     f"{BASE}/basic-financials/{SYMBOL}?period=quarterly&token={TOKEN}"),
+                      # ── Price ─────────────────────────────────────────
+                      ("OHLC (daily-quotes, all years)",
+                          f"{BASE}/daily-quotes/{SYMBOL}?token={TOKEN}"),
+                      ("OHLC (daily-quotes, 2024-2026)",
+                          f"{BASE}/daily-quotes/{SYMBOL}?from=2024&to=2026&token={TOKEN}"),
+                      ("Daily Quote (today)",
+                          f"{BASE}/daily-quotes/{SYMBOL}?from=2026&to=2026&token={TOKEN}"),
+                      ("Quote",
+                          f"{BASE}/quote?symbol={SYMBOL}&token={TOKEN}"),
 
-                      # Price Ratios
-                      ("Daily Price Ratios annual",f"{BASE}/daily-price-ratios/{SYMBOL}?period=annual&token={TOKEN}"),
+                      # ── Price Ratios ───────────────────────────────────
+                      ("Annual Price Ratios",
+                          f"{BASE}/annual-price-ratios/{SYMBOL}?statement_type=c&token={TOKEN}"),
+                      ("Daily Price Ratios",
+                          f"{BASE}/daily-price-ratios/{SYMBOL}?statement_type=c&token={TOKEN}"),
 
-                      # OHLC — maybe needs exchange param
-                      ("OHLC NSE",                 f"{BASE}/historical-adjusted-price/{SYMBOL}?exchange=NSE&token={TOKEN}"),
-                      ("OHLC BSE",                 f"{BASE}/historical-adjusted-price/{SYMBOL}?exchange=BSE&token={TOKEN}"),
+                      # ── Financials ─────────────────────────────────────
+                      ("Financials PL quarterly",
+                          f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=pl&period=quarterly&token={TOKEN}"),
+                      ("Financials BS annual",
+                          f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=bs&period=annual&token={TOKEN}"),
+                      ("Financials CF annual",
+                          f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=cf&period=annual&token={TOKEN}"),
+                      ("Basic Financials PL",
+                          f"{BASE}/basic-financials/{SYMBOL}?statement_type=c&statement_code=pl&token={TOKEN}"),
+                      ("Basic Financials BS",
+                          f"{BASE}/basic-financials/{SYMBOL}?statement_type=c&statement_code=bs&token={TOKEN}"),
+                      ("Financial Metrics PL",
+                          f"{BASE}/financial-metrics/{SYMBOL}?statement_type=c&statement_code=pl&token={TOKEN}"),
+                      ("Ratios",
+                          f"{BASE}/ratios/{SYMBOL}?statement_type=c&token={TOKEN}"),
+                      ("Segment Revenue quarterly",
+                          f"{BASE}/segment-revenue/{SYMBOL}?statement_type=c&statement_code=pl&period=quarterly&token={TOKEN}"),
 
-                      # Shareholding — needs period
-                      ("Shareholding quarterly",   f"{BASE}/shareholdings/pattern/{SYMBOL}?period=quarterly&token={TOKEN}"),
-                      ("Shareholding annual",      f"{BASE}/shareholdings/pattern/{SYMBOL}?period=annual&token={TOKEN}"),
+                      # ── Company ────────────────────────────────────────
+                      ("Company Profile",
+                          f"{BASE}/company-profile/{SYMBOL}?token={TOKEN}"),
+                      ("Peers",
+                          f"{BASE}/peers/{SYMBOL}?token={TOKEN}"),
 
-                      # Corp Announcements — needs date range
-                      ("Corp Announcements",       f"{BASE}/corp-announcements?symbol={SYMBOL}&from_date={MONTH_AGO}&to_date={TODAY}&token={TOKEN}"),
+                      # ── Shareholding ───────────────────────────────────
+                      ("Shareholding quarterly",
+                          f"{BASE}/shareholdings/pattern/{SYMBOL}?period=quarterly&token={TOKEN}"),
 
-                      # Holiday Calendar — needs year?
-                      ("Holiday Calendar 2026",    f"{BASE}/holiday-calendar?year=2026&token={TOKEN}"),
-                      ("Holiday Calendar exchange",f"{BASE}/holiday-calendar?exchange=NSE&token={TOKEN}"),
+                      # ── Corporate ──────────────────────────────────────
+                      ("Corp Announcements",
+                          f"{BASE}/corp-announcements?symbol={SYMBOL}&from_date={MONTH_AGO}&to_date={TODAY}&token={TOKEN}"),
 
-                      # Segment Revenue
-                      ("Segment Revenue annual",   f"{BASE}/segment-revenue/{SYMBOL}?period=annual&token={TOKEN}"),
-                      ("Segment Revenue qtr",      f"{BASE}/segment-revenue/{SYMBOL}?period=quarterly&token={TOKEN}"),
+                      # ── Exchange ───────────────────────────────────────
+                      ("Results Calendar",
+                          f"{BASE}/results-calendar?from_date={TODAY}&to_date={NEXT30}&token={TOKEN}"),
+                      ("IPO Calendar",
+                          f"{BASE}/ipo-calendar?token={TOKEN}"),
+                      ("Index Master",
+                          f"{BASE}/index/master?token={TOKEN}"),
                   ]
 
                   for name, url in tests:
                       await test(client, name, url)
-                      await asyncio.sleep(0.3)
+                      await asyncio.sleep(0.4)
 
-              print("\nDone!")
+              print("\n✅ Done!")
 
           asyncio.run(main())
           EOF
