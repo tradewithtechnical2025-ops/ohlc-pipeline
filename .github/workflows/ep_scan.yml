@@ -27,7 +27,8 @@ jobs:
 
       - name: Run EP Scan
         env:
-          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
-          WORKER_URL:   ${{ secrets.WORKER_URL }}
-          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:    ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
         run: python pipeline.py ep_scan
