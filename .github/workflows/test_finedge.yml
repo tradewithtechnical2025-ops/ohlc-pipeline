@@ -1,4 +1,4 @@
-name: Test Finedge API
+name: Test All Finedge URLs
 
 on:
   workflow_dispatch:
@@ -7,72 +7,76 @@ env:
   FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
 
 jobs:
-  test_finedge:
-    name: Test all Finedge endpoints
+  test_all_urls:
+    name: Test all endpoints
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-
       - run: pip install httpx
 
-      - name: Test Finedge endpoints
+      - name: Test all endpoints
         run: |
           python - <<'EOF'
           import asyncio
           import httpx
           import os
-          import json
 
-          TOKEN   = os.environ["FINEDGE_TOKEN"]
-          BASE    = "https://data.finedgeapi.com/api/v1"
-          SYMBOL  = "ITC"
+          TOKEN  = os.environ["FINEDGE_TOKEN"]
+          BASE   = "https://data.finedgeapi.com/api/v1"
+          SYMBOL = "ITC"
 
           async def test(client, name, url):
-              try:
-                  r = await client.get(url, timeout=15)
-                  data = r.json()
-                  print(f"\n{'='*50}")
-                  print(f"✅ {name}")
-                  print(f"   Status : {r.status_code}")
-                  if isinstance(data, dict):
-                      keys = list(data.keys())
-                      print(f"   Keys   : {keys}")
-                      # Show first item of first list key
-                      for k in keys:
-                          if isinstance(data[k], list) and len(data[k]) > 0:
-                              print(f"   [{k}] count : {len(data[k])}")
-                              print(f"   Sample : {json.dumps(data[k][0], indent=2)[:300]}")
-                              break
-                  elif isinstance(data, list):
-                      print(f"   Count  : {len(data)}")
-                      if len(data) > 0:
-                          print(f"   Sample : {json.dumps(data[0], indent=2)[:300]}")
-              except Exception as e:
-                  print(f"\n❌ {name} — ERROR: {e}")
+              r = await client.get(url, timeout=15)
+              status = r.status_code
+              body   = r.text[:200] or "(empty)"
+              icon   = "✅" if (r.status_code == 200 and r.text.strip()) else "❌"
+              print(f"{icon} [{status}] {name}")
+              if r.status_code != 200 or not r.text.strip():
+                  print(f"       Body: {body}")
 
           async def main():
               async with httpx.AsyncClient() as client:
-                  endpoints = [
-                      ("OHLC (Adjusted)",        f"{BASE}/historical-adjusted-price/{SYMBOL}?token={TOKEN}"),
-                      ("Financials P&L quarterly", f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=pl&period=quarterly&token={TOKEN}"),
-                      ("Financials BS annual",    f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=bs&period=annual&token={TOKEN}"),
-                      ("Financials CF annual",    f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=cf&period=annual&token={TOKEN}"),
-                      ("Financial Ratios",        f"{BASE}/financial-ratios/{SYMBOL}?token={TOKEN}"),
-                      ("Company Profile",         f"{BASE}/company/{SYMBOL}?token={TOKEN}"),
-                      ("Results Calendar",        f"{BASE}/exchange/results-calendar?token={TOKEN}"),
-                      ("Holiday Calendar",        f"{BASE}/exchange/holiday-calendar?token={TOKEN}"),
-                      ("Shareholding",            f"{BASE}/shareholdings/{SYMBOL}?token={TOKEN}"),
-                      ("Corporate Actions",       f"{BASE}/corporate-actions/{SYMBOL}?token={TOKEN}"),
+                  tests = [
+                      # Company
+                      ("Company Profile",          f"{BASE}/company-profile/{SYMBOL}?token={TOKEN}"),
+                      ("Segment Revenue",          f"{BASE}/segment-revenue/{SYMBOL}?token={TOKEN}"),
+                      ("Peers",                    f"{BASE}/peers/{SYMBOL}?token={TOKEN}"),
+
+                      # Financials
+                      ("Financials PL quarterly",  f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=pl&period=quarterly&token={TOKEN}"),
+                      ("Financials BS annual",     f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=bs&period=annual&token={TOKEN}"),
+                      ("Financials CF annual",     f"{BASE}/financials/{SYMBOL}?statement_type=c&statement_code=cf&period=annual&token={TOKEN}"),
+                      ("Financial Ratios",         f"{BASE}/ratios/{SYMBOL}?token={TOKEN}"),
+                      ("Financial Metrics",        f"{BASE}/financial-metrics/{SYMBOL}?token={TOKEN}"),
+                      ("Basic Financials",         f"{BASE}/basic-financials/{SYMBOL}?token={TOKEN}"),
+
+                      # Price
+                      ("OHLC Historical Adjusted", f"{BASE}/historical-adjusted-price/{SYMBOL}?token={TOKEN}"),
+                      ("Daily Quote",              f"{BASE}/daily-quotes/{SYMBOL}?token={TOKEN}"),
+                      ("Quote",                    f"{BASE}/quote?symbol={SYMBOL}&token={TOKEN}"),
+                      ("Daily Price Ratios",       f"{BASE}/daily-price-ratios/{SYMBOL}?token={TOKEN}"),
+
+                      # Shareholding
+                      ("Shareholding Pattern",     f"{BASE}/shareholdings/pattern/{SYMBOL}?token={TOKEN}"),
+
+                      # Corporate
+                      ("Corp Announcements",       f"{BASE}/corp-announcements?symbol={SYMBOL}&token={TOKEN}"),
+
+                      # Exchange
+                      ("Results Calendar",         f"{BASE}/results-calendar?token={TOKEN}"),
+                      ("Holiday Calendar",         f"{BASE}/holiday-calendar?token={TOKEN}"),
+                      ("Index Master",             f"{BASE}/index/master?token={TOKEN}"),
                   ]
 
-                  for name, url in endpoints:
+                  for name, url in tests:
                       await test(client, name, url)
-                      await asyncio.sleep(0.5)
+                      await asyncio.sleep(0.3)
+
+              print("\nDone!")
 
           asyncio.run(main())
           EOF
