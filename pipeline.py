@@ -18,7 +18,6 @@ Usage:
 """
 
 import asyncio
-import gzip
 import json
 import logging
 import os
@@ -54,9 +53,6 @@ RATE_DELAY   = 0.5
 
 HERE = Path(__file__).parent
 
-NSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-BSE_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
-
 with open(HERE / "nse_holidays.json") as f:
     NSE_HOLIDAYS: set[str] = set(json.load(f))
 
@@ -72,55 +68,42 @@ BSE_META:     dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════
-# INSTRUMENT MAP BUILDER
+# INSTRUMENT MAP BUILDER — master.json driven
 # ══════════════════════════════════════════════════════════════
 
 async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
-    log.info("Fetching instrument files from Upstox…")
-    nse_r, bse_r = await asyncio.gather(
-        client.get(NSE_INSTRUMENTS_URL, timeout=60),
-        client.get(BSE_INSTRUMENTS_URL, timeout=60),
-    )
+    """
+    R2 master.json se NSE + BSE stock list build karo.
+    Upstox instrument files fetch nahi hote — master.json single source of truth hai.
 
-    nse_data: list = json.loads(gzip.decompress(nse_r.content))
-    bse_data: list = json.loads(gzip.decompress(bse_r.content))
+    master.json exchange values:
+      "NSE"      → ISIN_MAP      (NSE_EQ pipeline)
+      "BSE Only" → BSE_ISIN_MAP  (BSE_EQ pipeline)
+    """
+    log.info("Fetching master.json from R2…")
+    master = await r2_download(client, "master.json")
 
-    nse_stocks: dict[str, str] = {}
-    for item in nse_data:
-        if (item.get("instrument_type") == "EQ"
-                and item.get("segment") == "NSE_EQ"
-                and item.get("isin")
-                and item.get("trading_symbol")
-                and str(item.get("security_type", "")).upper() == "NORMAL"):
-            sym  = item["trading_symbol"].strip().upper()
-            isin = item["isin"].strip()
-            nse_stocks[sym] = isin
+    if not master or not isinstance(master, list):
+        raise RuntimeError("master.json missing or invalid in R2 — push from Google Sheet first!")
 
-    nse_isins = set(nse_stocks.values())
+    nse_map:  dict[str, str]  = {}
+    bse_map:  dict[str, str]  = {}
+    bse_meta: dict[str, dict] = {}
 
-    BSE_EQUITY_TYPES = {"A", "B", "T", "XT", "X", "Z", "ZP", "R", "P"}
+    for stock in master:
+        sym      = str(stock.get("symbol",   "")).strip().upper()
+        isin     = str(stock.get("isin",     "")).strip()
+        exchange = str(stock.get("exchange", "")).strip()
+        name     = str(stock.get("name",     "")).strip()
 
-    bse_stocks: dict[str, str] = {}
-    bse_meta:   dict[str, dict] = {}
-    for item in bse_data:
-        if (item.get("segment") == "BSE_EQ"
-                and str(item.get("instrument_type", "")).upper() in BSE_EQUITY_TYPES
-                and item.get("isin")
-                and item.get("trading_symbol")):
-            sym  = item["trading_symbol"].strip().upper()
-            isin = item["isin"].strip()
-            bse_stocks[sym] = isin
-            bse_meta[isin]  = {
-                "name"        : item.get("name", ""),
-                "listing_date": item.get("listing_date", ""),
-            }
+        if not sym or not isin:
+            continue
 
-    nse_map = dict(nse_stocks)
-    bse_map = {
-        sym: isin
-        for sym, isin in bse_stocks.items()
-        if isin not in nse_isins
-    }
+        if exchange == "NSE":
+            nse_map[sym] = isin
+        elif exchange == "BSE Only":
+            bse_map[sym]  = isin
+            bse_meta[isin] = {"name": name}
 
     log.info(f"✓ NSE stocks : {len(nse_map)}")
     log.info(f"✓ BSE-only   : {len(bse_map)}")
@@ -597,13 +580,12 @@ async def fetch_one_fundamental(client, sem, sym, isin):
 
 async def fetch_one_bse_profile(client, sem, sym, isin, meta: dict):
     """BSE-only stocks ke liye sirf profile fetch karo."""
-    await asyncio.sleep(2.0)  # extra delay — BSE profile rate limit tight hai
+    await asyncio.sleep(2.0)
     profile = await fetch_company_profile(client, sem, isin)
     obj = {
         "symbol"             : sym,
         "updated"            : today_ist(),
         "name"               : meta.get("name", ""),
-        "listing_date"       : meta.get("listing_date", ""),
         "profile_sector"     : profile.get("profile_sector", "")      if profile else "",
         "profile_description": profile.get("profile_description", "") if profile else "",
     }
@@ -735,7 +717,7 @@ async def r2_upload(client: httpx.AsyncClient, filename: str, data: str | bytes)
     log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
 
 
-async def r2_download(client: httpx.AsyncClient, filename: str) -> dict | None:
+async def r2_download(client: httpx.AsyncClient, filename: str) -> dict | list | None:
     url = f"{WORKER_URL}/{filename}"
     r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
     if r.status_code == 404:
@@ -893,7 +875,7 @@ async def run_daily() -> None:
         for s in pruned:
             del all_data[s]
         if pruned:
-            log.info(f"🗑  Pruned {len(pruned)} delisted stocks")
+            log.info(f"🗑  Pruned {len(pruned)} delisted/removed stocks")
 
         total_new = 0
         delta: dict = {}
@@ -1007,7 +989,6 @@ async def run_full() -> None:
             pct = min(i + batch, len(symbols))
             log.info(f"  {pct}/{len(symbols)}  OK:{len(all_data)}  Failed:{len(failed)}")
 
-            # Checkpoint har 500 stocks pe
             if pct % 500 == 0:
                 log.info(f"  💾 Checkpoint upload at {pct} stocks…")
                 await upload_all_chunks(client, all_data, today)
@@ -1093,7 +1074,6 @@ async def run_fund_daily() -> None:
 
 
 async def run_fund_weekly(part: int = 0) -> None:
-    """NSE stocks ke liye full fundamentals — BSE profiles alag run_bse_profiles se."""
     today       = today_ist()
     TOTAL_PARTS = 10
 
@@ -1148,11 +1128,6 @@ async def run_fund_weekly(part: int = 0) -> None:
 # ══════════════════════════════════════════════════════════════
 
 async def run_bse_profiles(part: int = 0) -> None:
-    """
-    BSE-only stocks ke liye sirf company profiles fetch karo.
-    Alag pipeline — rate limit ke liye slow aur checkpoint wala.
-    Parts mein chalao: bse_profiles_1 se bse_profiles_10 tak.
-    """
     today       = today_ist()
     TOTAL_PARTS = 10
 
@@ -1175,7 +1150,6 @@ async def run_bse_profiles(part: int = 0) -> None:
         chunk = bse_syms[start_idx:end_idx]
         log.info(f"━━━ BSE Profiles {label}  {today}  ({len(chunk)} stocks) ━━━")
 
-        # Download existing — skip already fetched
         bse_raw  = await r2_download(client, "bse_profiles.json")
         bse_fund: dict = {}
         if isinstance(bse_raw, list):
@@ -1183,7 +1157,6 @@ async def run_bse_profiles(part: int = 0) -> None:
         elif isinstance(bse_raw, dict):
             bse_fund = bse_raw
 
-        # Sirf missing stocks fetch karo
         missing = [sym for sym in chunk if sym not in bse_fund]
         log.info(f"Already fetched: {len(chunk) - len(missing)}  Missing: {len(missing)}")
 
@@ -1191,8 +1164,8 @@ async def run_bse_profiles(part: int = 0) -> None:
             log.info("✅ All stocks already fetched — nothing to do")
             return
 
-        sem        = asyncio.Semaphore(1)  # strictly 1 at a time
-        batch_size = 20                    # small batches + checkpoint upload
+        sem        = asyncio.Semaphore(1)
+        batch_size = 20
         ok         = 0
         fail       = 0
 
@@ -1216,7 +1189,6 @@ async def run_bse_profiles(part: int = 0) -> None:
             pct = min(i + batch_size, len(missing))
             log.info(f"  {pct}/{len(missing)}  ✓{ok}  ✗{fail}")
 
-            # Checkpoint har 20 stocks pe — agar fail bhi ho toh progress save hoga
             await r2_upload(client, "bse_profiles.json",
                             json.dumps(list(bse_fund.values())))
             log.info(f"  💾 Checkpoint saved ({len(bse_fund)} total)")
@@ -1822,12 +1794,10 @@ async def run_ep_scan() -> None:
 # ══════════════════════════════════════════════════════════════
 
 def _calc_ema(closes: list, period: int) -> list:
-    """Simple EMA calculation."""
     if len(closes) < period:
         return [None] * len(closes)
     ema = [None] * len(closes)
     k = 2 / (period + 1)
-    # seed with SMA
     ema[period - 1] = sum(closes[:period]) / period
     for i in range(period, len(closes)):
         ema[i] = closes[i] * k + ema[i - 1] * (1 - k)
@@ -1842,19 +1812,6 @@ def _detect_pullback(
     ema_proximity_pct: float   = 1.0,
     max_candle_range_pct: float = 6.0,
 ) -> list[dict]:
-    """
-    Pullback scanner — Pine Script logic ka Python translation.
-
-    Conditions:
-    1. Swing High then Swing Low (uptrend sequence)
-    2. Swing range >= min_swing_range_pct
-    3. Pullback from swing high >= min_pullback_pct
-    4. Price near EMA10 or EMA21 (within ema_proximity_pct) OR reversal from EMA
-    5. EMA alignment: EMA21 > EMA50, EMA10 > EMA50, close > EMA21
-    6. EMA50 rising (last 5 bars)
-    7. Candle range < max_candle_range_pct
-    8. MACD: macd line >= signal line
-    """
     signals = []
 
     for sym, s in all_data.items():
@@ -1870,7 +1827,6 @@ def _detect_pullback(
         if not _check_liquidity(volumes, closes, n):
             continue
 
-        # ── EMAs ──────────────────────────────────────────────
         ema10 = _calc_ema(closes, 10)
         ema21 = _calc_ema(closes, 21)
         ema50 = _calc_ema(closes, 50)
@@ -1878,7 +1834,6 @@ def _detect_pullback(
         if any(v is None for v in [ema10[-1], ema21[-1], ema50[-1]]):
             continue
 
-        # ── MACD ──────────────────────────────────────────────
         ema12 = _calc_ema(closes, 12)
         ema26 = _calc_ema(closes, 26)
         macd_line = [
@@ -1888,25 +1843,20 @@ def _detect_pullback(
         macd_valid = [v for v in macd_line if v is not None]
         if len(macd_valid) < 9:
             continue
-        # signal line = EMA9 of macd_line (only valid values)
         macd_arr = [v if v is not None else 0.0 for v in macd_line]
         macd_signal = _calc_ema(macd_arr, 9)
 
-        # ── Pivot High/Low detection ───────────────────────────
-        # ta.pivothigh(length, length) — high is highest in window
         last_swing_high_price = None
         last_swing_high_bar   = None
         last_swing_low_price  = None
         last_swing_low_bar    = None
 
         for i in range(length_pull, n - length_pull):
-            # Pivot High
             if all(highs[i] >= highs[i - k] for k in range(1, length_pull + 1)) and \
                all(highs[i] >= highs[i + k] for k in range(1, length_pull + 1)):
                 last_swing_high_price = highs[i]
                 last_swing_high_bar   = i
 
-            # Pivot Low
             if all(lows[i] <= lows[i - k] for k in range(1, length_pull + 1)) and \
                all(lows[i] <= lows[i + k] for k in range(1, length_pull + 1)):
                 last_swing_low_price = lows[i]
@@ -1915,26 +1865,21 @@ def _detect_pullback(
         if last_swing_high_price is None or last_swing_low_price is None:
             continue
 
-        # ── Current bar (last candle) ──────────────────────────
         i = n - 1
 
-        # Gate 1: Swing sequence — high bar must come AFTER low bar
         if last_swing_high_bar is None or last_swing_low_bar is None:
             continue
         if last_swing_high_bar <= last_swing_low_bar:
             continue
 
-        # Gate 2: Swing range
         swing_range_pct = (last_swing_high_price - last_swing_low_price) / last_swing_low_price * 100
         if swing_range_pct < min_swing_range_pct:
             continue
 
-        # Gate 3: Pullback from swing high
         pullback_pct = (last_swing_high_price - lows[i]) / last_swing_high_price * 100
         if pullback_pct < min_pullback_pct:
             continue
 
-        # Gate 4: Near EMA10 or EMA21 OR reversal wick
         e10 = ema10[i]
         e21 = ema21[i]
         near_ema10 = (
@@ -1951,31 +1896,26 @@ def _detect_pullback(
         if not pullback_proximity:
             continue
 
-        # Gate 5: EMA alignment
         e50 = ema50[i]
         ema_alignment = e21 > e50 and e10 > e50 and closes[i] > e21
         if not ema_alignment:
             continue
 
-        # Gate 6: EMA50 rising last 5 bars
         if i < 5 or any(ema50[i - k] is None for k in range(6)):
             continue
         ema50_rising = all(ema50[i - k] > ema50[i - k - 1] for k in range(5))
         if not ema50_rising:
             continue
 
-        # Gate 7: Candle range
         candle_range_pct = (highs[i] - lows[i]) / lows[i] * 100 if lows[i] > 0 else 0
         if candle_range_pct >= max_candle_range_pct:
             continue
 
-        # Gate 8: MACD >= Signal
         if macd_line[i] is None or macd_signal[i] is None:
             continue
         if macd_line[i] < macd_signal[i]:
             continue
 
-        # ── EMA proximity type ─────────────────────────────────
         if reversal_ema10 or reversal_ema21:
             ema_touch = "Reversal"
         elif near_ema10:
@@ -2134,7 +2074,6 @@ async def run_hlr_scan() -> None:
         all_data = await download_all_chunks(client)
         log.info(f"Loaded {len(all_data)} stocks")
 
-        # ── HLR Scan ──────────────────────────────────────────
         hlr_signals = _detect_hlr(all_data)
         order = {"BO": 0, "Consolidating near HLR": 1, "Near HLR": 2}
         hlr_signals.sort(key=lambda x: (order.get(x["state"], 9), -x["touches"]))
@@ -2144,7 +2083,6 @@ async def run_hlr_scan() -> None:
         near   = sum(1 for s in hlr_signals if s["state"] == "Near HLR")
         log.info(f"HLR — BO: {bo}  Consolidating: {consol}  Near: {near}  Total: {len(hlr_signals)}")
 
-        # ── Pullback Scan ─────────────────────────────────────
         log.info("Scanning for Pullbacks…")
         pb_signals = _detect_pullback(all_data)
         pb_signals.sort(key=lambda x: x["pullback_pct"], reverse=True)
