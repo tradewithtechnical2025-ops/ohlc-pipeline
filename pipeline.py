@@ -268,6 +268,10 @@ async def _finedge_get(
                 log.warning("  Finedge rate limit — waiting 20s")
                 await asyncio.sleep(20)
                 continue
+            if r.status_code in (502, 503, 504):
+                log.warning(f"  Finedge {r.status_code} — retry {attempt+1}")
+                await asyncio.sleep(2 ** attempt)
+                continue
             if r.status_code != 200 or not r.text.strip():
                 return None
             try:
@@ -1024,12 +1028,26 @@ async def run_fund_full(part: int = 0) -> None:
         chunk = nse_symbols[start_idx:end_idx]
         log.info(f"━━━ Fund Full {label}  ({len(chunk)} NSE stocks) ━━━")
 
+        # ETFs skip karo — unke financials hote nahi
+        ETF_KEYWORDS = (
+            "ETF", "BEES", "LIQUID", "GILT", "GOLD", "SILVER",
+            "NIFTY", "BANKEX", "IETF", "MSCIN", "MMQS", "TOTAL",
+        )
+        def is_etf(sym: str) -> bool:
+            s = sym.upper()
+            return any(s.endswith(k) or k in s for k in ETF_KEYWORDS)
+
+        equity_chunk = [sym for sym in chunk if not is_etf(sym)]
+        skipped_etf  = len(chunk) - len(equity_chunk)
+        if skipped_etf:
+            log.info(f"Skipping {skipped_etf} ETFs — only equity stocks get fundamentals")
+
         log.info("Downloading existing fundamentals.json…")
         fund_data = await r2_download_fund(client)
 
         # Skip already fetched
-        missing = [sym for sym in chunk if sym not in fund_data]
-        already = len(chunk) - len(missing)
+        missing = [sym for sym in equity_chunk if sym not in fund_data]
+        already = len(equity_chunk) - len(missing)
         log.info(f"Already done: {already}  Remaining: {len(missing)}")
 
         if not missing:
