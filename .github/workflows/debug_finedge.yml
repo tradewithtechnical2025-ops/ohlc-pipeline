@@ -1,0 +1,74 @@
+name: Debug Finedge Endpoints
+
+on:
+  workflow_dispatch:
+
+env:
+  FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+
+jobs:
+  debug_finedge:
+    name: Debug failed endpoints
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install httpx
+
+      - name: Debug endpoints
+        run: |
+          python - <<'EOF'
+          import asyncio
+          import httpx
+          import os
+
+          TOKEN  = os.environ["FINEDGE_TOKEN"]
+          BASE   = "https://data.finedgeapi.com/api/v1"
+          SYMBOL = "ITC"
+
+          async def debug(client, name, url):
+              r = await client.get(url, timeout=15)
+              print(f"\n{'='*50}")
+              print(f"  {name}")
+              print(f"  Status  : {r.status_code}")
+              print(f"  Headers : {dict(r.headers)}")
+              print(f"  Body    : {r.text[:500]}")
+
+          async def main():
+              async with httpx.AsyncClient() as client:
+                  tests = [
+                      # Try different URL formats for OHLC
+                      ("OHLC v1",          f"{BASE}/historical-adjusted-price/{SYMBOL}?token={TOKEN}"),
+                      ("OHLC v2",          f"{BASE}/price/historical-adjusted/{SYMBOL}?token={TOKEN}"),
+                      ("OHLC v3",          f"{BASE}/stock/historical-price/{SYMBOL}?token={TOKEN}"),
+
+                      # Try different URL formats for profile
+                      ("Profile v1",       f"{BASE}/company/{SYMBOL}?token={TOKEN}"),
+                      ("Profile v2",       f"{BASE}/company/profile/{SYMBOL}?token={TOKEN}"),
+                      ("Profile v3",       f"{BASE}/stock-search?group=symbol&value={SYMBOL}&token={TOKEN}"),
+
+                      # Try different URL formats for ratios
+                      ("Ratios v1",        f"{BASE}/financial-ratios/{SYMBOL}?token={TOKEN}"),
+                      ("Ratios v2",        f"{BASE}/financials/ratios/{SYMBOL}?token={TOKEN}"),
+                      ("Ratios v3",        f"{BASE}/ratios/{SYMBOL}?token={TOKEN}"),
+
+                      # Try different URL formats for calendar
+                      ("Results Cal v1",   f"{BASE}/exchange/results-calendar?token={TOKEN}"),
+                      ("Results Cal v2",   f"{BASE}/results-calendar?token={TOKEN}"),
+                      ("Holiday Cal v1",   f"{BASE}/exchange/holiday-calendar?token={TOKEN}"),
+                      ("Holiday Cal v2",   f"{BASE}/holiday-calendar?token={TOKEN}"),
+
+                      # Shareholding
+                      ("Shareholding v1",  f"{BASE}/shareholdings/{SYMBOL}?token={TOKEN}"),
+                      ("Shareholding v2",  f"{BASE}/shareholding/{SYMBOL}?token={TOKEN}"),
+                  ]
+
+                  for name, url in tests:
+                      await debug(client, name, url)
+                      await asyncio.sleep(0.3)
+
+          asyncio.run(main())
+          EOF
