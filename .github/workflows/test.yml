@@ -1,0 +1,75 @@
+name: Test Master JSON
+
+on:
+  workflow_dispatch:
+
+env:
+  UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+  WORKER_URL:   ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+
+jobs:
+  test_master:
+    name: Test master.json load
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - run: pip install httpx
+
+      - name: Test master.json
+        run: |
+          python - <<'EOF'
+          import asyncio, httpx, os, json
+
+          WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
+          WORKER_TOKEN = os.environ["WORKER_TOKEN"]
+          HEADERS      = {"X-Secret-Token": WORKER_TOKEN}
+
+          async def test():
+              async with httpx.AsyncClient() as client:
+                  print("Fetching master.json from R2...")
+                  r = await client.get(f"{WORKER_URL}/master.json", headers=HEADERS, timeout=30)
+                  print(f"HTTP status : {r.status_code}")
+
+                  if r.status_code != 200:
+                      print(f"ERROR: {r.text}")
+                      raise SystemExit(1)
+
+                  data = r.json()
+                  print(f"Total stocks: {len(data)}")
+
+                  nse      = [s for s in data if s.get("exchange") == "NSE"]
+                  bse_only = [s for s in data if s.get("exchange") == "BSE Only"]
+                  other    = [s for s in data if s.get("exchange") not in ("NSE", "BSE Only")]
+
+                  print(f"NSE stocks  : {len(nse)}")
+                  print(f"BSE Only    : {len(bse_only)}")
+                  print(f"Other/blank : {len(other)}")
+
+                  if other:
+                      print(f"  Sample other: {[s.get('exchange') for s in other[:5]]}")
+
+                  if nse:
+                      print(f"\nNSE sample  : {nse[:2]}")
+                  if bse_only:
+                      print(f"BSE sample  : {bse_only[:2]}")
+
+                  # Check required fields
+                  missing = []
+                  for s in data[:10]:
+                      for field in ("symbol", "isin", "exchange", "sector", "industry"):
+                          if not s.get(field):
+                              missing.append(f"{s.get('symbol','?')} missing {field}")
+                  if missing:
+                      print(f"\n⚠ Missing fields: {missing}")
+                  else:
+                      print(f"\n✅ All required fields present in first 10 rows")
+
+          asyncio.run(test())
+          EOF
