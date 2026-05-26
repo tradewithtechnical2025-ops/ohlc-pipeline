@@ -178,6 +178,7 @@ async def fetch_one_fundamental(
                 "depreciation" : q.get("depreciationAndAmortisation"),
                 "finance_costs": q.get("financeCosts"),
                 "tax"          : q.get("taxExpense"),
+                "other_income" : q.get("otherIncome"),
             }
             for q in pl_qtr[:12]
         ]
@@ -198,6 +199,7 @@ async def fetch_one_fundamental(
                 "depreciation"    : q.get("depreciationAndAmortisation"),
                 "finance_costs"   : q.get("financeCosts"),
                 "dividend_payout" : div_payout_by_year.get(q.get("year")),
+                "other_income"    : q.get("otherIncome"),
             }
             for q in pl_ann[:5]
         ]
