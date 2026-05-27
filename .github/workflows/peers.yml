@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
   schedule:
-    # Every Sunday
     - cron: "0 4 * * 0"
 
 jobs:
@@ -12,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout Repo
         uses: actions/checkout@v4
 
@@ -26,6 +26,7 @@ jobs:
 
       - name: Run Peers Pipeline
         env:
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
 
