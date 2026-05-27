@@ -272,7 +272,11 @@ async def fetch_one(client, sem, symbol):
     )
 
     if not data:
-        return symbol, None
+
+        return symbol, {
+            "updated": datetime.now().strftime("%Y-%m-%d"),
+            "data": []
+        }
 
     try:
 
@@ -344,6 +348,13 @@ async def main():
             results = await asyncio.gather(*tasks)
 
             for sym, data in results:
+
+                if not data:
+
+                    data = {
+                        "updated": datetime.now().strftime("%Y-%m-%d"),
+                        "data": []
+                    }
 
                 output[sym] = data
 
