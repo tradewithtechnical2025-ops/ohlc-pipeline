@@ -75,6 +75,7 @@ async def finedge_get(client, sem, path, params):
             await asyncio.sleep(RATE_DELAY)
 
             try:
+
                 r = await client.get(
                     url,
                     params=params,
@@ -82,13 +83,19 @@ async def finedge_get(client, sem, path, params):
                 )
 
             except Exception as e:
+
                 print(f"Network Error: {e}")
+
                 await asyncio.sleep(2 ** attempt)
+
                 continue
 
             if r.status_code == 429:
+
                 print("429 Rate Limit")
+
                 await asyncio.sleep(15)
+
                 continue
 
             if r.status_code != 200:
@@ -107,12 +114,11 @@ async def finedge_get(client, sem, path, params):
 # Shareholding Parser
 # ─────────────────────────────────────────────
 
-def parse_shareholding(data):
+def parse_shareholding(symbol, data):
 
     rows = data.get("rows") or []
     cols = (data.get("columns") or [])[:8]
 
-    # safety
     if not rows or not cols:
 
         return {
@@ -124,27 +130,98 @@ def parse_shareholding(data):
             "public"   : [],
         }
 
-    def find_row(keywords):
+    # ─────────────────────────────────────────
+
+    def clean_text(v):
+        return str(v).lower().strip()
+
+    # ─────────────────────────────────────────
+
+    def find_row(targets):
 
         for row in rows:
 
-            text = (
-                f"{row.get('name','')} "
-                f"{row.get('catagory','')}"
-            ).lower()
+            name = clean_text(row.get("name"))
+            cat  = clean_text(row.get("catagory"))
 
-            if any(k in text for k in keywords):
+            text = f"{name} {cat}"
 
-                d = row.get("data") or {}
+            for t in targets:
 
-                return [d.get(q) for q in cols]
+                t = clean_text(t)
+
+                # exact match first
+                if name == t or cat == t:
+
+                    d = row.get("data") or {}
+
+                    return [d.get(q) for q in cols]
+
+                # contains fallback
+                if t in text:
+
+                    d = row.get("data") or {}
+
+                    return [d.get(q) for q in cols]
 
         return []
 
-    promoter = find_row(["promoter"])
-    fii      = find_row(["foreign", "fii"])
-    dii      = find_row(["domestic", "dii"])
-    public   = find_row(["public", "non-institutions"])
+    # ─────────────────────────────────────────
+    # Strict Matching
+    # ─────────────────────────────────────────
+
+    promoter = find_row([
+        "promoter indian",
+        "promoter"
+    ])
+
+    fii = find_row([
+        "institutions foreign",
+        "foreign institutions",
+        "foreign",
+        "fii"
+    ])
+
+    dii = find_row([
+        "institutions domestic",
+        "domestic institutions",
+        "domestic",
+        "dii"
+    ])
+
+    public = find_row([
+        "non institutions",
+        "non-institutions",
+        "public"
+    ])
+
+    # ─────────────────────────────────────────
+    # Validation
+    # ─────────────────────────────────────────
+
+    try:
+
+        total = (
+            (promoter[0] if promoter else 0) +
+            (fii[0] if fii else 0) +
+            (dii[0] if dii else 0) +
+            (public[0] if public else 0)
+        )
+
+        if total > 130:
+
+            print(
+                f"⚠ BAD DATA {symbol} | "
+                f"P={promoter[:1]} "
+                f"F={fii[:1]} "
+                f"D={dii[:1]} "
+                f"PUB={public[:1]}"
+            )
+
+    except Exception:
+        pass
+
+    # ─────────────────────────────────────────
 
     return {
         "updated"  : datetime.now().strftime("%Y-%m-%d"),
@@ -157,7 +234,7 @@ def parse_shareholding(data):
 
 
 # ─────────────────────────────────────────────
-# Fetch One Stock
+# Fetch One
 # ─────────────────────────────────────────────
 
 async def fetch_one(client, sem, symbol):
@@ -173,11 +250,15 @@ async def fetch_one(client, sem, symbol):
         return symbol, None
 
     try:
-        parsed = parse_shareholding(data)
+
+        parsed = parse_shareholding(symbol, data)
+
         return symbol, parsed
 
     except Exception as e:
+
         print(f"Parse Error {symbol}: {e}")
+
         return symbol, None
 
 
@@ -189,7 +270,10 @@ async def main():
 
     async with httpx.AsyncClient() as client:
 
-        master = await r2_download(client, "master.json")
+        master = await r2_download(
+            client,
+            "master.json"
+        )
 
         symbols = [
             x["symbol"]
@@ -217,10 +301,13 @@ async def main():
             for sym, data in results:
 
                 if data:
+
                     output[sym] = data
+
                     print(f"✓ {sym}")
 
                 else:
+
                     print(f"✗ {sym}")
 
             print(f"{min(i+25, total)}/{total}")
