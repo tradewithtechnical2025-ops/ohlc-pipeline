@@ -111,31 +111,72 @@ async def fetch_actions(client):
 
     today = datetime.now().date()
 
-    from_date = (
-        today - timedelta(days=30)
-    ).strftime("%d-%b-%Y")
+    start = today - timedelta(days=30)
+    end   = today + timedelta(days=90)
 
-    to_date = (
-        today + timedelta(days=90)
-    ).strftime("%d-%b-%Y")
+    all_rows = []
 
-    url = f"{FINEDGE_BASE}/corporate-actions/all"
+    current = start
 
-    params = {
-        "from_date": from_date,
-        "to_date": to_date,
-        "token": FINEDGE_TOKEN,
-    }
+    while current < end:
 
-    r = await client.get(
-        url,
-        params=params,
-        timeout=120,
-    )
+        chunk_end = min(
+            current + timedelta(days=29),
+            end
+        )
 
-    r.raise_for_status()
+        from_date = current.strftime(
+            "%d-%b-%Y"
+        )
 
-    return r.json()
+        to_date = chunk_end.strftime(
+            "%d-%b-%Y"
+        )
+
+        print(
+            f"Fetching {from_date} -> {to_date}"
+        )
+
+        url = f"{FINEDGE_BASE}/corporate-actions/all"
+
+        params = {
+            "from_date": from_date,
+            "to_date": to_date,
+            "token": FINEDGE_TOKEN,
+        }
+
+        try:
+
+            r = await client.get(
+                url,
+                params=params,
+                timeout=120,
+            )
+
+            if r.status_code != 200:
+
+                print(
+                    f"Failed: {from_date} -> {to_date}"
+                )
+
+                current = chunk_end + timedelta(days=1)
+                continue
+
+            data = r.json()
+
+            if isinstance(data, list):
+
+                all_rows.extend(data)
+
+        except Exception as e:
+
+            print(
+                f"Error {from_date} -> {to_date}: {e}"
+            )
+
+        current = chunk_end + timedelta(days=1)
+
+    return all_rows
 
 
 # ─────────────────────────────────────────────
