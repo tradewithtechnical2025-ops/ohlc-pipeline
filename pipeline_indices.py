@@ -110,7 +110,7 @@ def is_bad_index(symbol, index_name):
 
 
 # ─────────────────────────────────────────────
-# R2 Helpers
+# R2 Upload
 # ─────────────────────────────────────────────
 
 async def r2_upload(client, filename, data):
@@ -162,8 +162,12 @@ def parse_index_master(rows):
 
     for row in rows:
 
+        raw_symbol = str(
+            row.get("index_symbol", "")
+        ).strip()
+
         symbol = normalize_index_symbol(
-            row.get("index_symbol")
+            raw_symbol
         )
 
         if not symbol:
@@ -211,6 +215,8 @@ def parse_index_master(rows):
 
         output[symbol] = {
 
+            "api_symbol": raw_symbol,
+
             "name": row.get(
                 "index_name"
             ),
@@ -244,7 +250,7 @@ def parse_index_master(rows):
 
 
 # ─────────────────────────────────────────────
-# Index Daily Feed
+# Daily Feed
 # ─────────────────────────────────────────────
 
 async def fetch_index_daily(client):
@@ -414,12 +420,12 @@ def parse_index_returns(rows, valid_symbols):
 
 
 # ─────────────────────────────────────────────
-# Historical OHLC
+# Historical
 # ─────────────────────────────────────────────
 
 async def fetch_index_history_one(
     client,
-    symbol
+    api_symbol
 ):
 
     today = datetime.now().date()
@@ -435,7 +441,7 @@ async def fetch_index_history_one(
     url = f"{FINEDGE_BASE}/index/market-price/historical"
 
     params = {
-        "index_symbol": symbol,
+        "index_symbol": api_symbol,
         "from_date": from_date,
         "to_date": to_date,
         "token": FINEDGE_TOKEN,
@@ -451,25 +457,17 @@ async def fetch_index_history_one(
 
         if r.status_code != 200:
 
-            print(
-                f"✗ {symbol} | API error"
-            )
-
-            return symbol, []
+            return []
 
         data = r.json()
 
-        rows = data.get("rows") or []
+        return data.get(
+            "rows"
+        ) or []
 
-        return symbol, rows
+    except:
 
-    except Exception as e:
-
-        print(
-            f"✗ {symbol} | {e}"
-        )
-
-        return symbol, []
+        return []
 
 
 def parse_index_history(rows):
@@ -643,7 +641,7 @@ async def main():
         )
 
         symbols = sorted(
-            list(valid_symbols)
+            master_parsed.items()
         )
 
         total = len(symbols)
@@ -651,11 +649,11 @@ async def main():
         success = 0
         failed = 0
 
-        for i, symbol in enumerate(symbols, 1):
+        for i, (symbol, meta) in enumerate(symbols, 1):
 
-            sym, rows = await fetch_index_history_one(
+            rows = await fetch_index_history_one(
                 client,
-                symbol
+                meta["api_symbol"]
             )
 
             parsed = parse_index_history(
@@ -668,13 +666,13 @@ async def main():
 
                 print(
                     f"[{i}/{total}] "
-                    f"✗ {sym} | no data"
+                    f"✗ {symbol} | no data"
                 )
 
                 continue
 
             filename = (
-                f"index_history/{sym}.json"
+                f"index_history/{symbol}.json"
             )
 
             await r2_upload(
@@ -687,7 +685,7 @@ async def main():
 
             print(
                 f"[{i}/{total}] "
-                f"✓ {sym} "
+                f"✓ {symbol} "
                 f"| {len(parsed)} candles"
             )
 
