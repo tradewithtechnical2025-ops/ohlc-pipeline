@@ -54,7 +54,7 @@ CONCURRENCY      = 5
 FUND_CONCURRENCY = 4
 RETRY            = 3
 RATE_DELAY       = 0.5
-FINEDGE_DELAY    = 0.30    # safety with 13 calls/stock — ~300/min limit
+FINEDGE_DELAY    = 0.25    # safety with 13 calls/stock — ~300/min limit
 
 HERE = Path(__file__).parent
 
