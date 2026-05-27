@@ -81,22 +81,32 @@ async def finedge_get(client, sem, path, params):
                     timeout=30,
                 )
 
-            except Exception:
+            except Exception as e:
+
+                print(f"Network Error: {e}")
+
                 await asyncio.sleep(2 ** attempt)
+
                 continue
 
             if r.status_code == 429:
 
+                print("429 Rate Limit")
+
                 await asyncio.sleep(15)
+
                 continue
 
             if r.status_code != 200:
+
                 return None
 
             try:
+
                 return r.json()
 
             except Exception:
+
                 return None
 
     return None
@@ -114,11 +124,14 @@ def parse_peers(symbol, data):
 
     for p in peers_raw:
 
-        sym = (
+        if not isinstance(p, dict):
+            continue
+
+        sym = str(
             p.get("symbol")
             or p.get("ticker")
             or ""
-        ).strip()
+        ).strip().upper()
 
         if not sym:
             continue
@@ -131,10 +144,8 @@ def parse_peers(symbol, data):
     peers = list(dict.fromkeys(peers))[:10]
 
     return {
-        "sector"       : data.get("sector", ""),
-        "industry"     : data.get("industry", ""),
-        "sub_industry" : data.get("subIndustry", ""),
-        "peers"        : peers,
+        "group" : "sub_industry",
+        "peers" : peers
     }
 
 
@@ -147,13 +158,17 @@ async def fetch_one(client, sem, symbol):
     data = await finedge_get(
         client,
         sem,
-        f"stocks/peers/{symbol}",
+        f"peers/{symbol}",
         {
-            "filter": "sub_industry"
+            "group": "sub_industry"
         }
     )
 
-    if not data:
+    if (
+        not data
+        or not isinstance(data, dict)
+        or not data.get("data")
+    ):
         return symbol, None
 
     try:
@@ -188,6 +203,23 @@ async def main():
             if x.get("exchange") == "NSE"
         ]
 
+        # Remove ETF / Index Symbols
+        BAD_KEYWORDS = [
+            "ETF",
+            "LIQUID",
+            "NIFTY",
+            "GOLD",
+            "SILVER",
+            "NEXT50",
+            "MIDCAP",
+            "SMALLCAP",
+        ]
+
+        symbols = [
+            s for s in symbols
+            if not any(k in s for k in BAD_KEYWORDS)
+        ]
+
         sem = asyncio.Semaphore(CONCURRENCY)
 
         output = {}
@@ -215,7 +247,7 @@ async def main():
 
                 else:
 
-                    print(f"✗ {sym}")
+                    print(f"✗ {sym} | no peer data")
 
             print(f"{min(i+25, total)}/{total}")
 
