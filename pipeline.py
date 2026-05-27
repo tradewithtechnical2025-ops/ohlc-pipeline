@@ -37,6 +37,7 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)   # 400s suppress
 
 UPSTOX_TOKEN  = os.environ["UPSTOX_TOKEN"]
 WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
@@ -53,7 +54,7 @@ CONCURRENCY      = 5
 FUND_CONCURRENCY = 4
 RETRY            = 3
 RATE_DELAY       = 0.5
-FINEDGE_DELAY    = 0.25
+FINEDGE_DELAY    = 0.35    # safety with 13 calls/stock — ~300/min limit
 
 HERE = Path(__file__).parent
 
@@ -416,19 +417,62 @@ async def _finedge_profile(client, sem, sym) -> dict | None:
 
 
 async def _finedge_growth_metrics(client, sem, sym) -> dict | None:
-    """financial-metrics — revenue/eps/ebitda CAGR 3yr + 5yr."""
-    d = await _finedge_get(client, sem, f"financial-metrics/{sym}", {})
-    if not d:
-        return None
-    return d.get("financial_metrics") or {}
+    """financial-metrics?ratio_type=gr — revenue/eps/ebitda CAGR 3yr+5yr.
+       statement_type=c first, fallback s.
+    """
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"financial-metrics/{sym}",
+                               {"statement_type": stype, "ratio_type": "gr"})
+        fm = (d or {}).get("financial_metrics")
+        if fm:
+            return fm
+    return None
 
 
 async def _finedge_annual_price_ratios(client, sem, sym) -> list | None:
-    """annual-price-ratios — historical PE/PB/PS/PFCF per year."""
-    d = await _finedge_get(client, sem, f"annual-price-ratios/{sym}", {})
-    if not d:
-        return None
-    return d.get("price_ratios", [])
+    """annual-price-ratios — historical PE/PB/PS/PFCF per year.
+       statement_type=c first, fallback s.
+    """
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"annual-price-ratios/{sym}",
+                               {"statement_type": stype})
+        rows = (d or {}).get("price_ratios", [])
+        if rows:
+            return rows
+    return None
+
+
+async def _finedge_ratios_le(client, sem, sym) -> list | None:
+    """ratios?ratio_type=le — leverage: D/E, financial leverage, debt/assets."""
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}",
+                               {"statement_type": stype, "ratio_type": "le"})
+        rows = (d or {}).get("ratios", [])
+        if rows:
+            return rows
+    return None
+
+
+async def _finedge_ratios_li(client, sem, sym) -> list | None:
+    """ratios?ratio_type=li — liquidity: current ratio, quick ratio, interest coverage."""
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}",
+                               {"statement_type": stype, "ratio_type": "li"})
+        rows = (d or {}).get("ratios", [])
+        if rows:
+            return rows
+    return None
+
+
+async def _finedge_ratios_ef(client, sem, sym) -> list | None:
+    """ratios?ratio_type=ef — efficiency: asset turnover, CCC, inventory/debtor days."""
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}",
+                               {"statement_type": stype, "ratio_type": "ef"})
+        rows = (d or {}).get("ratios", [])
+        if rows:
+            return rows
+    return None
 
 
 async def fetch_one_fundamental(
@@ -438,16 +482,19 @@ async def fetch_one_fundamental(
     isin: str = "",
 ) -> tuple[str, dict | None]:
     """
-    10 parallel Finedge calls per stock:
-      1. P&L quarterly (12 qtrs)    2. P&L annual (5 yrs)
-      3. BS annual (5 yrs)          4. CF annual (5 yrs)
-      5. Basic financials (TTM)     6. Profitability ratios (5 yrs)
-      7. Shareholding (8 qtrs)      8. Company profile
-      9. Growth metrics (CAGR)     10. Annual price ratios
+    13 parallel Finedge calls per stock:
+      1. P&L quarterly      2. P&L annual
+      3. BS annual          4. CF annual
+      5. Basic financials   6. Profitability ratios (pr)
+      7. Shareholding       8. Company profile
+      9. Growth metrics    10. Annual price ratios
+     11. Leverage ratios   12. Liquidity ratios
+     13. Efficiency ratios
     """
     (pl_qtr, pl_ann, bs_ann, cf_ann,
      basic, prof_ratios, sh, profile,
-     growth, ann_pr) = await asyncio.gather(
+     growth, ann_pr,
+     ratios_le, ratios_li, ratios_ef) = await asyncio.gather(
         _finedge_financials(client, sem, sym, "pl", "quarterly"),
         _finedge_financials(client, sem, sym, "pl", "annual"),
         _finedge_financials(client, sem, sym, "bs", "annual"),
@@ -458,6 +505,9 @@ async def fetch_one_fundamental(
         _finedge_profile(client, sem, sym),
         _finedge_growth_metrics(client, sem, sym),
         _finedge_annual_price_ratios(client, sem, sym),
+        _finedge_ratios_le(client, sem, sym),
+        _finedge_ratios_li(client, sem, sym),
+        _finedge_ratios_ef(client, sem, sym),
     )
 
     if not any([pl_qtr, pl_ann, bs_ann, cf_ann]):
@@ -645,6 +695,54 @@ async def fetch_one_fundamental(
             }
             for r in ann_pr[:5]
             if r.get("year") and r.get("pe")
+        ]
+
+    # ── Leverage Ratios — 5 years ─────────────────────────────
+    if ratios_le:
+        obj["ratios_leverage"] = [
+            {
+                "header"            : r.get("header", ""),
+                "year"              : r.get("year"),
+                "de_ratio"          : r.get("totalDebtToEquity"),
+                "lt_de_ratio"       : r.get("longTermDebtToEquity"),
+                "financial_leverage": r.get("financialLeverage"),
+                "debt_to_assets"    : r.get("totalDebttoAssets"),
+                "debt_to_fcf"       : r.get("totalDebtTofcf"),
+            }
+            for r in ratios_le[:6]
+            if r.get("year") and r.get("header") != "TTM"
+        ]
+
+    # ── Liquidity Ratios — 5 years ────────────────────────────
+    if ratios_li:
+        obj["ratios_liquidity"] = [
+            {
+                "header"            : r.get("header", ""),
+                "year"              : r.get("year"),
+                "current_ratio"     : r.get("currentRatio"),
+                "quick_ratio"       : r.get("quickRatio"),
+                "interest_coverage" : r.get("interestCoverage"),
+            }
+            for r in ratios_li[:6]
+            if r.get("year") and r.get("header") != "TTM"
+        ]
+
+    # ── Efficiency Ratios — 5 years ───────────────────────────
+    if ratios_ef:
+        obj["ratios_efficiency"] = [
+            {
+                "header"                : r.get("header", ""),
+                "year"                  : r.get("year"),
+                "asset_turnover"        : r.get("assetTurnover"),
+                "inventory_turnover"    : r.get("inventoryTurnover"),
+                "receivable_turnover"   : r.get("receivableTurnover"),
+                "cash_conversion_cycle" : r.get("cashConversionCycle"),
+                "debtor_days"           : r.get("debtorDays"),
+                "inventory_days"        : r.get("inventoryDays"),
+                "days_payable"          : r.get("daysPayable"),
+            }
+            for r in ratios_ef[:6]
+            if r.get("year") and r.get("header") != "TTM"
         ]
 
     # ── Post-processing: derive from PL/BS ────────────────────
