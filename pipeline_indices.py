@@ -28,14 +28,85 @@ def normalize_index_symbol(v):
     v = str(v).upper().strip()
 
     REPLACE = {
+
         "NIF50": "NIFTY50",
         "NIFTY 50": "NIFTY50",
+
         "NIFTY BANK": "NIFTYBANK",
         "NIFTY IT": "NIFTYIT",
         "NIFTY AUTO": "NIFTYAUTO",
+
+        "NIFTY FMCG": "NIFTYFMCG",
+        "NIFTY PHARMA": "NIFTYPHARMA",
+
+        "NIFTY REALTY": "NIFTYREALTY",
+        "NIFTY METAL": "NIFTYMETAL",
     }
 
-    return REPLACE.get(v, v.replace(" ", ""))
+    return REPLACE.get(
+        v,
+        v.replace(" ", "")
+    )
+
+
+BAD_KEYWORDS = [
+
+    "2X",
+    "1X",
+
+    "INV",
+    "LEV",
+
+    "TRI",
+
+    "EQW",
+    "EQUAL",
+
+    "LOWVOL",
+    "ALPHA",
+    "QUALITY",
+
+    "MOM",
+    "MOMENTUM",
+
+    "ESG",
+
+    "VOL",
+
+    "MULT",
+    "QUA",
+    "VALUE",
+
+    "SHODUR",
+    "ENH",
+
+    "30T",
+    "50T",
+
+    "LIQ",
+    "VAR",
+
+    "BETA",
+]
+
+
+BAD_TYPES = {
+
+    "Strategy",
+    "Strategy Indices",
+    "Volatility",
+}
+
+
+def is_bad_index(symbol, index_name):
+
+    symbol = str(symbol).upper()
+    index_name = str(index_name).upper()
+
+    return any(
+        k in symbol or k in index_name
+        for k in BAD_KEYWORDS
+    )
 
 
 # ─────────────────────────────────────────────
@@ -54,26 +125,10 @@ async def r2_upload(client, filename, data):
     )
 
     if r.status_code != 200:
-        raise RuntimeError(f"{filename} upload failed")
 
-
-async def r2_download(client, filename):
-
-    url = f"{WORKER_URL}/{filename}"
-
-    r = await client.get(
-        url,
-        headers=WORKER_HEADERS,
-        timeout=300,
-    )
-
-    if r.status_code != 200:
-        return {}
-
-    try:
-        return r.json()
-    except:
-        return {}
+        raise RuntimeError(
+            f"{filename} upload failed"
+        )
 
 
 # ─────────────────────────────────────────────
@@ -103,6 +158,8 @@ def parse_index_master(rows):
 
     output = {}
 
+    skipped = 0
+
     for row in rows:
 
         symbol = normalize_index_symbol(
@@ -110,6 +167,46 @@ def parse_index_master(rows):
         )
 
         if not symbol:
+            skipped += 1
+            continue
+
+        index_name = str(
+            row.get("index_name", "")
+        )
+
+        index_sub_type = str(
+            row.get("index_sub_type", "")
+        )
+
+        constituents = row.get(
+            "constituents"
+        ) or []
+
+        # Remove noisy indices
+
+        if is_bad_index(
+            symbol,
+            index_name
+        ):
+            skipped += 1
+            continue
+
+        # Remove bad types
+
+        if index_sub_type in BAD_TYPES:
+            skipped += 1
+            continue
+
+        # Remove empty
+
+        if not constituents:
+            skipped += 1
+            continue
+
+        # Remove tiny/synthetic
+
+        if len(constituents) < 5:
+            skipped += 1
             continue
 
         output[symbol] = {
@@ -118,9 +215,7 @@ def parse_index_master(rows):
                 "index_name"
             ),
 
-            "type": row.get(
-                "index_sub_type"
-            ),
+            "type": index_sub_type,
 
             "index_type": row.get(
                 "index_type"
@@ -134,10 +229,16 @@ def parse_index_master(rows):
                 "description"
             ),
 
-            "constituents": row.get(
-                "constituents", []
-            ),
+            "constituents": constituents,
         }
+
+    print(
+        f"✓ Clean indices: {len(output)}"
+    )
+
+    print(
+        f"✓ Removed noisy indices: {skipped}"
+    )
 
     return output
 
@@ -165,9 +266,11 @@ async def fetch_index_daily(client):
     return r.json()
 
 
-def parse_index_daily(rows):
+def parse_index_daily(rows, valid_symbols):
 
     output = {}
+
+    skipped = 0
 
     for row in rows:
 
@@ -175,7 +278,8 @@ def parse_index_daily(rows):
             row.get("index_symbol")
         )
 
-        if not symbol:
+        if symbol not in valid_symbols:
+            skipped += 1
             continue
 
         output[symbol] = {
@@ -220,18 +324,22 @@ def parse_index_daily(rows):
                 "market_cap"
             ),
 
-            "pe": row.get(
-                "pe"
-            ),
+            "pe": row.get("pe"),
 
-            "pb": row.get(
-                "pb"
-            ),
+            "pb": row.get("pb"),
 
             "div_yield": row.get(
                 "div_yield"
             ),
         }
+
+    print(
+        f"✓ Daily feed indices: {len(output)}"
+    )
+
+    print(
+        f"✓ Skipped noisy daily feed: {skipped}"
+    )
 
     return output
 
@@ -259,7 +367,7 @@ async def fetch_index_returns(client):
     return r.json()
 
 
-def parse_index_returns(rows):
+def parse_index_returns(rows, valid_symbols):
 
     output = {}
 
@@ -274,13 +382,16 @@ def parse_index_returns(rows):
         "10Y",
     ]
 
+    skipped = 0
+
     for row in rows:
 
         symbol = normalize_index_symbol(
             row.get("index_symbol")
         )
 
-        if not symbol:
+        if symbol not in valid_symbols:
+            skipped += 1
             continue
 
         item = {}
@@ -291,11 +402,19 @@ def parse_index_returns(rows):
 
         output[symbol] = item
 
+    print(
+        f"✓ Returns indices: {len(output)}"
+    )
+
+    print(
+        f"✓ Skipped noisy returns: {skipped}"
+    )
+
     return output
 
 
 # ─────────────────────────────────────────────
-# Index Historical
+# Historical OHLC
 # ─────────────────────────────────────────────
 
 async def fetch_index_history_one(
@@ -331,19 +450,32 @@ async def fetch_index_history_one(
         )
 
         if r.status_code != 200:
+
+            print(
+                f"✗ {symbol} | API error"
+            )
+
             return symbol, []
 
         data = r.json()
 
-        return symbol, data.get(
-            "rows", []
+        rows = data.get("rows") or []
+
+        return symbol, rows
+
+    except Exception as e:
+
+        print(
+            f"✗ {symbol} | {e}"
         )
 
-    except:
         return symbol, []
 
 
 def parse_index_history(rows):
+
+    if not rows:
+        return []
 
     parsed = []
 
@@ -399,20 +531,43 @@ async def main():
 
     async with httpx.AsyncClient() as client:
 
+        print(
+            "\n================================="
+        )
+
+        print(
+            " INDEX PIPELINE STARTED"
+        )
+
+        print(
+            "=================================\n"
+        )
+
         # ─────────────────────────
         # Index Master
         # ─────────────────────────
 
         print(
-            "\n=== Index Master ==="
+            "=== INDEX MASTER ==="
         )
 
         master_rows = await fetch_index_master(
             client
         )
 
+        if isinstance(master_rows, dict):
+
+            master_rows = master_rows.get(
+                "data",
+                []
+            )
+
         master_parsed = parse_index_master(
             master_rows
+        )
+
+        valid_symbols = set(
+            master_parsed.keys()
         )
 
         await r2_upload(
@@ -422,15 +577,15 @@ async def main():
         )
 
         print(
-            "✅ index_master.json uploaded"
+            "✅ index_master.json uploaded\n"
         )
 
         # ─────────────────────────
-        # Index Daily Feed
+        # Daily Feed
         # ─────────────────────────
 
         print(
-            "\n=== Index Daily Feed ==="
+            "=== INDEX DAILY FEED ==="
         )
 
         daily_rows = await fetch_index_daily(
@@ -438,7 +593,8 @@ async def main():
         )
 
         daily_parsed = parse_index_daily(
-            daily_rows
+            daily_rows,
+            valid_symbols
         )
 
         await r2_upload(
@@ -448,15 +604,15 @@ async def main():
         )
 
         print(
-            "✅ index_daily.json uploaded"
+            "✅ index_daily.json uploaded\n"
         )
 
         # ─────────────────────────
-        # Index Returns
+        # Returns
         # ─────────────────────────
 
         print(
-            "\n=== Index Returns ==="
+            "=== INDEX RETURNS ==="
         )
 
         returns_rows = await fetch_index_returns(
@@ -464,7 +620,8 @@ async def main():
         )
 
         returns_parsed = parse_index_returns(
-            returns_rows
+            returns_rows,
+            valid_symbols
         )
 
         await r2_upload(
@@ -474,20 +631,25 @@ async def main():
         )
 
         print(
-            "✅ index_returns.json uploaded"
+            "✅ index_returns.json uploaded\n"
         )
 
         # ─────────────────────────
-        # Historical OHLC
+        # Historical
         # ─────────────────────────
 
         print(
-            "\n=== Index Historical ==="
+            "=== INDEX HISTORICAL ==="
         )
 
-        symbols = list(
-            master_parsed.keys()
+        symbols = sorted(
+            list(valid_symbols)
         )
+
+        total = len(symbols)
+
+        success = 0
+        failed = 0
 
         for i, symbol in enumerate(symbols, 1):
 
@@ -500,6 +662,17 @@ async def main():
                 rows
             )
 
+            if not parsed:
+
+                failed += 1
+
+                print(
+                    f"[{i}/{total}] "
+                    f"✗ {sym} | no data"
+                )
+
+                continue
+
             filename = (
                 f"index_history/{sym}.json"
             )
@@ -510,13 +683,36 @@ async def main():
                 parsed
             )
 
+            success += 1
+
             print(
+                f"[{i}/{total}] "
                 f"✓ {sym} "
-                f"({i}/{len(symbols)})"
+                f"| {len(parsed)} candles"
             )
 
         print(
-            "\n✅ All Index History Uploaded"
+            "\n================================="
+        )
+
+        print(
+            " INDEX PIPELINE COMPLETED"
+        )
+
+        print(
+            "================================="
+        )
+
+        print(
+            f"\n✅ Success: {success}"
+        )
+
+        print(
+            f"❌ Failed : {failed}"
+        )
+
+        print(
+            f"📦 Total  : {total}\n"
         )
 
 
