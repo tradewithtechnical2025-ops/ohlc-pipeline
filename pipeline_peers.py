@@ -1,12 +1,20 @@
+#!/usr/bin/env python3
+
 import asyncio
 import json
 import os
-from collections import defaultdict
 
 import httpx
 
-WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
-WORKER_TOKEN = os.environ["WORKER_TOKEN"]
+FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
+WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
+
+FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
+
+CONCURRENCY = 5
+RATE_DELAY  = 0.20
+RETRY       = 3
 
 WORKER_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
@@ -15,14 +23,18 @@ WORKER_HEADERS = {
 
 
 # ─────────────────────────────────────────────
-# Helpers
+# R2 Helpers
 # ─────────────────────────────────────────────
 
 async def r2_download(client, filename):
 
     url = f"{WORKER_URL}/{filename}"
 
-    r = await client.get(url, headers=WORKER_HEADERS)
+    r = await client.get(
+        url,
+        headers=WORKER_HEADERS,
+        timeout=120,
+    )
 
     if r.status_code != 200:
         raise RuntimeError(f"{filename} download failed")
@@ -46,6 +58,118 @@ async def r2_upload(client, filename, data):
 
 
 # ─────────────────────────────────────────────
+# Finedge Helper
+# ─────────────────────────────────────────────
+
+async def finedge_get(client, sem, path, params):
+
+    params["token"] = FINEDGE_TOKEN
+
+    url = f"{FINEDGE_BASE}/{path}"
+
+    async with sem:
+
+        for attempt in range(RETRY):
+
+            await asyncio.sleep(RATE_DELAY)
+
+            try:
+
+                r = await client.get(
+                    url,
+                    params=params,
+                    timeout=30,
+                )
+
+            except Exception:
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+            if r.status_code == 429:
+
+                await asyncio.sleep(15)
+                continue
+
+            if r.status_code != 200:
+                return None
+
+            try:
+                return r.json()
+
+            except Exception:
+                return None
+
+    return None
+
+
+# ─────────────────────────────────────────────
+# Parse Peers
+# ─────────────────────────────────────────────
+
+def parse_peers(symbol, data):
+
+    peers_raw = data.get("data") or []
+
+    peers = []
+
+    for p in peers_raw:
+
+        sym = (
+            p.get("symbol")
+            or p.get("ticker")
+            or ""
+        ).strip()
+
+        if not sym:
+            continue
+
+        if sym == symbol:
+            continue
+
+        peers.append(sym)
+
+    peers = list(dict.fromkeys(peers))[:10]
+
+    return {
+        "sector"       : data.get("sector", ""),
+        "industry"     : data.get("industry", ""),
+        "sub_industry" : data.get("subIndustry", ""),
+        "peers"        : peers,
+    }
+
+
+# ─────────────────────────────────────────────
+# Fetch One
+# ─────────────────────────────────────────────
+
+async def fetch_one(client, sem, symbol):
+
+    data = await finedge_get(
+        client,
+        sem,
+        f"stocks/peers/{symbol}",
+        {
+            "filter": "sub_industry"
+        }
+    )
+
+    if not data:
+        return symbol, None
+
+    try:
+
+        parsed = parse_peers(symbol, data)
+
+        return symbol, parsed
+
+    except Exception as e:
+
+        print(f"Parse Error {symbol}: {e}")
+
+        return symbol, None
+
+
+# ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
 
@@ -53,49 +177,52 @@ async def main():
 
     async with httpx.AsyncClient() as client:
 
-        master = await r2_download(client, "master.json")
+        master = await r2_download(
+            client,
+            "master.json"
+        )
 
-        industry_map = defaultdict(list)
+        symbols = [
+            x["symbol"]
+            for x in master
+            if x.get("exchange") == "NSE"
+        ]
 
-        for stock in master:
+        sem = asyncio.Semaphore(CONCURRENCY)
 
-            sym = stock.get("symbol")
+        output = {}
 
-            industry = (
-                stock.get("industry")
-                or stock.get("sector")
-                or "Unknown"
-            )
+        total = len(symbols)
 
-            industry_map[industry].append(sym)
+        for i in range(0, total, 25):
 
-        peers = {}
+            batch = symbols[i:i+25]
 
-        for stock in master:
+            tasks = [
+                fetch_one(client, sem, s)
+                for s in batch
+            ]
 
-            sym = stock.get("symbol")
+            results = await asyncio.gather(*tasks)
 
-            industry = (
-                stock.get("industry")
-                or stock.get("sector")
-                or "Unknown"
-            )
+            for sym, data in results:
 
-            peer_list = [
-                x for x in industry_map[industry]
-                if x != sym
-            ][:10]
+                if data:
 
-            peers[sym] = {
-                "sector"   : stock.get("sector", ""),
-                "industry" : industry,
-                "peers"    : peer_list,
-            }
+                    output[sym] = data
+
+                    print(f"✓ {sym}")
+
+                else:
+
+                    print(f"✗ {sym}")
+
+            print(f"{min(i+25, total)}/{total}")
 
         await r2_upload(
             client,
             "peers.json",
-            peers
+            output
         )
 
         print("✅ peers.json uploaded")
