@@ -122,18 +122,21 @@ def parse_shareholding(symbol, data):
     if not rows or not cols:
 
         return {
-            "updated"  : datetime.now().strftime("%Y-%m-%d"),
-            "quarters" : [],
-            "promoter" : [],
-            "fii"      : [],
-            "dii"      : [],
-            "public"   : [],
+            "updated": datetime.now().strftime("%Y-%m-%d"),
+            "data": []
         }
 
     # ─────────────────────────────────────────
 
     def clean_text(v):
         return str(v).lower().strip()
+
+    def clean_num(v):
+
+        try:
+            return round(float(v), 2)
+        except:
+            return 0
 
     # ─────────────────────────────────────────
 
@@ -178,14 +181,12 @@ def parse_shareholding(symbol, data):
     fii = find_row([
         "institutions foreign",
         "foreign institutions",
-        "foreign",
         "fii"
     ])
 
     dii = find_row([
         "institutions domestic",
         "domestic institutions",
-        "domestic",
         "dii"
     ])
 
@@ -196,26 +197,54 @@ def parse_shareholding(symbol, data):
     ])
 
     # ─────────────────────────────────────────
+    # Build Final Structured Output
+    # ─────────────────────────────────────────
+
+    structured = []
+
+    for i, q in enumerate(cols):
+
+        structured.append({
+
+            "quarter": q,
+
+            "promoter": clean_num(
+                promoter[i] if i < len(promoter) else 0
+            ),
+
+            "fii": clean_num(
+                fii[i] if i < len(fii) else 0
+            ),
+
+            "dii": clean_num(
+                dii[i] if i < len(dii) else 0
+            ),
+
+            "public": clean_num(
+                public[i] if i < len(public) else 0
+            ),
+        })
+
+    # ─────────────────────────────────────────
     # Validation
     # ─────────────────────────────────────────
 
     try:
 
+        latest = structured[0]
+
         total = (
-            (promoter[0] if promoter else 0) +
-            (fii[0] if fii else 0) +
-            (dii[0] if dii else 0) +
-            (public[0] if public else 0)
+            latest["promoter"] +
+            latest["fii"] +
+            latest["dii"] +
+            latest["public"]
         )
 
         if total > 130:
 
             print(
                 f"⚠ BAD DATA {symbol} | "
-                f"P={promoter[:1]} "
-                f"F={fii[:1]} "
-                f"D={dii[:1]} "
-                f"PUB={public[:1]}"
+                f"{latest}"
             )
 
     except Exception:
@@ -224,12 +253,8 @@ def parse_shareholding(symbol, data):
     # ─────────────────────────────────────────
 
     return {
-        "updated"  : datetime.now().strftime("%Y-%m-%d"),
-        "quarters" : cols,
-        "promoter" : promoter,
-        "fii"      : fii,
-        "dii"      : dii,
-        "public"   : public,
+        "updated": datetime.now().strftime("%Y-%m-%d"),
+        "data": structured
     }
 
 
@@ -259,7 +284,10 @@ async def fetch_one(client, sem, symbol):
 
         print(f"Parse Error {symbol}: {e}")
 
-        return symbol, None
+        return symbol, {
+            "updated": datetime.now().strftime("%Y-%m-%d"),
+            "data": []
+        }
 
 
 # ─────────────────────────────────────────────
@@ -281,6 +309,23 @@ async def main():
             if x.get("exchange") == "NSE"
         ]
 
+        # Remove ETF / Index Symbols
+        BAD_KEYWORDS = [
+            "ETF",
+            "LIQUID",
+            "NIFTY",
+            "GOLD",
+            "SILVER",
+            "NEXT50",
+            "MIDCAP",
+            "SMALLCAP",
+        ]
+
+        symbols = [
+            s for s in symbols
+            if not any(k in s for k in BAD_KEYWORDS)
+        ]
+
         sem = asyncio.Semaphore(CONCURRENCY)
 
         output = {}
@@ -300,15 +345,15 @@ async def main():
 
             for sym, data in results:
 
-                if data:
+                output[sym] = data
 
-                    output[sym] = data
+                if data.get("data"):
 
                     print(f"✓ {sym}")
 
                 else:
 
-                    print(f"✗ {sym}")
+                    print(f"• {sym} | empty shareholding")
 
             print(f"{min(i+25, total)}/{total}")
 
