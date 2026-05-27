@@ -1,8 +1,9 @@
+#!/usr/bin/env python3
+
 import asyncio
 import json
 import os
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 
@@ -12,11 +13,9 @@ WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
-CONCURRENCY  = 4
-RATE_DELAY   = 0.25
-RETRY        = 3
-
-HERE = Path(__file__).parent
+CONCURRENCY = 4
+RATE_DELAY  = 0.25
+RETRY       = 3
 
 WORKER_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
@@ -25,12 +24,18 @@ WORKER_HEADERS = {
 
 
 # ─────────────────────────────────────────────
-# Helpers
+# R2 Helpers
 # ─────────────────────────────────────────────
 
 async def r2_download(client, filename):
+
     url = f"{WORKER_URL}/{filename}"
-    r = await client.get(url, headers=WORKER_HEADERS)
+
+    r = await client.get(
+        url,
+        headers=WORKER_HEADERS,
+        timeout=120,
+    )
 
     if r.status_code != 200:
         raise RuntimeError(f"{filename} download failed")
@@ -39,6 +44,7 @@ async def r2_download(client, filename):
 
 
 async def r2_upload(client, filename, data):
+
     url = f"{WORKER_URL}?file={filename}"
 
     r = await client.post(
@@ -52,24 +58,36 @@ async def r2_upload(client, filename, data):
         raise RuntimeError(f"{filename} upload failed")
 
 
+# ─────────────────────────────────────────────
+# Finedge Helper
+# ─────────────────────────────────────────────
+
 async def finedge_get(client, sem, path, params):
+
     params["token"] = FINEDGE_TOKEN
 
     url = f"{FINEDGE_BASE}/{path}"
 
     async with sem:
+
         for attempt in range(RETRY):
 
             await asyncio.sleep(RATE_DELAY)
 
             try:
-                r = await client.get(url, params=params, timeout=30)
+                r = await client.get(
+                    url,
+                    params=params,
+                    timeout=30,
+                )
 
-            except Exception:
+            except Exception as e:
+                print(f"Network Error: {e}")
                 await asyncio.sleep(2 ** attempt)
                 continue
 
             if r.status_code == 429:
+                print("429 Rate Limit")
                 await asyncio.sleep(15)
                 continue
 
@@ -78,6 +96,7 @@ async def finedge_get(client, sem, path, params):
 
             try:
                 return r.json()
+
             except Exception:
                 return None
 
@@ -90,8 +109,20 @@ async def finedge_get(client, sem, path, params):
 
 def parse_shareholding(data):
 
-    rows = data.get("rows", [])
-    cols = data.get("columns", [])[:8]
+    rows = data.get("rows") or []
+    cols = (data.get("columns") or [])[:8]
+
+    # safety
+    if not rows or not cols:
+
+        return {
+            "updated"  : datetime.now().strftime("%Y-%m-%d"),
+            "quarters" : [],
+            "promoter" : [],
+            "fii"      : [],
+            "dii"      : [],
+            "public"   : [],
+        }
 
     def find_row(keywords):
 
@@ -104,16 +135,16 @@ def parse_shareholding(data):
 
             if any(k in text for k in keywords):
 
-                d = row.get("data", {})
+                d = row.get("data") or {}
 
                 return [d.get(q) for q in cols]
 
         return []
 
     promoter = find_row(["promoter"])
-    fii       = find_row(["foreign", "fii"])
-    dii       = find_row(["domestic", "dii"])
-    public    = find_row(["public", "non-institutions"])
+    fii      = find_row(["foreign", "fii"])
+    dii      = find_row(["domestic", "dii"])
+    public   = find_row(["public", "non-institutions"])
 
     return {
         "updated"  : datetime.now().strftime("%Y-%m-%d"),
@@ -126,7 +157,7 @@ def parse_shareholding(data):
 
 
 # ─────────────────────────────────────────────
-# Fetch One
+# Fetch One Stock
 # ─────────────────────────────────────────────
 
 async def fetch_one(client, sem, symbol):
@@ -141,9 +172,13 @@ async def fetch_one(client, sem, symbol):
     if not data:
         return symbol, None
 
-    parsed = parse_shareholding(data)
+    try:
+        parsed = parse_shareholding(data)
+        return symbol, parsed
 
-    return symbol, parsed
+    except Exception as e:
+        print(f"Parse Error {symbol}: {e}")
+        return symbol, None
 
 
 # ─────────────────────────────────────────────
@@ -166,7 +201,9 @@ async def main():
 
         output = {}
 
-        for i in range(0, len(symbols), 25):
+        total = len(symbols)
+
+        for i in range(0, total, 25):
 
             batch = symbols[i:i+25]
 
@@ -186,7 +223,7 @@ async def main():
                 else:
                     print(f"✗ {sym}")
 
-            print(f"{min(i+25, len(symbols))}/{len(symbols)}")
+            print(f"{min(i+25, total)}/{total}")
 
         await r2_upload(
             client,
