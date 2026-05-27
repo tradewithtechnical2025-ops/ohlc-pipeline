@@ -60,11 +60,32 @@ VALID_TYPES = {
 }
 
 
+KEYWORDS = [
+    "presentation",
+    "transcript",
+    "concall",
+    "conference call",
+    "earnings call",
+    "analyst meet",
+    "investor meet",
+]
+
+
 def normalize_type(v):
 
     v = str(v).strip().lower()
 
     return TYPE_MAP.get(v, v.title())
+
+
+def clean_float(v):
+
+    try:
+        return float(
+            str(v).replace(",", "")
+        )
+    except:
+        return 0
 
 
 # ─────────────────────────────────────────────
@@ -335,19 +356,100 @@ def parse_results_calendar(rows):
 
 
 # ─────────────────────────────────────────────
-# Filings
+# IPO Calendar
 # ─────────────────────────────────────────────
 
-KEYWORDS = [
-    "presentation",
-    "transcript",
-    "concall",
-    "conference call",
-    "earnings call",
-    "analyst meet",
-    "investor meet",
-]
+async def fetch_ipo_calendar(client):
 
+    today = datetime.now().date()
+
+    from_date = (
+        today - timedelta(days=7)
+    ).strftime("%Y-%m-%d")
+
+    to_date = (
+        today + timedelta(days=30)
+    ).strftime("%Y-%m-%d")
+
+    url = f"{FINEDGE_BASE}/ipo-calendar"
+
+    params = {
+        "from_date": from_date,
+        "to_date": to_date,
+        "token": FINEDGE_TOKEN,
+    }
+
+    r = await client.get(
+        url,
+        params=params,
+        timeout=120,
+    )
+
+    r.raise_for_status()
+
+    data = r.json()
+
+    return data.get("data", [])
+
+
+def parse_ipo_calendar(rows):
+
+    output = {}
+
+    for row in rows:
+
+        symbol = str(
+            row.get("symbol", "")
+        ).strip().upper()
+
+        if not symbol:
+            continue
+
+        output[symbol] = {
+
+            "name": row.get(
+                "company_name"
+            ),
+
+            "status": row.get(
+                "ipo_status"
+            ),
+
+            "start_date": row.get(
+                "start_date"
+            ),
+
+            "end_date": row.get(
+                "end_date"
+            ),
+
+            "price_range": row.get(
+                "price_range"
+            ),
+
+            "issue_size": row.get(
+                "issue_size"
+            ),
+
+            "subscription": clean_float(
+                row.get("subscription")
+            ),
+
+            "security_type": row.get(
+                "security_type"
+            ),
+
+            "exchange": row.get(
+                "exchange"
+            ),
+        }
+
+    return output
+
+
+# ─────────────────────────────────────────────
+# Filings
+# ─────────────────────────────────────────────
 
 async def fetch_filings_chunk(
     client,
@@ -587,6 +689,32 @@ async def main():
 
         print(
             "✅ Results Calendar Uploaded"
+        )
+
+        # ─────────────────────────
+        # IPO Calendar
+        # ─────────────────────────
+
+        print(
+            "\n=== IPO Calendar ==="
+        )
+
+        ipo_rows = await fetch_ipo_calendar(
+            client
+        )
+
+        ipo_parsed = parse_ipo_calendar(
+            ipo_rows
+        )
+
+        await r2_upload(
+            client,
+            "ipo_calendar.json",
+            ipo_parsed
+        )
+
+        print(
+            "✅ IPO Calendar Uploaded"
         )
 
         # ─────────────────────────
