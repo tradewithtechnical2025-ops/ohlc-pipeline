@@ -55,6 +55,8 @@ FUND_CONCURRENCY = 4
 RETRY            = 3
 RATE_DELAY       = 0.5
 FINEDGE_DELAY    = 0.25    # safety with 13 calls/stock — ~300/min limit
+TODAY_CONCURRENCY = 10
+TODAY_RATE_DELAY  = 0.4
 
 HERE = Path(__file__).parent
 
@@ -205,7 +207,7 @@ async def fetch_today_candle(
 
     for attempt in range(RETRY):
         async with sem:
-            await asyncio.sleep(RATE_DELAY)
+            await asyncio.sleep(TODAY_RATE_DELAY)
             try:
                 r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
             except httpx.RequestError:
@@ -1025,8 +1027,6 @@ async def run_daily() -> None:
             r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
         )
     log.info("━━━ Daily complete ━━━")
-
-
 async def run_today() -> None:
     today = today_ist()
     if not is_trading_day(today):
@@ -1034,24 +1034,36 @@ async def run_today() -> None:
         return
 
     log.info(f"━━━ Today (v3 intraday)  {today} ━━━")
-    sem = asyncio.Semaphore(CONCURRENCY)
+    sem = asyncio.Semaphore(TODAY_CONCURRENCY)
 
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
 
-        nse_tasks = [fetch_today_candle(client, sem, sym, ISIN_MAP[sym], "NSE_EQ") for sym in ISIN_MAP]
-        bse_tasks = [fetch_today_candle(client, sem, sym, BSE_ISIN_MAP[sym], "BSE_EQ") for sym in BSE_ISIN_MAP]
-
-        nse_results, bse_results = await asyncio.gather(
-            asyncio.gather(*nse_tasks),
-            asyncio.gather(*bse_tasks),
+        all_tasks = (
+            [fetch_today_candle(client, sem, sym, ISIN_MAP[sym], "NSE_EQ") for sym in ISIN_MAP] +
+            [fetch_today_candle(client, sem, sym, BSE_ISIN_MAP[sym], "BSE_EQ") for sym in BSE_ISIN_MAP]
         )
+        total = len(all_tasks)
+        log.info(f"Fetching {total} stocks (NSE: {len(ISIN_MAP)}  BSE: {len(BSE_ISIN_MAP)})")
 
-        fetched = {sym: c for sym, c in [*nse_results, *bse_results] if c}
-        log.info(f"✓ {len(fetched)} have today's candle")
+        # Chunk download runs in background while fetching
+        chunk_task = asyncio.create_task(download_all_chunks(client))
 
-        all_data = await download_all_chunks(client)
+        # Live progress via as_completed
+        fetched: dict = {}
+        done = 0
+        for coro in asyncio.as_completed(all_tasks):
+            sym, c = await coro
+            done += 1
+            if c:
+                fetched[sym] = c
+            if done % 500 == 0 or done == total:
+                log.info(f"  ⏳ {done}/{total}  ✓{len(fetched)}  ✗{done - len(fetched)}")
+
+        log.info(f"✓ {len(fetched)} have today's candle  ✗ {total - len(fetched)} no data")
+
+        all_data = await chunk_task
         for sym, c in fetched.items():
             upsert_candle(all_data, sym, c)
 
@@ -1062,6 +1074,8 @@ async def run_today() -> None:
         )
         log.info(f"✅ delta: {len(delta)} stocks with today's candle")
     log.info("━━━ Today complete ━━━")
+
+
 
 
 async def run_full() -> None:
