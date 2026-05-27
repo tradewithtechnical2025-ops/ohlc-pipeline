@@ -148,33 +148,56 @@ def parse_peers(symbol, data):
 
 async def fetch_one(client, sem, symbol):
 
-    data = await finedge_get(
-        client,
-        sem,
-        f"peers/{symbol}",
-        {
-            "group": "sub_industry"
-        }
-    )
+    groups = [
+        "sub_industry",
+        "industry",
+        "sector"
+    ]
 
-    if (
-        not data
-        or not isinstance(data, dict)
-        or not data.get("peers")
-    ):
-        return symbol, None
+    for grp in groups:
 
-    try:
+        data = await finedge_get(
+            client,
+            sem,
+            f"peers/{symbol}",
+            {
+                "group": grp
+            }
+        )
 
-        parsed = parse_peers(symbol, data)
+        if (
+            not data
+            or not isinstance(data, dict)
+        ):
+            continue
 
-        return symbol, parsed
+        peers = data.get("peers") or []
 
-    except Exception as e:
+        if not peers:
+            continue
 
-        print(f"Parse Error {symbol}: {e}")
+        try:
 
-        return symbol, None
+            parsed = parse_peers(symbol, data)
+
+            parsed["group"] = grp
+
+            return symbol, parsed
+
+        except Exception as e:
+
+            print(f"Parse Error {symbol}: {e}")
+
+            return symbol, {
+                "group": grp,
+                "peers": []
+            }
+
+    # Final fallback
+    return symbol, {
+        "group": "none",
+        "peers": []
+    }
 
 
 # ─────────────────────────────────────────────
