@@ -118,20 +118,13 @@ async def finedge_get(client, sem, path, params):
 
 def parse_peers(symbol, data):
 
-    peers_raw = data.get("data") or []
+    peers_raw = data.get("peers") or []
 
     peers = []
 
-    for p in peers_raw:
+    for sym in peers_raw:
 
-        if not isinstance(p, dict):
-            continue
-
-        sym = str(
-            p.get("symbol")
-            or p.get("ticker")
-            or ""
-        ).strip().upper()
+        sym = str(sym).strip().upper()
 
         if not sym:
             continue
@@ -144,8 +137,8 @@ def parse_peers(symbol, data):
     peers = list(dict.fromkeys(peers))[:10]
 
     return {
-        "group" : "sub_industry",
-        "peers" : peers
+        "group": "sub_industry",
+        "peers": peers
     }
 
 
@@ -167,7 +160,7 @@ async def fetch_one(client, sem, symbol):
     if (
         not data
         or not isinstance(data, dict)
-        or not data.get("data")
+        or not data.get("peers")
     ):
         return symbol, None
 
