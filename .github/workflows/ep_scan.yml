@@ -2,8 +2,7 @@ name: EP Scan
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '45 10 * * 1-5'   # 4:15 PM IST
+  
 
 jobs:
   ep_scan:
