@@ -1545,54 +1545,137 @@ def _build_rs_history_json(all_data,rs_data):
 # ══════════════════════════════════════════════════════════════
 # SECTOR RS HISTORY
 # ══════════════════════════════════════════════════════════════
-def _build_sector_rs_history(classification, rs_data, all_data, history_days=60):
-    sector_map = {}
-    for s in classification:
-        sym    = s.get("symbol")
-        sector = s.get("sector")
-        if not sym or not sector:
-            continue
-        sector_map.setdefault(sector, []).append(sym)
 
-    # Reconstruct date labels from all_data (same logic as _build_rs_history_json)
-    sample_sym  = max(all_data.keys(), key=lambda s: len(all_data[s].get("d", [])))
-    dates       = all_data[sample_sym]["d"]
-    n           = len(dates)
-    history_len = history_days + 1
-    start_idx   = n - history_len
+def _build_group_rs_history(
+    classification,
+    rs_history_json,
+    field_name,
+):
+
+    # =====================================================
+    # GROUP MAP
+    # =====================================================
+
+    group_map = {}
+
+    for s in classification:
+
+        sym = s.get("symbol")
+
+        group = s.get(field_name)
+
+        if not sym or not group:
+            continue
+
+        group_map.setdefault(
+            group,
+            []
+        ).append(sym)
+
+    # =====================================================
+    # DATE COLUMNS
+    # =====================================================
+
+    sample = rs_history_json[0]
+
+    date_cols = [
+
+        k for k in sample.keys()
+
+        if k != "Stock Name"
+    ]
 
     output = []
-    for i in range(history_len):
-        date_idx = start_idx + i
-        if not (0 <= date_idx < n):
-            continue
-        dt = dates[date_idx]
 
-        sectors = {}
-        for sector, syms in sector_map.items():
-            valid = rs60 = rs70 = rs80 = rs90 = 0
+    # =====================================================
+    # DATE LOOP
+    # =====================================================
+
+    for dt in date_cols:
+
+        stocks = {}
+
+        for row in rs_history_json:
+
+            sym = row.get("Stock Name")
+
+            rs = row.get(dt)
+
+            if sym and rs is not None:
+
+                stocks[sym] = rs
+
+        groups = {}
+
+        for group, syms in group_map.items():
+
+            valid = 0
+
+            rs60 = 0
+            rs70 = 0
+            rs80 = 0
+            rs90 = 0
+
             for sym in syms:
-                hist = rs_data.get(sym, {}).get("history", [])
-                if i >= len(hist) or hist[i] is None:
+
+                rs = stocks.get(sym)
+
+                if rs is None:
                     continue
-                rs = hist[i]
+
                 valid += 1
-                if rs >= 60: rs60 += 1
-                if rs >= 70: rs70 += 1
-                if rs >= 80: rs80 += 1
-                if rs >= 90: rs90 += 1
-            if valid == 0:
+
+                if rs >= 60:
+                    rs60 += 1
+
+                if rs >= 70:
+                    rs70 += 1
+
+                if rs >= 80:
+                    rs80 += 1
+
+                if rs >= 90:
+                    rs90 += 1
+
+            # REMOVE TINY GROUPS
+            if valid < 5:
                 continue
-            sectors[sector] = {
+
+            groups[group] = {
+
                 "stocks": valid,
-                "rs60":   round(rs60 / valid * 100, 1),
-                "rs70":   round(rs70 / valid * 100, 1),
-                "rs80":   round(rs80 / valid * 100, 1),
-                "rs90":   round(rs90 / valid * 100, 1),
+
+                "rs60": round(
+                    rs60 / valid * 100,
+                    1
+                ),
+
+                "rs70": round(
+                    rs70 / valid * 100,
+                    1
+                ),
+
+                "rs80": round(
+                    rs80 / valid * 100,
+                    1
+                ),
+
+                "rs90": round(
+                    rs90 / valid * 100,
+                    1
+                ),
             }
-        output.append({"date": dt, "sectors": sectors})
+
+        output.append({
+
+            "date": dt,
+
+            "groups": groups
+        })
 
     return output
+
+
 
 
 def _calculate_mswing(all_data,history_days=60):
@@ -1712,12 +1795,25 @@ async def run_ep_scan() -> None:
             client,
             "classification.json"
         )
-
-        sector_rs_history = _build_sector_rs_history(
+        
+        macro_sector_rs_history = _build_group_rs_history(
             classification,
-            rs_data,
-            all_data,
+            rs_history_list,
+            "macro_sector"
         )
+
+        industry_rs_history = _build_group_rs_history(
+            classification,
+            rs_history_list,
+            "industry"
+        )
+
+        sector_rs_history = _build_group_rs_history(
+            classification,
+            rs_history_list,
+            "sector"
+        )
+      
 
 
         mswing_data = _calculate_mswing(all_data, history_days=ROLLING_DAYS - 50)
