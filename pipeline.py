@@ -994,10 +994,10 @@ async def run_daily() -> None:
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-
-        nse_tasks = [fetch_ohlc(client, sem, sym, ISIN_MAP[sym], prev, today, "NSE_EQ") for sym in ISIN_MAP]
-        bse_tasks = [fetch_ohlc(client, sem, sym, BSE_ISIN_MAP[sym], prev, today, "BSE_EQ") for sym in BSE_ISIN_MAP]
-
+        from_year = int(cutoff[:4])
+        to_year   = int(today[:4])
+        nse_tasks = [fetch_ohlc(client, sem, sym, from_year, to_year) for sym in ISIN_MAP]
+        bse_tasks = [fetch_ohlc(client, sem, sym, from_year, to_year) for sym in BSE_ISIN_MAP]
         nse_results, bse_results = await asyncio.gather(
             asyncio.gather(*nse_tasks),
             asyncio.gather(*bse_tasks),
