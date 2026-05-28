@@ -307,6 +307,7 @@ async def main():
         output = {}
         total  = len(symbols)
 
+        failed    = []   # symbols to retry
         preserved = 0
         updated   = 0
         empty     = 0
@@ -331,30 +332,63 @@ async def main():
                     print(f"  ✓ {sym}")
 
                 elif sym in existing and existing[sym].get("data"):
-                    # API failed / empty → preserve existing
+                    # API failed → preserve existing, schedule retry
                     output[sym] = existing[sym]
                     preserved += 1
-                    print(f"  ↺ {sym} | empty response — keeping existing")
+                    failed.append(sym)
+                    print(f"  ↺ {sym} | preserved — will retry")
 
                 else:
-                    # No data anywhere
+                    # No data anywhere, schedule retry
                     output[sym] = {
                         "updated": datetime.now().strftime("%Y-%m-%d"),
                         "data": []
                     }
                     empty += 1
-                    print(f"  • {sym} | no data")
+                    failed.append(sym)
+                    print(f"  • {sym} | no data — will retry")
 
             print(f"── {min(i + 25, total)}/{total} done ──")
+
+        # ── Retry Pass ───────────────────────
+        retry_ok = 0
+
+        if failed:
+
+            print(f"\n🔄 Retrying {len(failed)} failed symbols...")
+            await asyncio.sleep(5)
+
+            for i in range(0, len(failed), 25):
+
+                batch = failed[i:i + 25]
+
+                tasks = [
+                    fetch_one(client, sem, s)
+                    for s in batch
+                ]
+
+                results = await asyncio.gather(*tasks)
+
+                for sym, data in results:
+
+                    if data and data.get("data"):
+                        output[sym] = data
+                        retry_ok += 1
+                        print(f"  ✓ {sym} (retry ok)")
+                    else:
+                        print(f"  ✗ {sym} (retry failed — keeping existing)")
+
+            print(f"  Retry recovered: {retry_ok}/{len(failed)}")
 
         # ── Upload ───────────────────────────
         await r2_upload(client, "shareholding.json", output)
 
         print(
             f"\n✅ shareholding.json uploaded\n"
-            f"   Updated:   {updated}\n"
-            f"   Preserved: {preserved}\n"
+            f"   Updated:   {updated + retry_ok}\n"
+            f"   Preserved: {preserved + empty - retry_ok}\n"
             f"   Empty:     {empty}\n"
+            f"   Retry OK:  {retry_ok}/{len(failed)}\n"
             f"   Total:     {len(output)}"
         )
 
