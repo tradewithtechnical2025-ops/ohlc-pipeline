@@ -1814,8 +1814,6 @@ async def run_ep_scan() -> None:
             "sector"
         )
       
-
-
         mswing_data = _calculate_mswing(all_data, history_days=ROLLING_DAYS - 50)
         mswing_list = _build_mswing_json(all_data, mswing_data)
         for sig in signals:
@@ -1830,6 +1828,8 @@ async def run_ep_scan() -> None:
             r2_upload(client, "mswing.json",              json.dumps(mswing_list)),
             r2_upload(client, "post_result_signals.json", json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
             r2_upload( client, "sector_rs_history.json",  json.dumps(sector_rs_history) ),
+            r2_upload(client,  "macro_sector_rs_history.json",json.dumps(macro_sector_rs_history)),
+            r2_upload(client, "industry_rs_history.json",     json.dumps(industry_rs_history)),
         )
         log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS+MSwing:{len(rs_data)}")
     log.info("━━━ EP + Post-Result Scan complete ━━━")
