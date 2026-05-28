@@ -1575,12 +1575,26 @@ def _build_sector_rs_history(
     # =====================================================
     # DAILY LOOP
     # =====================================================
+    sample = rs_history_json[0]["history"]
+    
 
-    for row in rs_history_json:
 
-        dt = row["date"]
+    for i in range(len(sample)):
 
-        stocks = row["stocks"]
+        dt = sample[i]["date"]
+
+        stocks = {}
+
+        for row in rs_history_json:
+
+            sym = row["symbol"]
+
+            hist = row["history"]
+
+            if i >= len(hist):
+                continue
+
+            stocks[sym] = hist[i]["rs"]
 
         sectors = {}
 
