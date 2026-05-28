@@ -1,28 +1,23 @@
-# Final `.github/workflows/master.yml`
-
 ```yaml
 name: Master Pipeline
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "0 2 1 * *"
+    - cron: '0 2 1 * *'
 
 jobs:
-
   master:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout Repo
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install Dependencies
         run: |
@@ -31,7 +26,6 @@ jobs:
       - name: Run Master Pipeline
         env:
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
 
