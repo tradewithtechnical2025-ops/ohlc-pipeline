@@ -1,5 +1,3 @@
-# Final `pipeline_master.py`
-
 ```python
 #!/usr/bin/env python3
 
@@ -27,11 +25,6 @@ RETRY = 3
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
-}
-
-WORKER_HEADERS = {
-    "X-Secret-Token": WORKER_TOKEN,
-    "Content-Type": "application/json",
 }
 
 # =========================================================
@@ -154,17 +147,25 @@ async def r2_upload(client, filename, data):
 
     url = f"{WORKER_URL}?file={filename}"
 
+    payload = json.dumps(data)
+
     r = await client.post(
         url,
-        headers=WORKER_HEADERS,
-        content=json.dumps(data).encode(),
+        headers={
+            "X-Secret-Token": WORKER_TOKEN,
+            "Content-Type": "application/json",
+        },
+        content=payload.encode(),
         timeout=120,
     )
 
     if r.status_code != 200:
+
         raise RuntimeError(
-            f"{filename} upload failed"
+            f"{filename} upload failed: {r.status_code}"
         )
+
+    print(f"✅ Uploaded {filename}")
 
 
 # =========================================================
@@ -181,6 +182,7 @@ async def fetch_symbols(client):
     )
 
     if not data:
+
         raise RuntimeError(
             "stock-symbols fetch failed"
         )
@@ -210,6 +212,7 @@ def build_master(data):
     for idx, stock in enumerate(data, start=1):
 
         if not is_valid_stock(stock):
+
             skipped += 1
             continue
 
@@ -284,7 +287,7 @@ async def main():
         )
 
         print()
-        print("✅ master.json uploaded")
+        print("🎉 master.json uploaded")
 
 
 if __name__ == "__main__":
