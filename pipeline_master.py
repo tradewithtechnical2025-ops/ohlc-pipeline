@@ -1,6 +1,6 @@
-# pipeline_master.py
+```python
+#!/usr/bin/env python3
 
-```python id="f8q0za"
 import asyncio
 import json
 import os
@@ -12,14 +12,28 @@ import httpx
 # CONFIG
 # =========================================================
 
-TOKEN = os.getenv("FINEDGE_TOKEN")
+FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 
-STOCK_SYMBOLS_API = (
-    f"https://data.finedgeapi.com/api/v1/stock-symbols"
-    f"?token={TOKEN}"
-)
+FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 OUTPUT_FILE = "master.json"
+
+CONCURRENCY = 5
+RATE_DELAY  = 0.20
+RETRY       = 3
+
+# =========================================================
+# R2 CONFIG
+# =========================================================
+
+R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
+R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY_ID"]
+R2_SECRET_KEY = os.environ["R2_SECRET_ACCESS_KEY"]
+R2_BUCKET     = os.environ["R2_BUCKET"]
+
+# =========================================================
+# HEADERS
+# =========================================================
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -29,18 +43,29 @@ HEADERS = {
 # FILTERS
 # =========================================================
 
-EXCLUDE_KEYWORDS = [
+BAD_KEYWORDS = [
+
+    "ETF",
+    "BEES",
+
+    "LIQUID",
 
     "NIFTY",
     "SENSEX",
-    "ETF",
-    "BEES",
-    "LIQUID",
+
     "GOLD",
     "SILVER",
+
     "INDEX",
+
+    "NEXT50",
+    "MIDCAP",
+    "SMALLCAP",
 ]
 
+# =========================================================
+# HELPERS
+# =========================================================
 
 def is_valid_stock(stock):
 
@@ -58,7 +83,7 @@ def is_valid_stock(stock):
     if not name:
         return False
 
-    for keyword in EXCLUDE_KEYWORDS:
+    for keyword in BAD_KEYWORDS:
 
         if keyword in symbol:
             return False
@@ -70,20 +95,79 @@ def is_valid_stock(stock):
 
 
 # =========================================================
-# FETCH STOCKS
+# FINEDGE GET
 # =========================================================
 
-async def fetch_stocks(client):
+async def finedge_get(client, path):
+
+    url = f"{FINEDGE_BASE}/{path}"
+
+    params = {
+        "token": FINEDGE_TOKEN
+    }
+
+    for attempt in range(RETRY):
+
+        await asyncio.sleep(RATE_DELAY)
+
+        try:
+
+            r = await client.get(
+                url,
+                params=params,
+                timeout=60,
+            )
+
+        except Exception as e:
+
+            print(f"Network Error: {e}")
+
+            await asyncio.sleep(2 ** attempt)
+
+            continue
+
+        if r.status_code == 429:
+
+            print("429 Rate Limit")
+
+            await asyncio.sleep(15)
+
+            continue
+
+        if r.status_code != 200:
+
+            print(f"HTTP {r.status_code}")
+
+            return None
+
+        try:
+
+            return r.json()
+
+        except Exception:
+
+            return None
+
+    return None
+
+
+# =========================================================
+# FETCH STOCK SYMBOLS
+# =========================================================
+
+async def fetch_symbols(client):
 
     print("Fetching stock universe...")
 
-    r = await client.get(
-        STOCK_SYMBOLS_API
+    data = await finedge_get(
+        client,
+        "stock-symbols"
     )
 
-    r.raise_for_status()
-
-    data = r.json()
+    if not data:
+        raise RuntimeError(
+            "stock-symbols fetch failed"
+        )
 
     print(f"Fetched {len(data)} symbols")
 
@@ -103,9 +187,9 @@ def build_master(data):
 
     master = []
 
-    total = len(data)
-
     skipped = 0
+
+    total = len(data)
 
     for idx, stock in enumerate(data, start=1):
 
@@ -113,12 +197,19 @@ def build_master(data):
             skipped += 1
             continue
 
-        symbol = stock.get("symbol")
+        symbol = str(
+            stock.get("symbol")
+        ).strip().upper()
 
         if symbol in seen:
             continue
 
         seen.add(symbol)
+
+        nse_code = stock.get("nse_code")
+        bse_code = stock.get("bse_code")
+
+        exchange = "NSE" if nse_code else "BSE"
 
         item = {
 
@@ -126,9 +217,11 @@ def build_master(data):
 
             "name": stock.get("name"),
 
-            "bse_code": stock.get("bse_code"),
+            "exchange": exchange,
 
-            "nse_code": stock.get("nse_code"),
+            "bse_code": bse_code,
+
+            "nse_code": nse_code,
 
             "consolidated_ind": stock.get(
                 "consolidated_ind",
@@ -151,7 +244,7 @@ def build_master(data):
 
 
 # =========================================================
-# SAVE
+# SAVE JSON
 # =========================================================
 
 def save_json(data, filename):
@@ -175,19 +268,11 @@ def save_json(data, filename):
 
 def upload_to_r2(filepath):
 
-    account_id = os.getenv("R2_ACCOUNT_ID")
-
-    access_key = os.getenv("R2_ACCESS_KEY_ID")
-
-    secret_key = os.getenv("R2_SECRET_ACCESS_KEY")
-
-    bucket = os.getenv("R2_BUCKET")
-
     s3 = boto3.client(
         "s3",
-        endpoint_url=f"https://{account_id}.r2.cloudflarestorage.com",
-        aws_access_key_id=access_key,
-        aws_secret_access_key=secret_key,
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY,
         region_name="auto"
     )
 
@@ -195,7 +280,7 @@ def upload_to_r2(filepath):
 
     s3.upload_file(
         filepath,
-        bucket,
+        R2_BUCKET,
         filename,
         ExtraArgs={
             "ContentType": "application/json"
@@ -212,13 +297,16 @@ def upload_to_r2(filepath):
 async def main():
 
     async with httpx.AsyncClient(
-        timeout=60,
         headers=HEADERS
     ) as client:
 
-        data = await fetch_stocks(client)
+        data = await fetch_symbols(
+            client
+        )
 
-        master = build_master(data)
+        master = build_master(
+            data
+        )
 
         save_json(
             master,
