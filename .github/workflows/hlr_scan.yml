@@ -1,8 +1,7 @@
 name: HLR Scan
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '50 10 * * 1-5'   # 4:20 PM IST
+  
 jobs:
   hlr_scan:
     runs-on: ubuntu-latest
