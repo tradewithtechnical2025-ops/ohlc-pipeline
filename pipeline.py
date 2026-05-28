@@ -1771,7 +1771,7 @@ async def run_ep_scan() -> None:
 
         sector_rs_history = _build_sector_rs_history(
             classification,
-            rs_history
+            rs_history_list
         )
 
 
