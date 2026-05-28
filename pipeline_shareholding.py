@@ -84,7 +84,7 @@ async def finedge_get(client, sem, path, params):
 
             except Exception as e:
 
-                print(f"Network Error: {e}")
+                print(f"  Network Error: {e}")
 
                 await asyncio.sleep(2 ** attempt)
 
@@ -92,7 +92,7 @@ async def finedge_get(client, sem, path, params):
 
             if r.status_code == 429:
 
-                print("429 Rate Limit")
+                print("  429 Rate Limit — waiting 15s")
 
                 await asyncio.sleep(15)
 
@@ -111,6 +111,60 @@ async def finedge_get(client, sem, path, params):
 
 
 # ─────────────────────────────────────────────
+# Category → Field Mapping
+#
+#   catagory (API typo)  →  our field
+#   ─────────────────────────────────────────
+#   "Indian"             →  promoter  (Promoter Indian)
+#   "Foreign"            →  promoter  (Promoter Foreign, += to total)
+#   "InstitutionsForeign"→  fii
+#   "InstitutionsDomestic"→  dii
+#   "Goverments"         →  govt      (separate, not merged into DII)
+#   "NonInstitutions"    →  public
+# ─────────────────────────────────────────────
+
+CATEGORY_MAP = {
+    "indian":               "promoter",
+    "foreign":              "promoter",
+    "institutionsforeign":  "fii",
+    "institutionsdomestic": "dii",
+    "goverments":           "govt",
+    "noninstitutions":      "public",
+}
+
+FIELDS = ["promoter", "fii", "dii", "govt", "public"]
+
+
+def get_field(catagory, name):
+
+    # Primary: catagory-based (most reliable)
+    field = CATEGORY_MAP.get(catagory.lower().strip())
+
+    if field:
+        return field
+
+    # Fallback: name-based (catches API variants)
+    name_l = name.lower().strip()
+
+    if "promoter" in name_l:
+        return "promoter"
+
+    if "foreign" in name_l and "institution" in name_l:
+        return "fii"
+
+    if "domestic" in name_l and "institution" in name_l:
+        return "dii"
+
+    if "government" in name_l or "govt" in name_l:
+        return "govt"
+
+    if "non-institution" in name_l or "noninstitution" in name_l:
+        return "public"
+
+    return None
+
+
+# ─────────────────────────────────────────────
 # Shareholding Parser
 # ─────────────────────────────────────────────
 
@@ -120,137 +174,65 @@ def parse_shareholding(symbol, data):
     cols = (data.get("columns") or [])[:8]
 
     if not rows or not cols:
-
         return {
             "updated": datetime.now().strftime("%Y-%m-%d"),
             "data": []
         }
 
-    # ─────────────────────────────────────────
+    # Per-quarter accumulator
+    # Using += so Promoter Indian + Promoter Foreign both add correctly
+    quarter_data = {
+        q: {f: 0.0 for f in FIELDS}
+        for q in cols
+    }
 
-    def clean_text(v):
-        return str(v).lower().strip()
+    for row in rows:
 
-    def clean_num(v):
+        cat   = row.get("catagory", "")
+        name  = row.get("name",     "")
+        field = get_field(cat, name)
 
-        try:
-            return round(float(v), 2)
-        except:
-            return 0
+        if not field:
+            continue
 
-    # ─────────────────────────────────────────
+        d = row.get("data") or {}
 
-    def find_row(targets):
+        for q in cols:
 
-        for row in rows:
+            val = d.get(q)
 
-            name = clean_text(row.get("name"))
-            cat  = clean_text(row.get("catagory"))
+            if val is None:
+                continue
 
-            text = f"{name} {cat}"
+            try:
+                quarter_data[q][field] += float(val)
+            except Exception:
+                pass
 
-            for t in targets:
-
-                t = clean_text(t)
-
-                # exact match first
-                if name == t or cat == t:
-
-                    d = row.get("data") or {}
-
-                    return [d.get(q) for q in cols]
-
-                # contains fallback
-                if t in text:
-
-                    d = row.get("data") or {}
-
-                    return [d.get(q) for q in cols]
-
-        return []
-
-    # ─────────────────────────────────────────
-    # Strict Matching
-    # ─────────────────────────────────────────
-
-    promoter = find_row([
-        "promoter indian",
-        "promoter"
-    ])
-
-    fii = find_row([
-        "institutions foreign",
-        "foreign institutions",
-        "fii"
-    ])
-
-    dii = find_row([
-        "institutions domestic",
-        "domestic institutions",
-        "dii"
-    ])
-
-    public = find_row([
-        "non institutions",
-        "non-institutions",
-        "public"
-    ])
-
-    # ─────────────────────────────────────────
-    # Build Final Structured Output
-    # ─────────────────────────────────────────
-
+    # Build structured output
     structured = []
 
-    for i, q in enumerate(cols):
+    for q in cols:
 
-        structured.append({
+        entry = {"quarter": q}
 
-            "quarter": q,
+        for f in FIELDS:
+            entry[f] = round(quarter_data[q][f], 2)
 
-            "promoter": clean_num(
-                promoter[i] if i < len(promoter) else 0
-            ),
+        structured.append(entry)
 
-            "fii": clean_num(
-                fii[i] if i < len(fii) else 0
-            ),
-
-            "dii": clean_num(
-                dii[i] if i < len(dii) else 0
-            ),
-
-            "public": clean_num(
-                public[i] if i < len(public) else 0
-            ),
-        })
-
-    # ─────────────────────────────────────────
-    # Validation
-    # ─────────────────────────────────────────
-
-    try:
+    # Validation: total should be ~100%
+    if structured:
 
         latest = structured[0]
+        total  = sum(latest[f] for f in FIELDS)
 
-        total = (
-            latest["promoter"] +
-            latest["fii"] +
-            latest["dii"] +
-            latest["public"]
-        )
-
-        if total > 130:
-
+        if abs(total - 100) > 5:
             print(
-                f"⚠ BAD DATA {symbol} | "
-                f"{latest}"
+                f"  ⚠  BAD TOTAL {symbol} = {total:.1f}% | "
+                f"P:{latest['promoter']} F:{latest['fii']} "
+                f"D:{latest['dii']} G:{latest['govt']} Pub:{latest['public']}"
             )
-
-    except Exception:
-        pass
-
-    # ─────────────────────────────────────────
 
     return {
         "updated": datetime.now().strftime("%Y-%m-%d"),
@@ -272,26 +254,15 @@ async def fetch_one(client, sem, symbol):
     )
 
     if not data:
-
-        return symbol, {
-            "updated": datetime.now().strftime("%Y-%m-%d"),
-            "data": []
-        }
+        return symbol, None   # None = API failed, preserve existing
 
     try:
-
         parsed = parse_shareholding(symbol, data)
-
         return symbol, parsed
 
     except Exception as e:
-
-        print(f"Parse Error {symbol}: {e}")
-
-        return symbol, {
-            "updated": datetime.now().strftime("%Y-%m-%d"),
-            "data": []
-        }
+        print(f"  Parse Error {symbol}: {e}")
+        return symbol, None   # None = parse failed, preserve existing
 
 
 # ─────────────────────────────────────────────
@@ -302,10 +273,8 @@ async def main():
 
     async with httpx.AsyncClient() as client:
 
-        master = await r2_download(
-            client,
-            "master.json"
-        )
+        # ── Download master list ──────────────
+        master = await r2_download(client, "master.json")
 
         symbols = [
             x["symbol"]
@@ -313,16 +282,9 @@ async def main():
             if x.get("exchange") == "NSE"
         ]
 
-        # Remove ETF / Index Symbols
         BAD_KEYWORDS = [
-            "ETF",
-            "LIQUID",
-            "NIFTY",
-            "GOLD",
-            "SILVER",
-            "NEXT50",
-            "MIDCAP",
-            "SMALLCAP",
+            "ETF", "LIQUID", "NIFTY", "GOLD",
+            "SILVER", "NEXT50", "MIDCAP", "SMALLCAP",
         ]
 
         symbols = [
@@ -330,15 +292,28 @@ async def main():
             if not any(k in s for k in BAD_KEYWORDS)
         ]
 
-        sem = asyncio.Semaphore(CONCURRENCY)
+        print(f"Total symbols: {len(symbols)}")
 
+        # ── Download existing data (for preservation) ──
+        try:
+            existing = await r2_download(client, "shareholding.json")
+            print(f"Existing data: {len(existing)} symbols")
+        except Exception:
+            existing = {}
+            print("No existing shareholding.json found — fresh run")
+
+        # ── Fetch all ────────────────────────
+        sem    = asyncio.Semaphore(CONCURRENCY)
         output = {}
+        total  = len(symbols)
 
-        total = len(symbols)
+        preserved = 0
+        updated   = 0
+        empty     = 0
 
         for i in range(0, total, 25):
 
-            batch = symbols[i:i+25]
+            batch = symbols[i:i + 25]
 
             tasks = [
                 fetch_one(client, sem, s)
@@ -349,32 +324,39 @@ async def main():
 
             for sym, data in results:
 
-                if not data:
+                if data and data.get("data"):
+                    # Fresh data successfully fetched
+                    output[sym] = data
+                    updated += 1
+                    print(f"  ✓ {sym}")
 
-                    data = {
+                elif sym in existing and existing[sym].get("data"):
+                    # API failed / empty → preserve existing
+                    output[sym] = existing[sym]
+                    preserved += 1
+                    print(f"  ↺ {sym} | empty response — keeping existing")
+
+                else:
+                    # No data anywhere
+                    output[sym] = {
                         "updated": datetime.now().strftime("%Y-%m-%d"),
                         "data": []
                     }
+                    empty += 1
+                    print(f"  • {sym} | no data")
 
-                output[sym] = data
+            print(f"── {min(i + 25, total)}/{total} done ──")
 
-                if data.get("data"):
+        # ── Upload ───────────────────────────
+        await r2_upload(client, "shareholding.json", output)
 
-                    print(f"✓ {sym}")
-
-                else:
-
-                    print(f"• {sym} | empty shareholding")
-
-            print(f"{min(i+25, total)}/{total}")
-
-        await r2_upload(
-            client,
-            "shareholding.json",
-            output
+        print(
+            f"\n✅ shareholding.json uploaded\n"
+            f"   Updated:   {updated}\n"
+            f"   Preserved: {preserved}\n"
+            f"   Empty:     {empty}\n"
+            f"   Total:     {len(output)}"
         )
-
-        print("✅ shareholding.json uploaded")
 
 
 if __name__ == "__main__":
