@@ -3,23 +3,21 @@ name: Master Universe Pipeline
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "0 2 1 * *"
+    - cron: '0 2 1 * *'
 
 jobs:
   master:
     runs-on: ubuntu-latest
 
     steps:
-
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install Dependencies
         run: |
@@ -29,7 +27,6 @@ jobs:
       - name: Run Master Pipeline
         env:
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-
           R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -39,5 +36,5 @@ jobs:
           python pipeline_master.py
 
       - name: Workflow Complete
-        run: echo "✅ master.json updated"
+        run: echo "master.json updated"
 ```
