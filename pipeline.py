@@ -1542,6 +1542,114 @@ def _build_rs_history_json(all_data,rs_data):
         rows.append(row)
     return rows
 
+# ══════════════════════════════════════════════════════════════
+# SECTOR RS HISTORY
+# ══════════════════════════════════════════════════════════════
+
+def _build_sector_rs_history(
+    classification,
+    rs_history_json,
+):
+
+    sector_map = {}
+
+    # =====================================================
+    # BUILD SECTOR MAP
+    # =====================================================
+
+    for s in classification:
+
+        sym = s.get("symbol")
+        sector = s.get("sector")
+
+        if not sym or not sector:
+            continue
+
+        sector_map.setdefault(
+            sector,
+            []
+        ).append(sym)
+
+    output = []
+
+    # =====================================================
+    # DAILY LOOP
+    # =====================================================
+
+    for row in rs_history_json:
+
+        dt = row["date"]
+
+        stocks = row["stocks"]
+
+        sectors = {}
+
+        for sector, syms in sector_map.items():
+
+            valid = 0
+
+            rs60 = 0
+            rs70 = 0
+            rs80 = 0
+            rs90 = 0
+
+            for sym in syms:
+
+                rs = stocks.get(sym)
+
+                if rs is None:
+                    continue
+
+                valid += 1
+
+                if rs >= 60:
+                    rs60 += 1
+
+                if rs >= 70:
+                    rs70 += 1
+
+                if rs >= 80:
+                    rs80 += 1
+
+                if rs >= 90:
+                    rs90 += 1
+
+            if valid == 0:
+                continue
+
+            sectors[sector] = {
+
+                "stocks": valid,
+
+                "rs60": round(
+                    rs60 / valid * 100,
+                    1
+                ),
+
+                "rs70": round(
+                    rs70 / valid * 100,
+                    1
+                ),
+
+                "rs80": round(
+                    rs80 / valid * 100,
+                    1
+                ),
+
+                "rs90": round(
+                    rs90 / valid * 100,
+                    1
+                ),
+            }
+
+        output.append({
+
+            "date": dt,
+
+            "sectors": sectors
+        })
+
+    return output
 
 def _calculate_mswing(all_data,history_days=60):
     result={}
@@ -1655,6 +1763,17 @@ async def run_ep_scan() -> None:
         for sig in signals: sig["rs_calc"]=rs_data.get(sig["symbol"],{}).get("rs")
         for sig in pr_signals: sig["rs_calc"]=rs_data.get(sig["symbol"],{}).get("rs")
         rs_history_list = _build_rs_history_json(all_data, rs_data)
+        
+        classification = await r2_download(
+            client,
+            "classification.json"
+        )
+
+        sector_rs_history = _build_sector_rs_history(
+            classification,
+            rs_history
+        )
+
 
         mswing_data = _calculate_mswing(all_data, history_days=ROLLING_DAYS - 50)
         mswing_list = _build_mswing_json(all_data, mswing_data)
@@ -1669,6 +1788,7 @@ async def run_ep_scan() -> None:
             r2_upload(client, "rs_history.json",          json.dumps(rs_history_list)),
             r2_upload(client, "mswing.json",              json.dumps(mswing_list)),
             r2_upload(client, "post_result_signals.json", json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
+            r2_upload( client, "sector_rs_history.json",  json.dumps(sector_rs_history) ),
         )
         log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS+MSwing:{len(rs_data)}")
     log.info("━━━ EP + Post-Result Scan complete ━━━")
