@@ -1,9 +1,7 @@
 name: OHLC Daily
 
 on:
-  schedule:
-    # 4:00 PM IST = 10:30 UTC  (weekdays only)
-    - cron: '30 10 * * 1-5'
+  
   workflow_dispatch:   # manual trigger from Actions tab
 
 jobs:
