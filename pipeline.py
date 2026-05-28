@@ -154,48 +154,80 @@ async def fetch_ohlc(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     sym: str,
-    isin: str,
-    from_date: str,
-    to_date: str,
-    exchange: str = "NSE_EQ",
+    from_year: int,
+    to_year: int,
 ) -> tuple[str, list | None]:
-    key = quote(f"{exchange}|{isin}", safe="")
-    url = f"{BASE_URL}/{key}/day/{to_date}/{from_date}"
+
+    url = f"{FINEDGE_BASE}/daily-quotes/{sym}"
+
+    params = {
+        "from": from_year,
+        "to": to_year,
+        "token": FINEDGE_TOKEN,
+    }
 
     for attempt in range(RETRY):
+
         async with sem:
+
             await asyncio.sleep(RATE_DELAY)
+
             try:
-                r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
+                r = await client.get(
+                    url,
+                    params=params,
+                    timeout=30,
+                )
+
             except httpx.RequestError as e:
-                log.warning(f"  {sym}: network error ({e}), retry {attempt+1}")
+                log.warning(f"{sym}: network error ({e}), retry {attempt+1}")
                 await asyncio.sleep(2 ** attempt)
                 continue
 
         if r.status_code == 401:
-            log.error("❌ TOKEN EXPIRED — update UPSTOX_TOKEN secret!")
+            log.error("❌ FINEDGE TOKEN INVALID")
             sys.exit(1)
+
         if r.status_code == 429:
-            log.warning(f"  {sym}: 429 — waiting 10s")
-            await asyncio.sleep(10)
+            log.warning(f"{sym}: rate limited — waiting 15s")
+            await asyncio.sleep(15)
             continue
+
+        if r.status_code in (502, 503, 504):
+            log.warning(f"{sym}: server error {r.status_code} — retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt)
+            continue
+
         if r.status_code != 200:
             return sym, None
 
-        payload = r.json()
-        if payload.get("status") != "success":
+        try:
+            payload = r.json()
+        except Exception:
             return sym, None
 
-        raw = payload.get("data", {}).get("candles", [])
+        raw = payload.get("price", [])
+
         if not raw:
             return sym, None
 
         candles = sorted(
-            [{"d": c[0][:10], "o": c[1], "h": c[2], "l": c[3],
-              "c": c[4], "v": c[5], "oi": c[6] if len(c) > 6 else 0}
-             for c in raw],
+            [
+                {
+                    "d": c["quote_date"],
+                    "o": c["open_price"],
+                    "h": c["high_price"],
+                    "l": c["low_price"],
+                    "c": c["close_price"],
+                    "v": c["volume"],
+                    "oi": 0,
+                }
+                for c in raw
+                if c.get("quote_date")
+            ],
             key=lambda x: x["d"],
         )
+
         return sym, candles
 
     return sym, None
