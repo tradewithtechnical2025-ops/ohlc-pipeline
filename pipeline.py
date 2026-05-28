@@ -80,7 +80,7 @@ BSE_META:     dict[str, dict] = {}
 
 async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
     log.info("Fetching master.json from R2…")
-    master = await r2_download(client, "master.json")
+    master = await r2_download(client, "classification.json")
 
     if not master or not isinstance(master, list):
         raise RuntimeError("master.json missing or invalid in R2 — push from Google Sheet first!")
@@ -100,7 +100,7 @@ async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
 
         if exchange == "NSE":
             nse_map[sym] = isin
-        elif exchange == "BSE Only":
+        elif exchange == "BSE":
             bse_map[sym]  = isin
             bse_meta[isin] = {"name": name}
 
