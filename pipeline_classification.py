@@ -15,7 +15,7 @@ FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
-MASTER_URL = f"{WORKER_URL}/master.json"
+FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 OUTPUT_FILE = "classification.json"
 
@@ -33,6 +33,11 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
 
+WORKER_HEADERS = {
+    "X-Secret-Token": WORKER_TOKEN,
+    "Content-Type": "application/json",
+}
+
 # =========================================================
 # PROFILE API
 # =========================================================
@@ -42,25 +47,49 @@ PROFILE_URL = (
 )
 
 # =========================================================
-# DOWNLOAD MASTER
+# R2 DOWNLOAD
 # =========================================================
 
-async def load_master(client):
+async def r2_download(client, filename):
 
-    print("Downloading master.json...")
+    url = f"{WORKER_URL}/{filename}"
 
     r = await client.get(
-        MASTER_URL,
-        timeout=120
+        url,
+        headers=WORKER_HEADERS,
+        timeout=120,
     )
 
-    r.raise_for_status()
+    if r.status_code != 200:
 
-    data = r.json()
+        raise RuntimeError(
+            f"{filename} download failed"
+        )
 
-    print(f"Loaded {len(data)} stocks")
+    return r.json()
 
-    return data
+# =========================================================
+# R2 UPLOAD
+# =========================================================
+
+async def r2_upload(client, filename, data):
+
+    url = f"{WORKER_URL}?file={filename}"
+
+    r = await client.post(
+        url,
+        headers=WORKER_HEADERS,
+        content=json.dumps(data).encode(),
+        timeout=120,
+    )
+
+    if r.status_code != 200:
+
+        raise RuntimeError(
+            f"{filename} upload failed"
+        )
+
+    print(f"✅ Uploaded {filename}")
 
 # =========================================================
 # PROFILE FETCH
@@ -87,9 +116,12 @@ async def fetch_profile(client, symbol, semaphore):
                     timeout=60
                 )
 
-            except Exception:
+            except Exception as e:
+
+                print(f"{symbol} Network Error: {e}")
 
                 await asyncio.sleep(2 ** attempt)
+
                 continue
 
             if r.status_code == 429:
@@ -97,11 +129,15 @@ async def fetch_profile(client, symbol, semaphore):
                 print(f"{symbol} -> 429")
 
                 await asyncio.sleep(10)
+
                 continue
 
             if r.status_code != 200:
 
-                print(f"{symbol} -> HTTP {r.status_code}")
+                print(
+                    f"{symbol} -> HTTP {r.status_code}"
+                )
+
                 return None
 
             try:
@@ -109,6 +145,7 @@ async def fetch_profile(client, symbol, semaphore):
                 return r.json()
 
             except Exception:
+
                 return None
 
     return None
@@ -128,6 +165,9 @@ async def process_stock(client, stock, semaphore):
     )
 
     if not profile:
+
+        print(f"✗ {symbol} | profile fail")
+
         return None
 
     market_cap = (
@@ -136,13 +176,26 @@ async def process_stock(client, stock, semaphore):
     )
 
     try:
+
         market_cap = float(market_cap)
+
     except:
+
         market_cap = 0
 
-    # Skip tiny illiquid companies
+    # Skip tiny companies
+
     if market_cap < MIN_MARKET_CAP_CR:
+
+        print(
+            f"✗ {symbol} | market cap < 50cr"
+        )
+
         return None
+
+    print(
+        f"✓ {symbol} | {market_cap:.0f}cr"
+    )
 
     return {
 
@@ -169,34 +222,6 @@ async def process_stock(client, stock, semaphore):
     }
 
 # =========================================================
-# WORKER UPLOAD
-# =========================================================
-
-async def r2_upload(client, filename, data):
-
-    url = f"{WORKER_URL}?file={filename}"
-
-    payload = json.dumps(data)
-
-    r = await client.post(
-        url,
-        headers={
-            "X-Secret-Token": WORKER_TOKEN,
-            "Content-Type": "application/json",
-        },
-        content=payload.encode(),
-        timeout=120,
-    )
-
-    if r.status_code != 200:
-
-        raise RuntimeError(
-            f"{filename} upload failed"
-        )
-
-    print(f"Uploaded {filename}")
-
-# =========================================================
 # MAIN
 # =========================================================
 
@@ -210,7 +235,16 @@ async def main():
         headers=HEADERS
     ) as client:
 
-        master = await load_master(client)
+        print("Downloading master.json...")
+
+        master = await r2_download(
+            client,
+            "master.json"
+        )
+
+        print(
+            f"Loaded {len(master)} stocks"
+        )
 
         tasks = [
 
@@ -239,8 +273,14 @@ async def main():
 
         print()
         print("=== SUMMARY ===")
+
         print(
-            f"Final Stocks: {len(classification)}"
+            f"✓ Final Stocks : {len(classification)}"
+        )
+
+        print(
+            f"✗ Removed      : "
+            f"{len(master) - len(classification)}"
         )
 
         await r2_upload(
@@ -250,7 +290,7 @@ async def main():
         )
 
         print()
-        print("classification.json uploaded")
+        print("🎉 classification.json uploaded")
 
 
 if __name__ == "__main__":
