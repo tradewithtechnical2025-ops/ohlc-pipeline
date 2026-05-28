@@ -1,40 +1,40 @@
+# Final `.github/workflows/master.yml`
+
 ```yaml
-name: Master Universe Pipeline
+name: Master Pipeline
 
 on:
   workflow_dispatch:
+
   schedule:
-    - cron: '0 2 1 * *'
+    - cron: "0 2 1 * *"
 
 jobs:
+
   master:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Repository
+
+      - name: Checkout Repo
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install Dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install httpx boto3
+          pip install httpx
 
       - name: Run Master Pipeline
         env:
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
 
         run: |
           python pipeline_master.py
-
-      - name: Workflow Complete
-        run: echo "master.json updated"
 ```
