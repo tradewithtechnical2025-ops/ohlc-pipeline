@@ -79,36 +79,42 @@ BSE_META:     dict[str, dict] = {}
 # ══════════════════════════════════════════════════════════════
 
 async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
+
     log.info("Fetching classification.json from R2…")
+
     master = await r2_download(client, "classification.json")
 
     if not master or not isinstance(master, list):
-        raise RuntimeError("classification.json missing or invalid in R2 — push from Google Sheet first!")
+        raise RuntimeError(
+            "classification.json missing or invalid in R2 — push from Google Sheet first!"
+        )
 
     nse_map:  dict[str, str]  = {}
     bse_map:  dict[str, str]  = {}
     bse_meta: dict[str, dict] = {}
 
     for stock in master:
-        sym      = str(stock.get("symbol",   "")).strip().upper()
-        isin     = str(stock.get("isin",     "")).strip()
-        exchange = str(stock.get("exchange", "")).strip()
-        name     = str(stock.get("name",     "")).strip()
 
-        if not sym or not isin:
+        sym      = str(stock.get("symbol", "")).strip().upper()
+        exchange = str(stock.get("exchange", "")).strip()
+        name     = str(stock.get("name", "")).strip()
+
+        if not sym:
             continue
 
         if exchange == "NSE":
-            nse_map[sym] = isin
+            nse_map[sym] = sym
+
         elif exchange == "BSE":
-            bse_map[sym]  = isin
-            bse_meta[isin] = {"name": name}
+            bse_map[sym] = sym
+            bse_meta[sym] = {
+                "name": name
+            }
 
     log.info(f"✓ NSE stocks : {len(nse_map)}")
     log.info(f"✓ BSE-only   : {len(bse_map)}")
+
     return nse_map, bse_map, bse_meta
-
-
 # ══════════════════════════════════════════════════════════════
 # TRADING CALENDAR
 # ══════════════════════════════════════════════════════════════
