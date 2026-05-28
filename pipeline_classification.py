@@ -19,10 +19,11 @@ FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 OUTPUT_FILE = "classification.json"
 
-CONCURRENCY = 5
-BATCH_SIZE  = 50
+# Slower + safer
+CONCURRENCY = 3
+BATCH_SIZE  = 25
 
-RATE_DELAY = 0.15
+RATE_DELAY = 0.25
 RETRY = 3
 
 MIN_MARKET_CAP_CR = 50
@@ -45,7 +46,7 @@ WORKER_HEADERS = {
 # =========================================================
 
 PROFILE_URL = (
-    "https://data.finedgeapi.com/api/v1/stock/profile"
+    "https://data.finedgeapi.com/api/v1/company-profile"
 )
 
 # =========================================================
@@ -99,11 +100,6 @@ async def r2_upload(client, filename, data):
 
 async def fetch_profile(client, symbol, semaphore):
 
-    params = {
-        "token": FINEDGE_TOKEN,
-        "symbol": symbol
-    }
-
     async with semaphore:
 
         for attempt in range(RETRY):
@@ -113,16 +109,22 @@ async def fetch_profile(client, symbol, semaphore):
             try:
 
                 r = await client.get(
-                    PROFILE_URL,
-                    params=params,
+                    f"{PROFILE_URL}/{symbol}",
+                    params={
+                        "token": FINEDGE_TOKEN
+                    },
                     timeout=60
                 )
 
             except Exception as e:
 
-                print(f"{symbol} Network Error: {e}")
+                print(
+                    f"{symbol} Network Error: {e}"
+                )
 
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(
+                    2 ** attempt
+                )
 
                 continue
 
@@ -130,7 +132,7 @@ async def fetch_profile(client, symbol, semaphore):
 
                 print(f"{symbol} -> 429")
 
-                await asyncio.sleep(10)
+                await asyncio.sleep(15)
 
                 continue
 
@@ -164,7 +166,11 @@ async def fetch_profile(client, symbol, semaphore):
 # PROCESS STOCK
 # =========================================================
 
-async def process_stock(client, stock, semaphore):
+async def process_stock(
+    client,
+    stock,
+    semaphore
+):
 
     symbol = stock["symbol"]
 
@@ -176,7 +182,9 @@ async def process_stock(client, stock, semaphore):
 
     if not profile:
 
-        print(f"✗ {symbol} | profile fail")
+        print(
+            f"✗ {symbol} | profile fail"
+        )
 
         return None
 
@@ -198,13 +206,15 @@ async def process_stock(client, stock, semaphore):
     if market_cap < MIN_MARKET_CAP_CR:
 
         print(
-            f"✗ {symbol} | market cap < 50cr"
+            f"✗ {symbol} | "
+            f"market cap < 50cr"
         )
 
         return None
 
     print(
-        f"✓ {symbol} | {market_cap:.0f}cr"
+        f"✓ {symbol} | "
+        f"{market_cap:.0f}cr"
     )
 
     return {
@@ -223,6 +233,18 @@ async def process_stock(client, stock, semaphore):
 
         "sub_industry": profile.get(
             "sub_industry"
+        ),
+
+        "macro_sector": profile.get(
+            "macro_sector"
+        ),
+
+        "bse_code": profile.get(
+            "bse_code"
+        ),
+
+        "nse_code": profile.get(
+            "nse_code"
         ),
 
         "consolidated_ind": stock.get(
@@ -245,7 +267,10 @@ async def main():
         headers=HEADERS
     ) as client:
 
-        print("Downloading master.json...")
+        print()
+        print(
+            "Downloading master.json..."
+        )
 
         master = await r2_download(
             client,
@@ -262,7 +287,9 @@ async def main():
 
         for i in range(0, total, BATCH_SIZE):
 
-            batch = master[i:i+BATCH_SIZE]
+            batch = master[
+                i:i+BATCH_SIZE
+            ]
 
             tasks = [
 
@@ -282,11 +309,15 @@ async def main():
             results.extend(batch_results)
 
             print()
+
             print(
                 f"Processed "
                 f"{min(i+BATCH_SIZE, total)}"
                 f"/{total}"
             )
+
+            # Extra cooling delay
+            await asyncio.sleep(2)
 
         classification = [
             x for x in results
@@ -318,7 +349,9 @@ async def main():
         )
 
         print()
-        print("🎉 classification.json uploaded")
+        print(
+            "🎉 classification.json uploaded"
+        )
 
 
 if __name__ == "__main__":
