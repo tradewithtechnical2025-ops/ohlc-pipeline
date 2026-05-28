@@ -79,11 +79,11 @@ BSE_META:     dict[str, dict] = {}
 # ══════════════════════════════════════════════════════════════
 
 async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
-    log.info("Fetching master.json from R2…")
+    log.info("Fetching classification.json from R2…")
     master = await r2_download(client, "classification.json")
 
     if not master or not isinstance(master, list):
-        raise RuntimeError("master.json missing or invalid in R2 — push from Google Sheet first!")
+        raise RuntimeError("classification.json missing or invalid in R2 — push from Google Sheet first!")
 
     nse_map:  dict[str, str]  = {}
     bse_map:  dict[str, str]  = {}
