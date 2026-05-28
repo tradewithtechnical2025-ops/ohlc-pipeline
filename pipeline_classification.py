@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 
 import asyncio
@@ -19,7 +20,9 @@ FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 OUTPUT_FILE = "classification.json"
 
-CONCURRENCY = 10
+CONCURRENCY = 5
+BATCH_SIZE  = 50
+
 RATE_DELAY = 0.15
 RETRY = 3
 
@@ -129,6 +132,14 @@ async def fetch_profile(client, symbol, semaphore):
                 print(f"{symbol} -> 429")
 
                 await asyncio.sleep(10)
+
+                continue
+
+            if r.status_code == 503:
+
+                print(f"{symbol} -> 503")
+
+                await asyncio.sleep(5)
 
                 continue
 
@@ -246,20 +257,37 @@ async def main():
             f"Loaded {len(master)} stocks"
         )
 
-        tasks = [
+        results = []
 
-            process_stock(
-                client,
-                stock,
-                semaphore
+        total = len(master)
+
+        for i in range(0, total, BATCH_SIZE):
+
+            batch = master[i:i+BATCH_SIZE]
+
+            tasks = [
+
+                process_stock(
+                    client,
+                    stock,
+                    semaphore
+                )
+
+                for stock in batch
+            ]
+
+            batch_results = await asyncio.gather(
+                *tasks
             )
 
-            for stock in master
-        ]
+            results.extend(batch_results)
 
-        results = await asyncio.gather(
-            *tasks
-        )
+            print()
+            print(
+                f"Processed "
+                f"{min(i+BATCH_SIZE, total)}"
+                f"/{total}"
+            )
 
         classification = [
             x for x in results
@@ -275,7 +303,8 @@ async def main():
         print("=== SUMMARY ===")
 
         print(
-            f"✓ Final Stocks : {len(classification)}"
+            f"✓ Final Stocks : "
+            f"{len(classification)}"
         )
 
         print(
@@ -295,4 +324,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
+```
