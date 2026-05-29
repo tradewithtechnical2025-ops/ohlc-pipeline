@@ -1959,8 +1959,8 @@ def _detect_hlr(all_data,swing_n=5,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
         for i in range(swing_n,n-swing_n):
             if all(highs[i]>=highs[i-k] for k in range(1,swing_n+1)) and all(highs[i]>=highs[i+k] for k in range(1,swing_n+1)):
                 sh_price=highs[i]
-                broken_before=any(closes[j]>sh_price for j in range(i+1,n-1))
-                broke_today=closes[-1]>sh_price
+                broken_before=any(closes[j]>sh_price for j in range(i+1,n-1) if closes[j] is not None)
+                broke_today=closes[-1] is not None and closes[-1]>sh_price
                 if broken_before: continue
                 swing_highs.append((sh_price,dates[i],"BO" if broke_today else "valid"))
         if not swing_highs: continue
@@ -1976,10 +1976,17 @@ def _detect_hlr(all_data,swing_n=5,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
             cluster_tag="BO" if any(c[2]=="BO" for c in cluster) else "valid"
             touch_pts=sorted([{"date":c[1],"price":round(c[0],2)} for c in cluster],key=lambda x:x["date"])
             levels.append((level,zone_low,touches,is_zone,touch_pts,cluster_tag))
-        curr_close=closes[-1]; curr_date=dates[-1]
+        curr_close=closes[-1]
+        if curr_close is None: continue
+        curr_date=dates[-1]
         if n>=consol_days:
-            recent_high=max(highs[-consol_days:]); recent_low=min(lows[-consol_days:])
-            range_pct=(recent_high-recent_low)/curr_close*100; is_consol=range_pct<consol_pct
+            recent_highs=[v for v in highs[-consol_days:] if v is not None]
+            recent_lows=[v for v in lows[-consol_days:] if v is not None]
+            if recent_highs and recent_lows:
+                recent_high=max(recent_highs); recent_low=min(recent_lows)
+                range_pct=(recent_high-recent_low)/curr_close*100; is_consol=range_pct<consol_pct
+            else:
+                range_pct=0; is_consol=False
         else: range_pct=0; is_consol=False
         for (level,zone_low,touches,is_zone,touch_pts,cluster_tag) in levels:
             dist_pct=(level-curr_close)/level*100
@@ -1988,7 +1995,6 @@ def _detect_hlr(all_data,swing_n=5,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
             else: continue
             signals.append({"symbol":sym,"state":state,"resistance":round(level,2),"zone_low":round(zone_low,2),"is_zone":is_zone,"touches":touches,"touch_points":touch_pts,"dist_pct":round(dist_pct,2),"last_close":round(curr_close,2),"last_date":curr_date,"consol_range":round(range_pct,2),"vol_spike":round(vol_spike,1) if vol_spike is not None else None})
     return signals
-
 async def run_hlr_scan() -> None:
     today=today_ist()
     if not is_trading_day(today): log.info(f"⏭  {today} is not a trading day — exiting"); return
@@ -2011,58 +2017,105 @@ async def run_hlr_scan() -> None:
         log.info(f"✅ HLR:{len(hlr_signals)}  Pullback:{len(pb_signals)}")
     log.info("━━━ HLR + Pullback Scan complete ━━━")
 
-def _build_weekly(dates,opens,highs,lows,closes,volumes):
+def _build_weekly(dates, opens, highs, lows, closes, volumes):
     from datetime import date as dt
-    weekly={}
-    for d,o,h,l,c,v in zip(dates,opens,highs,lows,closes,volumes):
-        key=dt.fromisoformat(d).isocalendar()[:2]
-        if key not in weekly: weekly[key]={"o":o,"h":h,"l":l,"c":c,"v":v,"d":d}
-        else: weekly[key]["h"]=max(weekly[key]["h"],h); weekly[key]["l"]=min(weekly[key]["l"],l); weekly[key]["c"]=c; weekly[key]["v"]+=v
+    weekly = {}
+    for d, o, h, l, c, v in zip(dates, opens, highs, lows, closes, volumes):
+        if h is None or l is None or c is None:
+            continue
+        key = dt.fromisoformat(d).isocalendar()[:2]
+        if key not in weekly:
+            weekly[key] = {"o": o, "h": h, "l": l, "c": c, "v": v or 0, "d": d}
+        else:
+            weekly[key]["h"] = max(weekly[key]["h"], h)
+            weekly[key]["l"] = min(weekly[key]["l"], l)
+            weekly[key]["c"] = c
+            weekly[key]["v"] += v or 0
     return weekly
 
-def _detect_patterns(all_data,min_volume=2500,coil_min_babies=3,tight_close_weeks=3,tight_close_pct=2.0):
-    from datetime import date as dt; signals=[]
-    for sym,s in all_data.items():
+
+def _detect_patterns(all_data, min_volume=2500, coil_min_babies=3, tight_close_weeks=3, tight_close_pct=2.0):
+    from datetime import date as dt
+    signals = []
+    for sym, s in all_data.items():
         dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
-        if n<10: continue
-        if not _check_liquidity(volumes,closes,n): continue
-        if volumes[-1]<min_volume: continue
-        today=dates[-1]
-        if highs[-1]<=highs[-2] and lows[-1]>=lows[-2]: signals.append({"symbol":sym,"pattern":"Inside Bar","date":today,"high":round(highs[-1],2),"low":round(lows[-1],2),"prev_high":round(highs[-2],2),"prev_low":round(lows[-2],2)})
-        if n>=3 and highs[-1]<=highs[-2] and lows[-1]>=lows[-2] and highs[-2]<=highs[-3] and lows[-2]>=lows[-3]: signals.append({"symbol":sym,"pattern":"Double Inside Bar","date":today,"high":round(highs[-1],2),"low":round(lows[-1],2),"mother_high":round(highs[-3],2),"mother_low":round(lows[-3],2)})
-        if n>=7:
-            today_range=highs[-1]-lows[-1]; past_ranges=[highs[-i]-lows[-i] for i in range(2,8)]
-            if today_range<=min(past_ranges): signals.append({"symbol":sym,"pattern":"NR7","date":today,"range":round(today_range,2),"high":round(highs[-1],2),"low":round(lows[-1],2)})
-        seen_mothers=set()
-        for m_idx in range(n-coil_min_babies-1,max(0,n-60),-1):
-            m_high=highs[m_idx]; m_low=lows[m_idx]; m_key=round(m_high*200)
+        if n < 10: continue
+        if not _check_liquidity(volumes, closes, n): continue
+
+        # Guard: last few candles None check
+        if any(v is None for v in [highs[-1], highs[-2], lows[-1], lows[-2], closes[-1]]): continue
+        if volumes[-1] is None or volumes[-1] < min_volume: continue
+
+        today = dates[-1]
+
+        # Inside Bar
+        if highs[-1] <= highs[-2] and lows[-1] >= lows[-2]:
+            signals.append({"symbol":sym,"pattern":"Inside Bar","date":today,"high":round(highs[-1],2),"low":round(lows[-1],2),"prev_high":round(highs[-2],2),"prev_low":round(lows[-2],2)})
+
+        # Double Inside Bar
+        if n >= 3 and highs[-3] is not None and lows[-3] is not None:
+            if highs[-1]<=highs[-2] and lows[-1]>=lows[-2] and highs[-2]<=highs[-3] and lows[-2]>=lows[-3]:
+                signals.append({"symbol":sym,"pattern":"Double Inside Bar","date":today,"high":round(highs[-1],2),"low":round(lows[-1],2),"mother_high":round(highs[-3],2),"mother_low":round(lows[-3],2)})
+
+        # NR7
+        if n >= 7:
+            last7_h = [highs[-i] for i in range(1, 8)]
+            last7_l = [lows[-i]  for i in range(1, 8)]
+            if all(v is not None for v in last7_h + last7_l):
+                today_range = last7_h[0] - last7_l[0]
+                past_ranges = [last7_h[i] - last7_l[i] for i in range(1, 7)]
+                if today_range <= min(past_ranges):
+                    signals.append({"symbol":sym,"pattern":"NR7","date":today,"range":round(today_range,2),"high":round(highs[-1],2),"low":round(lows[-1],2)})
+
+        # MCP / Mini Coil
+        seen_mothers = set()
+        for m_idx in range(n - coil_min_babies - 1, max(0, n - 60), -1):
+            m_high = highs[m_idx]; m_low = lows[m_idx]
+            if m_high is None or m_low is None: continue
+            m_key = round(m_high * 200)
             if m_key in seen_mothers: continue
-            baby_count=0; coil_state="Coiling"
-            for b in range(m_idx+1,n):
-                if highs[b]>m_high: coil_state="Upper BO"; break
-                elif lows[b]<m_low: coil_state="Lower BD"; break
-                else: baby_count+=1
-            if baby_count>=coil_min_babies and coil_state=="Coiling":
+            baby_count = 0; coil_state = "Coiling"
+            for b in range(m_idx + 1, n):
+                if highs[b] is None or lows[b] is None: continue
+                if highs[b] > m_high:   coil_state = "Upper BO"; break
+                elif lows[b] < m_low:   coil_state = "Lower BD"; break
+                else: baby_count += 1
+            if baby_count >= coil_min_babies and coil_state == "Coiling":
                 seen_mothers.add(m_key)
                 signals.append({"symbol":sym,"pattern":f"{baby_count} Bar MCP" if baby_count<=6 else "Mini Coil","date":today,"mcp_high":round(m_high,2),"mcp_low":round(m_low,2),"baby_count":baby_count,"coil_state":coil_state,"mother_date":dates[m_idx]})
-        weekly=_build_weekly(dates,opens,highs,lows,closes,volumes)
+
+        # Weekly patterns
+        weekly = _build_weekly(dates, opens, highs, lows, closes, volumes)
         if not weekly: continue
-        current_week=dt.fromisoformat(today).isocalendar()[:2]
-        past_weeks=sorted(k for k in weekly if k<current_week)
-        if len(past_weeks)<2: continue
-        lw=weekly[past_weeks[-1]]; lw2=weekly[past_weeks[-2]]
-        if lw["h"]<=lw2["h"] and lw["l"]>=lw2["l"]:
+        current_week = dt.fromisoformat(today).isocalendar()[:2]
+        past_weeks   = sorted(k for k in weekly if k < current_week)
+        if len(past_weeks) < 2: continue
+        lw  = weekly[past_weeks[-1]]
+        lw2 = weekly[past_weeks[-2]]
+
+        # Weekly IB
+        if lw["h"] <= lw2["h"] and lw["l"] >= lw2["l"]:
             signals.append({"symbol":sym,"pattern":"Weekly IB","date":today,"w_high":round(lw["h"],2),"w_low":round(lw["l"],2),"w_close":round(lw["c"],2),"prev_w_high":round(lw2["h"],2),"prev_w_low":round(lw2["l"],2)})
-            if len(past_weeks)>=3:
-                lw3=weekly[past_weeks[-3]]
-                if lw2["h"]<=lw3["h"] and lw2["l"]>=lw3["l"]: signals.append({"symbol":sym,"pattern":"Weekly Double IB","date":today,"w_high":round(lw["h"],2),"w_low":round(lw["l"],2),"mother_w_high":round(lw3["h"],2),"mother_w_low":round(lw3["l"],2)})
-        if len(past_weeks)>=7:
-            lw_range=lw["h"]-lw["l"]; past_ranges=[weekly[past_weeks[-i]]["h"]-weekly[past_weeks[-i]]["l"] for i in range(2,8)]
-            if lw_range<=min(past_ranges): signals.append({"symbol":sym,"pattern":"Weekly NR7","date":today,"w_range":round(lw_range,2),"w_high":round(lw["h"],2),"w_low":round(lw["l"],2)})
-        if len(past_weeks)>=tight_close_weeks:
-            last_n_closes=[weekly[past_weeks[-i]]["c"] for i in range(1,tight_close_weeks+1)]
-            tc_range=(max(last_n_closes)-min(last_n_closes))/min(last_n_closes)*100
-            if tc_range<=tight_close_pct: signals.append({"symbol":sym,"pattern":"Weekly Tight Close","date":today,"closes":[round(c,2) for c in last_n_closes],"range_pct":round(tc_range,2)})
+            if len(past_weeks) >= 3:
+                lw3 = weekly[past_weeks[-3]]
+                if lw2["h"] <= lw3["h"] and lw2["l"] >= lw3["l"]:
+                    signals.append({"symbol":sym,"pattern":"Weekly Double IB","date":today,"w_high":round(lw["h"],2),"w_low":round(lw["l"],2),"mother_w_high":round(lw3["h"],2),"mother_w_low":round(lw3["l"],2)})
+
+        # Weekly NR7
+        if len(past_weeks) >= 7:
+            lw_range    = lw["h"] - lw["l"]
+            past_ranges = [weekly[past_weeks[-i]]["h"] - weekly[past_weeks[-i]]["l"] for i in range(2, 8)]
+            if lw_range <= min(past_ranges):
+                signals.append({"symbol":sym,"pattern":"Weekly NR7","date":today,"w_range":round(lw_range,2),"w_high":round(lw["h"],2),"w_low":round(lw["l"],2)})
+
+        # Weekly Tight Close
+        if len(past_weeks) >= tight_close_weeks:
+            last_n_closes = [weekly[past_weeks[-i]]["c"] for i in range(1, tight_close_weeks + 1)]
+            if all(c is not None for c in last_n_closes) and min(last_n_closes) > 0:
+                tc_range = (max(last_n_closes) - min(last_n_closes)) / min(last_n_closes) * 100
+                if tc_range <= tight_close_pct:
+                    signals.append({"symbol":sym,"pattern":"Weekly Tight Close","date":today,"closes":[round(c,2) for c in last_n_closes],"range_pct":round(tc_range,2)})
+
     return signals
 
 async def run_pattern_scan() -> None:
