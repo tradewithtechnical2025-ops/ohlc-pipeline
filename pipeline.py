@@ -1550,11 +1550,16 @@ def _calculate_rs(all_data,history_days=30):
             idx=n-1-day_offset
             if idx<63: scores.append(None); continue
             def ret(lookback):
-                prev_idx=idx-lookback
-                if prev_idx<0: return None
-                prev=closes[prev_idx]
-                if prev==0: return None
-                return (closes[idx]-prev)/prev*100
+                prev_idx = idx - lookback
+                if prev_idx < 0:
+                    return None
+                prev = closes[prev_idx]
+                if not prev:  # handles None and 0
+                    return None
+                c = closes[idx]
+                if c is None:  # guard current close too
+                    return None
+                return (c - prev) / prev * 100
             p63=ret(63); p126=ret(126); p189=ret(189); p252=ret(252)
             if p252 is not None and p189 is not None and p126 is not None and p63 is not None: composite=(p63*2+p126+p189+p252)/5
             elif p189 is not None and p126 is not None and p63 is not None: composite=(p63*2+p126+p189)/4
