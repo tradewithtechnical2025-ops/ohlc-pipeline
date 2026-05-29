@@ -1514,7 +1514,10 @@ def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,vol
         if avg_vol==0: continue
         result_day_ch=round((closes[ri]-closes[ri-1])/closes[ri-1]*100,2) if ri>0 and closes[ri-1] else 0.0
         result_day_vol_x=round(volumes[ri]/avg_vol,1)
-        if lows[ti]>highs[ri]: continue
+        if lows[ti] is None or highs[ri] is None:
+          continue
+        if lows[ti] > highs[ri]:
+          continue
         prev_close=closes[ri]
         if prev_close==0: continue
         price_ch_pct=(closes[ti]-prev_close)/prev_close*100
