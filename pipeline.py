@@ -1444,8 +1444,10 @@ def _detect_ep(
         for i in range(scan_from, n):
             prev_high = highs[i - 1]
             today_low = lows[i]
+            if prev_high is None or today_low is None:
+               continue
             if prev_high <= 0 or today_low <= 0:
-              continue
+               continue
             if today_low <= prev_high:
               continue
             gap_pct = (today_low - prev_high) / prev_high * 100
