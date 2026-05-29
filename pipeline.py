@@ -237,40 +237,29 @@ async def fetch_today_candle(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     sym: str,
-    isin: str,
-    exchange: str = "NSE_EQ",
 ) -> tuple[str, dict | None]:
-    key = quote(f"{exchange}|{isin}", safe="")
-    url = f"{V3_URL}/{key}/days/1"
 
-    for attempt in range(RETRY):
-        async with sem:
-            await asyncio.sleep(TODAY_RATE_DELAY)
-            try:
-                r = await client.get(url, headers=UPSTOX_HEADERS, timeout=20)
-            except httpx.RequestError:
-                await asyncio.sleep(2 ** attempt)
-                continue
+    data = await _finedge_get(
+        client,
+        sem,
+        "quote",
+        {"symbol": sym},
+    )
 
-        if r.status_code == 401:
-            log.error("❌ TOKEN EXPIRED")
-            sys.exit(1)
-        if r.status_code == 429:
-            log.warning(f"  {sym}: 429 — waiting 10s")
-            await asyncio.sleep(10)
-            continue
-        if r.status_code != 200:
-            return sym, None
+    if not data or sym not in data:
+        return sym, None
 
-        raw = r.json().get("data", {}).get("candles", [])
-        if not raw:
-            return sym, None
+    q = data[sym]
 
-        c = raw[0]
-        return sym, {"d": c[0][:10], "o": c[1], "h": c[2], "l": c[3],
-                     "c": c[4], "v": c[5], "oi": c[6] if len(c) > 6 else 0}
-
-    return sym, None
+    return sym, {
+        "d": today_ist(),
+        "o": q.get("open_price"),
+        "h": q.get("high_price"),
+        "l": q.get("low_price"),
+        "c": q.get("current_price"),
+        "v": q.get("volume", 0),
+        "oi": 0,
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1079,8 +1068,8 @@ async def run_today() -> None:
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
 
         all_tasks = (
-            [fetch_today_candle(client, sem, sym, ISIN_MAP[sym], "NSE_EQ") for sym in ISIN_MAP] +
-            [fetch_today_candle(client, sem, sym, BSE_ISIN_MAP[sym], "BSE_EQ") for sym in BSE_ISIN_MAP]
+            [fetch_today_candle(client, sem, sym) for sym in ISIN_MAP] +
+            [fetch_today_candle(client, sem, sym) for sym in BSE_ISIN_MAP]
         )
         total = len(all_tasks)
         log.info(f"Fetching {total} stocks (NSE: {len(ISIN_MAP)}  BSE: {len(BSE_ISIN_MAP)})")
