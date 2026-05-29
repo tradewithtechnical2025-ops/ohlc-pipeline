@@ -1895,11 +1895,20 @@ async def run_ep_scan() -> None:
 # HLR + PULLBACK + PATTERN SCANNERS
 # ══════════════════════════════════════════════════════════════
 
-def _calc_ema(closes,period):
-    if len(closes)<period: return [None]*len(closes)
-    ema=[None]*len(closes); k=2/(period+1)
-    ema[period-1]=sum(closes[:period])/period
-    for i in range(period,len(closes)): ema[i]=closes[i]*k+ema[i-1]*(1-k)
+def _calc_ema(closes, period):
+    if len(closes) < period: return [None] * len(closes)
+    ema = [None] * len(closes)
+    k = 2 / (period + 1)
+    # seed: first `period` values ka average, None skip karte hue
+    seed_vals = [v for v in closes[:period] if v is not None]
+    if not seed_vals: return ema
+    ema[period - 1] = sum(seed_vals) / len(seed_vals)
+    for i in range(period, len(closes)):
+        c = closes[i]
+        if c is None:
+            ema[i] = ema[i - 1]  # carry forward
+        else:
+            ema[i] = c * k + ema[i - 1] * (1 - k)
     return ema
 
 def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullback_pct=5.0,ema_proximity_pct=1.0,max_candle_range_pct=6.0):
