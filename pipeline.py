@@ -1434,7 +1434,10 @@ def _detect_ep(
         for i in range(scan_from, n):
             prev_high = highs[i - 1]
             today_low = lows[i]
-            if today_low <= prev_high: continue
+            if prev_high <= 0 or today_low <= 0:
+              continue
+            if today_low <= prev_high:
+              continue
             gap_pct = (today_low - prev_high) / prev_high * 100
             if gap_pct < min_gap_pct: continue
             avg_vol = sum(volumes[i - volume_lookback:i]) / volume_lookback
