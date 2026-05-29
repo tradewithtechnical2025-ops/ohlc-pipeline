@@ -115,6 +115,8 @@ async def build_isin_map(client: httpx.AsyncClient) -> tuple[dict, dict, dict]:
     log.info(f"✓ BSE-only   : {len(bse_map)}")
 
     return nse_map, bse_map, bse_meta
+
+
 # ══════════════════════════════════════════════════════════════
 # TRADING CALENDAR
 # ══════════════════════════════════════════════════════════════
@@ -257,12 +259,21 @@ async def fetch_today_candle(
 
     q = data[sym]
 
+    # FIX #5: guard against None price fields before returning candle
+    o = q.get("open_price")
+    h = q.get("high_price")
+    l = q.get("low_price")
+    c = q.get("current_price")
+
+    if None in (o, h, l, c):
+        return sym, None
+
     return sym, {
         "d": today_ist(),
-        "o": q.get("open_price"),
-        "h": q.get("high_price"),
-        "l": q.get("low_price"),
-        "c": q.get("current_price"),
+        "o": o,
+        "h": h,
+        "l": l,
+        "c": c,
         "v": q.get("volume", 0),
         "oi": 0,
     }
@@ -1001,7 +1012,6 @@ def upsert_candle(all_data: dict, sym: str, c: dict) -> None:
         _sort_stock(s)
 
 
-
 # ══════════════════════════════════════════════════════════════
 # PIPELINE MODES — OHLC
 # ══════════════════════════════════════════════════════════════
@@ -1060,6 +1070,8 @@ async def run_daily() -> None:
             r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
         )
     log.info("━━━ Daily complete ━━━")
+
+
 async def run_today() -> None:
     today = today_ist()
     if not is_trading_day(today):
@@ -1109,8 +1121,6 @@ async def run_today() -> None:
     log.info("━━━ Today complete ━━━")
 
 
-
-
 async def run_full() -> None:
     today  = last_trading_day()
     start  = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
@@ -1123,19 +1133,21 @@ async def run_full() -> None:
     total_stocks = len(ISIN_MAP) + len(BSE_ISIN_MAP)
     log.info(f"━━━ Full Load  {start} → {today}  ({total_stocks} stocks) ━━━")
 
+    # FIX #2: compute year range correctly (matching run_daily signature)
+    from_year = int(start[:4])
+    to_year   = int(today[:4])
+
     sem      = asyncio.Semaphore(CONCURRENCY)
     all_data: dict = {}
     failed:   list[str] = []
 
-    all_sym_map = {sym: (isin, "NSE_EQ") for sym, isin in ISIN_MAP.items()}
-    all_sym_map.update({sym: (isin, "BSE_EQ") for sym, isin in BSE_ISIN_MAP.items()})
+    all_sym_list = list(ISIN_MAP.keys()) + list(BSE_ISIN_MAP.keys())
 
     async with httpx.AsyncClient() as client:
-        symbols = list(all_sym_map.keys())
-        for i in range(0, len(symbols), 50):
-            chunk_syms = symbols[i : i + 50]
-            tasks   = [fetch_ohlc(client, sem, sym, all_sym_map[sym][0], start, today, all_sym_map[sym][1]) for sym in chunk_syms]
-            results = await asyncio.gather(*tasks)
+        for i in range(0, len(all_sym_list), 50):
+            chunk_syms = all_sym_list[i : i + 50]
+            tasks      = [fetch_ohlc(client, sem, sym, from_year, to_year) for sym in chunk_syms]
+            results    = await asyncio.gather(*tasks)
             for sym, candles in results:
                 if candles:
                     filtered = [c for c in candles if c["d"] >= cutoff]
@@ -1144,8 +1156,8 @@ async def run_full() -> None:
                 else:
                     failed.append(sym)
 
-            pct = min(i + 50, len(symbols))
-            log.info(f"  {pct}/{len(symbols)}  OK:{len(all_data)}  Failed:{len(failed)}")
+            pct = min(i + 50, len(all_sym_list))
+            log.info(f"  {pct}/{len(all_sym_list)}  OK:{len(all_data)}  Failed:{len(failed)}")
             if pct % 500 == 0:
                 await upload_all_chunks(client, all_data, today)
 
@@ -1246,10 +1258,18 @@ async def run_fund_full(part: int = 0) -> None:
         chunk = nse_symbols[start_idx:end_idx]
         log.info(f"━━━ Fund Full {label}  ({len(chunk)} NSE stocks) ━━━")
 
-        ETF_KEYWORDS = ("ETF","BEES","LIQUID","GILT","GOLD","SILVER","NIFTY","BANKEX","IETF","MSCIN","MMQS","TOTAL")
-        equity_chunk = [sym for sym in chunk if not any(sym.upper().endswith(k) or k in sym.upper() for k in ETF_KEYWORDS)]
-        if len(chunk) - len(equity_chunk):
-            log.info(f"Skipping {len(chunk)-len(equity_chunk)} ETFs")
+        # FIX #8: tighten ETF filter — endswith for ambiguous short tokens only,
+        # contains only for tokens safe to match anywhere in the symbol
+        ETF_ENDSWITH = ("ETF", "BEES", "LIQUID", "GILT", "IETF", "MMQS", "TOTAL")
+        ETF_CONTAINS = ("NIFTY", "BANKEX", "MSCIN")
+        def _is_etf(sym: str) -> bool:
+            s = sym.upper()
+            return any(s.endswith(k) for k in ETF_ENDSWITH) or any(k in s for k in ETF_CONTAINS)
+
+        equity_chunk = [sym for sym in chunk if not _is_etf(sym)]
+        skipped_etf  = len(chunk) - len(equity_chunk)
+        if skipped_etf:
+            log.info(f"Skipping {skipped_etf} ETFs")
 
         fund_data = await r2_download_fund(client)
         missing   = [sym for sym in equity_chunk if sym not in fund_data]
@@ -1410,7 +1430,6 @@ async def run_bse_profiles(part: int = 0) -> None:
     log.info(f"━━━ BSE Profiles {label} complete — ✓{ok}  ✗{fail} ━━━")
 
 
-
 # ══════════════════════════════════════════════════════════════
 # EP FORMATION SCANNER
 # ══════════════════════════════════════════════════════════════
@@ -1512,7 +1531,11 @@ def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,vol
         s=all_data[sym]; dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
         if n<volume_lookback+2: continue
         if result_date not in dates: continue
-        ri=dates.index(result_date); ti=ri+1
+        # FIX #3: safe index lookup — handle missing/duplicate dates
+        ri_list = [i for i, d in enumerate(dates) if d == result_date]
+        if not ri_list: continue
+        ri = ri_list[-1]
+        ti=ri+1
         if ti>=n: continue
         lookback=min(volume_lookback,ri)
         if lookback==0: continue
@@ -1542,231 +1565,220 @@ def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,vol
     return signals
 
 
-def _calculate_rs(all_data,history_days=30):
-    all_syms=list(all_data.keys()); result={}; day_scores={}
-    for sym,s in all_data.items():
-        closes=s["c"]; n=len(closes); scores=[]
-        for day_offset in range(history_days,-1,-1):
-            idx=n-1-day_offset
-            if idx<63: scores.append(None); continue
+def _calculate_rs(all_data, history_days=30):
+    all_syms = list(all_data.keys())
+    result   = {}
+    day_scores = {}
+
+    for sym, s in all_data.items():
+        closes = s["c"]
+        n      = len(closes)
+        scores = []
+
+        for day_offset in range(history_days, -1, -1):
+            idx = n - 1 - day_offset
+            if idx < 63:
+                scores.append(None)
+                continue
+
+            # FIX #1: guard None for both closes[idx] and closes[prev_idx]
             def ret(lookback):
                 prev_idx = idx - lookback
                 if prev_idx < 0:
                     return None
                 prev = closes[prev_idx]
-                if not prev:  # handles None and 0
-                    return None
-                c = closes[idx]
-                if c is None:  # guard current close too
+                c    = closes[idx]
+                if not prev or c is None:   # handles None and 0
                     return None
                 return (c - prev) / prev * 100
-            p63=ret(63); p126=ret(126); p189=ret(189); p252=ret(252)
-            if p252 is not None and p189 is not None and p126 is not None and p63 is not None: composite=(p63*2+p126+p189+p252)/5
-            elif p189 is not None and p126 is not None and p63 is not None: composite=(p63*2+p126+p189)/4
-            elif p126 is not None and p63 is not None: composite=(p63*2+p126)/3
-            elif p63 is not None: composite=p63
-            else: scores.append(None); continue
+
+            p63  = ret(63)
+            p126 = ret(126)
+            p189 = ret(189)
+            p252 = ret(252)
+
+            if p252 is not None and p189 is not None and p126 is not None and p63 is not None:
+                composite = (p63*2 + p126 + p189 + p252) / 5
+            elif p189 is not None and p126 is not None and p63 is not None:
+                composite = (p63*2 + p126 + p189) / 4
+            elif p126 is not None and p63 is not None:
+                composite = (p63*2 + p126) / 3
+            elif p63 is not None:
+                composite = p63
+            else:
+                scores.append(None)
+                continue
+
             scores.append(composite)
-        day_scores[sym]=scores
-    n_days=history_days+1; rs_history={sym:[] for sym in all_syms}
+
+        day_scores[sym] = scores
+
+    n_days     = history_days + 1
+    rs_history = {sym: [] for sym in all_syms}
+
     for d in range(n_days):
-        day_composites={sym:day_scores[sym][d] for sym in all_syms if day_scores[sym][d] is not None}
+        day_composites = {sym: day_scores[sym][d] for sym in all_syms if day_scores[sym][d] is not None}
         if not day_composites:
-            for sym in all_syms: rs_history[sym].append(None)
+            for sym in all_syms:
+                rs_history[sym].append(None)
             continue
-        sorted_syms=sorted(day_composites,key=lambda x:day_composites[x]); total=len(sorted_syms)
-        ranks={sym:round((i+1)/total*99) for i,sym in enumerate(sorted_syms)}
-        for sym in all_syms: rs_history[sym].append(ranks.get(sym))
-    final_composites={sym:day_scores[sym][-1] for sym in all_syms if day_scores[sym][-1] is not None}
-    final_sorted=sorted(final_composites,key=lambda x:final_composites[x]); final_total=len(final_sorted)
-    final_rank_pos={sym:i+1 for i,sym in enumerate(final_sorted)}
+        sorted_syms = sorted(day_composites, key=lambda x: day_composites[x])
+        total       = len(sorted_syms)
+        ranks       = {sym: round((i+1) / total * 99) for i, sym in enumerate(sorted_syms)}
+        for sym in all_syms:
+            rs_history[sym].append(ranks.get(sym))
+
+    final_composites = {sym: day_scores[sym][-1] for sym in all_syms if day_scores[sym][-1] is not None}
+    final_sorted     = sorted(final_composites, key=lambda x: final_composites[x])
+    final_total      = len(final_sorted)
+    final_rank_pos   = {sym: i+1 for i, sym in enumerate(final_sorted)}
+
     for sym in all_syms:
-        hist=rs_history[sym]; current_rs=next((v for v in reversed(hist) if v is not None),None)
-        result[sym]={"rs":current_rs,"rs_rank":final_rank_pos.get(sym),"rs_total":final_total,"history":hist}
+        hist       = rs_history[sym]
+        current_rs = next((v for v in reversed(hist) if v is not None), None)
+        result[sym] = {
+            "rs"      : current_rs,
+            "rs_rank" : final_rank_pos.get(sym),
+            "rs_total": final_total,
+            "history" : hist,
+        }
+
     return result
 
 
-def _build_rs_history_json(all_data,rs_data):
+def _build_rs_history_json(all_data, rs_data):
     from datetime import date as dt
-    sample_sym=max(all_data.keys(),key=lambda s:len(all_data[s].get("d",[])))
-    dates=all_data[sample_sym]["d"]; n=len(dates)
-    history_len=len(next(iter(rs_data.values()))["history"]); start_idx=n-history_len
+    sample_sym  = max(all_data.keys(), key=lambda s: len(all_data[s].get("d", [])))
+    dates       = all_data[sample_sym]["d"]
+    n           = len(dates)
+    history_len = len(next(iter(rs_data.values()))["history"])
+    start_idx   = n - history_len
     def fmt_date(d_str): return dt.fromisoformat(d_str).strftime("%-d-%b-%y")
-    date_labels=[(i,fmt_date(dates[start_idx+i])) for i in range(history_len) if 0<=start_idx+i<n]
-    rows=[]
-    for sym,v in rs_data.items():
-        row={"Stock Name":sym}
-        for i,label in date_labels:
-            if v["history"][i] is not None: row[label]=v["history"][i]
+    date_labels = [(i, fmt_date(dates[start_idx+i])) for i in range(history_len) if 0 <= start_idx+i < n]
+    rows = []
+    for sym, v in rs_data.items():
+        row = {"Stock Name": sym}
+        for i, label in date_labels:
+            if v["history"][i] is not None:
+                row[label] = v["history"][i]
         rows.append(row)
     return rows
+
 
 # ══════════════════════════════════════════════════════════════
 # SECTOR RS HISTORY
 # ══════════════════════════════════════════════════════════════
 
-def _build_group_rs_history(
-    classification,
-    rs_history_json,
-    field_name,
-):
-
-    # =====================================================
-    # GROUP MAP
-    # =====================================================
+def _build_group_rs_history(classification, rs_history_json, field_name):
+    # FIX #6: guard against classification being None
+    if not classification or not isinstance(classification, list):
+        log.warning(f"_build_group_rs_history: classification is empty/None — skipping {field_name}")
+        return []
 
     group_map = {}
-
     for s in classification:
-
-        sym = s.get("symbol")
-
+        sym   = s.get("symbol")
         group = s.get(field_name)
-
         if not sym or not group:
             continue
+        group_map.setdefault(group, []).append(sym)
 
-        group_map.setdefault(
-            group,
-            []
-        ).append(sym)
+    if not rs_history_json:
+        return []
 
-    # =====================================================
-    # DATE COLUMNS
-    # =====================================================
-
-    sample = rs_history_json[0]
-
-    date_cols = [
-
-        k for k in sample.keys()
-
-        if k != "Stock Name"
-    ]
-
-    output = []
-
-    # =====================================================
-    # DATE LOOP
-    # =====================================================
+    sample    = rs_history_json[0]
+    date_cols = [k for k in sample.keys() if k != "Stock Name"]
+    output    = []
 
     for dt in date_cols:
-
         stocks = {}
-
         for row in rs_history_json:
-
             sym = row.get("Stock Name")
-
-            rs = row.get(dt)
-
+            rs  = row.get(dt)
             if sym and rs is not None:
-
                 stocks[sym] = rs
 
         groups = {}
-
         for group, syms in group_map.items():
-
-            valid = 0
-
-            rs60 = 0
-            rs70 = 0
-            rs80 = 0
-            rs90 = 0
-
+            valid = rs60 = rs70 = rs80 = rs90 = 0
             for sym in syms:
-
                 rs = stocks.get(sym)
-
                 if rs is None:
                     continue
-
                 valid += 1
-
-                if rs >= 60:
-                    rs60 += 1
-
-                if rs >= 70:
-                    rs70 += 1
-
-                if rs >= 80:
-                    rs80 += 1
-
-                if rs >= 90:
-                    rs90 += 1
-
-            # REMOVE TINY GROUPS
+                if rs >= 60: rs60 += 1
+                if rs >= 70: rs70 += 1
+                if rs >= 80: rs80 += 1
+                if rs >= 90: rs90 += 1
             if valid < 5:
                 continue
-
             groups[group] = {
-
                 "stocks": valid,
-
-                "rs60": round(
-                    rs60 / valid * 100,
-                    1
-                ),
-
-                "rs70": round(
-                    rs70 / valid * 100,
-                    1
-                ),
-
-                "rs80": round(
-                    rs80 / valid * 100,
-                    1
-                ),
-
-                "rs90": round(
-                    rs90 / valid * 100,
-                    1
-                ),
+                "rs60"  : round(rs60 / valid * 100, 1),
+                "rs70"  : round(rs70 / valid * 100, 1),
+                "rs80"  : round(rs80 / valid * 100, 1),
+                "rs90"  : round(rs90 / valid * 100, 1),
             }
 
-        output.append({
-
-            "date": dt,
-
-            "groups": groups
-        })
+        output.append({"date": dt, "groups": groups})
 
     return output
 
 
+def _calculate_mswing(all_data, history_days=60):
+    result = {}
+    for sym, s in all_data.items():
+        closes  = s["c"]
+        n       = len(closes)
+        history = []
 
+        for day_offset in range(history_days, -1, -1):
+            idx = n - 1 - day_offset
+            if idx < 51:
+                history.append(None)
+                continue
 
-def _calculate_mswing(all_data,history_days=60):
-    result={}
-    for sym,s in all_data.items():
-        closes=s["c"]; n=len(closes); history=[]
-        for day_offset in range(history_days,-1,-1):
-            idx=n-1-day_offset
-            if idx<51: history.append(None); continue
+            # FIX #4: guard None/zero closes before arithmetic
+            c_now = closes[idx]
+            c20   = closes[idx - 20]
+            c50   = closes[idx - 50]
+
+            if c_now is None or not c20 or not c50:
+                history.append(None)
+                continue
+
             try:
-                ret_20=(closes[idx]-closes[idx-20])/closes[idx-20]*100/20
-                ret_50=(closes[idx]-closes[idx-50])/closes[idx-50]*100/50
-                history.append(round(ret_20+ret_50,4))
-            except ZeroDivisionError: history.append(None)
-        valid=[v for v in history[-9:] if v is not None]
-        avg9=round(sum(valid)/len(valid),4) if valid else None
-        result[sym]={"mswing":history[-1] if history else None,"mswing_avg9":avg9,"mswing_history":history}
+                ret_20 = (c_now - c20) / c20 * 100 / 20
+                ret_50 = (c_now - c50) / c50 * 100 / 50
+                history.append(round(ret_20 + ret_50, 4))
+            except ZeroDivisionError:
+                history.append(None)
+
+        valid    = [v for v in history[-9:] if v is not None]
+        avg9     = round(sum(valid) / len(valid), 4) if valid else None
+        result[sym] = {
+            "mswing"         : history[-1] if history else None,
+            "mswing_avg9"    : avg9,
+            "mswing_history" : history,
+        }
     return result
 
 
-def _build_mswing_json(all_data,mswing_data):
+def _build_mswing_json(all_data, mswing_data):
     from datetime import date as dt
-    sample_sym=max(all_data.keys(),key=lambda s:len(all_data[s].get("d",[])))
-    dates=all_data[sample_sym]["d"]; n=len(dates)
-    history_len=len(next(iter(mswing_data.values()))["mswing_history"]); start_idx=n-history_len
+    sample_sym  = max(all_data.keys(), key=lambda s: len(all_data[s].get("d", [])))
+    dates       = all_data[sample_sym]["d"]
+    n           = len(dates)
+    history_len = len(next(iter(mswing_data.values()))["mswing_history"])
+    start_idx   = n - history_len
     def fmt_date(d_str): return dt.fromisoformat(d_str).strftime("%-d-%b-%y")
-    date_labels=[(i,fmt_date(dates[start_idx+i])) for i in range(history_len) if 0<=start_idx+i<n]
-    rows=[]
-    for sym,v in mswing_data.items():
-        row={"Stock Name":sym}
-        for i,label in date_labels:
-            if v["mswing_history"][i] is not None: row[label]=v["mswing_history"][i]
+    date_labels = [(i, fmt_date(dates[start_idx+i])) for i in range(history_len) if 0 <= start_idx+i < n]
+    rows = []
+    for sym, v in mswing_data.items():
+        row = {"Stock Name": sym}
+        for i, label in date_labels:
+            if v["mswing_history"][i] is not None:
+                row[label] = v["mswing_history"][i]
         rows.append(row)
     return rows
 
@@ -1845,34 +1857,19 @@ async def run_ep_scan() -> None:
             ah=sum(1 for s in pr_signals if "AH" in s["reaction_type"]); ih=sum(1 for s in pr_signals if "IH" in s["reaction_type"])
             log.info(f"Post-Result signals: {len(pr_signals)}  (AH→T+1: {ah}  IH→T+1: {ih})")
 
-        rs_data = _calculate_rs(all_data, history_days=60)
-        for sig in signals: sig["rs_calc"]=rs_data.get(sig["symbol"],{}).get("rs")
-        for sig in pr_signals: sig["rs_calc"]=rs_data.get(sig["symbol"],{}).get("rs")
-        rs_history_list = _build_rs_history_json(all_data, rs_data)
-        
-        classification = await r2_download(
-            client,
-            "classification.json"
-        )
-        
-        macro_sector_rs_history = _build_group_rs_history(
-            classification,
-            rs_history_list,
-            "macro_sector"
-        )
+        rs_data          = _calculate_rs(all_data, history_days=60)
+        for sig in signals:   sig["rs_calc"] = rs_data.get(sig["symbol"], {}).get("rs")
+        for sig in pr_signals: sig["rs_calc"] = rs_data.get(sig["symbol"], {}).get("rs")
+        rs_history_list  = _build_rs_history_json(all_data, rs_data)
 
-        industry_rs_history = _build_group_rs_history(
-            classification,
-            rs_history_list,
-            "industry"
-        )
+        # FIX #6: classification already fetched during build_isin_map — re-use from R2
+        # Use the same already-downloaded data; fall back to [] if missing
+        classification = await r2_download(client, "classification.json") or []
 
-        sector_rs_history = _build_group_rs_history(
-            classification,
-            rs_history_list,
-            "sector"
-        )
-      
+        macro_sector_rs_history = _build_group_rs_history(classification, rs_history_list, "macro_sector")
+        industry_rs_history     = _build_group_rs_history(classification, rs_history_list, "industry")
+        sector_rs_history       = _build_group_rs_history(classification, rs_history_list, "sector")
+
         mswing_data = _calculate_mswing(all_data, history_days=ROLLING_DAYS - 50)
         mswing_list = _build_mswing_json(all_data, mswing_data)
         for sig in signals:
@@ -1881,21 +1878,21 @@ async def run_ep_scan() -> None:
             sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
 
         await asyncio.gather(
-            r2_upload(client, "ep_signals.json",          json.dumps({"updated":today,"count":len(signals),"signals":signals})),
-            r2_upload(client, "rs_ratings.json",          json.dumps({"updated":today,"count":len(rs_data),"stocks":rs_data})),
-            r2_upload(client, "rs_history.json",          json.dumps(rs_history_list)),
-            r2_upload(client, "mswing.json",              json.dumps(mswing_list)),
-            r2_upload(client, "post_result_signals.json", json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
-            r2_upload( client, "sector_rs_history.json",  json.dumps(sector_rs_history) ),
-            r2_upload(client,  "macro_sector_rs_history.json",json.dumps(macro_sector_rs_history)),
-            r2_upload(client, "industry_rs_history.json",     json.dumps(industry_rs_history)),
+            r2_upload(client, "ep_signals.json",               json.dumps({"updated":today,"count":len(signals),"signals":signals})),
+            r2_upload(client, "rs_ratings.json",               json.dumps({"updated":today,"count":len(rs_data),"stocks":rs_data})),
+            r2_upload(client, "rs_history.json",               json.dumps(rs_history_list)),
+            r2_upload(client, "mswing.json",                   json.dumps(mswing_list)),
+            r2_upload(client, "post_result_signals.json",      json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
+            r2_upload(client, "sector_rs_history.json",        json.dumps(sector_rs_history)),
+            r2_upload(client, "macro_sector_rs_history.json",  json.dumps(macro_sector_rs_history)),
+            r2_upload(client, "industry_rs_history.json",      json.dumps(industry_rs_history)),
         )
         log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS+MSwing:{len(rs_data)}")
     log.info("━━━ EP + Post-Result Scan complete ━━━")
 
 
 # ══════════════════════════════════════════════════════════════
-# HLR + PULLBACK + PATTERN SCANNERS (unchanged from original)
+# HLR + PULLBACK + PATTERN SCANNERS
 # ══════════════════════════════════════════════════════════════
 
 def _calc_ema(closes,period):
