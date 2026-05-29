@@ -1933,6 +1933,7 @@ def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullbac
         i=n-1
         if last_swing_high_bar is None or last_swing_low_bar is None: continue
         if last_swing_high_bar<=last_swing_low_bar: continue
+        if closes[i] is None or highs[i] is None or lows[i] is None: continue
         swing_range_pct=(last_swing_high_price-last_swing_low_price)/last_swing_low_price*100
         if swing_range_pct<min_swing_range_pct: continue
         pullback_pct=(last_swing_high_price-lows[i])/last_swing_high_price*100
