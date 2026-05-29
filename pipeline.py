@@ -1916,9 +1916,9 @@ def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullbac
         macd_arr=[v if v is not None else 0.0 for v in macd_line]; macd_signal=_calc_ema(macd_arr,9)
         last_swing_high_price=last_swing_high_bar=last_swing_low_price=last_swing_low_bar=None
         for i in range(length_pull,n-length_pull):
-            if all(highs[i]>=highs[i-k] for k in range(1,length_pull+1)) and all(highs[i]>=highs[i+k] for k in range(1,length_pull+1)):
+            if all(highs[i]>=highs[i-k] for k in range(1,length_pull+1) if highs[i-k] is not None) and all(highs[i]>=highs[i+k] for k in range(1,length_pull+1) if highs[i+k] is not None):
                 last_swing_high_price=highs[i]; last_swing_high_bar=i
-            if all(lows[i]<=lows[i-k] for k in range(1,length_pull+1)) and all(lows[i]<=lows[i+k] for k in range(1,length_pull+1)):
+            if all(lows[i]<=lows[i-k] for k in range(1,length_pull+1) if lows[i-k] is not None) and all(lows[i]<=lows[i+k] for k in range(1,length_pull+1) if lows[i+k] is not None):
                 last_swing_low_price=lows[i]; last_swing_low_bar=i
         if last_swing_high_price is None or last_swing_low_price is None: continue
         i=n-1
