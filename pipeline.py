@@ -1411,9 +1411,19 @@ async def run_bse_profiles(part: int = 0) -> None:
 
 def _check_liquidity(volumes, closes, n, min_turnover=3_00_00_000):
     lookback = min(50, n)
-    if lookback < 20: return True
-    avg_vol   = sum(volumes[-lookback:]) / lookback
-    avg_price = sum(closes[-lookback:])  / lookback
+
+    if lookback < 20:
+        return True
+
+    vols   = [v for v in volumes[-lookback:] if v is not None]
+    prices = [c for c in closes[-lookback:] if c is not None and c > 0]
+
+    if len(vols) < 20 or len(prices) < 20:
+        return False
+
+    avg_vol   = sum(vols) / len(vols)
+    avg_price = sum(prices) / len(prices)
+
     return (avg_vol * avg_price) >= min_turnover
 
 def _detect_ep(
