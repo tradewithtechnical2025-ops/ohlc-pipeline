@@ -171,7 +171,7 @@ def get_field(catagory, name):
 def parse_shareholding(symbol, data):
 
     rows = data.get("rows") or []
-    cols = (data.get("columns") or [])[:8]
+    cols = data.get("columns") or []   # all quarters, no cap
 
     if not rows or not cols:
         return {
