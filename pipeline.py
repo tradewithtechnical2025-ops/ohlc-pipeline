@@ -223,7 +223,13 @@ async def fetch_ohlc(
                     "oi": 0,
                 }
                 for c in raw
-                if c.get("quote_date")
+                if (
+                    c.get("quote_date")
+                    and c.get("open_price") is not None
+                    and c.get("high_price") is not None
+                    and c.get("low_price") is not None
+                    and c.get("close_price") is not None
+                )
             ],
             key=lambda x: x["d"],
         )
