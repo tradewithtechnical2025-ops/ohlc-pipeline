@@ -1460,8 +1460,13 @@ def _detect_ep(
             consol_count = 0
             ep_intact = True
             for j in range(i + 1, min(i + max_consolidation + 1, n)):
+                if closes[j] is None:
+                  continue
+
                 if closes[j] < gap_lower:
-                    ep_intact = False; break
+                  ep_intact = False
+                    break
+
                 consol_count += 1
             if not ep_intact: continue
             if consol_count >= max_consolidation: continue
