@@ -142,7 +142,72 @@ SECTOR_GROUP_MAP = {
     # Water / Waste
     "Water Treatment": "Environmental Services",
     "Waste Management": "Environmental Services",
-}
+    # IT
+    "Computers - Software & Consulting": "IT Services",
+    "IT Enabled Services": "IT Services",
+    "Software Products": "Software",
+    
+    # Power
+    "Power Generation": "Power",
+    "Power - Transmission": "Power",
+    "Power Distribution": "Power",
+    "Integrated Power Utilities": "Power",
+    "Power Trading": "Power",
+    
+    # Telecom
+    "Telecom - Cellular & Fixed line services": "Telecom",
+    "Telecom - Infrastructure": "Telecom",
+    "Telecom - Equipment & Accessories": "Telecom",
+    "Other Telecom Services": "Telecom",
+    
+    # FMCG
+    "Diversified FMCG": "FMCG",
+    "Packaged Foods": "FMCG",
+    "Personal Care": "FMCG",
+    "Other Beverages": "FMCG",
+    "Tea & Coffee": "FMCG",
+    "Edible Oil": "FMCG",
+    "Dairy Products": "FMCG",
+    
+    # Infrastructure
+    "Civil Construction": "Infrastructure",
+    
+    # Realty
+    "Residential, Commercial Projects": "Real Estate",
+    
+    # Retail
+    "Speciality Retail": "Retail",
+    "Diversified Retail": "Retail",
+    "E-Retail/ E-Commerce": "Retail",
+    "Internet & Catalogue Retail": "Retail",
+    "Pharmacy Retail": "Retail",
+    
+    # Electrical Equipment
+    "Heavy Electrical Equipment": "Electrical Equipment",
+    "Other Electrical Equipment": "Electrical Equipment",
+    
+    # Agriculture
+    "Fertilizers": "Agriculture",
+    "Pesticides & Agrochemicals": "Agriculture",
+    "Animal Feed": "Agriculture",
+    
+    # Logistics
+    "Logistics Solution Provider": "Logistics",
+    "Shipping": "Logistics",
+    "Port & Port services": "Logistics",
+    "Airport & Airport services": "Logistics",
+    
+    # Travel
+    "Hotels & Resorts": "Travel & Hospitality",
+    "Airline": "Travel & Hospitality",
+    "Restaurants": "Travel & Hospitality",
+    "Tour, Travel Related Services": "Travel & Hospitality",
+    
+    # Financials
+    "Financial Institution": "NBFC",
+    "Investment Company": "NBFC",
+    "Holding Company": "NBFC",
+    }
 
 # =========================================================
 # LOGIC
