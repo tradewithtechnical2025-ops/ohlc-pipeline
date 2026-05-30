@@ -1018,9 +1018,9 @@ def upsert_candle(all_data: dict, sym: str, c: dict) -> None:
 
 async def run_daily() -> None:
     today = today_ist()
-    if not is_trading_day(today):
-        log.info(f"⏭  {today} is not a trading day — exiting")
-        return
+    #if not is_trading_day(today):
+        #log.info(f"⏭  {today} is not a trading day — exiting")
+        #return
 
     prev   = prev_trading_day(today)
     cutoff = rolling_cutoff(today)
