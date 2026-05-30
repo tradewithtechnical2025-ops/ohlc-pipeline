@@ -20,7 +20,7 @@ jobs:
         run: |
           pip install httpx
 
-      - name: Run Test Pipeline
+      - name: pipeline_sector_groups_test
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
