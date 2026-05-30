@@ -1883,7 +1883,7 @@ async def run_ep_scan() -> None:
             r2_upload(client, "rs_history.json",               json.dumps(rs_history_list)),
             r2_upload(client, "mswing.json",                   json.dumps(mswing_list)),
             r2_upload(client, "post_result_signals.json",      json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
-            r2_upload(client, "sector_group_rs_history.json",        json.dumps(sector_rs_history)),
+            r2_upload(client, "sector_group_rs_history.json",        json.dumps(sector_group_rs_history)),
             r2_upload(client, "macro_sector_rs_history.json",  json.dumps(macro_sector_rs_history)),
             r2_upload(client, "industry_rs_history.json",      json.dumps(industry_rs_history)),
         )
