@@ -1701,11 +1701,13 @@ def _build_group_rs_history(classification, rs_history_json, field_name):
         groups = {}
         for group, syms in group_map.items():
             valid = rs60 = rs70 = rs80 = rs90 = 0
+            rs_sum = 0
             for sym in syms:
                 rs = stocks.get(sym)
                 if rs is None:
                     continue
                 valid += 1
+                rs_sum += rs
                 if rs >= 60: rs60 += 1
                 if rs >= 70: rs70 += 1
                 if rs >= 80: rs80 += 1
@@ -1718,6 +1720,7 @@ def _build_group_rs_history(classification, rs_history_json, field_name):
                 "rs70"  : round(rs70 / valid * 100, 1),
                 "rs80"  : round(rs80 / valid * 100, 1),
                 "rs90"  : round(rs90 / valid * 100, 1),
+                "avg_rs": round(rs_sum / valid, 1),
             }
 
         output.append({"date": dt, "groups": groups})
