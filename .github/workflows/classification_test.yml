@@ -1,4 +1,4 @@
-name: Sector Group Test
+name: pipeline_sector_groups_test
 
 on:
   workflow_dispatch:
