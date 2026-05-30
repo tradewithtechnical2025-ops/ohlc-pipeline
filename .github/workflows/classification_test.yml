@@ -25,4 +25,4 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: |
-          python sector_group_test.py
+          pipeline_sector_groups_test.py
