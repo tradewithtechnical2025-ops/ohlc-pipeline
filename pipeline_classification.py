@@ -761,9 +761,8 @@ def classify(symbol: str, profile: dict) -> tuple[str, str, list[str]]:
     sector_group     = desc_sg or get_sector_group(profile)
     display_industry = desc_di or get_display_industry(profile)
 
-    # Themes: merge manual list + description-derived (deduplicated)
-    manual_themes = SYMBOL_THEMES.get(symbol, [])
-    all_themes = list(dict.fromkeys(manual_themes + desc_themes))
+    # Themes: manual list only
+    all_themes = SYMBOL_THEMES.get(symbol, [])
 
     return sector_group, display_industry, all_themes
 
