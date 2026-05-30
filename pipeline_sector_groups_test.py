@@ -223,6 +223,55 @@ SECTOR_GROUP_MAP = {
     "Healthcare Research, Analytics & Technology": "Healthcare",
     "Medical Equipment & Supplies": "Healthcare",
     "Biotechnology": "Healthcare",
+    # Paints
+    "Paints": "Paints",
+    
+    # Tobacco
+    "Cigarettes & Tobacco Products": "Tobacco",
+    
+    # Consumer Services
+    "Other Consumer Services": "Business Services",
+    
+    # Publishing / Media
+    "Printing & Publication": "Media & Publishing",
+    "Electronic Media": "Entertainment",
+    
+    # Travel
+    "Amusement Parks/ Other Recreation": "Travel & Hospitality",
+    "Tour Travel Related Services": "Travel & Hospitality",
+    "Wellness": "Travel & Hospitality",
+    
+    # Consumer
+    "Granites & Marbles": "Consumer Durables",
+    "Leisure Products": "Consumer Durables",
+    "Cycles": "Consumer Durables",
+    "Diversified consumer products": "Consumer Durables",
+    
+    # Jewellery
+    "Gems Jewellery And Watches": "Jewellery",
+    "Gems, Jewellery And Watches": "Jewellery",
+    
+    # Textile
+    "Trading - Textile Products": "Textiles",
+    
+    # Auto
+    "Trading - Auto Components": "Automobiles",
+    "Dealers-Commercial Vehicles, Tractors, Construction Vehicles": "Automobiles",
+    
+    # Retail
+    "Distributors": "Retail",
+    
+    # Paper
+    "Forest Products": "Paper & Packaging",
+    
+    # Energy
+    "Trading Coal": "Energy",
+    
+    # Utilities
+    "Other Utilities": "Utilities",
+    
+    # Metals
+    "Precious Metals": "Metals & Mining",
     
     # Entertainment
     "Media & Entertainment": "Entertainment",
