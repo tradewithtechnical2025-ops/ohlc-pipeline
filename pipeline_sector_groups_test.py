@@ -262,6 +262,101 @@ SECTOR_GROUP_MAP = {
     "Pig Iron": "Metals & Mining",
     "Ferro & Silica Manganese": "Metals & Mining",
     "Aluminium, Copper & Zinc Products": "Metals & Mining"
+    # Consumer Durables
+    "Gems, Jewellery And Watches": "Jewellery",
+    "Household Appliances": "Consumer Durables",
+    "Consumer Electronics": "Consumer Durables",
+    "Ceramics": "Consumer Durables",
+    "Plastic Products - Consumer": "Consumer Durables",
+    "Leather And Leather Products": "Consumer Durables",
+    "Furniture Home Furnishing": "Consumer Durables",
+    "Glass - Consumer": "Consumer Durables",
+    
+    # Chemicals
+    "Industrial Gases": "Chemicals",
+    "Petrochemicals": "Chemicals",
+    "Dyes And Pigments": "Chemicals",
+    "Carbon Black": "Chemicals",
+    "Printing Inks": "Chemicals",
+    "Trading - Chemicals": "Chemicals",
+    "Explosives": "Chemicals",
+    
+    # Agriculture
+    "Sugar": "Agriculture",
+    "Other Agricultural Products": "Agriculture",
+    "Meat Products including Poultry": "Agriculture",
+    "Seafood": "Agriculture",
+    
+    # FMCG
+    "Breweries & Distilleries": "FMCG",
+    "Other Food Products": "FMCG",
+    "Household Products": "FMCG",
+    
+    # Financials
+    "Financial Technology (Fintech)": "Fintech",
+    "Other Financial Services": "NBFC",
+    "Microfinance Institutions": "NBFC",
+    "Insurance Distributors": "Insurance",
+    "Depositories Clearing Houses and Other Intermediaries": "Capital Markets",
+    "Other Capital Market related Services": "Capital Markets",
+    
+    # Telecom
+    "Telecom -  Equipment & Accessories": "Telecom",
+    "Computers Hardware & Equipments": "IT Hardware",
+    
+    # Defence
+    "Ship Building & Allied Services": "Defence",
+    
+    # Auto
+    "Tyres & Rubber Products": "Automobiles",
+    "Construction Vehicles": "Automobiles",
+    "Tractors": "Automobiles",
+    "Auto -Dealer": "Automobiles",
+    
+    # Energy
+    "Lubricants": "Energy",
+    "Oil Equipment & Services": "Energy",
+    "Oil Storage & Transportation": "Energy",
+    "Trading - Gas": "Energy",
+    "Offshore Support Solution Drilling": "Energy",
+    
+    # Media
+    "Print Media": "Entertainment",
+    "Advertising & Media Agencies": "Entertainment",
+    "Web based media and service": "Entertainment",
+    "Film Production Distribution & Exhibition": "Entertainment",
+    
+    # Education
+    "Education": "Education",
+    "E-Learning": "Education",
+    
+    # Services
+    "Diversified Commercial Services": "Business Services",
+    "Trading & Distributors": "Business Services",
+    "Consulting Services": "Business Services",
+    "Data Processing Services": "Business Services",
+    "Business Process Outsourcing (BPO)/ Knowledge Process Outsourcing (KPO)": "Business Services",
+    
+    # Transport
+    "Road Transport": "Logistics",
+    "Transport Related Services": "Logistics",
+    "Dredging": "Logistics",
+    
+    # Construction
+    "Other Construction Materials": "Infrastructure",
+    "Residential Commercial Projects": "Real Estate",
+    "Real Estate related services": "Real Estate",
+    "Road Assets–Toll, Annuity, Hybrid-Annuity": "Infrastructure",
+    
+    # Metals
+    "Trading - Minerals": "Metals & Mining",
+    "Sponge Iron": "Metals & Mining",
+    
+    # Misc
+    "Diversified": "Diversified",
+    "Stationary": "Consumer Products",
+    "Jute & Jute Products": "Paper & Packaging",
+    "Multi Utilities": "Utilities"
     }
 
 # =========================================================
