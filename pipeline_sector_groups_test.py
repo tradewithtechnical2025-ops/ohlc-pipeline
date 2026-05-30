@@ -207,6 +207,61 @@ SECTOR_GROUP_MAP = {
     "Financial Institution": "NBFC",
     "Investment Company": "NBFC",
     "Holding Company": "NBFC",
+    # Industrials
+    "Industrial Products": "Industrials",
+    "Other Industrial Products": "Industrials",
+    "Compressors, Pumps & Diesel Engines": "Industrials",
+    "Castings & Forgings": "Industrials",
+    "Abrasives & Bearings": "Industrials",
+    "Plastic Products - Industrial": "Industrials",
+    "Packaging": "Industrials",
+    "Glass - Industrial": "Industrials",
+    "Electrodes & Refractories": "Industrials",
+    
+    # Healthcare
+    "Healthcare Service Provider": "Healthcare",
+    "Healthcare Research, Analytics & Technology": "Healthcare",
+    "Medical Equipment & Supplies": "Healthcare",
+    "Biotechnology": "Healthcare",
+    
+    # Entertainment
+    "Media & Entertainment": "Entertainment",
+    "TV Broadcasting & Software Production": "Entertainment",
+    "Film Production, Distribution & Exhibition": "Entertainment",
+    "Digital Entertainment": "Entertainment",
+    
+    # Textiles
+    "Garments & Apparels": "Textiles",
+    "Other Textile Products": "Textiles",
+    
+    # Capital Markets
+    "Depositories, Clearing Houses and Other Intermediaries": "Capital Markets",
+    "Ratings": "Capital Markets",
+    "Financial Products Distributor": "Capital Markets",
+    
+    # Railways
+    "Railway Wagons": "Railways",
+    
+    # Water
+    "Water Supply & Management": "Environmental Services",
+    
+    # Consumer
+    "Footwear": "Consumer Durables",
+    "Furniture, Home Furnishing": "Consumer Durables",
+    "Houseware": "Consumer Durables",
+    "Sanitary Ware": "Consumer Durables",
+    "Plywood Boards/ Laminates": "Consumer Durables",
+    
+    # Paper
+    "Paper & Paper Products": "Paper & Packaging",
+    
+    # Metals
+    "Iron & Steel Products": "Metals & Mining",
+    "Trading - Metals": "Metals & Mining",
+    "Copper": "Metals & Mining",
+    "Pig Iron": "Metals & Mining",
+    "Ferro & Silica Manganese": "Metals & Mining",
+    "Aluminium, Copper & Zinc Products": "Metals & Mining"
     }
 
 # =========================================================
