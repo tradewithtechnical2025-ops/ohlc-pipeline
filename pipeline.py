@@ -1786,7 +1786,7 @@ def _build_mswing_json(all_data, mswing_data):
 async def run_ep_scan() -> None:
     today = today_ist()
     #if not is_trading_day(today):
-        l#og.info(f"⏭  {today} is not a trading day — exiting"); return
+        #log.info(f"⏭  {today} is not a trading day — exiting"); return
 
     log.info(f"━━━ EP + Post-Result Scan  {today} ━━━")
     async with httpx.AsyncClient() as client:
