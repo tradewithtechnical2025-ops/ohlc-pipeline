@@ -11,20 +11,16 @@ import httpx
 # =========================================================
 
 FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
+WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 
-WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
-WORKER_TOKEN = os.environ["WORKER_TOKEN"]
+OUTPUT_FILE          = "classification.json"
+FUNDAMENTAL_FILE     = "fundamental.json"
 
-FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
-
-OUTPUT_FILE = "classification.json"
-
-# Slower + safer
 CONCURRENCY = 3
 BATCH_SIZE  = 25
-
-RATE_DELAY = 0.25
-RETRY = 3
+RATE_DELAY  = 0.25
+RETRY       = 3
 
 MIN_MARKET_CAP_CR = 50
 
@@ -65,13 +61,12 @@ SECTOR_GROUP_MAP = {
     "Aluminium, Copper & Zinc Products":        "Metals & Mining",
     "Aluminium Copper & Zinc Products":         "Metals & Mining",
 
-    # ── Banks (standalone) ──
+    # ── Banks ──
     "Private Sector Bank":                      "Banks",
     "Public Sector Bank":                       "Banks",
     "Other Bank":                               "Banks",
 
     # ── Financial Services ──
-    # (NBFC + Insurance + Capital Markets + Fintech merged)
     "Non Banking Financial Company (NBFC)":     "Financial Services",
     "Housing Finance Company":                  "Financial Services",
     "Financial Institution":                    "Financial Services",
@@ -86,8 +81,8 @@ SECTOR_GROUP_MAP = {
     "Asset Management Company":                 "Financial Services",
     "Exchange and Data Platform":               "Financial Services",
     "Financial Products Distributor":           "Financial Services",
-    "Depositories, Clearing Houses and Other Intermediaries":  "Financial Services",
-    "Depositories Clearing Houses and Other Intermediaries":   "Financial Services",
+    "Depositories, Clearing Houses and Other Intermediaries": "Financial Services",
+    "Depositories Clearing Houses and Other Intermediaries":  "Financial Services",
     "Other Capital Market related Services":    "Financial Services",
     "Ratings":                                  "Financial Services",
     "Financial Technology (Fintech)":           "Financial Services",
@@ -121,7 +116,7 @@ SECTOR_GROUP_MAP = {
     # ── Pharma ──
     "Pharmaceuticals":                          "Pharma",
 
-    # ── Healthcare (Hospitals merged) ──
+    # ── Healthcare ──
     "Hospital":                                 "Healthcare",
     "Healthcare Service Provider":              "Healthcare",
     "Healthcare Research, Analytics & Technology": "Healthcare",
@@ -140,17 +135,17 @@ SECTOR_GROUP_MAP = {
     "Waste Management":                         "Environmental Services",
     "Water Supply & Management":                "Environmental Services",
 
-    # ── IT Services (standalone) ──
+    # ── IT Services ──
     "Computers - Software & Consulting":        "IT Services",
     "IT Enabled Services":                      "IT Services",
 
-    # ── Software (standalone) ──
+    # ── Software ──
     "Software Products":                        "Software",
 
-    # ── IT Hardware (standalone) ──
+    # ── IT Hardware ──
     "Computers Hardware & Equipments":          "IT Hardware",
 
-    # ── Power (Utilities merged) ──
+    # ── Power ──
     "Power Generation":                         "Power",
     "Power - Transmission":                     "Power",
     "Power Distribution":                       "Power",
@@ -166,7 +161,7 @@ SECTOR_GROUP_MAP = {
     "Telecom -  Equipment & Accessories":       "Telecom",
     "Other Telecom Services":                   "Telecom",
 
-    # ── FMCG (Tobacco merged) ──
+    # ── FMCG ──
     "Diversified FMCG":                         "FMCG",
     "Packaged Foods":                           "FMCG",
     "Personal Care":                            "FMCG",
@@ -228,7 +223,7 @@ SECTOR_GROUP_MAP = {
     "Tour Travel Related Services":             "Travel & Hospitality",
     "Wellness":                                 "Travel & Hospitality",
 
-    # ── Industrials (Railways merged) ──
+    # ── Industrials ──
     "Industrial Products":                      "Industrials",
     "Other Industrial Products":                "Industrials",
     "Compressors, Pumps & Diesel Engines":      "Industrials",
@@ -242,7 +237,7 @@ SECTOR_GROUP_MAP = {
     "Railway Wagons":                           "Industrials",
     "Rubber":                                   "Industrials",
 
-    # ── Consumer Durables (Jewellery + Paints + Consumer Products merged) ──
+    # ── Consumer Durables ──
     "Household Appliances":                     "Consumer Durables",
     "Consumer Electronics":                     "Consumer Durables",
     "Granites & Marbles":                       "Consumer Durables",
@@ -264,7 +259,7 @@ SECTOR_GROUP_MAP = {
     "Paints":                                   "Consumer Durables",
     "Stationary":                               "Consumer Durables",
 
-    # ── Entertainment (Media & Publishing merged) ──
+    # ── Entertainment ──
     "Media & Entertainment":                    "Entertainment",
     "TV Broadcasting & Software Production":    "Entertainment",
     "Film Production, Distribution & Exhibition": "Entertainment",
@@ -304,288 +299,383 @@ SECTOR_GROUP_MAP = {
 
 # =========================================================
 # INDUSTRY MAP
-# sub_industry → display_industry (clean UI label)
+# sub_industry → display_industry
 # =========================================================
 
 INDUSTRY_MAP = {
-
-    # Agriculture
-    "Other Agricultural Products":          "Agri Products",
-    "Sugar":                                "Sugar",
-    "Pesticides & Agrochemicals":           "Agrochemicals",
-    "Fertilizers":                          "Fertilizers",
-    "Animal Feed":                          "Agri Products",
-    "Seafood":                              "Agri Products",
-    "Meat Products including Poultry":      "Agri Products",
-
-    # Automobiles
-    "Auto Components & Equipments":         "Auto Components",
-    "Tyres & Rubber Products":              "Tyres & Rubber",
-    "2/3 Wheelers":                         "2/3 Wheelers",
-    "Passenger Cars & Utility Vehicles":    "Passenger Vehicles",
-    "Construction Vehicles":                "Commercial Vehicles",
-    "Commercial Vehicles":                  "Commercial Vehicles",
-    "Tractors":                             "Commercial Vehicles",
-    "Auto -Dealer":                         "Auto Dealers",
-    "Trading - Auto Components":            "Auto Components",
+    "Other Agricultural Products": "Agri Products",
+    "Sugar": "Sugar",
+    "Pesticides & Agrochemicals": "Agrochemicals",
+    "Fertilizers": "Fertilizers",
+    "Animal Feed": "Agri Products",
+    "Seafood": "Agri Products",
+    "Meat Products including Poultry": "Agri Products",
+    "Auto Components & Equipments": "Auto Components",
+    "Tyres & Rubber Products": "Tyres & Rubber",
+    "2/3 Wheelers": "2/3 Wheelers",
+    "Passenger Cars & Utility Vehicles": "Passenger Vehicles",
+    "Construction Vehicles": "Commercial Vehicles",
+    "Commercial Vehicles": "Commercial Vehicles",
+    "Tractors": "Commercial Vehicles",
+    "Auto -Dealer": "Auto Dealers",
+    "Trading - Auto Components": "Auto Components",
     "Dealers-Commercial Vehicles, Tractors, Construction Vehicles": "Commercial Vehicles",
-
-    # Banks
-    "Private Sector Bank":                  "Private Banks",
-    "Public Sector Bank":                   "PSU Banks",
-    "Other Bank":                           "Other Banks",
-
-    # Financial Services
-    "Stockbroking & Allied":                "Stockbroking",
-    "Asset Management Company":             "Asset Management",
-    "Exchange and Data Platform":           "Exchanges",
-    "Financial Products Distributor":       "Wealth Mgmt",
+    "Private Sector Bank": "Private Banks",
+    "Public Sector Bank": "PSU Banks",
+    "Other Bank": "Other Banks",
+    "Stockbroking & Allied": "Stockbroking",
+    "Asset Management Company": "Asset Management",
+    "Exchange and Data Platform": "Exchanges",
+    "Financial Products Distributor": "Wealth Mgmt",
     "Depositories, Clearing Houses and Other Intermediaries": "Depositories",
-    "Depositories Clearing Houses and Other Intermediaries":  "Depositories",
-    "Other Capital Market related Services":"Other Cap Markets",
-    "Ratings":                              "Ratings",
-    "Financial Technology (Fintech)":       "Fintech",
+    "Depositories Clearing Houses and Other Intermediaries": "Depositories",
+    "Other Capital Market related Services": "Other Cap Markets",
+    "Ratings": "Ratings",
+    "Financial Technology (Fintech)": "Fintech",
     "Non Banking Financial Company (NBFC)": "NBFC",
-    "Other Financial Services":             "Other Financials",
-    "Investment Company":                   "Investment Cos",
-    "Holding Company":                      "Holding Cos",
-    "Housing Finance Company":              "Housing Finance",
-    "Financial Institution":                "Other Financials",
-    "Microfinance Institutions":            "Microfinance",
-    "Life Insurance":                       "Life Insurance",
-    "General Insurance":                    "General Insurance",
-    "Insurance Distributors":               "Insurance Broking",
-
-    # Business Services
-    "Diversified Commercial Services":      "Commercial Services",
-    "Trading & Distributors":               "Trading & Distribution",
-    "Consulting Services":                  "Consulting",
+    "Other Financial Services": "Other Financials",
+    "Investment Company": "Investment Cos",
+    "Holding Company": "Holding Cos",
+    "Housing Finance Company": "Housing Finance",
+    "Financial Institution": "Other Financials",
+    "Microfinance Institutions": "Microfinance",
+    "Life Insurance": "Life Insurance",
+    "General Insurance": "General Insurance",
+    "Insurance Distributors": "Insurance Broking",
+    "Diversified Commercial Services": "Commercial Services",
+    "Trading & Distributors": "Trading & Distribution",
+    "Consulting Services": "Consulting",
     "Business Process Outsourcing (BPO)/ Knowledge Process Outsourcing (KPO)": "BPO/KPO",
-    "Other Consumer Services":              "Other Services",
-    "Data Processing Services":             "Other Services",
-
-    # Cement
-    "Cement & Cement Products":             "Cement",
-
-    # Chemicals
-    "Specialty Chemicals":                  "Specialty Chemicals",
-    "Commodity Chemicals":                  "Commodity Chemicals",
-    "Dyes And Pigments":                    "Dyes & Pigments",
-    "Petrochemicals":                       "Petrochemicals",
-    "Trading - Chemicals":                  "Specialty Chemicals",
-    "Explosives":                           "Specialty Chemicals",
-    "Industrial Gases":                     "Industrial Gases",
-    "Carbon Black":                         "Specialty Chemicals",
-    "Printing Inks":                        "Specialty Chemicals",
-
-    # Consumer Durables
-    "Household Appliances":                 "Appliances",
-    "Consumer Electronics":                 "Electronics",
-    "Plywood Boards/ Laminates":            "Building Materials",
-    "Footwear":                             "Footwear",
-    "Ceramics":                             "Building Materials",
-    "Plastic Products - Consumer":          "Plastic Products",
-    "Furniture Home Furnishing":            "Furniture",
-    "Furniture, Home Furnishing":           "Furniture",
-    "Granites & Marbles":                   "Building Materials",
-    "Leather And Leather Products":         "Leather",
-    "Houseware":                            "Appliances",
-    "Leisure Products":                     "Other Durables",
-    "Sanitary Ware":                        "Building Materials",
-    "Diversified consumer products":        "Other Durables",
-    "Glass - Consumer":                     "Other Durables",
-    "Cycles":                               "Other Durables",
-    "Paints":                               "Paints",
-    "Stationary":                           "Stationery",
-    "Gems, Jewellery And Watches":          "Jewellery",
-    "Gems Jewellery And Watches":           "Jewellery",
-
-    # Defence
-    "Aerospace & Defense":                  "Aerospace & Defense",
-    "Ship Building & Allied Services":      "Shipbuilding",
-
-    # Education
-    "Education":                            "Education",
-    "E-Learning":                           "E-Learning",
-
-    # Electrical Equipment
-    "Heavy Electrical Equipment":           "Heavy Electricals",
-    "Other Electrical Equipment":           "Electrical Equipment",
-
-    # Energy
-    "Refineries & Marketing":               "Refineries",
-    "Lubricants":                           "Lubricants",
-    "LPG/CNG/PNG/LNG Supplier":             "Gas Distribution",
-    "Oil Exploration & Production":         "Oil E&P",
-    "Oil Equipment & Services":             "Oil Services",
-    "Offshore Support Solution Drilling":   "Oil Services",
-    "Coal":                                 "Coal",
-    "Oil Storage & Transportation":         "Oil Services",
-    "Gas Transmission/Marketing":           "Gas Distribution",
-    "Trading - Gas":                        "Gas Distribution",
-    "Trading Coal":                         "Coal",
-
-    # Entertainment
-    "Media & Entertainment":                "Media & Entertainment",
+    "Other Consumer Services": "Other Services",
+    "Data Processing Services": "Other Services",
+    "Cement & Cement Products": "Cement",
+    "Specialty Chemicals": "Specialty Chemicals",
+    "Commodity Chemicals": "Commodity Chemicals",
+    "Dyes And Pigments": "Dyes & Pigments",
+    "Petrochemicals": "Petrochemicals",
+    "Trading - Chemicals": "Specialty Chemicals",
+    "Explosives": "Specialty Chemicals",
+    "Industrial Gases": "Industrial Gases",
+    "Carbon Black": "Specialty Chemicals",
+    "Printing Inks": "Specialty Chemicals",
+    "Household Appliances": "Appliances",
+    "Consumer Electronics": "Electronics",
+    "Plywood Boards/ Laminates": "Building Materials",
+    "Footwear": "Footwear",
+    "Ceramics": "Building Materials",
+    "Plastic Products - Consumer": "Plastic Products",
+    "Furniture Home Furnishing": "Furniture",
+    "Furniture, Home Furnishing": "Furniture",
+    "Granites & Marbles": "Building Materials",
+    "Leather And Leather Products": "Leather",
+    "Houseware": "Appliances",
+    "Leisure Products": "Other Durables",
+    "Sanitary Ware": "Building Materials",
+    "Diversified consumer products": "Other Durables",
+    "Glass - Consumer": "Other Durables",
+    "Cycles": "Other Durables",
+    "Paints": "Paints",
+    "Stationary": "Stationery",
+    "Gems, Jewellery And Watches": "Jewellery",
+    "Gems Jewellery And Watches": "Jewellery",
+    "Aerospace & Defense": "Aerospace & Defense",
+    "Ship Building & Allied Services": "Shipbuilding",
+    "Education": "Education",
+    "E-Learning": "E-Learning",
+    "Heavy Electrical Equipment": "Heavy Electricals",
+    "Other Electrical Equipment": "Electrical Equipment",
+    "Refineries & Marketing": "Refineries",
+    "Lubricants": "Lubricants",
+    "LPG/CNG/PNG/LNG Supplier": "Gas Distribution",
+    "Oil Exploration & Production": "Oil E&P",
+    "Oil Equipment & Services": "Oil Services",
+    "Offshore Support Solution Drilling": "Oil Services",
+    "Coal": "Coal",
+    "Oil Storage & Transportation": "Oil Services",
+    "Gas Transmission/Marketing": "Gas Distribution",
+    "Trading - Gas": "Gas Distribution",
+    "Trading Coal": "Coal",
+    "Media & Entertainment": "Media & Entertainment",
     "Film Production, Distribution & Exhibition": "Film & OTT",
-    "Film Production Distribution & Exhibition":  "Film & OTT",
-    "TV Broadcasting & Software Production":"Broadcasting",
-    "Advertising & Media Agencies":         "Advertising",
-    "Print Media":                          "Print Media",
-    "Printing & Publication":               "Print Media",
-    "Web based media and service":          "Digital Media",
-    "Digital Entertainment":               "Film & OTT",
-    "Electronic Media":                     "Broadcasting",
-
-    # Environmental Services
-    "Waste Management":                     "Waste Management",
-    "Water Supply & Management":            "Water Management",
-    "Water Treatment":                      "Water Treatment",
-
-    # FMCG
-    "Other Food Products":                  "Food Products",
-    "Packaged Foods":                       "Packaged Foods",
-    "Breweries & Distilleries":             "Beverages",
-    "Edible Oil":                           "Edible Oil",
-    "Tea & Coffee":                         "Tea & Coffee",
-    "Personal Care":                        "Personal Care",
-    "Dairy Products":                       "Dairy",
-    "Household Products":                   "Household Products",
-    "Diversified FMCG":                     "Diversified FMCG",
-    "Other Beverages":                      "Beverages",
-    "Cigarettes & Tobacco Products":        "Tobacco",
-
-    # Healthcare
-    "Medical Equipment & Supplies":         "Med Devices",
-    "Healthcare Service Provider":          "Healthcare Services",
+    "Film Production Distribution & Exhibition": "Film & OTT",
+    "TV Broadcasting & Software Production": "Broadcasting",
+    "Advertising & Media Agencies": "Advertising",
+    "Print Media": "Print Media",
+    "Printing & Publication": "Print Media",
+    "Web based media and service": "Digital Media",
+    "Digital Entertainment": "Film & OTT",
+    "Electronic Media": "Broadcasting",
+    "Waste Management": "Waste Management",
+    "Water Supply & Management": "Water Management",
+    "Water Treatment": "Water Treatment",
+    "Other Food Products": "Food Products",
+    "Packaged Foods": "Packaged Foods",
+    "Breweries & Distilleries": "Beverages",
+    "Edible Oil": "Edible Oil",
+    "Tea & Coffee": "Tea & Coffee",
+    "Personal Care": "Personal Care",
+    "Dairy Products": "Dairy",
+    "Household Products": "Household Products",
+    "Diversified FMCG": "Diversified FMCG",
+    "Other Beverages": "Beverages",
+    "Cigarettes & Tobacco Products": "Tobacco",
+    "Medical Equipment & Supplies": "Med Devices",
+    "Healthcare Service Provider": "Healthcare Services",
     "Healthcare Research, Analytics & Technology": "Health Tech",
-    "Biotechnology":                        "Biotech",
-    "Hospital":                             "Hospitals",
-
-    # IT
-    "Computers Hardware & Equipments":      "IT Hardware",
-    "Computers - Software & Consulting":    "IT Consulting",
-    "IT Enabled Services":                  "IT Enabled Services",
-    "Software Products":                    "Software Products",
-
-    # Industrials
-    "Industrial Products":                  "Industrial Products",
-    "Packaging":                            "Packaging",
-    "Plastic Products - Industrial":        "Plastic Products",
-    "Other Industrial Products":            "Industrial Products",
-    "Castings & Forgings":                  "Castings & Forgings",
-    "Electrodes & Refractories":            "Electrodes & Refractories",
-    "Rubber":                               "Rubber",
-    "Compressors, Pumps & Diesel Engines":  "Machinery",
-    "Compressors Pumps & Diesel Engines":   "Machinery",
-    "Abrasives & Bearings":                 "Machinery",
-    "Aluminium Copper & Zinc Products":     "Other Industrials",
-    "Glass - Industrial":                   "Other Industrials",
-    "Railway Wagons":                       "Railways",
-
-    # Infrastructure
-    "Civil Construction":                   "Civil Construction",
-    "Other Construction Materials":         "Construction Materials",
+    "Biotechnology": "Biotech",
+    "Hospital": "Hospitals",
+    "Computers Hardware & Equipments": "IT Hardware",
+    "Computers - Software & Consulting": "IT Consulting",
+    "IT Enabled Services": "IT Enabled Services",
+    "Software Products": "Software Products",
+    "Industrial Products": "Industrial Products",
+    "Packaging": "Packaging",
+    "Plastic Products - Industrial": "Plastic Products",
+    "Other Industrial Products": "Industrial Products",
+    "Castings & Forgings": "Castings & Forgings",
+    "Electrodes & Refractories": "Electrodes & Refractories",
+    "Rubber": "Rubber",
+    "Compressors, Pumps & Diesel Engines": "Machinery",
+    "Compressors Pumps & Diesel Engines": "Machinery",
+    "Abrasives & Bearings": "Machinery",
+    "Aluminium Copper & Zinc Products": "Other Industrials",
+    "Glass - Industrial": "Other Industrials",
+    "Railway Wagons": "Railways",
+    "Civil Construction": "Civil Construction",
+    "Other Construction Materials": "Construction Materials",
     "Road Assets–Toll, Annuity, Hybrid-Annuity": "Road Assets",
-
-    # Logistics
-    "Logistics Solution Provider":          "3PL Logistics",
-    "Shipping":                             "Shipping",
-    "Port & Port services":                 "Ports",
-    "Road Transport":                       "Road Transport",
-    "Airport & Airport services":           "Airports",
-    "Transport Related Services":           "Transport Services",
-    "Dredging":                             "Shipping",
-
-    # Metals & Mining
-    "Iron & Steel Products":                "Steel",
-    "Iron & Steel":                         "Steel",
-    "Industrial Minerals":                  "Minerals & Mining",
-    "Aluminium, Copper & Zinc Products":    "Non-Ferrous Metals",
-    "Aluminium":                            "Aluminium",
-    "Ferro & Silica Manganese":             "Steel",
-    "Trading - Metals":                     "Metals Trading",
-    "Sponge Iron":                          "Steel",
-    "Diversified Metals":                   "Non-Ferrous Metals",
-    "Copper":                               "Non-Ferrous Metals",
-    "Trading - Minerals":                   "Minerals & Mining",
-    "Zinc":                                 "Non-Ferrous Metals",
-    "Pig Iron":                             "Steel",
-    "Precious Metals":                      "Non-Ferrous Metals",
-
-    # Paper & Packaging
-    "Paper & Paper Products":               "Paper",
-    "Jute & Jute Products":                 "Paper",
-    "Forest Products":                      "Paper",
-
-    # Pharma
-    "Pharmaceuticals":                      "Pharmaceuticals",
-
-    # Power
-    "Power Generation":                     "Power Generation",
-    "Integrated Power Utilities":           "Integrated Power",
-    "Power Distribution":                   "Power Distribution",
-    "Power - Transmission":                 "Power Transmission",
-    "Power Trading":                        "Power Generation",
-    "Multi Utilities":                      "Utilities",
-    "Other Utilities":                      "Utilities",
-
-    # Real Estate
-    "Residential, Commercial Projects":     "Real Estate",
-    "Residential Commercial Projects":      "Real Estate",
-    "Real Estate related services":         "Real Estate Services",
-
-    # Retail
-    "Speciality Retail":                    "Specialty Retail",
-    "Diversified Retail":                   "Diversified Retail",
-    "E-Retail/ E-Commerce":                 "E-Commerce",
-    "Internet & Catalogue Retail":          "E-Commerce",
-    "Distributors":                         "Distribution",
-    "Pharmacy Retail":                      "Pharmacy Retail",
-
-    # Telecom
-    "Telecom -  Equipment & Accessories":   "Telecom Equipment",
-    "Telecom - Equipment & Accessories":    "Telecom Equipment",
-    "Telecom - Infrastructure":             "Telecom Infra",
+    "Logistics Solution Provider": "3PL Logistics",
+    "Shipping": "Shipping",
+    "Port & Port services": "Ports",
+    "Road Transport": "Road Transport",
+    "Airport & Airport services": "Airports",
+    "Transport Related Services": "Transport Services",
+    "Dredging": "Shipping",
+    "Iron & Steel Products": "Steel",
+    "Iron & Steel": "Steel",
+    "Industrial Minerals": "Minerals & Mining",
+    "Aluminium, Copper & Zinc Products": "Non-Ferrous Metals",
+    "Aluminium": "Aluminium",
+    "Ferro & Silica Manganese": "Steel",
+    "Trading - Metals": "Metals Trading",
+    "Sponge Iron": "Steel",
+    "Diversified Metals": "Non-Ferrous Metals",
+    "Copper": "Non-Ferrous Metals",
+    "Trading - Minerals": "Minerals & Mining",
+    "Zinc": "Non-Ferrous Metals",
+    "Pig Iron": "Steel",
+    "Precious Metals": "Non-Ferrous Metals",
+    "Paper & Paper Products": "Paper",
+    "Jute & Jute Products": "Paper",
+    "Forest Products": "Paper",
+    "Pharmaceuticals": "Pharmaceuticals",
+    "Power Generation": "Power Generation",
+    "Integrated Power Utilities": "Integrated Power",
+    "Power Distribution": "Power Distribution",
+    "Power - Transmission": "Power Transmission",
+    "Power Trading": "Power Generation",
+    "Multi Utilities": "Utilities",
+    "Other Utilities": "Utilities",
+    "Residential, Commercial Projects": "Real Estate",
+    "Residential Commercial Projects": "Real Estate",
+    "Real Estate related services": "Real Estate Services",
+    "Speciality Retail": "Specialty Retail",
+    "Diversified Retail": "Diversified Retail",
+    "E-Retail/ E-Commerce": "E-Commerce",
+    "Internet & Catalogue Retail": "E-Commerce",
+    "Distributors": "Distribution",
+    "Pharmacy Retail": "Pharmacy Retail",
+    "Telecom -  Equipment & Accessories": "Telecom Equipment",
+    "Telecom - Equipment & Accessories": "Telecom Equipment",
+    "Telecom - Infrastructure": "Telecom Infra",
     "Telecom - Cellular & Fixed line services": "Telecom Services",
-    "Other Telecom Services":               "Telecom Services",
-
-    # Textiles
-    "Other Textile Products":               "Textiles",
-    "Garments & Apparels":                  "Garments",
-    "Trading - Textile Products":           "Textiles",
-
-    # Travel & Hospitality
-    "Hotels & Resorts":                     "Hotels",
-    "Restaurants":                          "Restaurants",
-    "Tour, Travel Related Services":        "Travel Services",
-    "Airline":                              "Airlines",
-    "Amusement Parks/ Other Recreation":    "Recreation",
-    "Wellness":                             "Travel Services",
-    "Tour Travel Related Services":         "Travel Services",
-
-    # Wires & Cables
-    "Cables - Electricals":                 "Wires & Cables",
-
-    # Diversified
-    "Diversified":                          "Diversified",
+    "Other Telecom Services": "Telecom Services",
+    "Other Textile Products": "Textiles",
+    "Garments & Apparels": "Garments",
+    "Trading - Textile Products": "Textiles",
+    "Hotels & Resorts": "Hotels",
+    "Restaurants": "Restaurants",
+    "Tour, Travel Related Services": "Travel Services",
+    "Airline": "Airlines",
+    "Amusement Parks/ Other Recreation": "Recreation",
+    "Wellness": "Travel Services",
+    "Tour Travel Related Services": "Travel Services",
+    "Cables - Electricals": "Wires & Cables",
+    "Diversified": "Diversified",
 }
 
 # =========================================================
-# THEMES
-# symbol → [theme1, theme2, ...]  (cross-sector)
+# DESCRIPTION-BASED OVERRIDES
+# Scans company description for keywords
+# Priority: description > sub_industry map
+# =========================================================
+
+# Format: ([keywords], sector_group, display_industry)
+DESCRIPTION_SECTOR_MAP = [
+    (["prepaid payment", "prepaid card", "expense management platform",
+      "fintech service", "digital payment", "payment solution",
+      "payment gateway", "neobank", "buy now pay later", "bnpl",
+      "digital lending", "peer-to-peer lending", "p2p lending"],
+     "Financial Services", "Fintech"),
+
+    (["wealth management", "portfolio management service",
+      "investment advisory", "estate planning", "family office",
+      "private wealth", "wealth and asset management"],
+     "Financial Services", "Wealth Mgmt"),
+
+    (["mutual fund", "alternative investment fund", "aif management",
+      "asset management company", "fund management"],
+     "Financial Services", "Asset Management"),
+
+    (["life insurance", "general insurance", "health insurance",
+      "reinsurance", "insurance broker", "insurance distributor"],
+     "Financial Services", "Life Insurance"),
+
+    (["stockbroking", "stock broking", "equity broking",
+      "commodity broking", "depository participant"],
+     "Financial Services", "Stockbroking"),
+
+    (["housing finance", "home loan", "mortgage loan"],
+     "Financial Services", "Housing Finance"),
+
+    (["microfinance", "micro finance", "self help group",
+      "joint liability group"],
+     "Financial Services", "Microfinance"),
+
+    (["solar panel", "solar cell", "solar module", "photovoltaic",
+      "wind turbine", "wind energy", "renewable energy developer",
+      "green energy developer"],
+     "Power", "Power Generation"),
+
+    (["water treatment plant", "wastewater treatment", "sewage treatment",
+      "desalination plant", "effluent treatment plant"],
+     "Environmental Services", "Water Treatment"),
+
+    (["multispecialty hospital", "hospital chain", "healthcare delivery",
+      "tertiary care hospital", "hospital network"],
+     "Healthcare", "Hospitals"),
+]
+
+# Format: ([keywords], [themes])
+DESCRIPTION_THEME_MAP = [
+    (["5g", "telecom infrastructure", "optical fibre", "fiber optic",
+      "telecom tower", "cellular network", "wireless network"],
+     ["Telecom & 5G"]),
+
+    (["data center", "data centre", "artificial intelligence platform",
+      "machine learning platform", "cloud infrastructure", "colocation"],
+     ["Data Center & AI Infra"]),
+
+    (["power cable", "electrical cable", "winding wire",
+      "optical fibre cable", "submarine cable", "cables and wires"],
+     ["Cables & Wires"]),
+
+    (["wealth management", "asset management", "portfolio management",
+      "mutual fund", "alternative investment fund"],
+     ["Wealth & AMC"]),
+
+    (["defence", "defense", "aerospace", "military", "naval vessel",
+      "armament", "missile", "radar system", "unmanned aerial vehicle",
+      "uav", "surveillance system"],
+     ["Defence"]),
+
+    (["solar", "wind energy", "renewable energy", "green energy",
+      "clean energy", "photovoltaic", "wind turbine", "hydropower"],
+     ["Renewable Energy"]),
+
+    (["electric vehicle", " ev ", "electric mobility", "ev charging",
+      "battery management", "electric bus", "electric two wheeler",
+      "electric car"],
+     ["EV"]),
+
+    (["railway", "rail vikas", "metro rail", "freight corridor",
+      "railway signalling", "rail coach", "railway wagon",
+      "railway electrification", "locomotive", "dedicated freight"],
+     ["Railways"]),
+
+    (["stock exchange", "commodity exchange", "depository services",
+      "clearing corporation", "stockbroking", "investment banking",
+      "capital market services"],
+     ["Capital Markets"]),
+
+    (["semiconductor", "integrated circuit", "pcb assembly",
+      "electronic manufacturing service", "chip design",
+      "embedded system", "vlsi design"],
+     ["Semiconductor", "Electronics Manufacturing"]),
+
+    (["water treatment", "wastewater treatment", "sewage treatment",
+      "desalination", "water purification", "effluent treatment"],
+     ["Water Treatment"]),
+
+    (["specialty chemical", "agrochemical", "fine chemical",
+      "fluorochemical", "dye intermediate", "pigment manufacture",
+      "performance chemical"],
+     ["Specialty Chemicals"]),
+
+    (["airline", "aviation services", "airport operations",
+      "aircraft maintenance", "aerospace component", "mro service",
+      "air cargo"],
+     ["Aviation"]),
+
+    (["logistics", "supply chain", "warehousing", "freight forwarding",
+      "cargo", "last mile delivery", "cold chain logistics", "3pl"],
+     ["Logistics"]),
+
+    (["road construction", "highway construction", "bridge construction",
+      "infrastructure project", "epc contractor", "civil engineering",
+      "toll road"],
+     ["Infrastructure"]),
+
+    (["residential project", "commercial project", "real estate developer",
+      "township development", "shopping mall", "office space developer"],
+     ["Real Estate"]),
+
+    (["power generation", "power distribution", "power transmission",
+      "thermal power", "hydroelectric", "nuclear power", "power utility"],
+     ["Power"]),
+
+    (["pharmaceutical", "drug formulation", "api manufacturer",
+      "generics", "biosimilar", "vaccine manufacturer",
+      "active pharmaceutical ingredient"],
+     ["Pharma"]),
+
+    (["consumer goods", "packaged food", "personal care product",
+      "household product", "fast moving consumer"],
+     ["FMCG"]),
+
+    (["quick service restaurant", "food delivery platform",
+      "fashion retail", "retail chain", "e-commerce platform",
+      "consumer brand"],
+     ["Consumption"]),
+
+    (["public sector bank", "nationalised bank", "government owned bank"],
+     ["PSU Banks"]),
+
+    (["hotel chain", "hospitality company", "luxury hotel",
+      "hotel management", "resort operations"],
+     ["Hotels"]),
+
+    (["life insurance", "general insurance", "health insurance",
+      "reinsurance", "insurance company"],
+     ["Insurance"]),
+
+    (["prepaid", "payment solution", "fintech", "digital payment",
+      "neobank", "digital lending", "expense management"],
+     ["Capital Markets"]),
+]
+
+# =========================================================
+# THEMES (manual symbol list — fallback/supplement)
 # =========================================================
 
 _THEME_SYMBOLS = {
     "Telecom & 5G": [
         "BHARTIARTL","IDEA","TTML","MTNL","TATACOMM","RAILTEL","HFCL","STLTECH",
-        "TEJAS","ROUTE","VINDHYATEL","GTLINFRA","GTPL","ONMOBILE","TANLA",
-        "NELCO","ITI","MAHANAGAR",
+        "TEJAS","ROUTE","VINDHYATEL","GTLINFRA","GTPL","ONMOBILE","TANLA","NELCO","ITI","MAHANAGAR",
     ],
     "Data Center & AI Infra": [
         "NETWEB","SIFY","STLTECH","HCLTECH","INFY","TCS","WIPRO","MPHASIS",
-        "COFORGE","MASTEK","PERSISTENT","LTTS","TATAELXSI","KELLTON","ZENSAR",
-        "KPITTECH","CMSINFO","RATEGAIN",
+        "COFORGE","MASTEK","PERSISTENT","LTTS","TATAELXSI","KELLTON","ZENSAR","KPITTECH","CMSINFO","RATEGAIN",
     ],
     "Cables & Wires": [
         "POLYCAB","KEI","RRKABEL","FINCABLES","UNIVCABLES","VINDHYATEL",
@@ -593,83 +683,68 @@ _THEME_SYMBOLS = {
     ],
     "Wealth & AMC": [
         "ICICIAMC","HDFCAMC","NAM-INDIA","ABSLAMC","UTIAMC","CRAMC",
-        "GROWW","MOTILALOFS","360ONE","ANGELONE","ISEC","ICICISEC",
-        "NUVAMA","ANANDRATHI","GEOJITFSL","5PAISA","EMKAY",
+        "GROWW","MOTILALOFS","360ONE","ANGELONE","ISEC","ICICISEC","NUVAMA","ANANDRATHI","GEOJITFSL","5PAISA","EMKAY",
     ],
     "Pharma": [
         "SUNPHARMA","DRREDDY","CIPLA","LUPIN","AUROPHARMA","ALKEM","ZYDUSLIFE",
         "TORNTPHARM","IPCALAB","GLENMARK","NATCO","BIOCON","GRANULES","LAURUSLABS",
-        "AJANTPHARM","PFIZER","ABBOTINDIA","SANOFI","GLAXO","DIVISLAB",
-        "SUVEN","SOLARA","ERIS","JBCHEPHARM","CAPLIPOINT",
+        "AJANTPHARM","PFIZER","ABBOTINDIA","SANOFI","GLAXO","DIVISLAB","SUVEN","SOLARA","ERIS","JBCHEPHARM","CAPLIPOINT",
     ],
     "Defence": [
         "BEL","HAL","BDL","MAZDOCK","COCHINSHIP","GRSE","MTARTECH","DATAPATTNS",
         "ZENTEC","AEQUS","ASTRAMICRO","APOLLO","SWANDEF","AXISCADES","MIDHANI",
-        "PARAS","UNIMECH","AVANTEL","ROSSTECH","IDEAFORGE","JAYKAY","DCXINDIA",
-        "NIBE","SIKA","KRISHNADEF","APSISAERO","TECHERA",
+        "PARAS","UNIMECH","AVANTEL","ROSSTECH","IDEAFORGE","JAYKAY","DCXINDIA","NIBE","SIKA","KRISHNADEF",
     ],
     "Power": [
         "NTPC","ADANIPOWER","TATAPOWER","CESC","TORNTPOWER","NHPC","SJVN",
-        "NEYVELI","JSPL","POWERGRID","RECLTD","PFC","IREDA","NLCINDIA",
-        "RPOWER","JPPOWER","JSWENERGY","KALPATPOWR",
+        "NEYVELI","JSPL","POWERGRID","RECLTD","PFC","IREDA","NLCINDIA","RPOWER","JPPOWER","JSWENERGY","KALPATPOWR",
     ],
     "Capital Markets": [
         "BSE","MCX","CDSL","CAMS","KFINTECH","ANANDRATHI","ICICISEC",
-        "GROWW","MOTILALOFS","360ONE","ANGELONE","ISEC","NUVAMA",
-        "5PAISA","EMKAY","GEOJITFSL","MOFSL",
+        "GROWW","MOTILALOFS","360ONE","ANGELONE","ISEC","NUVAMA","5PAISA","EMKAY","GEOJITFSL","MOFSL",
     ],
     "Renewable Energy": [
         "ADANIGREEN","ACMESOLAR","WEBSOL","INSOLATION","WAAREE","SUZLON",
-        "INOXWIND","SJVN","NTPC","TATAPOWER","STERLINWIL","GENSOL",
-        "ORIENTGREEN","PREMIER","UJAAS","WINDWORLD","KPIL","TRIL",
+        "INOXWIND","SJVN","NTPC","TATAPOWER","STERLINWIL","GENSOL","ORIENTGREEN","PREMIER","UJAAS","WINDWORLD","KPIL","TRIL",
     ],
     "EV": [
         "TATAMOTORS","MAHINDRA","BAJAJ-AUTO","TVSMOTOR","HMCL","OLECTRA",
-        "GOLDSTONE","SONA","MOTHERSON","EXIDEIND","AMARAJABAT","MINDA",
-        "LUMAXIND","CRAFTSMAN",
+        "GOLDSTONE","SONA","MOTHERSON","EXIDEIND","AMARAJABAT","MINDA","LUMAXIND","CRAFTSMAN",
     ],
     "PSU Banks": [
         "SBIN","PNB","BANKBARODA","BANKINDIA","CANARABANK","UNIONBANK",
-        "INDIANB","CENTRALBK","MAHABANK","UCOBANK","IOB","J&KBANK",
-        "PSBBANK","BANDHANBNK",
+        "INDIANB","CENTRALBK","MAHABANK","UCOBANK","IOB","J&KBANK","PSBBANK","BANDHANBNK",
     ],
     "Semiconductor": [
         "KAYNES","SYRMA","AVALON","CENTUM","RUTTONSHA","MOSCHIP","PGEL",
-        "CGPOWER","IDEAFORGE","VEDL","TATAELXSI","SASKEN","INTELLECT",
-        "SAKSOFT","HCLTECH",
+        "CGPOWER","IDEAFORGE","VEDL","TATAELXSI","SASKEN","INTELLECT","SAKSOFT","HCLTECH",
     ],
     "Specialty Chemicals": [
         "NAVINFLUOR","DEEPAKNITRITE","CLEANSCIENCE","AARTIIND","VINATIORGA",
         "FINEORG","GALAXYSURF","SUDARSCHEM","ROSSARI","ALKYLAMINE","TATACHEM",
-        "NOCIL","ATUL","PIDILITIND","NEOGEN","GUJALKALI","FLUOROCHEM",
-        "LAXCHEM","ANUPAM","OMNICHM",
+        "NOCIL","ATUL","PIDILITIND","NEOGEN","GUJALKALI","FLUOROCHEM","LAXCHEM","ANUPAM","OMNICHM",
     ],
     "Water Treatment": [
-        "WABAG","THERMAX","IONEXCHANG","ENVIROTECH","EWL","DEWA",
-        "WATERBASE","VATECH","PERMIONICS","ROCHEM","PRAJ","TRIVENI",
+        "WABAG","THERMAX","IONEXCHANG","ENVIROTECH","EWL","DEWA","WATERBASE","VATECH","PERMIONICS","ROCHEM","PRAJ","TRIVENI",
     ],
     "FMCG": [
         "HINDUNILVR","ITC","NESTLEIND","MARICO","DABUR","COLPAL","EMAMILTD",
-        "TATACONSUM","BRITANNIA","GODREJCP","VBL","UBL","RADICO",
-        "MCDOWELL-N","JYOTHYLAB","BAJAJCON","ZYDUSWELL",
+        "TATACONSUM","BRITANNIA","GODREJCP","VBL","UBL","RADICO","MCDOWELL-N","JYOTHYLAB","BAJAJCON","ZYDUSWELL",
     ],
     "Electronics Manufacturing": [
         "DIXON","AMBER","PGEL","KAYNES","SYRMA","AVALON","CENTUM","ELINCOIN",
         "VSSL","SANSERA","MOTHERSON","CGPOWER","TATAELXSI","ASTRA","APARINDS",
     ],
     "Aviation": [
-        "INDIGO","SPICEJET","GMRAIRPORT","GMRP&UI","AIAENG",
-        "BLUEDART","INTERGLOBE","TAALTECH",
+        "INDIGO","SPICEJET","GMRAIRPORT","GMRP&UI","AIAENG","BLUEDART","INTERGLOBE","TAALTECH",
     ],
     "Logistics": [
         "ADANIPORTS","CONCOR","MAHLOG","BLUEDART","DELHIVERY","ALLCARGO",
-        "GATI","TVSSCS","AEGISLOG","VRLLOG","TCIEXPRESS","SNOWMAN",
-        "GATEWAY","CONTAINERC",
+        "GATI","TVSSCS","AEGISLOG","VRLLOG","TCIEXPRESS","SNOWMAN","GATEWAY","CONTAINERC",
     ],
     "Real Estate": [
         "DLF","GODREJPROP","PRESTIGE","OBEROIRLTY","BRIGADE","PHOENIXLTD",
-        "SOBHA","MACROTECH","MAHLIFE","KOLTEPATIL","SUNTECK","ANANTRAJ",
-        "ARVIND","ASHIANA","NESCO","ELDECO",
+        "SOBHA","MACROTECH","MAHLIFE","KOLTEPATIL","SUNTECK","ANANTRAJ","ARVIND","ASHIANA","NESCO","ELDECO",
     ],
     "Railways": [
         "RVNL","IRFC","IRCON","RITES","RAILTEL","IRCTC","TITAGARH",
@@ -677,16 +752,14 @@ _THEME_SYMBOLS = {
     ],
     "Consumption": [
         "TITAN","TRENT","DMART","VSTIND","ZOMATO","NYKAA","SAPPHIREF",
-        "WESTLIFE","DEVYANI","JUBLFOOD","MANYAVAR","VEDANT","SENCO",
-        "METRO","CAMPUS","BATA","RELAXO","VIP","SAFARI",
+        "WESTLIFE","DEVYANI","JUBLFOOD","MANYAVAR","VEDANT","SENCO","METRO","CAMPUS","BATA","RELAXO","VIP","SAFARI",
     ],
     "Infrastructure": [
         "LT","NCC","HCC","PNCINFRA","KNRCON","ASHOKA","IRB","DILIPBUILD",
         "JSWINFRA","AHLUWALIA","PSP","CAPACITE","GRINFRA","HGINFRA","POLYCAB",
     ],
     "Hotels": [
-        "INDHOTEL","TAJGVK","LEMONTREE","CHALET","EIHOTEL","ORIENTHOTEL",
-        "KAMAT","ROYALORCH","SINCLAIRS","BARBEQUE",
+        "INDHOTEL","TAJGVK","LEMONTREE","CHALET","EIHOTEL","ORIENTHOTEL","KAMAT","ROYALORCH","SINCLAIRS","BARBEQUE",
     ],
     "Insurance": [
         "SBILIFE","HDFCLIFE","ICICIPRULI","LICI","NIACL","STARHEALTH",
@@ -701,8 +774,33 @@ for _theme, _syms in _THEME_SYMBOLS.items():
         SYMBOL_THEMES.setdefault(_sym, []).append(_theme)
 
 # =========================================================
-# HELPERS
+# CLASSIFICATION HELPERS
 # =========================================================
+
+def get_description_overrides(description: str):
+    """Extract sector_group, display_industry, themes from description."""
+    if not description:
+        return None, None, []
+
+    desc = description.lower()
+    sector_group = None
+    display_industry = None
+
+    for keywords, sg, di in DESCRIPTION_SECTOR_MAP:
+        if any(kw in desc for kw in keywords):
+            sector_group = sg
+            display_industry = di
+            break
+
+    themes = []
+    for keywords, theme_list in DESCRIPTION_THEME_MAP:
+        if any(kw in desc for kw in keywords):
+            for t in theme_list:
+                if t not in themes:
+                    themes.append(t)
+
+    return sector_group, display_industry, themes
+
 
 def get_sector_group(profile: dict) -> str:
     for field in ["sub_industry", "industry", "sector"]:
@@ -718,6 +816,28 @@ def get_display_industry(profile: dict) -> str:
         if value in INDUSTRY_MAP:
             return INDUSTRY_MAP[value]
     return (profile.get("sub_industry") or profile.get("sector") or "Other")
+
+
+def classify(symbol: str, profile: dict) -> tuple[str, str, list[str]]:
+    """
+    Returns (sector_group, display_industry, themes)
+    Priority: description keywords > sub_industry map
+    Themes: description keywords + manual symbol list (merged, deduplicated)
+    """
+    description = profile.get("description", "")
+
+    # Get description-based overrides
+    desc_sg, desc_di, desc_themes = get_description_overrides(description)
+
+    # Sector group & display industry
+    sector_group     = desc_sg or get_sector_group(profile)
+    display_industry = desc_di or get_display_industry(profile)
+
+    # Themes: merge manual list + description-derived (deduplicated)
+    manual_themes = SYMBOL_THEMES.get(symbol, [])
+    all_themes = list(dict.fromkeys(manual_themes + desc_themes))
+
+    return sector_group, display_industry, all_themes
 
 # =========================================================
 # HEADERS
@@ -779,28 +899,24 @@ async def fetch_profile(client, symbol, semaphore):
                 print(f"{symbol} -> 429")
                 await asyncio.sleep(15)
                 continue
-
             if r.status_code == 503:
                 print(f"{symbol} -> 503")
                 await asyncio.sleep(5)
                 continue
-
             if r.status_code != 200:
                 print(f"{symbol} -> HTTP {r.status_code}")
                 return None
-
             try:
                 return r.json()
             except Exception:
                 return None
-
     return None
 
 # =========================================================
 # PROCESS STOCK
 # =========================================================
 
-async def process_stock(client, stock, semaphore):
+async def process_stock(client, stock, semaphore, fundamentals: dict):
     symbol = stock["symbol"]
 
     profile = await fetch_profile(client, symbol, semaphore)
@@ -810,14 +926,26 @@ async def process_stock(client, stock, semaphore):
         return None
 
     market_cap = float(profile.get("market_cap") or 0)
-
     if market_cap < MIN_MARKET_CAP_CR:
         print(f"✗ {symbol} | market cap < {MIN_MARKET_CAP_CR}cr")
         return None
 
-    sector_group     = get_sector_group(profile)
-    display_industry = get_display_industry(profile)
-    themes           = SYMBOL_THEMES.get(symbol, [])
+    # Store profile in fundamentals dict (for fundamental.json)
+    fundamentals[symbol] = {
+        "symbol":      symbol,
+        "name":        profile.get("name"),
+        "description": profile.get("description", ""),
+        "website":     profile.get("website", ""),
+        "bse_code":    profile.get("bse_code"),
+        "nse_code":    profile.get("nse_code"),
+        "macro_sector":profile.get("macro_sector"),
+        "sector":      profile.get("sector"),
+        "industry":    profile.get("industry"),
+        "sub_industry":profile.get("sub_industry"),
+        "market_cap":  market_cap,
+    }
+
+    sector_group, display_industry, themes = classify(symbol, profile)
 
     print(f"✓ {symbol} | {market_cap:.0f}cr | {sector_group} | {display_industry}")
 
@@ -843,46 +971,41 @@ async def process_stock(client, stock, semaphore):
 # =========================================================
 
 async def main():
-    semaphore = asyncio.Semaphore(CONCURRENCY)
+    semaphore   = asyncio.Semaphore(CONCURRENCY)
+    fundamentals: dict = {}
 
     async with httpx.AsyncClient(headers=HEADERS) as client:
 
-        print()
-        print("Downloading master.json...")
-
+        print("\nDownloading master.json...")
         master = await r2_download(client, "master.json")
-
         print(f"Loaded {len(master)} stocks")
 
         results = []
-        total = len(master)
+        total   = len(master)
 
         for i in range(0, total, BATCH_SIZE):
             batch = master[i:i + BATCH_SIZE]
             tasks = [
-                process_stock(client, stock, semaphore)
+                process_stock(client, stock, semaphore, fundamentals)
                 for stock in batch
             ]
             batch_results = await asyncio.gather(*tasks)
             results.extend(batch_results)
-
-            print()
-            print(f"Processed {min(i + BATCH_SIZE, total)}/{total}")
-
+            print(f"\nProcessed {min(i + BATCH_SIZE, total)}/{total}")
             await asyncio.sleep(2)
 
         classification = [x for x in results if x]
         classification.sort(key=lambda x: x["market_cap_cr"], reverse=True)
 
-        print()
-        print("=== SUMMARY ===")
+        print("\n=== SUMMARY ===")
         print(f"✓ Final Stocks : {len(classification)}")
         print(f"✗ Removed      : {len(master) - len(classification)}")
 
+        # Upload both files
         await r2_upload(client, OUTPUT_FILE, classification)
+        await r2_upload(client, FUNDAMENTAL_FILE, list(fundamentals.values()))
 
-        print()
-        print("🎉 classification.json uploaded")
+        print("\n🎉 Done! classification.json + fundamental.json uploaded")
 
 
 if __name__ == "__main__":
