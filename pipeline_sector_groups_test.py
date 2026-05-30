@@ -261,7 +261,7 @@ SECTOR_GROUP_MAP = {
     "Copper": "Metals & Mining",
     "Pig Iron": "Metals & Mining",
     "Ferro & Silica Manganese": "Metals & Mining",
-    "Aluminium, Copper & Zinc Products": "Metals & Mining"
+    "Aluminium, Copper & Zinc Products": "Metals & Mining",
     # Consumer Durables
     "Gems, Jewellery And Watches": "Jewellery",
     "Household Appliances": "Consumer Durables",
