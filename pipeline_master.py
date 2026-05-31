@@ -24,7 +24,6 @@ RETRY = 3
 MIN_MARKET_CAP_CR = 50
 MIN_PRICE = 10
 MIN_TURNOVER_CR = 1
-QUOTE_CONCURRENCY = 20
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -202,73 +201,7 @@ async def fetch_symbols(client):
     print(f"Fetched {len(data)} symbols")
 
     return data
-async def process_stock(client, stock, semaphore):
 
-    symbol = str(
-        stock.get("symbol", "")
-    ).strip().upper()
-
-    if not is_valid_stock(stock):
-        return None
-
-    async with semaphore:
-
-        quote = await fetch_quote(
-            client,
-            symbol
-        )
-
-    if not quote:
-        return None
-
-    q = quote.get(symbol)
-
-    if not q:
-        return None
-
-    price = float(
-        q.get("current_price") or 0
-    )
-
-    volume = float(
-        q.get("volume") or 0
-    )
-
-    market_cap = float(
-        q.get("market_cap") or 0
-    )
-
-    turnover_cr = (
-        price * volume
-    ) / 1e7
-
-    if market_cap < MIN_MARKET_CAP_CR:
-        return None
-
-    if price < MIN_PRICE:
-        return None
-
-    if turnover_cr < MIN_TURNOVER_CR:
-        return None
-
-    nse_code = stock.get("nse_code")
-    bse_code = stock.get("bse_code")
-
-    return {
-        "symbol": symbol,
-        "name": stock.get("name"),
-        "exchange": "NSE" if nse_code else "BSE",
-        "bse_code": bse_code,
-        "nse_code": nse_code,
-        "consolidated_ind": stock.get(
-            "consolidated_ind",
-            False
-        ),
-        "market_cap_cr": market_cap,
-        "price": price,
-        "volume": volume,
-        "turnover_cr": round(turnover_cr, 2)
-    }
 
 # =========================================================
 # BUILD MASTER
@@ -279,27 +212,130 @@ async def build_master(client, data):
     print()
     print("=== Building Master Universe ===")
 
-    semaphore = asyncio.Semaphore(
-        QUOTE_CONCURRENCY
-    )
+    master = []
+    filtered_mcap = 0
+    filtered_price = 0
+    filtered_turnover = 0
+    batch_size = 75
 
-    tasks = [
-        process_stock(
-            client,
-            stock,
-            semaphore
+    for i in range(0, len(data), batch_size):
+        print(
+            f"\n📦 Batch {i//batch_size + 1}"
         )
-        for stock in data
-    ]
+        batch = data[i:i + batch_size]
 
-    results = await asyncio.gather(
-        *tasks
-    )
+        symbols = []
 
-    master = [
-        x for x in results
-        if x
-    ]
+        stock_map = {}
+
+        for stock in batch:
+
+            if not is_valid_stock(stock):
+                continue
+
+            symbol = str(
+                stock.get("symbol", "")
+            ).strip().upper()
+
+            if not symbol:
+                continue
+
+            symbols.append(symbol)
+
+            stock_map[symbol] = stock
+
+        if not symbols:
+            continue
+
+        path = "quote?" + "&".join(
+            f"symbol={s}"
+            for s in symbols
+        )
+
+        quotes = await finedge_get(
+            client,
+            path
+        )
+
+        if not quotes:
+            continue
+
+        for symbol, q in quotes.items():
+
+            try:
+
+                price = float(
+                    q.get("current_price") or 0
+                )
+
+                volume = float(
+                    q.get("volume") or 0
+                )
+
+                market_cap = float(
+                    q.get("market_cap") or 0
+                )
+
+            except Exception:
+                continue
+
+            turnover_cr = (
+                price * volume
+            ) / 1e7
+
+            if market_cap < MIN_MARKET_CAP_CR:
+                filtered_mcap += 1
+                continue
+
+            if price < MIN_PRICE:
+                filtered_price += 1
+                continue
+
+            if turnover_cr < MIN_TURNOVER_CR:
+                filtered_turnover += 1
+                continue
+
+            stock = stock_map.get(symbol)
+
+            if not stock:
+                continue
+
+            nse_code = stock.get("nse_code")
+            bse_code = stock.get("bse_code")
+
+            master.append({
+
+                "symbol": symbol,
+
+                "name": stock.get("name"),
+
+                "exchange": "NSE"
+                if nse_code else "BSE",
+
+                "bse_code": bse_code,
+
+                "nse_code": nse_code,
+
+                "consolidated_ind": stock.get(
+                    "consolidated_ind",
+                    False
+                ),
+
+                "market_cap_cr": market_cap,
+
+                "price": price,
+
+                "volume": volume,
+
+                "turnover_cr": round(
+                    turnover_cr,
+                    2
+                )
+            })
+
+        print(
+            f"Processed {min(i + batch_size, len(data))}/{len(data)}"
+        )
 
     master.sort(
         key=lambda x: x["market_cap_cr"],
@@ -308,10 +344,12 @@ async def build_master(client, data):
 
     print()
     print("=== Summary ===")
-    print(f"✓ Final Stocks : {len(master)}")
+    print(f"✓ Final Stocks     : {len(master)}")
+    print(f"✗ MCAP Rejected   : {filtered_mcap}")
+    print(f"✗ Price Rejected  : {filtered_price}")
+    print(f"✗ Turn Rejected   : {filtered_turnover}")
 
     return master
-
 
 # =========================================================
 # MAIN
