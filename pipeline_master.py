@@ -235,6 +235,32 @@ async def build_master(client, data):
 
     master.sort(key=lambda x: x["market_cap_cr"], reverse=True)
 
+    # Debug — breakdown of bad symbol rejections
+    from collections import Counter
+    reject_reasons  = Counter()
+    reject_samples  = {}
+    for symbol, q in quotes.items():
+        stock = stock_map.get(symbol)
+        name  = stock.get("name") if stock else q.get("name") or symbol
+        if is_bad_symbol(symbol, name):
+            if symbol.isdigit():
+                reason = "NUMERIC"
+            elif symbol.endswith("-RE"):
+                reason = "-RE"
+            else:
+                # Find which keyword matched
+                reason = "KEYWORD:?"
+                for kw in BAD_KEYWORDS:
+                    pattern = r'' + re.escape(kw) + r''
+                    if re.search(pattern, symbol) or (name and re.search(pattern, name)):
+                        reason = f"KEYWORD:{kw}"
+                        break
+            reject_reasons[reason] += 1
+            if reason not in reject_samples:
+                reject_samples[reason] = []
+            if len(reject_samples[reason]) < 5:
+                reject_samples[reason].append(symbol)
+
     print("=" * 50)
     print("               Summary")
     print("=" * 50)
@@ -247,6 +273,11 @@ async def build_master(client, data):
     print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
+
+    print()
+    print("🔎 Bad Symbol Breakdown:")
+    for reason, count in reject_reasons.most_common():
+        print(f"  {reason:20s} : {count:5d}  samples={reject_samples.get(reason, [])}")
 
     return master
 
