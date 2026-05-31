@@ -22,7 +22,7 @@ OUTPUT_FILE = "master.json"
 RATE_DELAY = 0.20
 RETRY = 3
 MIN_MARKET_CAP_CR = 10
-MIN_PRICE = 5
+MIN_PRICE = 10
 MIN_TURNOVER_CR = 1
 
 HEADERS = {
@@ -261,6 +261,23 @@ async def build_master(client, data):
     print(f"  ✗ Not in Universe      : {not_in_universe}")
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
+
+    # Top 20 extra symbols by market cap not in stock-symbols
+    extras = []
+    for symbol, q in quotes.items():
+        if symbol not in stock_map:
+            try:
+                mc    = float(q.get("market_cap")    or 0)
+                price = float(q.get("current_price") or 0)
+                extras.append((symbol, price, mc))
+            except Exception:
+                pass
+
+    extras.sort(key=lambda x: x[2], reverse=True)
+    print()
+    print("🔎 Top 20 extras (in quotes but NOT in stock-symbols):")
+    for sym, price, mc in extras[:20]:
+        print(f"  {sym:20s}  price={price:<10}  mcap={mc:.0f} Cr")
 
     return master
 
