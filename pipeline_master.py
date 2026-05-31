@@ -216,7 +216,7 @@ async def build_master(client, data):
     filtered_mcap = 0
     filtered_price = 0
     filtered_turnover = 0
-    batch_size = 75
+    batch_size = 25
 
     for i in range(0, len(data), batch_size):
         print(
