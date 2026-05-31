@@ -34,20 +34,14 @@ HEADERS = {
 # =========================================================
 
 BAD_KEYWORDS = [
-
     "ETF",
     "BEES",
-
     "LIQUID",
-
     "NIFTY",
     "SENSEX",
-
     "GOLD",
     "SILVER",
-
     "INDEX",
-
     "NEXT50",
     "MIDCAP",
     "SMALLCAP",
@@ -110,7 +104,7 @@ async def finedge_get(client, path):
 
         except Exception as e:
 
-            print(f"Network Error: {e}")
+            print(f"  ⚠️  Network Error: {e}")
 
             await asyncio.sleep(2 ** attempt)
 
@@ -118,7 +112,7 @@ async def finedge_get(client, path):
 
         if r.status_code == 429:
 
-            print("429 Rate Limit")
+            print("  ⏳ 429 Rate Limit — waiting 15s...")
 
             await asyncio.sleep(15)
 
@@ -126,7 +120,7 @@ async def finedge_get(client, path):
 
         if r.status_code != 200:
 
-            print(f"HTTP {r.status_code}")
+            print(f"  ❌ HTTP {r.status_code} for path: {path[:80]}")
 
             return None
 
@@ -139,16 +133,7 @@ async def finedge_get(client, path):
             return None
 
     return None
-# =========================================================
-# QUOTE
-# =========================================================
 
-async def fetch_quote(client, symbol):
-
-    return await finedge_get(
-        client,
-        f"quote?symbol={symbol}"
-    )
 
 # =========================================================
 # WORKER UPLOAD
@@ -185,7 +170,7 @@ async def r2_upload(client, filename, data):
 
 async def fetch_symbols(client):
 
-    print("Fetching stock universe...")
+    print("📡 Fetching stock universe...")
 
     data = await finedge_get(
         client,
@@ -198,7 +183,7 @@ async def fetch_symbols(client):
             "stock-symbols fetch failed"
         )
 
-    print(f"Fetched {len(data)} symbols")
+    print(f"✅ Fetched {len(data)} symbols")
 
     return data
 
@@ -210,27 +195,35 @@ async def fetch_symbols(client):
 async def build_master(client, data):
 
     print()
-    print("=== Building Master Universe ===")
+    print("=" * 50)
+    print("     Building Master Universe")
+    print("=" * 50)
 
     master = []
-    filtered_mcap = 0
-    filtered_price = 0
+    filtered_mcap     = 0
+    filtered_price    = 0
     filtered_turnover = 0
-    batch_size = 25
+    filtered_keyword  = 0
+    api_empty         = 0
+    batch_size        = 25
+    total_batches     = (len(data) + batch_size - 1) // batch_size
 
     for i in range(0, len(data), batch_size):
-        print(
-            f"\n📦 Batch {i//batch_size + 1}"
-        )
+
+        batch_num = i // batch_size + 1
+
+        print()
+        print(f"📦 Batch {batch_num}/{total_batches}  (symbols {i+1}–{min(i+batch_size, len(data))})")
+
         batch = data[i:i + batch_size]
 
-        symbols = []
-
+        symbols   = []
         stock_map = {}
 
         for stock in batch:
 
             if not is_valid_stock(stock):
+                filtered_keyword += 1
                 continue
 
             symbol = str(
@@ -241,10 +234,10 @@ async def build_master(client, data):
                 continue
 
             symbols.append(symbol)
-
             stock_map[symbol] = stock
 
         if not symbols:
+            print("  ⏭️  All symbols filtered by keyword — skipping")
             continue
 
         path = "quote?" + "&".join(
@@ -252,92 +245,72 @@ async def build_master(client, data):
             for s in symbols
         )
 
-        quotes = await finedge_get(
-            client,
-            path
-        )
+        quotes = await finedge_get(client, path)
 
         if not quotes:
+            print(f"  ⚠️  Empty response for batch {batch_num} — skipping")
+            api_empty += len(symbols)
             continue
-        print(path)
-        print(list(quotes.keys())[:10])
 
-        break
+        batch_added    = 0
+        batch_rejected = 0
+
         for symbol, q in quotes.items():
+
+            if symbol not in stock_map:
+                continue
 
             try:
 
-                price = float(
-                    q.get("current_price") or 0
-                )
-
-                volume = float(
-                    q.get("volume") or 0
-                )
-
-                market_cap = float(
-                    q.get("market_cap") or 0
-                )
+                price      = float(q.get("current_price") or 0)
+                volume     = float(q.get("volume")        or 0)
+                market_cap = float(q.get("market_cap")    or 0)
 
             except Exception:
+                batch_rejected += 1
                 continue
 
-            turnover_cr = (
-                price * volume
-            ) / 1e7
+            turnover_cr = (price * volume) / 1e7
 
             if market_cap < MIN_MARKET_CAP_CR:
                 filtered_mcap += 1
+                batch_rejected += 1
                 continue
 
             if price < MIN_PRICE:
                 filtered_price += 1
+                batch_rejected += 1
                 continue
 
             if turnover_cr < MIN_TURNOVER_CR:
                 filtered_turnover += 1
+                batch_rejected += 1
                 continue
 
-            stock = stock_map.get(symbol)
-
-            if not stock:
-                continue
+            stock = stock_map[symbol]
 
             nse_code = stock.get("nse_code")
             bse_code = stock.get("bse_code")
 
             master.append({
-
-                "symbol": symbol,
-
-                "name": stock.get("name"),
-
-                "exchange": "NSE"
-                if nse_code else "BSE",
-
-                "bse_code": bse_code,
-
-                "nse_code": nse_code,
-
-                "consolidated_ind": stock.get(
-                    "consolidated_ind",
-                    False
-                ),
-
-                "market_cap_cr": market_cap,
-
-                "price": price,
-
-                "volume": volume,
-
-                "turnover_cr": round(
-                    turnover_cr,
-                    2
-                )
+                "symbol":           symbol,
+                "name":             stock.get("name"),
+                "exchange":         "NSE" if nse_code else "BSE",
+                "bse_code":         bse_code,
+                "nse_code":         nse_code,
+                "consolidated_ind": stock.get("consolidated_ind", False),
+                "market_cap_cr":    market_cap,
+                "price":            price,
+                "volume":           volume,
+                "turnover_cr":      round(turnover_cr, 2),
             })
 
+            batch_added += 1
+
         print(
-            f"Processed {min(i + batch_size, len(data))}/{len(data)}"
+            f"  ✓ Added: {batch_added:>4}   "
+            f"✗ Rejected: {batch_rejected:>4}   "
+            f"Running total: {len(master)}"
         )
 
     master.sort(
@@ -346,13 +319,19 @@ async def build_master(client, data):
     )
 
     print()
-    print("=== Summary ===")
-    print(f"✓ Final Stocks     : {len(master)}")
-    print(f"✗ MCAP Rejected   : {filtered_mcap}")
-    print(f"✗ Price Rejected  : {filtered_price}")
-    print(f"✗ Turn Rejected   : {filtered_turnover}")
+    print("=" * 50)
+    print("               Summary")
+    print("=" * 50)
+    print(f"  ✓ Final Stocks         : {len(master)}")
+    print(f"  ✗ Keyword Filtered     : {filtered_keyword}")
+    print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
+    print(f"  ✗ Price Rejected       : {filtered_price}")
+    print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
+    print(f"  ✗ API Empty/Skipped    : {api_empty}")
+    print("=" * 50)
 
     return master
+
 
 # =========================================================
 # MAIN
@@ -360,27 +339,16 @@ async def build_master(client, data):
 
 async def main():
 
-    async with httpx.AsyncClient(
-        headers=HEADERS
-    ) as client:
+    async with httpx.AsyncClient(headers=HEADERS) as client:
 
-        data = await fetch_symbols(
-            client
-        )
+        data = await fetch_symbols(client)
 
-        master = await build_master(
-            client,
-            data
-        )
+        master = await build_master(client, data)
 
-        await r2_upload(
-            client,
-            OUTPUT_FILE,
-            master
-        )
+        await r2_upload(client, OUTPUT_FILE, master)
 
         print()
-        print("🎉 master.json uploaded")
+        print("🎉 Done — master.json uploaded successfully")
 
 
 if __name__ == "__main__":
