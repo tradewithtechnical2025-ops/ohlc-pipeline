@@ -1,0 +1,31 @@
+name: Fund Daily
+
+on:
+  schedule:
+   
+  workflow_dispatch:
+
+jobs:
+  fund_daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run fund_daily
+        env:
+          UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+          WORKER_URL:    ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline.py fund_daily
