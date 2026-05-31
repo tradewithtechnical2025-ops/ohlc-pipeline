@@ -1116,7 +1116,7 @@ def _calc_rsi(closes, period=14):
 def _build_screener_feed(
     all_data, classification, rs_data, mswing_data,
     result_calendar, sheet_data, today,
-    hlr_map=None, pb_map=None
+    hlr_map=None, pb_map=None, pat_map=None
 ):
     """Build unified screener_feed.json from all sources."""
 
@@ -1480,6 +1480,15 @@ def _build_screener_feed(
             "launchpad"     : launchpad,
             "gap_fill"      : gap_fill_state,
 
+            # Pattern signals from pattern_signals.json
+            "ib"        : "Inside Bar"        in (pat_map or {}).get(sym, set()),
+            "dib"       : "Double Inside Bar" in (pat_map or {}).get(sym, set()),
+            "nr7"       : "NR7"               in (pat_map or {}).get(sym, set()),
+            "wib"       : "Weekly IB"         in (pat_map or {}).get(sym, set()),
+            "w_dib"     : "Weekly Double IB"  in (pat_map or {}).get(sym, set()),
+            "w_nr7"     : "Weekly NR7"        in (pat_map or {}).get(sym, set()),
+            "w_3tc"     : "Weekly Tight Close" in (pat_map or {}).get(sym, set()),
+
             # HLR & Pullback
             "hlr_state" : (hlr_map or {}).get(sym, {}).get("state"),
             "hlr_res"   : (hlr_map or {}).get(sym, {}).get("resistance"),
@@ -1517,7 +1526,7 @@ async def run_ep_scan() -> None:
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
         (ohlc_results, screener_raw, fund_raw, cal_raw, classification,
          idx_hist_n50, idx_hist_n500, idx_hist_sm400, idx_daily, sheet_raw,
-         hlr_raw, pb_raw) = await asyncio.gather(
+         hlr_raw, pb_raw, pat_raw) = await asyncio.gather(
             asyncio.gather(*ohlc_tasks, return_exceptions=True),
             r2_download(client, "screener.json"),
             r2_download_fund(client),
@@ -1530,6 +1539,7 @@ async def run_ep_scan() -> None:
             r2_download(client, "sheet_data.json"),
             r2_download(client, "hlr_signals.json"),
             r2_download(client, "pullback_signals.json"),
+            r2_download(client, "pattern_signals.json"),
         )
 
         # OHLC
@@ -1602,6 +1612,16 @@ async def run_ep_scan() -> None:
                 sym = sig.get("symbol")
                 if sym: pb_map[sym] = sig
         log.info(f"Pullback signals: {len(pb_map)} stocks")
+
+        # Pattern signals map — per symbol, collect all pattern names
+        pat_map = {}
+        if isinstance(pat_raw, dict):
+            for sig in (pat_raw.get("signals") or []):
+                sym = sig.get("symbol")
+                pat = sig.get("pattern")
+                if sym and pat:
+                    pat_map.setdefault(sym, set()).add(pat)
+        log.info(f"Pattern signals: {len(pat_map)} stocks")
 
         # EP signals
         signals = _detect_ep(all_data)
@@ -1676,7 +1696,7 @@ async def run_ep_scan() -> None:
         screener_feed = _build_screener_feed(
             all_data, classification, rs_data, mswing_data,
             result_calendar, sheet_data, today,
-            hlr_map=hlr_map, pb_map=pb_map
+            hlr_map=hlr_map, pb_map=pb_map, pat_map=pat_map
         )
         # Enrich with patterns and fundamentals
         pat_map = {}
@@ -1718,6 +1738,13 @@ async def run_ep_scan() -> None:
             if row.get("gap_fill"):      pats.add(row["gap_fill"])
             if row.get("tl_hl_bo"):      pats.add("TL/HL BO")
             if row.get("hpbc"):          pats.add("HPBC")
+            if row.get("ib"):            pats.add("IB")
+            if row.get("dib"):           pats.add("DIB")
+            if row.get("nr7"):           pats.add("NR7")
+            if row.get("wib"):           pats.add("WIB")
+            if row.get("w_dib"):         pats.add("W-DIB")
+            if row.get("w_nr7"):         pats.add("W-NR7")
+            if row.get("w_3tc"):         pats.add("3WTC")
             if row.get("hlr_state"):     pats.add(row["hlr_state"])
             if row.get("pullback"):      pats.add("PullBack")
             # Add EP flag
