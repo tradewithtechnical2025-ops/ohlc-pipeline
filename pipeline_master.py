@@ -21,6 +21,10 @@ OUTPUT_FILE = "master.json"
 
 RATE_DELAY = 0.20
 RETRY = 3
+MIN_MARKET_CAP_CR = 50
+MIN_PRICE = 10
+MIN_TURNOVER_CR = 1
+QUOTE_CONCURRENCY = 20
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -136,7 +140,16 @@ async def finedge_get(client, path):
             return None
 
     return None
+# =========================================================
+# QUOTE
+# =========================================================
 
+async def fetch_quote(client, symbol):
+
+    return await finedge_get(
+        client,
+        f"quote?symbol={symbol}"
+    )
 
 # =========================================================
 # WORKER UPLOAD
@@ -189,74 +202,113 @@ async def fetch_symbols(client):
     print(f"Fetched {len(data)} symbols")
 
     return data
+async def process_stock(client, stock, semaphore):
 
+    symbol = str(
+        stock.get("symbol", "")
+    ).strip().upper()
+
+    if not is_valid_stock(stock):
+        return None
+
+    async with semaphore:
+
+        quote = await fetch_quote(
+            client,
+            symbol
+        )
+
+    if not quote:
+        return None
+
+    q = quote.get(symbol)
+
+    if not q:
+        return None
+
+    price = float(
+        q.get("current_price") or 0
+    )
+
+    volume = float(
+        q.get("volume") or 0
+    )
+
+    market_cap = float(
+        q.get("market_cap") or 0
+    )
+
+    turnover_cr = (
+        price * volume
+    ) / 1e7
+
+    if market_cap < MIN_MARKET_CAP_CR:
+        return None
+
+    if price < MIN_PRICE:
+        return None
+
+    if turnover_cr < MIN_TURNOVER_CR:
+        return None
+
+    nse_code = stock.get("nse_code")
+    bse_code = stock.get("bse_code")
+
+    return {
+        "symbol": symbol,
+        "name": stock.get("name"),
+        "exchange": "NSE" if nse_code else "BSE",
+        "bse_code": bse_code,
+        "nse_code": nse_code,
+        "consolidated_ind": stock.get(
+            "consolidated_ind",
+            False
+        ),
+        "market_cap_cr": market_cap,
+        "price": price,
+        "volume": volume,
+        "turnover_cr": round(turnover_cr, 2)
+    }
 
 # =========================================================
 # BUILD MASTER
 # =========================================================
 
-def build_master(data):
+async def build_master(client, data):
 
     print()
     print("=== Building Master Universe ===")
 
-    seen = set()
+    semaphore = asyncio.Semaphore(
+        QUOTE_CONCURRENCY
+    )
 
-    master = []
-
-    skipped = 0
-
-    total = len(data)
-
-    for idx, stock in enumerate(data, start=1):
-
-        if not is_valid_stock(stock):
-
-            skipped += 1
-            continue
-
-        symbol = str(
-            stock.get("symbol")
-        ).strip().upper()
-
-        if symbol in seen:
-            continue
-
-        seen.add(symbol)
-
-        nse_code = stock.get("nse_code")
-        bse_code = stock.get("bse_code")
-
-        exchange = "NSE" if nse_code else "BSE"
-
-        item = {
-
-            "symbol": symbol,
-
-            "name": stock.get("name"),
-
-            "exchange": exchange,
-
-            "bse_code": bse_code,
-
-            "nse_code": nse_code,
-
-            "consolidated_ind": stock.get(
-                "consolidated_ind",
-                False
-            )
-        }
-
-        master.append(item)
-
-        print(
-            f"[{idx}/{total}] ✓ {symbol}"
+    tasks = [
+        process_stock(
+            client,
+            stock,
+            semaphore
         )
+        for stock in data
+    ]
+
+    results = await asyncio.gather(
+        *tasks
+    )
+
+    master = [
+        x for x in results
+        if x
+    ]
+
+    master.sort(
+        key=lambda x: x["market_cap_cr"],
+        reverse=True
+    )
 
     print()
     print("=== Summary ===")
     print(f"✓ Final Stocks : {len(master)}")
-    print(f"✗ Skipped      : {skipped}")
 
     return master
 
@@ -265,25 +317,24 @@ def build_master(data):
 # MAIN
 # =========================================================
 
-async def main():
+async with httpx.AsyncClient(
+    headers=HEADERS
+) as client:
 
-    async with httpx.AsyncClient(
-        headers=HEADERS
-    ) as client:
+    data = await fetch_symbols(
+        client
+    )
 
-        data = await fetch_symbols(
-            client
-        )
+    master = await build_master(
+        client,
+        data
+    )
 
-        master = build_master(
-            data
-        )
-
-        await r2_upload(
-            client,
-            OUTPUT_FILE,
-            master
-        )
+    await r2_upload(
+        client,
+        OUTPUT_FILE,
+        master
+    )
 
         print()
         print("🎉 master.json uploaded")
