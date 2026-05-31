@@ -1232,8 +1232,12 @@ def _build_screener_feed(
         week_map = {}
         for i, (d, c) in enumerate(zip(dates, closes)):
             if c is None: continue
-            wk = dt.fromisoformat(d).isocalendar()[:2]
-            week_map[wk] = c
+            try:
+                parts = d.split("-")
+                d_norm = f"{parts[0]}-{parts[1].zfill(2)}-{parts[2].zfill(2)}"
+                wk = dt.fromisoformat(d_norm).isocalendar()[:2]
+                week_map[wk] = c
+            except: continue
         weekly_closes = [week_map[k] for k in sorted(week_map.keys())]
         wrsi = _calc_rsi(weekly_closes[-30:]) if len(weekly_closes) >= 15 else None
 
@@ -1242,8 +1246,11 @@ def _build_screener_feed(
         month_map = {}
         for d, c in zip(dates, closes):
             if c is None: continue
-            mk = d[:7]  # YYYY-MM
-            month_map[mk] = c
+            try:
+                parts = d.split("-")
+                mk = f"{parts[0]}-{parts[1].zfill(2)}"
+                month_map[mk] = c
+            except: continue
         monthly_closes = [month_map[k] for k in sorted(month_map.keys())]
         mrsi = _calc_rsi(monthly_closes) if len(monthly_closes) >= 15 else None
 
