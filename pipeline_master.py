@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 
+import re
+
 import httpx
 
 # =========================================================
@@ -22,7 +24,7 @@ OUTPUT_FILE = "master.json"
 RATE_DELAY = 0.20
 RETRY = 3
 MIN_MARKET_CAP_CR = 10
-MIN_PRICE = 10
+MIN_PRICE = 5
 MIN_TURNOVER_CR = 1
 
 HEADERS = {
@@ -62,9 +64,11 @@ def is_valid_stock(stock):
         return False
 
     for keyword in BAD_KEYWORDS:
-        if keyword in symbol:
+        # Exact word match — SKYGOLD passes, "GOLD ETF" fails
+        pattern = r'\b' + re.escape(keyword) + r'\b'
+        if re.search(pattern, symbol):
             return False
-        if keyword in name:
+        if re.search(pattern, name):
             return False
 
     return True
@@ -162,20 +166,17 @@ async def build_master(client, data):
     print("     Building Master Universe")
     print("=" * 50)
 
-    # Build global stock_map with keyword filter applied
-    stock_map        = {}
-    filtered_keyword = 0
+    # Build global stock_map — enrichment only, no filtering here
+    stock_map = {}
 
     for stock in data:
         if not is_valid_stock(stock):
-            filtered_keyword += 1
             continue
         sym = str(stock.get("symbol", "")).strip().upper()
         if sym:
             stock_map[sym] = stock
 
-    print(f"  📋 Valid symbols after keyword filter : {len(stock_map)}")
-    print(f"  ✗  Keyword filtered                  : {filtered_keyword}")
+    print(f"  📋 stock_map built from stock-symbols : {len(stock_map)}")
     print()
 
     # ── Single API call — response contains full universe ─────────────────
@@ -196,13 +197,33 @@ async def build_master(client, data):
     filtered_mcap     = 0
     filtered_price    = 0
     filtered_turnover = 0
-    not_in_universe   = 0
+    filtered_keyword  = 0
 
     for symbol, q in quotes.items():
 
-        # Must be in our valid stock_map
-        if symbol not in stock_map:
-            not_in_universe += 1
+        # Enrich from stock_map if available, else use quote data directly
+        stock    = stock_map.get(symbol)
+        nse_code = stock.get("nse_code") if stock else None
+        bse_code = stock.get("bse_code") if stock else (
+            symbol if symbol.isdigit() else None
+        )
+        name     = stock.get("name") if stock else q.get("name") or symbol
+        exchange = "NSE" if nse_code else "BSE"
+
+        # Skip BSE-only stocks
+        # If nse_code exists → NSE ✓
+        # If symbol is purely numeric → BSE code, skip
+        # If symbol is alphabetic but not in stock_map → assume NSE (e.g. FIRSTCRY)
+        is_numeric_bse = symbol.isdigit()
+        if is_numeric_bse:
+            continue
+        if not nse_code:
+            nse_code = symbol  # assume NSE listing
+
+        # Apply keyword filter using resolved name + symbol
+        fake_entry = {"symbol": symbol, "name": name}
+        if not is_valid_stock(fake_entry):
+            filtered_keyword += 1
             continue
 
         try:
@@ -227,17 +248,13 @@ async def build_master(client, data):
             filtered_turnover += 1
             continue
 
-        stock    = stock_map[symbol]
-        nse_code = stock.get("nse_code")
-        bse_code = stock.get("bse_code")
-
         master.append({
             "symbol":           symbol,
-            "name":             stock.get("name"),
-            "exchange":         "NSE" if nse_code else "BSE",
+            "name":             name,
+            "exchange":         exchange,
             "bse_code":         bse_code,
             "nse_code":         nse_code,
-            "consolidated_ind": stock.get("consolidated_ind", False),
+            "consolidated_ind": stock.get("consolidated_ind", False) if stock else False,
             "market_cap_cr":    market_cap,
             "price":            price,
             "volume":           volume,
@@ -253,12 +270,16 @@ async def build_master(client, data):
     print("=" * 50)
     print("               Summary")
     print("=" * 50)
+    enriched   = sum(1 for s in master if s["nse_code"] or s["bse_code"])
+    unenriched = len(master) - enriched
+
     print(f"  ✓ Final Stocks         : {len(master)}")
+    print(f"    — Enriched (in stock-symbols) : {enriched}")
+    print(f"    — Quote-only (not in symbols) : {unenriched}")
     print(f"  ✗ Keyword Filtered     : {filtered_keyword}")
     print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
     print(f"  ✗ Price Rejected       : {filtered_price}")
     print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
-    print(f"  ✗ Not in Universe      : {not_in_universe}")
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
 
