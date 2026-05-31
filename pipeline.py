@@ -65,8 +65,8 @@ BSE_META:     dict[str, dict] = {}
 # Index symbols on R2
 INDEX_SYMBOLS = {
     "nifty50"    : "NIFTY50",
-    "nifty500"   : "NIF500",
-    "smallmid400": "NIFMID400",
+    "nifty500"   : "CNX500",
+    "smallmid400": "NIFTYMIDSML400",
 }
 
 
@@ -1254,6 +1254,134 @@ def _build_screener_feed(
         monthly_closes = [month_map[k] for k in sorted(month_map.keys())]
         mrsi = _calc_rsi(monthly_closes) if len(monthly_closes) >= 15 else None
 
+        # ── Volume patterns ──
+        sma_vol20 = sum(v for v in volumes[-21:-1] if v) / 20 if n >= 21 else None
+        sma_vol50 = sum(v for v in volumes[-51:-1] if v) / 50 if n >= 51 else None
+
+        # VD — volume dry up
+        sma_ref = sma_vol50 if sma_vol50 else sma_vol20
+        vd = bool(sma_ref and vol and vol < sma_ref * 0.5)
+
+        # HVQ / HVM / HVY / LVQ / LVM / LVY
+        vols_63  = [v for v in volumes[-64:-1] if v]
+        vols_21  = [v for v in volumes[-22:-1] if v]
+        vols_252 = [v for v in volumes[-253:-1] if v]
+        hvq = bool(vols_63  and vol and vol > max(vols_63))
+        hvm = bool(vols_21  and vol and vol > max(vols_21))
+        hvy = bool(vols_252 and vol and vol > max(vols_252))
+        lvq = bool(vols_63  and vol and vol < min(vols_63))
+        lvm = bool(vols_21  and vol and vol < min(vols_21))
+        lvy = bool(vols_252 and vol and vol < min(vols_252))
+
+        # Volume Footprint — unusual volume in last 21 days
+        unusual_vol_idx = None
+        if vols_252:
+            max_vol_252 = max(volumes[-252:])
+            for i in range(n-1, max(n-22, 0), -1):
+                if volumes[i] and volumes[i] >= max_vol_252 * 0.95:
+                    unusual_vol_idx = i; break
+        vol_footprint = bool(
+            (hvq or hvm or hvy or (rvol and rvol >= 5.0)) and
+            (unusual_vol_idx is not None and (n - 1 - unusual_vol_idx) <= 21)
+        )
+
+        # ── EMA of lows (33) for patterns ──
+        def ema_series(arr, period):
+            """Return full EMA series"""
+            if len(arr) < period: return [None]*len(arr)
+            result = [None]*len(arr)
+            k = 2/(period+1)
+            vals = [v for v in arr[:period] if v]
+            if not vals: return result
+            result[period-1] = sum(vals)/len(vals)
+            for i in range(period, len(arr)):
+                v = arr[i]
+                result[i] = v*k + result[i-1]*(1-k) if v and result[i-1] else result[i-1]
+            return result
+
+        ema_low33_series = ema_series(lows, 33)
+        ema_low33 = ema_low33_series[-1]
+
+        # ── ATR Tightness ──
+        atr_tightness = bool(
+            range3d is not None and pct_atr is not None and
+            ema50 is not None and
+            range3d <= pct_atr and ltp > ema50
+        )
+
+        # ── Bull Snort (BS) ──
+        candle_range = highs[-1] - lows[-1] if highs[-1] and lows[-1] else 0
+        close_pos = (ltp - lows[-1]) / candle_range if candle_range > 0 else 0
+        bs = bool(
+            rvol and rvol >= 2.0 and
+            closes[-2] and ltp > closes[-2] and
+            close_pos >= 0.65
+        )
+
+        # ── Pocket Pivot (PP) ──
+        down_vols_20 = [volumes[i] for i in range(max(0,n-21), n-1)
+                        if closes[i] is not None and opens[i] is not None
+                        and closes[i] < opens[i] and volumes[i]]
+        max_down_vol = max(down_vols_20) if down_vols_20 else 0
+        pp = bool(
+            opens[-1] and ltp > opens[-1] and
+            vol and vol > max_down_vol and
+            close_pos >= 0.5
+        )
+
+        # ── MCP detection (for Launchpad) ──
+        mcp_high = mcp_low = None
+        seen_mothers = set()
+        for m_idx in range(n - 4, max(0, n - 60), -1):
+            mh = highs[m_idx]; ml = lows[m_idx]
+            if mh is None or ml is None: continue
+            mk = round(mh * 200)
+            if mk in seen_mothers: continue
+            baby_count = 0; intact = True
+            for b in range(m_idx+1, n):
+                if highs[b] is None or lows[b] is None: continue
+                if highs[b] > mh or lows[b] < ml: intact = False; break
+                baby_count += 1
+            if baby_count >= 3 and intact:
+                seen_mothers.add(mk)
+                mcp_high = mh; mcp_low = ml; break
+
+        mcp_flag = mcp_high is not None
+
+        # ── Launchpad ──
+        launchpad = bool(
+            mcp_flag and ema10 and ema21 and ema50 and
+            mcp_low <= ema10 <= mcp_high and
+            mcp_low <= ema21 <= mcp_high and
+            mcp_low <= ema50 <= mcp_high
+        )
+
+        # ── Gap Filling ──
+        gap_fill_state = None
+        for i in range(n-2, max(0, n-120), -1):
+            if i == 0: break
+            prev_low = lows[i-1]; today_high = highs[i]
+            if prev_low is None or today_high is None: continue
+            if today_high >= prev_low: continue
+            gap_pct = (prev_low - today_high) / prev_low * 100
+            if gap_pct < 2.0: continue
+            # Check unfilled — no candle after gap crossed prev_low
+            gap_top = prev_low
+            filled = any(highs[j] and highs[j] >= gap_top for j in range(i+1, n-1))
+            if filled: continue
+            # Current price near gap (within 5%)
+            dist_pct = (gap_top - ltp) / gap_top * 100
+            if 0 <= dist_pct <= 5.0:
+                # Consolidating = last 5 days near gap
+                recent_near = all(
+                    highs[j] and lows[j] and
+                    abs((gap_top - closes[j]) / gap_top * 100) <= 5.0
+                    for j in range(max(0, n-6), n-1)
+                    if closes[j]
+                )
+                gap_fill_state = "Consolidating near Gap" if recent_near else "Near Gap"
+                break
+
         # ── RS data ──
         rs_info  = rs_data.get(sym, {})
         ms_info  = mswing_data.get(sym, {})
@@ -1331,9 +1459,30 @@ def _build_screener_feed(
             # Result
             "results"   : result_date,
 
+            # Volume patterns
+            "vd"            : vd,
+            "hvq"           : hvq,
+            "hvm"           : hvm,
+            "hvy"           : hvy,
+            "lvq"           : lvq,
+            "lvm"           : lvm,
+            "lvy"           : lvy,
+            "vol_footprint" : vol_footprint,
+
+            # Price patterns
+            "atr_tightness" : atr_tightness,
+            "bs"            : bs,
+            "pp"            : pp,
+            "mcp"           : mcp_flag,
+            "mcp_high"      : mcp_high,
+            "mcp_low"       : mcp_low,
+            "launchpad"     : launchpad,
+            "gap_fill"      : gap_fill_state,
+
             # Sheet fields
             "circuit"   : sh_info.get("circuit"),
             "hpbc"      : sh_info.get("hpbc"),
+            "tl_hl_bo"  : sh_info.get("tl_hl_bo"),
         }
 
         feed.append(row)
@@ -1416,9 +1565,10 @@ async def run_ep_scan() -> None:
             for row in sheet_raw:
                 sym = row.get("symbol") or row.get("Stocks","")
                 if sym: sheet_data[sym] = {
-                    "circuit" : row.get("Circuit") or row.get("circuit"),
-                    "tv_code" : row.get("TV CODE") or row.get("tv_code",""),
-                    "hpbc"    : row.get("HPBC") or row.get("hpbc",""),
+                    "circuit"  : row.get("Circuit") or row.get("circuit"),
+                    "tv_code"  : row.get("TV CODE") or row.get("tv_code",""),
+                    "hpbc"     : row.get("HPBC") or row.get("hpbc",""),
+                    "tl_hl_bo" : row.get("TL/HL BO") or row.get("tl_hl_bo",""),
                 }
         elif isinstance(sheet_raw, dict):
             sheet_data = sheet_raw
@@ -1506,13 +1656,41 @@ async def run_ep_scan() -> None:
         # Add pattern_signals patterns
         for row in screener_feed:
             sym = row["symbol"]
-            sc  = screener.get(sym, {})
-            row["patterns"]  = sc.get("patterns", "")
-            row["sales_ch"]  = sc.get("sales_ch", "")
-            row["eps_ch"]    = sc.get("eps_ch", "")
+            sc   = screener.get(sym, {})
             fund = fund_lookup.get(sym, {})
             pl   = fund.get("pl_quarterly", [])
             row["q_name"] = pl[0].get("header","") if pl else ""
+
+            # Sales/EPS YoY (same quarter last year = index 4)
+            if pl and len(pl) >= 5:
+                s0 = pl[0].get("sales"); s4 = pl[4].get("sales")
+                row["sales_ch"] = round((s0-s4)/s4*100, 1) if s0 and s4 else None
+                e0 = pl[0].get("eps"); e4 = pl[4].get("eps")
+                row["eps_ch"]   = round((e0-e4)/e4*100, 1) if e0 and e4 else None
+            else:
+                row["sales_ch"] = None; row["eps_ch"] = None
+
+            # Build patterns string from calculated flags
+            pats = set()
+            if row.get("vd"):            pats.add("VD")
+            if row.get("hvq"):           pats.add("HVQ")
+            if row.get("hvm"):           pats.add("HVM")
+            if row.get("hvy"):           pats.add("HVY")
+            if row.get("lvq"):           pats.add("LVQ")
+            if row.get("lvm"):           pats.add("LVM")
+            if row.get("lvy"):           pats.add("LVY")
+            if row.get("vol_footprint"): pats.add("Volume Footprint")
+            if row.get("atr_tightness"): pats.add("ATR Tightness")
+            if row.get("bs"):            pats.add("BS")
+            if row.get("pp"):            pats.add("PP")
+            if row.get("mcp"):           pats.add("MCP")
+            if row.get("launchpad"):     pats.add("Launchpad")
+            if row.get("gap_fill"):      pats.add(row["gap_fill"])
+            if row.get("tl_hl_bo"):      pats.add("TL/HL BO")
+            if row.get("hpbc"):          pats.add("HPBC")
+            # Add EP flag
+            if sym in pat_map:           pats |= pat_map[sym]
+            row["patterns"] = "||".join(sorted(pats))
             # Add EP flag
             if sym in pat_map:
                 existing = set(row["patterns"].split("||")) if row["patterns"] else set()
