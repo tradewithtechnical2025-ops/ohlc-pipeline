@@ -1870,7 +1870,7 @@ async def run_ep_scan() -> None:
         classification = await r2_download(client, "classification.json") or []
 
         macro_sector_rs_history = _build_group_rs_history(classification, rs_history_list, "macro_sector")
-        industry_rs_history     = _build_group_rs_history(classification, rs_history_list, "industry")
+        industry_rs_history     = _build_group_rs_history(classification, rs_history_list, "display_industry")
         sector_group_rs_history = _build_group_rs_history(classification, rs_history_list, "sector_group")
 
         mswing_data = _calculate_mswing(all_data, history_days=ROLLING_DAYS - 50)
