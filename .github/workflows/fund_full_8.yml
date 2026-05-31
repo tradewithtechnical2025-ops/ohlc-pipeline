@@ -1,0 +1,22 @@
+name: Fund Full Part 8
+on:
+  workflow_dispatch:
+jobs:
+  fund-full-8:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies
+        run: pip install httpx
+      - name: Run fund full part 8
+        run: python pipeline.py fund_full_8
+        env:
+          UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:    ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
