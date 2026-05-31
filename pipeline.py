@@ -65,8 +65,8 @@ BSE_META:     dict[str, dict] = {}
 # Index symbols on R2
 INDEX_SYMBOLS = {
     "nifty50"    : "NIFTY50",
-    "nifty500"   : "CNX500",
-    "smallmid400": "NIFTYMIDSML400",
+    "nifty500"   : "NIF500",
+    "smallmid400": "NIFMID400",
 }
 
 
