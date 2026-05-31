@@ -19,7 +19,7 @@ FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 OUTPUT_FILE = "master.json"
 
-RATE_DELAY = 0.30
+RATE_DELAY = 0.40
 RETRY = 3
 MIN_MARKET_CAP_CR = 10
 MIN_PRICE = 10
@@ -56,13 +56,8 @@ BAD_KEYWORDS = [
 
 def is_valid_stock(stock):
 
-    symbol = str(
-        stock.get("symbol", "")
-    ).upper()
-
-    name = str(
-        stock.get("name", "")
-    ).upper()
+    symbol = str(stock.get("symbol", "")).upper()
+    name   = str(stock.get("name",   "")).upper()
 
     if not symbol:
         return False
@@ -71,10 +66,8 @@ def is_valid_stock(stock):
         return False
 
     for keyword in BAD_KEYWORDS:
-
         if keyword in symbol:
             return False
-
         if keyword in name:
             return False
 
@@ -87,52 +80,33 @@ def is_valid_stock(stock):
 
 async def finedge_get(client, path):
 
-    url = f"{FINEDGE_BASE}/{path}"
-
-    params = {
-        "token": FINEDGE_TOKEN
-    }
+    url    = f"{FINEDGE_BASE}/{path}"
+    params = {"token": FINEDGE_TOKEN}
 
     for attempt in range(RETRY):
 
         await asyncio.sleep(RATE_DELAY)
 
         try:
-
-            r = await client.get(
-                url,
-                params=params,
-                timeout=60,
-            )
+            r = await client.get(url, params=params, timeout=60)
 
         except Exception as e:
-
             print(f"  ⚠️  Network Error: {e}")
-
             await asyncio.sleep(2 ** attempt)
-
             continue
 
         if r.status_code == 429:
-
             print("  ⏳ 429 Rate Limit — waiting 15s...")
-
             await asyncio.sleep(15)
-
             continue
 
         if r.status_code != 200:
-
             print(f"  ❌ HTTP {r.status_code} for path: {path[:80]}")
-
             return None
 
         try:
-
             return r.json()
-
         except Exception:
-
             return None
 
     return None
@@ -144,25 +118,21 @@ async def finedge_get(client, path):
 
 async def r2_upload(client, filename, data):
 
-    url = f"{WORKER_URL}?file={filename}"
-
+    url     = f"{WORKER_URL}?file={filename}"
     payload = json.dumps(data)
 
     r = await client.post(
         url,
         headers={
             "X-Secret-Token": WORKER_TOKEN,
-            "Content-Type": "application/json",
+            "Content-Type":   "application/json",
         },
         content=payload.encode(),
         timeout=120,
     )
 
     if r.status_code != 200:
-
-        raise RuntimeError(
-            f"{filename} upload failed: {r.status_code}"
-        )
+        raise RuntimeError(f"{filename} upload failed: {r.status_code}")
 
     print(f"✅ Uploaded {filename}")
 
@@ -175,23 +145,17 @@ async def fetch_symbols(client):
 
     print("📡 Fetching stock universe...")
 
-    data = await finedge_get(
-        client,
-        "stock-symbols"
-    )
+    data = await finedge_get(client, "stock-symbols")
 
     if not data:
-
-        raise RuntimeError(
-            "stock-symbols fetch failed"
-        )
+        raise RuntimeError("stock-symbols fetch failed")
 
     print(f"✅ Fetched {len(data)} symbols")
-    print(f"   Sample entry format: {data[0]}")
+    print(f"   Sample entry: {data[0]}")
 
-    # Check watch list presence in stock-symbols
+    # Watch list check in stock-symbols
     print()
-    print("🔍 Watch List — stock-symbols check:")
+    print("🔍 Watch List — stock-symbols presence:")
     for entry in data:
         sym  = str(entry.get("symbol", "")).upper()
         name = str(entry.get("name",   "")).upper()
@@ -213,7 +177,8 @@ async def build_master(client, data):
     print("     Building Master Universe")
     print("=" * 50)
 
-    master = []
+    master        = []
+    added_symbols = set()   # prevent duplicates from API returning extra symbols
     filtered_mcap     = 0
     filtered_price    = 0
     filtered_turnover = 0
@@ -222,46 +187,42 @@ async def build_master(client, data):
     batch_size        = 25
     total_batches     = (len(data) + batch_size - 1) // batch_size
 
+    # ── Build GLOBAL stock_map once (keyword filter applied here) ──────────
+    stock_map = {}
+    for stock in data:
+        if not is_valid_stock(stock):
+            sym = str(stock.get("symbol", "")).upper()
+            if sym in DEBUG_WATCH:
+                print(f"  🔍 {sym}: ✗ REJECTED at keyword filter — entry={stock}")
+            filtered_keyword += 1
+            continue
+        sym = str(stock.get("symbol", "")).strip().upper()
+        if sym:
+            stock_map[sym] = stock
+
+    print(f"  📋 Global stock_map: {len(stock_map)} valid symbols")
+    print()
+
+    # ── Batch loop — only for building quote request URLs ─────────────────
     for i in range(0, len(data), batch_size):
 
         batch_num = i // batch_size + 1
 
-        print()
         print(f"📦 Batch {batch_num}/{total_batches}  (symbols {i+1}–{min(i+batch_size, len(data))})")
 
-        batch = data[i:i + batch_size]
-
-        symbols   = []
-        stock_map = {}
+        batch   = data[i:i + batch_size]
+        symbols = []
 
         for stock in batch:
-
-            if not is_valid_stock(stock):
-                sym = str(stock.get("symbol", "")).upper()
-                if sym in DEBUG_WATCH:
-                    print(f"  🔍 {sym}: ✗ REJECTED at keyword filter — entry={stock}")
-                filtered_keyword += 1
-                continue
-
-            symbol = str(
-                stock.get("symbol", "")
-            ).strip().upper()
-
-            if not symbol:
-                continue
-
-            symbols.append(symbol)
-            stock_map[symbol] = stock
+            sym = str(stock.get("symbol", "")).strip().upper()
+            if sym and sym in stock_map:
+                symbols.append(sym)
 
         if not symbols:
-            print("  ⏭️  All symbols filtered by keyword — skipping")
+            print("  ⏭️  All symbols filtered — skipping")
             continue
 
-        path = "quote?" + "&".join(
-            f"symbol={s}"
-            for s in symbols
-        )
-
+        path   = "quote?" + "&".join(f"symbol={s}" for s in symbols)
         quotes = await finedge_get(client, path)
 
         if not quotes:
@@ -276,13 +237,19 @@ async def build_master(client, data):
 
             is_watched = symbol in DEBUG_WATCH
 
+            # Skip if not in our valid universe
             if symbol not in stock_map:
                 if is_watched:
-                    print(f"  🔍 {symbol}: in quotes but NOT in stock_map (keyword filtered or missing)")
+                    print(f"  🔍 {symbol}: in quotes but NOT in stock_map")
+                continue
+
+            # Skip duplicates (API may return same symbol in multiple batches)
+            if symbol in added_symbols:
+                if is_watched:
+                    print(f"  🔍 {symbol}: already added — skipping duplicate")
                 continue
 
             try:
-
                 price      = float(q.get("current_price") or 0)
                 volume     = float(q.get("volume")        or 0)
                 market_cap = float(q.get("market_cap")    or 0)
@@ -325,8 +292,7 @@ async def build_master(client, data):
             if is_watched:
                 print(f"  🔍 {symbol}: ✓ ADDED to master")
 
-            stock = stock_map[symbol]
-
+            stock    = stock_map[symbol]
             nse_code = stock.get("nse_code")
             bse_code = stock.get("bse_code")
 
@@ -343,6 +309,7 @@ async def build_master(client, data):
                 "turnover_cr":      round(turnover_cr, 2),
             })
 
+            added_symbols.add(symbol)
             batch_added += 1
 
         print(
@@ -351,10 +318,15 @@ async def build_master(client, data):
             f"Running total: {len(master)}"
         )
 
-    master.sort(
-        key=lambda x: x["market_cap_cr"],
-        reverse=True
-    )
+    # Symbols in stock_map that never appeared in any quote response
+    never_quoted = set(stock_map.keys()) - added_symbols
+    # (filter rejections don't count — only truly absent ones)
+    print()
+    print(f"  ⚠️  Symbols never quoted by API : {len(never_quoted)}")
+    if DEBUG_WATCH & never_quoted:
+        print(f"  🔍 Watch list missing from quotes: {DEBUG_WATCH & never_quoted}")
+
+    master.sort(key=lambda x: x["market_cap_cr"], reverse=True)
 
     print()
     print("=" * 50)
@@ -366,6 +338,7 @@ async def build_master(client, data):
     print(f"  ✗ Price Rejected       : {filtered_price}")
     print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
     print(f"  ✗ API Empty/Skipped    : {api_empty}")
+    print(f"  ✗ Never Quoted         : {len(never_quoted)}")
     print("=" * 50)
 
     return master
