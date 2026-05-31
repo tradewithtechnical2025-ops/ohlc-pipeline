@@ -19,7 +19,7 @@ FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 OUTPUT_FILE = "master.json"
 
-RATE_DELAY = 0.20
+RATE_DELAY = 0.30
 RETRY = 3
 MIN_MARKET_CAP_CR = 10
 MIN_PRICE = 10
@@ -28,6 +28,9 @@ MIN_TURNOVER_CR = 1
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
+
+# Symbols to watch closely in debug logs
+DEBUG_WATCH = {"AAVAS", "HDFCBANK", "RELIANCE", "INFY"}
 
 # =========================================================
 # FILTERS
@@ -184,6 +187,17 @@ async def fetch_symbols(client):
         )
 
     print(f"✅ Fetched {len(data)} symbols")
+    print(f"   Sample entry format: {data[0]}")
+
+    # Check watch list presence in stock-symbols
+    print()
+    print("🔍 Watch List — stock-symbols check:")
+    for entry in data:
+        sym  = str(entry.get("symbol", "")).upper()
+        name = str(entry.get("name",   "")).upper()
+        for w in DEBUG_WATCH:
+            if w in sym or w in name:
+                print(f"   FOUND  {w:15s} → {entry}")
 
     return data
 
@@ -223,6 +237,9 @@ async def build_master(client, data):
         for stock in batch:
 
             if not is_valid_stock(stock):
+                sym = str(stock.get("symbol", "")).upper()
+                if sym in DEBUG_WATCH:
+                    print(f"  🔍 {sym}: ✗ REJECTED at keyword filter — entry={stock}")
                 filtered_keyword += 1
                 continue
 
@@ -257,7 +274,11 @@ async def build_master(client, data):
 
         for symbol, q in quotes.items():
 
+            is_watched = symbol in DEBUG_WATCH
+
             if symbol not in stock_map:
+                if is_watched:
+                    print(f"  🔍 {symbol}: in quotes but NOT in stock_map (keyword filtered or missing)")
                 continue
 
             try:
@@ -267,25 +288,42 @@ async def build_master(client, data):
                 market_cap = float(q.get("market_cap")    or 0)
 
             except Exception:
+                if is_watched:
+                    print(f"  🔍 {symbol}: failed to parse fields — raw={q}")
                 batch_rejected += 1
                 continue
 
             turnover_cr = (price * volume) / 1e7
 
+            if is_watched:
+                print(
+                    f"  🔍 {symbol}: price={price} vol={volume} "
+                    f"mcap={market_cap} turnover={turnover_cr:.2f}Cr"
+                )
+
             if market_cap < MIN_MARKET_CAP_CR:
+                if is_watched:
+                    print(f"  🔍 {symbol}: ✗ REJECTED — mcap {market_cap} < {MIN_MARKET_CAP_CR}")
                 filtered_mcap += 1
                 batch_rejected += 1
                 continue
 
             if price < MIN_PRICE:
+                if is_watched:
+                    print(f"  🔍 {symbol}: ✗ REJECTED — price {price} < {MIN_PRICE}")
                 filtered_price += 1
                 batch_rejected += 1
                 continue
 
             if turnover_cr < MIN_TURNOVER_CR:
+                if is_watched:
+                    print(f"  🔍 {symbol}: ✗ REJECTED — turnover {turnover_cr:.2f} < {MIN_TURNOVER_CR}")
                 filtered_turnover += 1
                 batch_rejected += 1
                 continue
+
+            if is_watched:
+                print(f"  🔍 {symbol}: ✓ ADDED to master")
 
             stock = stock_map[symbol]
 
