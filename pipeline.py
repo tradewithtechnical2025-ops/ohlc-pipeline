@@ -65,8 +65,8 @@ BSE_META:     dict[str, dict] = {}
 # Index symbols on R2
 INDEX_SYMBOLS = {
     "nifty50"    : "NIFTY50",
-    "nifty500"   : "NIF500",
-    "smallmid400": "NIFMID400",
+    "nifty500"   : "CNX500",
+    "smallmid400": "NIFTYMIDSML400",
 }
 
 
@@ -1092,6 +1092,250 @@ def _build_mswing_json(all_data, mswing_data):
 
 
 # ══════════════════════════════════════════════════════════════
+# SCREENER FEED BUILDER
+# ══════════════════════════════════════════════════════════════
+
+def _calc_rsi(closes, period=14):
+    """RSI from close prices list."""
+    if len(closes) < period + 1:
+        return None
+    gains = []; losses = []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0)); losses.append(max(-d, 0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period-1) + gains[i]) / period
+        avg_loss = (avg_loss * (period-1) + losses[i]) / period
+    if avg_loss == 0: return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - 100/(1+rs), 2)
+
+
+def _build_screener_feed(
+    all_data, classification, rs_data, mswing_data,
+    result_calendar, sheet_data, today
+):
+    """Build unified screener_feed.json from all sources."""
+
+    # classification lookup
+    cls_map = {}
+    for x in (classification or []):
+        sym = x.get("symbol") or x.get("nse_code")
+        if sym: cls_map[sym] = x
+
+    # result dates per symbol
+    result_map = {}
+    for date_str, syms in (result_calendar or {}).items():
+        for sym in syms:
+            if sym not in result_map or date_str > result_map[sym]:
+                result_map[sym] = date_str
+
+    feed = []
+
+    for sym, s in all_data.items():
+        dates  = s["d"]; opens = s["o"]; highs = s["h"]
+        lows   = s["l"]; closes = s["c"]; volumes = s["v"]
+        n = len(dates)
+        if n < 20: continue
+
+        # ── Last candle ──
+        ltp      = closes[-1]
+        prev_cls = closes[-2] if n >= 2 else None
+        pct_ch   = round((ltp - prev_cls) / prev_cls * 100, 2) if ltp and prev_cls else None
+        vol      = volumes[-1]
+
+        if not ltp: continue
+
+        # ── 52W High/Low (252 trading days) ──
+        w52_highs = [v for v in highs[-252:] if v is not None]
+        w52_lows  = [v for v in lows[-252:]  if v is not None]
+        high52    = max(w52_highs) if w52_highs else None
+        low52     = min(w52_lows)  if w52_lows  else None
+        whd52     = round((ltp - high52) / high52 * 100, 2) if high52 else None
+        wld52     = round((ltp - low52)  / low52  * 100, 2) if low52  else None
+        new_52wh  = bool(high52 and ltp >= high52)
+        new_52wl  = bool(low52  and ltp <= low52)
+
+        # ── RVol (vs 20d avg) ──
+        avg_vol20 = sum(v for v in volumes[-21:-1] if v) / 20 if n >= 21 else None
+        rvol      = round(vol / avg_vol20, 2) if avg_vol20 and vol else None
+
+        # ── %ATR 14d ──
+        trs = []
+        for i in range(max(1, n-14), n):
+            h=highs[i]; l=lows[i]; pc=closes[i-1]
+            if None in (h,l,pc): continue
+            trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+        atr14    = sum(trs)/len(trs) if trs else None
+        pct_atr  = round(atr14/ltp*100, 2) if atr14 and ltp else None
+
+        # ── %BBW 20d ──
+        cls20 = [v for v in closes[-20:] if v is not None]
+        if len(cls20) >= 20:
+            sma20   = sum(cls20) / 20
+            std20   = (sum((x-sma20)**2 for x in cls20)/20)**0.5
+            upper   = sma20 + 2*std20; lower = sma20 - 2*std20
+            pct_bbw = round((upper-lower)/sma20*100, 2) if sma20 else None
+        else:
+            pct_bbw = None
+
+        # ── EMA helpers ──
+        def ema(period):
+            if n < period: return None
+            k = 2/(period+1)
+            vals = [v for v in closes[:period] if v]
+            if not vals: return None
+            e = sum(vals)/len(vals)
+            for v in closes[period:]:
+                e = v*k + e*(1-k) if v else e
+            return round(e, 2)
+
+        ema10  = ema(10);  ema21 = ema(21)
+        ema50  = ema(50);  ema200 = ema(200)
+
+        above_21  = bool(ema21  and ltp > ema21)
+        above_50  = bool(ema50  and ltp > ema50)
+        above_200 = bool(ema200 and ltp > ema200)
+        gt_50_200 = bool(ema50  and ema200 and ema50 > ema200)
+        gt_21_50  = bool(ema21  and ema50  and ema21 > ema50)
+
+        # ── EMD% ──
+        emad10  = round((ltp-ema10) /ema10 *100, 2) if ema10  else None
+        emad21  = round((ltp-ema21) /ema21 *100, 2) if ema21  else None
+        emad50  = round((ltp-ema50) /ema50 *100, 2) if ema50  else None
+
+        # ── Returns ──
+        def ret(n_days):
+            idx = n - 1 - n_days
+            if idx < 0 or closes[idx] is None or not closes[idx]: return None
+            return round((ltp - closes[idx]) / closes[idx] * 100, 2)
+
+        mg1=ret(21); mg3=ret(63); mg6=ret(126); mg9=ret(189); mg12=ret(252)
+
+        # ── Range ──
+        def rng(n_days):
+            h = [v for v in highs[-n_days:] if v]
+            l = [v for v in lows[-n_days:]  if v]
+            if not h or not l or not ltp: return None
+            return round((max(h)-min(l))/ltp*100, 2)
+
+        range3d=rng(3); range5d=rng(5)
+
+        # ── RSI Daily ──
+        drsi = _calc_rsi([v for v in closes[-30:] if v is not None])
+
+        # ── RSI Weekly (build weekly closes) ──
+        from datetime import date as dt
+        weekly_closes = []
+        week_map = {}
+        for i, (d, c) in enumerate(zip(dates, closes)):
+            if c is None: continue
+            wk = dt.fromisoformat(d).isocalendar()[:2]
+            week_map[wk] = c
+        weekly_closes = [week_map[k] for k in sorted(week_map.keys())]
+        wrsi = _calc_rsi(weekly_closes[-30:]) if len(weekly_closes) >= 15 else None
+
+        # ── RSI Monthly ──
+        monthly_closes = []
+        month_map = {}
+        for d, c in zip(dates, closes):
+            if c is None: continue
+            mk = d[:7]  # YYYY-MM
+            month_map[mk] = c
+        monthly_closes = [month_map[k] for k in sorted(month_map.keys())]
+        mrsi = _calc_rsi(monthly_closes) if len(monthly_closes) >= 15 else None
+
+        # ── RS data ──
+        rs_info  = rs_data.get(sym, {})
+        ms_info  = mswing_data.get(sym, {})
+        cls_info = cls_map.get(sym, {})
+        sh_info  = sheet_data.get(sym, {})
+
+        # ── Result date ──
+        result_date = result_map.get(sym)
+
+        row = {
+            "symbol"    : sym,
+            "name"      : cls_info.get("name", ""),
+            "tv_code"   : sh_info.get("tv_code", f"NSE:{sym},"),
+            "sector"    : cls_info.get("sector_group", ""),
+            "industry"  : cls_info.get("display_industry", ""),
+            "mcap"      : cls_info.get("market_cap_cr"),
+            "themes"    : cls_info.get("themes", []),
+
+            # Price
+            "ltp"       : ltp,
+            "pct_ch"    : pct_ch,
+            "volume"    : vol,
+            "rvol"      : rvol,
+
+            # 52W
+            "high52"    : high52,
+            "low52"     : low52,
+            "52whd"     : whd52,
+            "52wld"     : wld52,
+            "new_52wh"  : new_52wh,
+            "new_52wl"  : new_52wl,
+
+            # Technical
+            "pct_atr"   : pct_atr,
+            "pct_bbw"   : pct_bbw,
+            "ema10"     : ema10,
+            "ema21"     : ema21,
+            "ema50"     : ema50,
+            "ema200"    : ema200,
+            "emad10"    : emad10,
+            "emad21"    : emad21,
+            "emad50"    : emad50,
+            "above_21"  : above_21,
+            "above_50"  : above_50,
+            "above_200" : above_200,
+            "gt_50_200" : gt_50_200,
+            "gt_21_50"  : gt_21_50,
+
+            # Returns
+            "1mg"       : mg1,
+            "3mg"       : mg3,
+            "6mg"       : mg6,
+            "9mg"       : mg9,
+            "12mg"      : mg12,
+            "range3d"   : range3d,
+            "range5d"   : range5d,
+
+            # RSI
+            "drsi"      : drsi,
+            "wrsi"      : wrsi,
+            "mrsi"      : mrsi,
+
+            # RS
+            "rs_rating" : rs_info.get("rs"),
+            "mswing"    : ms_info.get("mswing"),
+            "mswing_avg9": ms_info.get("mswing_avg9"),
+
+            # Fundamentals (from rs_data enriched by fund_lookup later)
+            "sales_ch"  : None,
+            "eps_ch"    : None,
+
+            # Patterns (filled later)
+            "patterns"  : "",
+
+            # Result
+            "results"   : result_date,
+
+            # Sheet fields
+            "circuit"   : sh_info.get("circuit"),
+            "hpbc"      : sh_info.get("hpbc"),
+        }
+
+        feed.append(row)
+
+    log.info(f"screener_feed: {len(feed)} stocks")
+    return feed
+
+
+# ══════════════════════════════════════════════════════════════
 # EP SCAN — MAIN
 # ══════════════════════════════════════════════════════════════
 
@@ -1108,7 +1352,7 @@ async def run_ep_scan() -> None:
         # Download everything in parallel
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
         (ohlc_results, screener_raw, fund_raw, cal_raw, classification,
-         idx_hist_n50, idx_hist_n500, idx_hist_sm400, idx_daily) = await asyncio.gather(
+         idx_hist_n50, idx_hist_n500, idx_hist_sm400, idx_daily, sheet_raw) = await asyncio.gather(
             asyncio.gather(*ohlc_tasks, return_exceptions=True),
             r2_download(client, "screener.json"),
             r2_download_fund(client),
@@ -1118,6 +1362,7 @@ async def run_ep_scan() -> None:
             r2_download(client, f"index_history/{INDEX_SYMBOLS['nifty500']}.json"),
             r2_download(client, f"index_history/{INDEX_SYMBOLS['smallmid400']}.json"),
             r2_download(client, "index_daily.json"),
+            r2_download(client, "sheet_data.json"),
         )
 
         # OHLC
@@ -1157,6 +1402,20 @@ async def run_ep_scan() -> None:
 
         result_calendar = cal_raw if isinstance(cal_raw, dict) else {}
         classification  = classification or []
+
+        # Sheet data (circuit, tv_code, hpbc)
+        sheet_data = {}
+        if isinstance(sheet_raw, list):
+            for row in sheet_raw:
+                sym = row.get("symbol") or row.get("Stocks","")
+                if sym: sheet_data[sym] = {
+                    "circuit" : row.get("Circuit") or row.get("circuit"),
+                    "tv_code" : row.get("TV CODE") or row.get("tv_code",""),
+                    "hpbc"    : row.get("HPBC") or row.get("hpbc",""),
+                }
+        elif isinstance(sheet_raw, dict):
+            sheet_data = sheet_raw
+        log.info(f"Sheet data: {len(sheet_data)} stocks")
 
         # EP signals
         signals = _detect_ep(all_data)
@@ -1227,6 +1486,32 @@ async def run_ep_scan() -> None:
             sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing")
             sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
 
+        # Build screener_feed
+        screener_feed = _build_screener_feed(
+            all_data, classification, rs_data, mswing_data,
+            result_calendar, sheet_data, today
+        )
+        # Enrich with patterns and fundamentals
+        pat_map = {}
+        for sig in signals:
+            sym = sig["symbol"]
+            pat_map.setdefault(sym, set()).add("EP")
+        # Add pattern_signals patterns
+        for row in screener_feed:
+            sym = row["symbol"]
+            sc  = screener.get(sym, {})
+            row["patterns"]  = sc.get("patterns", "")
+            row["sales_ch"]  = sc.get("sales_ch", "")
+            row["eps_ch"]    = sc.get("eps_ch", "")
+            fund = fund_lookup.get(sym, {})
+            pl   = fund.get("pl_quarterly", [])
+            row["q_name"] = pl[0].get("header","") if pl else ""
+            # Add EP flag
+            if sym in pat_map:
+                existing = set(row["patterns"].split("||")) if row["patterns"] else set()
+                existing |= pat_map[sym]
+                row["patterns"] = "||".join(sorted(existing))
+
         await asyncio.gather(
             r2_upload(client, "ep_signals.json",
                 json.dumps({"updated":today,"count":len(signals),"signals":signals})),
@@ -1241,6 +1526,7 @@ async def run_ep_scan() -> None:
                     "signals":pr_signals})),
             r2_upload(client, "sector_group_rs_history.json", json.dumps(sector_group_rs_history)),
             r2_upload(client, "industry_rs_history.json",     json.dumps(industry_rs_history)),
+            r2_upload(client, "screener_feed.json",            json.dumps(screener_feed)),
         )
         log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
     log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
