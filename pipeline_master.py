@@ -24,7 +24,7 @@ OUTPUT_FILE = "master.json"
 RATE_DELAY = 0.20
 RETRY = 3
 MIN_MARKET_CAP_CR = 10
-MIN_PRICE = 5
+MIN_PRICE = 10
 MIN_TURNOVER_CR = 1
 
 HEADERS = {
@@ -201,24 +201,20 @@ async def build_master(client, data):
 
     for symbol, q in quotes.items():
 
+        # Skip purely numeric BSE-only symbols
+        if symbol.isdigit():
+            continue
+
+        # Skip rights entitlement symbols (e.g. HCG-RE, TATA-RE)
+        if symbol.endswith("-RE"):
+            continue
+
         # Enrich from stock_map if available, else use quote data directly
         stock    = stock_map.get(symbol)
-        nse_code = stock.get("nse_code") if stock else None
-        bse_code = stock.get("bse_code") if stock else (
-            symbol if symbol.isdigit() else None
-        )
-        name     = stock.get("name") if stock else q.get("name") or symbol
+        nse_code = stock.get("nse_code") if stock else symbol
+        bse_code = stock.get("bse_code") if stock else None
+        name     = stock.get("name")     if stock else q.get("name") or symbol
         exchange = "NSE" if nse_code else "BSE"
-
-        # Skip BSE-only stocks
-        # If nse_code exists → NSE ✓
-        # If symbol is purely numeric → BSE code, skip
-        # If symbol is alphabetic but not in stock_map → assume NSE (e.g. FIRSTCRY)
-        is_numeric_bse = symbol.isdigit()
-        if is_numeric_bse:
-            continue
-        if not nse_code:
-            nse_code = symbol  # assume NSE listing
 
         # Apply keyword filter using resolved name + symbol
         fake_entry = {"symbol": symbol, "name": name}
