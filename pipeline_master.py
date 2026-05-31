@@ -259,9 +259,10 @@ async def build_master(client, data):
 
         if not quotes:
             continue
-        print(
-            f"Requested={len(symbols)} Returned={len(quotes)}"
-        )
+        print(path)
+        print(list(quotes.keys())[:10])
+
+        break
         for symbol, q in quotes.items():
 
             try:
