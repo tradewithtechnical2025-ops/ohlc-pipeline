@@ -1115,7 +1115,8 @@ def _calc_rsi(closes, period=14):
 
 def _build_screener_feed(
     all_data, classification, rs_data, mswing_data,
-    result_calendar, sheet_data, today
+    result_calendar, sheet_data, today,
+    hlr_map=None, pb_map=None
 ):
     """Build unified screener_feed.json from all sources."""
 
@@ -1479,6 +1480,13 @@ def _build_screener_feed(
             "launchpad"     : launchpad,
             "gap_fill"      : gap_fill_state,
 
+            # HLR & Pullback
+            "hlr_state" : (hlr_map or {}).get(sym, {}).get("state"),
+            "hlr_res"   : (hlr_map or {}).get(sym, {}).get("resistance"),
+            "hlr_dist"  : (hlr_map or {}).get(sym, {}).get("dist_pct"),
+            "hlr_touches": (hlr_map or {}).get(sym, {}).get("touches"),
+            "pullback"  : sym in (pb_map or {}),
+
             # Sheet fields
             "circuit"   : sh_info.get("circuit"),
             "hpbc"      : sh_info.get("hpbc"),
@@ -1508,7 +1516,8 @@ async def run_ep_scan() -> None:
         # Download everything in parallel
         ohlc_tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
         (ohlc_results, screener_raw, fund_raw, cal_raw, classification,
-         idx_hist_n50, idx_hist_n500, idx_hist_sm400, idx_daily, sheet_raw) = await asyncio.gather(
+         idx_hist_n50, idx_hist_n500, idx_hist_sm400, idx_daily, sheet_raw,
+         hlr_raw, pb_raw) = await asyncio.gather(
             asyncio.gather(*ohlc_tasks, return_exceptions=True),
             r2_download(client, "screener.json"),
             r2_download_fund(client),
@@ -1519,6 +1528,8 @@ async def run_ep_scan() -> None:
             r2_download(client, f"index_history/{INDEX_SYMBOLS['smallmid400']}.json"),
             r2_download(client, "index_daily.json"),
             r2_download(client, "sheet_data.json"),
+            r2_download(client, "hlr_signals.json"),
+            r2_download(client, "pullback_signals.json"),
         )
 
         # OHLC
@@ -1573,6 +1584,24 @@ async def run_ep_scan() -> None:
         elif isinstance(sheet_raw, dict):
             sheet_data = sheet_raw
         log.info(f"Sheet data: {len(sheet_data)} stocks")
+
+        # HLR signals map
+        hlr_map = {}
+        if isinstance(hlr_raw, dict):
+            for sig in (hlr_raw.get("signals") or []):
+                sym = sig.get("symbol")
+                if sym:
+                    if sym not in hlr_map or sig.get("touches",0) > hlr_map[sym].get("touches",0):
+                        hlr_map[sym] = sig
+        log.info(f"HLR signals: {len(hlr_map)} stocks")
+
+        # Pullback signals map
+        pb_map = {}
+        if isinstance(pb_raw, dict):
+            for sig in (pb_raw.get("signals") or []):
+                sym = sig.get("symbol")
+                if sym: pb_map[sym] = sig
+        log.info(f"Pullback signals: {len(pb_map)} stocks")
 
         # EP signals
         signals = _detect_ep(all_data)
@@ -1646,7 +1675,8 @@ async def run_ep_scan() -> None:
         # Build screener_feed
         screener_feed = _build_screener_feed(
             all_data, classification, rs_data, mswing_data,
-            result_calendar, sheet_data, today
+            result_calendar, sheet_data, today,
+            hlr_map=hlr_map, pb_map=pb_map
         )
         # Enrich with patterns and fundamentals
         pat_map = {}
@@ -1688,6 +1718,8 @@ async def run_ep_scan() -> None:
             if row.get("gap_fill"):      pats.add(row["gap_fill"])
             if row.get("tl_hl_bo"):      pats.add("TL/HL BO")
             if row.get("hpbc"):          pats.add("HPBC")
+            if row.get("hlr_state"):     pats.add(row["hlr_state"])
+            if row.get("pullback"):      pats.add("PullBack")
             # Add EP flag
             if sym in pat_map:           pats |= pat_map[sym]
             row["patterns"] = "||".join(sorted(pats))
@@ -1841,7 +1873,7 @@ def _detect_hlr(all_data, swing_n=5, cluster_pct=2.0, near_pct=4.0, consol_days=
 
 async def run_hlr_scan() -> None:
     today=today_ist()
-    #if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+    if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
     log.info(f"━━━ HLR + Pullback Scan  {today} ━━━")
     async with httpx.AsyncClient() as client:
         global ISIN_MAP,BSE_ISIN_MAP,BSE_META
