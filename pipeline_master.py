@@ -317,24 +317,26 @@ async def build_master(client, data):
 # MAIN
 # =========================================================
 
-async with httpx.AsyncClient(
-    headers=HEADERS
-) as client:
+async def main():
 
-    data = await fetch_symbols(
-        client
-    )
+    async with httpx.AsyncClient(
+        headers=HEADERS
+    ) as client:
 
-    master = await build_master(
-        client,
-        data
-    )
+        data = await fetch_symbols(
+            client
+        )
 
-    await r2_upload(
-        client,
-        OUTPUT_FILE,
-        master
-    )
+        master = await build_master(
+            client,
+            data
+        )
+
+        await r2_upload(
+            client,
+            OUTPUT_FILE,
+            master
+        )
 
         print()
         print("🎉 master.json uploaded")
@@ -342,4 +344,3 @@ async with httpx.AsyncClient(
 
 if __name__ == "__main__":
     asyncio.run(main())
-
