@@ -3,7 +3,6 @@
 import asyncio
 import json
 import os
-
 import re
 
 import httpx
@@ -36,42 +35,30 @@ HEADERS = {
 # =========================================================
 
 BAD_KEYWORDS = [
-    "ETF",
-    "BEES",
-    "LIQUID",
-    "NIFTY",
-    "SENSEX",
-    "GOLD",
-    "SILVER",
-    "INDEX",
-    "NEXT50",
-    "MIDCAP",
-    "SMALLCAP",
+    "ETF", "BEES", "LIQUID", "NIFTY", "SENSEX",
+    "GOLD", "SILVER", "INDEX", "NEXT50", "MIDCAP", "SMALLCAP",
 ]
 
-# =========================================================
-# HELPERS
-# =========================================================
+def is_bad_symbol(symbol, name):
+    """Return True if symbol should be excluded."""
 
-def is_valid_stock(stock):
+    # Purely numeric = BSE-only code
+    if symbol.isdigit():
+        return True
 
-    symbol = str(stock.get("symbol", "")).upper()
-    name   = str(stock.get("name",   "")).upper()
+    # Rights entitlement
+    if symbol.endswith("-RE"):
+        return True
 
-    if not symbol:
-        return False
-    if not name:
-        return False
-
+    # Keyword filter — exact word boundary match
     for keyword in BAD_KEYWORDS:
-        # Exact word match — SKYGOLD passes, "GOLD ETF" fails
         pattern = r'\b' + re.escape(keyword) + r'\b'
         if re.search(pattern, symbol):
-            return False
-        if re.search(pattern, name):
-            return False
+            return True
+        if name and re.search(pattern, name):
+            return True
 
-    return True
+    return False
 
 
 # =========================================================
@@ -166,25 +153,19 @@ async def build_master(client, data):
     print("     Building Master Universe")
     print("=" * 50)
 
-    # Build global stock_map — enrichment only, no filtering here
+    # Build stock_map — NO filtering here, just enrichment lookup
     stock_map = {}
-
     for stock in data:
-        if not is_valid_stock(stock):
-            continue
         sym = str(stock.get("symbol", "")).strip().upper()
         if sym:
             stock_map[sym] = stock
 
-    print(f"  📋 stock_map built from stock-symbols : {len(stock_map)}")
+    print(f"  📋 stock_map built : {len(stock_map)} symbols")
     print()
 
-    # ── Single API call — response contains full universe ─────────────────
-    # Use first symbol just to trigger the response
-    first_sym = next(iter(stock_map))
-    print(f"📡 Fetching quotes (single call, trigger symbol: {first_sym})...")
-
-    quotes = await finedge_get(client, f"quote?symbol={first_sym}")
+    # Single API call — returns full universe
+    print(f"📡 Fetching quotes (single call)...")
+    quotes = await finedge_get(client, "quote?symbol=RELIANCE")
 
     if not quotes:
         raise RuntimeError("quote fetch failed")
@@ -192,41 +173,31 @@ async def build_master(client, data):
     print(f"✅ Got {len(quotes)} quotes from API")
     print()
 
-    # ── Process all returned quotes ────────────────────────────────────────
+    # Process all returned quotes
     master            = []
+    filtered_bad      = 0
     filtered_mcap     = 0
     filtered_price    = 0
     filtered_turnover = 0
-    filtered_keyword  = 0
 
     for symbol, q in quotes.items():
 
-        # Skip purely numeric BSE-only symbols
-        if symbol.isdigit():
-            continue
-
-        # Skip rights entitlement symbols (e.g. HCG-RE, TATA-RE)
-        if symbol.endswith("-RE"):
-            continue
-
-        # Enrich from stock_map if available, else use quote data directly
+        # Enrich from stock_map if available
         stock    = stock_map.get(symbol)
+        name     = stock.get("name")     if stock else q.get("name") or symbol
         nse_code = stock.get("nse_code") if stock else symbol
         bse_code = stock.get("bse_code") if stock else None
-        name     = stock.get("name")     if stock else q.get("name") or symbol
         exchange = "NSE" if nse_code else "BSE"
 
-        # Apply keyword filter using resolved name + symbol
-        fake_entry = {"symbol": symbol, "name": name}
-        if not is_valid_stock(fake_entry):
-            filtered_keyword += 1
+        # Apply filters
+        if is_bad_symbol(symbol, name):
+            filtered_bad += 1
             continue
 
         try:
             price      = float(q.get("current_price") or 0)
             volume     = float(q.get("volume")        or 0)
             market_cap = float(q.get("market_cap")    or 0)
-
         except Exception:
             continue
 
@@ -257,44 +228,25 @@ async def build_master(client, data):
             "turnover_cr":      round(turnover_cr, 2),
         })
 
-    # Symbols in stock_map that API never returned
-    quoted_symbols  = set(quotes.keys())
-    never_quoted    = set(stock_map.keys()) - quoted_symbols
+    # Stats
+    never_quoted = set(stock_map.keys()) - set(quotes.keys())
+    enriched     = sum(1 for s in master if stock_map.get(s["symbol"]))
+    quote_only   = len(master) - enriched
 
     master.sort(key=lambda x: x["market_cap_cr"], reverse=True)
 
     print("=" * 50)
     print("               Summary")
     print("=" * 50)
-    enriched   = sum(1 for s in master if s["nse_code"] or s["bse_code"])
-    unenriched = len(master) - enriched
-
     print(f"  ✓ Final Stocks         : {len(master)}")
-    print(f"    — Enriched (in stock-symbols) : {enriched}")
-    print(f"    — Quote-only (not in symbols) : {unenriched}")
-    print(f"  ✗ Keyword Filtered     : {filtered_keyword}")
+    print(f"    — Enriched           : {enriched}")
+    print(f"    — Quote-only         : {quote_only}")
+    print(f"  ✗ Bad Symbol Filtered  : {filtered_bad}")
     print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
     print(f"  ✗ Price Rejected       : {filtered_price}")
     print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
-
-    # Top 20 extra symbols by market cap not in stock-symbols
-    extras = []
-    for symbol, q in quotes.items():
-        if symbol not in stock_map:
-            try:
-                mc    = float(q.get("market_cap")    or 0)
-                price = float(q.get("current_price") or 0)
-                extras.append((symbol, price, mc))
-            except Exception:
-                pass
-
-    extras.sort(key=lambda x: x[2], reverse=True)
-    print()
-    print("🔎 Top 20 extras (in quotes but NOT in stock-symbols):")
-    for sym, price, mc in extras[:20]:
-        print(f"  {sym:20s}  price={price:<10}  mcap={mc:.0f} Cr")
 
     return master
 
