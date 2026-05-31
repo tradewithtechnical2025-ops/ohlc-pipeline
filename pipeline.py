@@ -1873,7 +1873,7 @@ def _detect_hlr(all_data, swing_n=5, cluster_pct=2.0, near_pct=4.0, consol_days=
 
 async def run_hlr_scan() -> None:
     today=today_ist()
-    if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+    #if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
     log.info(f"━━━ HLR + Pullback Scan  {today} ━━━")
     async with httpx.AsyncClient() as client:
         global ISIN_MAP,BSE_ISIN_MAP,BSE_META
