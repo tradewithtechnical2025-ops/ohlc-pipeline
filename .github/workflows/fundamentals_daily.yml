@@ -1,8 +1,6 @@
 name: Fund Daily
 
 on:
-  schedule:
-   
   workflow_dispatch:
 
 jobs:
