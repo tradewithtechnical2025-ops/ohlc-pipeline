@@ -607,27 +607,47 @@ async def run_daily() -> None:
 async def run_today() -> None:
     today = today_ist()
     log.info(f"━━━ Today  {today} ━━━")
-    sem = asyncio.Semaphore(TODAY_CONCURRENCY)
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_tasks = ([fetch_today_candle(client,sem,sym) for sym in ISIN_MAP]+
-                     [fetch_today_candle(client,sem,sym) for sym in BSE_ISIN_MAP])
-        total = len(all_tasks)
-        log.info(f"Fetching {total} stocks")
+
+        my_universe = set(ISIN_MAP.keys()) | set(BSE_ISIN_MAP.keys())
+        log.info(f"My universe: {len(my_universe)} stocks")
+
+        sem = asyncio.Semaphore(1)
         chunk_task = asyncio.create_task(download_all_chunks(client))
-        fetched = {}; done = 0
-        for coro in asyncio.as_completed(all_tasks):
-            sym, c = await coro; done += 1
-            if c: fetched[sym] = c
-            if done % 500 == 0 or done == total:
-                log.info(f"  ⏳ {done}/{total}  ✓{len(fetched)}  ✗{done-len(fetched)}")
+        bulk_data = await _finedge_get(client, sem, "quote", {})
+
+        if not bulk_data:
+            log.error("❌ Bulk quote returned empty — aborting")
+            return
+
+        log.info(f"Bulk quote received: {len(bulk_data)} symbols")
+
+        fetched = {}
+        for sym, q in bulk_data.items():
+            if sym not in my_universe: continue
+            o = q.get("open_price")
+            h = q.get("high_price")
+            l = q.get("low_price")
+            c = q.get("current_price")
+            if None in (o, h, l, c): continue
+            fetched[sym] = {
+                "d": today, "o": o, "h": h, "l": l, "c": c,
+                "v": q.get("volume", 0), "oi": 0
+            }
+
+        log.info(f"Filtered to my universe: {len(fetched)} stocks")
+
         all_data = await chunk_task
-        for sym, c in fetched.items(): upsert_candle(all_data, sym, c)
-        delta = {sym:c for sym,c in fetched.items() if c["d"]==today}
+        for sym, c in fetched.items():
+            upsert_candle(all_data, sym, c)
+
+        delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json", json.dumps({"date":today,"stocks":delta})),
+            r2_upload(client, "ohlc_delta.json",
+                      json.dumps({"date": today, "stocks": delta})),
         )
         log.info(f"✅ delta: {len(delta)} stocks")
     log.info("━━━ Today complete ━━━")
