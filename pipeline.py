@@ -1258,7 +1258,30 @@ def _build_screener_feed(
         # ── Volume patterns ──
         sma_vol20 = sum(v for v in volumes[-21:-1] if v) / 20 if n >= 21 else None
         sma_vol50 = sum(v for v in volumes[-51:-1] if v) / 50 if n >= 51 else None
+        # ── Turnover (₹ Cr) ──
 
+        turnover = None
+        if sma_vol50 and n >= 51:
+            closes50 = [c for c in closes[-51:-1] if c is not None]
+            if len(closes50) >= 40:
+                avg_price50 = sum(closes50) / len(closes50)
+                turnover = round(
+                    (avg_price50 * sma_vol50) / 10000000,
+                    2
+                )
+        elif sma_vol20 and n >= 21:
+              closes20 = [c for c in closes[-21:-1] if c is not None]
+              if len(closes20) >= 15:
+                  avg_price20 = sum(closes20) / len(closes20)
+                  turnover = round(
+                      (avg_price20 * sma_vol20) / 10000000,
+                      2
+              )
+        if turnover is None and ltp and vol:
+            turnover = round(
+                (ltp * vol) / 10000000,
+                2
+            )
         # VD — volume dry up
         sma_ref = sma_vol50 if sma_vol50 else sma_vol20
         vd = bool(sma_ref and vol and vol < sma_ref * 0.5)
@@ -1468,6 +1491,7 @@ def _build_screener_feed(
             "lvq"           : lvq,
             "lvm"           : lvm,
             "lvy"           : lvy,
+            "to"            : turnover,
             "vol_footprint" : vol_footprint,
 
             # Price patterns
