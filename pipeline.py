@@ -632,8 +632,9 @@ async def run_today() -> None:
             l = q.get("low_price")
             c = q.get("current_price")
             if None in (o, h, l, c): continue
+            d = q.get("quote_date") or today
             fetched[sym] = {
-                "d": today, "o": o, "h": h, "l": l, "c": c,
+                "d": d, "o": o, "h": h, "l": l, "c": c,
                 "v": q.get("volume", 0), "oi": 0
             }
 
