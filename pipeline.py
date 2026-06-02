@@ -1132,7 +1132,46 @@ def _calc_rsi(closes, period=14):
     if avg_loss == 0: return 100.0
     rs = avg_gain / avg_loss
     return round(100 - 100/(1+rs), 2)
+# ══════════════════════════════════════════════════════════════
+# PATTERN HISTORY BACKUP (yearly rollover)
+# ══════════════════════════════════════════════════════════════
 
+PATTERN_BACKUP_FIELDS = [
+    "ib", "dib", "nr7", "pullback",                          # daily candle
+    "wib", "w_dib", "w_nr7", "w_3tc",                        # weekly candle
+    "mcp", "launchpad", "bs", "pp", "atr_tightness", "vol_footprint",  # setups
+    "new_52wh", "new_52wl",                                  # 52W breakout
+    "hvq", "hvm", "hvy", "lvq", "lvm", "lvy",                # volume (VD excluded)
+    "hpbc", "tl_hl_bo",                                      # sheet flags
+]
+HLR_STATE_KEYS = {
+    "BO": "hlr_bo", "Near HLR": "hlr_near", "Consolidating near HLR": "hlr_consol",
+}
+
+def _build_pattern_day(feed):
+    """screener_feed list -> {signal: [symbols]} (sirf fired signals)."""
+    day = {}
+    for f in PATTERN_BACKUP_FIELDS:
+        syms = [r["symbol"] for r in feed if r.get(f)]
+        if syms: day[f] = syms
+    for state, key in HLR_STATE_KEYS.items():
+        syms = [r["symbol"] for r in feed if r.get("hlr_state") == state]
+        if syms: day[key] = syms
+    return day
+
+async def backup_pattern_history(client, feed, today):
+    """Fetch yearly file -> aaj ki date key merge -> wapas upload. Re-run safe."""
+    fname = f"pattern_history_{today[:4]}.json"
+    day = _build_pattern_day(feed)
+    if not day:
+        log.info(f"  🗄  pattern backup: no patterns on {today}, skip"); return
+    hist = await r2_download(client, fname)
+    if not isinstance(hist, dict): hist = {}
+    hist[today] = day
+    await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
+    n_sym = len({s for v in day.values() for s in v})
+    log.info(f"  🗄  pattern_history: {today} → {fname}  "
+             f"({len(day)} signals, {n_sym} stocks, {len(hist)} dates)")
 
 def _build_screener_feed(
     all_data, classification, rs_data, mswing_data,
@@ -1432,7 +1471,17 @@ def _build_screener_feed(
         ms_info  = mswing_data.get(sym, {})
         cls_info = cls_map.get(sym, {})
         sh_info  = sheet_data.get(sym, {})
-
+        # ── Mansfield RS vs index (merged into rs_data before this call) ──
+        IDX_SHORT = {"nifty50": "n50", "nifty500": "n500", "smallmid400": "sm400"}
+        rs_idx = {}
+        for ikey, short in IDX_SHORT.items():
+            rs_idx[f"rs_val_{short}"]   = rs_info.get(f"rs_val_{ikey}")
+            rs_idx[f"rs_nh21_{short}"]  = rs_info.get(f"rs_nh_21_{ikey}")
+            rs_idx[f"rs_nl21_{short}"]  = rs_info.get(f"rs_nl_21_{ikey}")
+            rs_idx[f"rs_div21_{short}"] = rs_info.get(f"rs_div_21_{ikey}")
+            rs_idx[f"rs_nh50_{short}"]  = rs_info.get(f"rs_nh_50_{ikey}")
+            rs_idx[f"rs_nl50_{short}"]  = rs_info.get(f"rs_nl_50_{ikey}")
+            rs_idx[f"rs_div50_{short}"] = rs_info.get(f"rs_div_50_{ikey}")
         # ── Result date ──
         result_date = result_map.get(sym)
 
@@ -1493,7 +1542,7 @@ def _build_screener_feed(
             "rs_rating" : rs_info.get("rs"),
             "mswing"    : ms_info.get("mswing"),
             "mswing_avg9": ms_info.get("mswing_avg9"),
-
+            **rs_idx,
             # Fundamentals (from rs_data enriched by fund_lookup later)
             "sales_ch"  : None,
             "eps_ch"    : None,
@@ -1816,6 +1865,7 @@ async def run_ep_scan() -> None:
             r2_upload(client, "sector_group_rs_history.json", json.dumps(sector_group_rs_history)),
             r2_upload(client, "industry_rs_history.json",     json.dumps(industry_rs_history)),
             r2_upload(client, "screener_feed.json",            json.dumps(screener_feed)),
+            backup_pattern_history(client, screener_feed, today),
         )
         log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
     log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
