@@ -625,6 +625,7 @@ async def run_today() -> None:
         log.info(f"Bulk quote received: {len(bulk_data)} symbols")
         
         fetched = {}
+        suspicious = []
         for sym, q in bulk_data.items():
            
             if sym not in my_universe: continue
@@ -634,6 +635,7 @@ async def run_today() -> None:
             c = q.get("current_price")
             if None in (o, h, l, c): continue
             d = q.get("quote_date") or today
+            
             fetched[sym] = {
                 "d": d, "o": o, "h": h, "l": l, "c": c,
                 "v": q.get("volume", 0), "oi": 0
@@ -642,6 +644,22 @@ async def run_today() -> None:
         log.info(f"Filtered to my universe: {len(fetched)} stocks")
 
         all_data = await chunk_task
+        for sym, c in fetched.items():
+
+            hist = all_data.get(sym)
+
+            if not hist or not hist.get("d"):
+                continue
+
+            last_idx = len(hist["d"]) - 1
+        
+            if (
+                c["o"] == hist["o"][last_idx] and
+                c["h"] == hist["h"][last_idx] and
+                c["l"] == hist["l"][last_idx] and
+                c["c"] == hist["c"][last_idx]
+            ):
+                suspicious.append(sym)
         for sym, c in fetched.items():
             upsert_candle(all_data, sym, c)
 
@@ -652,6 +670,7 @@ async def run_today() -> None:
                       json.dumps({"date": today, "stocks": delta})),
         )
         log.info(f"✅ delta: {len(delta)} stocks")
+        log.info(f"Suspicious duplicate candles: {len(suspicious)}")
     log.info("━━━ Today complete ━━━")
 
 
