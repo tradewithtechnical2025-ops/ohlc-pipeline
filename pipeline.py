@@ -623,9 +623,17 @@ async def run_today() -> None:
             return
 
         log.info(f"Bulk quote received: {len(bulk_data)} symbols")
+        if "SAILIFE" in bulk_data:
+            print("\n========== BULK SAILIFE ==========")
+            print(json.dumps({"SAILIFE": bulk_data["SAILIFE"]}, indent=2))
+        else:
+            print("SAILIFE not found in bulk_data")
 
         fetched = {}
         for sym, q in bulk_data.items():
+            if sym == "SAILIFE":
+                print("\n========== SAILIFE RAW ==========")
+                print(json.dumps(q, indent=2))
             if sym not in my_universe: continue
             o = q.get("open_price")
             h = q.get("high_price")
