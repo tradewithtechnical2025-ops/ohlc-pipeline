@@ -1,24 +1,3 @@
-#!/usr/bin/env python3
-"""
-Upstox (live API) vs Finedge (R2 chunks) — OHLC Comparison
-============================================================
-
-Usage:
-  python compare_ohlc.py                  # all NSE symbols from classification.json
-  python compare_ohlc.py --days 30        # last N trading days window (default: 30)
-  python compare_ohlc.py --limit 50       # only first N symbols (for testing)
-  python compare_ohlc.py --sym RELIANCE TCS INFY   # specific symbols only
-
-Env vars required:
-  UPSTOX_TOKEN   — Upstox Bearer token
-  WORKER_URL     — Cloudflare Worker base URL  (e.g. https://xxx.workers.dev)
-  WORKER_TOKEN   — Worker secret token
-
-Output:
-  ohlc_comparison.csv   — full row-level diff
-  ohlc_summary.csv      — per-symbol summary
-"""
-
 import asyncio
 import csv
 import gzip
