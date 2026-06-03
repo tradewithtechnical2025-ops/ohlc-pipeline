@@ -678,6 +678,8 @@ async def run_today() -> None:
                 suspicious.append(sym)
 
         log.info(f"Initial duplicate candles: {len(suspicious)}")
+        if suspicious:
+            log.info(f"Initial duplicate symbols: {', '.join(sorted(suspicious))}")
 
         # -------------------------
         # Retry logic
@@ -747,6 +749,11 @@ async def run_today() -> None:
                     f"After retry duplicates: {len(suspicious_after_retry)} "
                     f"(resolved {len(suspicious) - len(suspicious_after_retry)})"
                 )
+                if suspicious_after_retry:
+                    log.info(
+                        f"After retry duplicate symbols: "
+                        f"{', '.join(sorted(suspicious_after_retry))}"
+                    )
 
                 suspicious = suspicious_after_retry
 
@@ -769,6 +776,11 @@ async def run_today() -> None:
 
         log.info(f"✅ delta: {len(delta)} stocks")
         log.info(f"Final duplicate candles: {len(suspicious)}")
+        if suspicious:
+            log.warning(
+                f"⚠ Final duplicate symbols (stale data) "
+                f"({len(suspicious)}): {', '.join(sorted(suspicious))}"
+            )
 
     log.info("━━━ Today complete ━━━")
 
