@@ -1,17 +1,13 @@
 name: TradeWithTech Pipeline
 
 on:
-  schedule:
-    # 4:10 PM IST = 10:40 UTC, Mon–Fri (NSE trading days)
-    - cron: "40 10 * * 1-5"
-  workflow_dispatch:        # manual run from Actions tab
+  workflow_dispatch:        # sirf manual run (Actions tab se)
 
-# Cancel a stale run if a new one starts
 concurrency:
   group: twt-pipeline
   cancel-in-progress: false
 
-# Defined ONCE here -> inherited by every job/step below.
+# Module import pe pipeline.py ye 4 vars padhti hai -> sab jobs ko chahiye
 env:
   PYTHON_VERSION: "3.11"
   UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
@@ -20,7 +16,7 @@ env:
   FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
 
 jobs:
-  fund_daily:
+  daily:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,10 +25,22 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: pip install httpx
-      - run: python pipeline.py fund_daily
+      - run: python pipeline.py daily          # prev-day OHLC -> ohlc_*.json
+
+  today:
+    needs: daily
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install httpx
+      - run: python pipeline.py today          # T+0 candle upsert -> ohlc_*.json
 
   hlr_scan:
-    needs: fund_daily
+    needs: today
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +49,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: pip install httpx
-      - run: python pipeline.py hlr_scan
+      - run: python pipeline.py hlr_scan        # -> hlr_signals.json + pullback_signals.json
 
   pattern_scan:
     needs: hlr_scan
@@ -53,9 +61,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: pip install httpx
-      - run: python pipeline.py pattern_scan
+      - run: python pipeline.py pattern_scan    # -> pattern_signals.json  (ep_scan iski file padhta hai)
 
-  ep_scan:
+  fund_daily:
     needs: pattern_scan
     runs-on: ubuntu-latest
     steps:
@@ -65,10 +73,10 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: pip install httpx
-      - run: python pipeline.py ep_scan
+      - run: python pipeline.py fund_daily      # result stocks -> fundamentals.json + result_calendar.json (no results -> fast exit)
 
-  today:
-    needs: ep_scan
+  ep_scan:
+    needs: fund_daily
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,4 +85,4 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: pip install httpx
-      - run: python pipeline.py today
+      - run: python pipeline.py ep_scan         # reads hlr/pullback/pattern/fundamentals -> screener_feed.json + rs_ratings.json + ...
