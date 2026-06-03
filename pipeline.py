@@ -607,6 +607,7 @@ async def run_daily() -> None:
 async def run_today() -> None:
     today = today_ist()
     log.info(f"━━━ Today  {today} ━━━")
+
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
@@ -616,6 +617,7 @@ async def run_today() -> None:
 
         sem = asyncio.Semaphore(1)
         chunk_task = asyncio.create_task(download_all_chunks(client))
+
         bulk_data = await _finedge_get(client, sem, "quote", {})
 
         if not bulk_data:
@@ -623,27 +625,41 @@ async def run_today() -> None:
             return
 
         log.info(f"Bulk quote received: {len(bulk_data)} symbols")
-        
+
         fetched = {}
-        suspicious = []
+
         for sym, q in bulk_data.items():
-           
-            if sym not in my_universe: continue
+
+            if sym not in my_universe:
+                continue
+
             o = q.get("open_price")
             h = q.get("high_price")
             l = q.get("low_price")
             c = q.get("current_price")
-            if None in (o, h, l, c): continue
-            d = q.get("quote_date") or today
-            
+
+            if None in (o, h, l, c):
+                continue
+
             fetched[sym] = {
-                "d": d, "o": o, "h": h, "l": l, "c": c,
-                "v": q.get("volume", 0), "oi": 0
+                "d": q.get("quote_date") or today,
+                "o": o,
+                "h": h,
+                "l": l,
+                "c": c,
+                "v": q.get("volume", 0),
+                "oi": 0,
             }
 
         log.info(f"Filtered to my universe: {len(fetched)} stocks")
 
         all_data = await chunk_task
+
+        # -------------------------
+        # Duplicate detection
+        # -------------------------
+        suspicious = []
+
         for sym, c in fetched.items():
 
             hist = all_data.get(sym)
@@ -652,27 +668,109 @@ async def run_today() -> None:
                 continue
 
             last_idx = len(hist["d"]) - 1
-        
+
             if (
-                c["o"] == hist["o"][last_idx] and
-                c["h"] == hist["h"][last_idx] and
-                c["l"] == hist["l"][last_idx] and
-                c["c"] == hist["c"][last_idx]
+                c["o"] == hist["o"][last_idx]
+                and c["h"] == hist["h"][last_idx]
+                and c["l"] == hist["l"][last_idx]
+                and c["c"] == hist["c"][last_idx]
             ):
                 suspicious.append(sym)
+
+        log.info(f"Initial duplicate candles: {len(suspicious)}")
+
+        # -------------------------
+        # Retry logic
+        # -------------------------
+        duplicate_ratio = len(suspicious) / max(len(fetched), 1)
+
+        if duplicate_ratio > 0.10:
+
+            log.warning(
+                f"⚠ Duplicate ratio {duplicate_ratio:.1%} "
+                f"({len(suspicious)} stocks) - retrying in 20 sec"
+            )
+
+            await asyncio.sleep(20)
+
+            retry_bulk = await _finedge_get(client, sem, "quote", {})
+
+            if retry_bulk:
+
+                fetched_retry = {}
+
+                for sym, q in retry_bulk.items():
+
+                    if sym not in my_universe:
+                        continue
+
+                    o = q.get("open_price")
+                    h = q.get("high_price")
+                    l = q.get("low_price")
+                    c = q.get("current_price")
+
+                    if None in (o, h, l, c):
+                        continue
+
+                    fetched_retry[sym] = {
+                        "d": q.get("quote_date") or today,
+                        "o": o,
+                        "h": h,
+                        "l": l,
+                        "c": c,
+                        "v": q.get("volume", 0),
+                        "oi": 0,
+                    }
+
+                fetched = fetched_retry
+
+                suspicious_after_retry = []
+
+                for sym, c in fetched.items():
+
+                    hist = all_data.get(sym)
+
+                    if not hist or not hist.get("d"):
+                        continue
+
+                    last_idx = len(hist["d"]) - 1
+
+                    if (
+                        c["o"] == hist["o"][last_idx]
+                        and c["h"] == hist["h"][last_idx]
+                        and c["l"] == hist["l"][last_idx]
+                        and c["c"] == hist["c"][last_idx]
+                    ):
+                        suspicious_after_retry.append(sym)
+
+                log.info(
+                    f"After retry duplicates: {len(suspicious_after_retry)} "
+                    f"(resolved {len(suspicious) - len(suspicious_after_retry)})"
+                )
+
+                suspicious = suspicious_after_retry
+
+        # -------------------------
+        # Update OHLC
+        # -------------------------
         for sym, c in fetched.items():
             upsert_candle(all_data, sym, c)
 
         delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
+
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json",
-                      json.dumps({"date": today, "stocks": delta})),
+            r2_upload(
+                client,
+                "ohlc_delta.json",
+                json.dumps({"date": today, "stocks": delta}),
+            ),
         )
-        log.info(f"✅ delta: {len(delta)} stocks")
-        log.info(f"Suspicious duplicate candles: {len(suspicious)}")
-    log.info("━━━ Today complete ━━━")
 
+        log.info(f"✅ delta: {len(delta)} stocks")
+        log.info(f"Final duplicate candles: {len(suspicious)}")
+
+    log.info("━━━ Today complete ━━━")
 
 async def run_full() -> None:
     today = last_trading_day()
