@@ -1,0 +1,115 @@
+name: TradeWithTech Pipeline
+
+on:
+  schedule:
+    # 4:10 PM IST = 10:40 UTC, Mon–Fri (NSE trading days)
+    - cron: "40 10 * * 1-5"
+  workflow_dispatch:        # manual run from Actions tab
+
+# Cancel a stale run if a new one starts
+concurrency:
+  group: twt-pipeline
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  fund_daily:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run fund_daily
+        env:
+          FINEDGE_TOKEN:   ${{ secrets.FINEDGE_TOKEN }}
+          UPSTOX_TOKEN:    ${{ secrets.UPSTOX_TOKEN }}
+          R2_ACCOUNT_ID:   ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY:   ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY:   ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:       ${{ secrets.R2_BUCKET }}
+        run: python pipeline.py fund_daily
+
+  hlr_scan:
+    needs: fund_daily
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run hlr_scan
+        env:
+          FINEDGE_TOKEN:   ${{ secrets.FINEDGE_TOKEN }}
+          UPSTOX_TOKEN:    ${{ secrets.UPSTOX_TOKEN }}
+          R2_ACCOUNT_ID:   ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY:   ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY:   ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:       ${{ secrets.R2_BUCKET }}
+        run: python pipeline.py hlr_scan
+
+  pattern_scan:
+    needs: hlr_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run pattern_scan (incl. VCP)
+        env:
+          FINEDGE_TOKEN:   ${{ secrets.FINEDGE_TOKEN }}
+          UPSTOX_TOKEN:    ${{ secrets.UPSTOX_TOKEN }}
+          R2_ACCOUNT_ID:   ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY:   ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY:   ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:       ${{ secrets.R2_BUCKET }}
+        run: python pipeline.py pattern_scan
+
+  ep_scan:
+    needs: pattern_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run ep_scan
+        env:
+          FINEDGE_TOKEN:   ${{ secrets.FINEDGE_TOKEN }}
+          UPSTOX_TOKEN:    ${{ secrets.UPSTOX_TOKEN }}
+          R2_ACCOUNT_ID:   ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY:   ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY:   ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:       ${{ secrets.R2_BUCKET }}
+        run: python pipeline.py ep_scan
+
+  today:
+    needs: ep_scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run today (OHLC delta)
+        env:
+          FINEDGE_TOKEN:   ${{ secrets.FINEDGE_TOKEN }}
+          UPSTOX_TOKEN:    ${{ secrets.UPSTOX_TOKEN }}
+          R2_ACCOUNT_ID:   ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY:   ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY:   ${{ secrets.R2_SECRET_KEY }}
+          R2_BUCKET:       ${{ secrets.R2_BUCKET }}
+        run: python pipeline.py today
