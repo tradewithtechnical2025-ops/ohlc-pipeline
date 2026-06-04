@@ -47,7 +47,6 @@ RATE_DELAY         = 0.4
 RETRY              = 5
 FUND_CONCURRENCY   = 4
 FINEDGE_DELAY      = 0.25
-TODAY_CONCURRENCY  = 10
 
 HERE = Path(__file__).parent
 
@@ -96,14 +95,25 @@ async def _load_bod_map(client, url, segment) -> dict[str, str]:
             instruments = json.loads(gzip.decompress(r.content))
         except Exception as e:
             log.warning(f"  BOD decompress error: {e}"); return {}
+        NSE_SUFFIXES = ("-EQ","-BE","-BL","-SM","-IL","-IV","-W1","-W2","-W3","-W4","-W5")
         sym_map = {}
         for inst in instruments:
-            if inst.get("segment") == segment and inst.get("instrument_type") == "EQ":
-                tsym = (inst.get("trading_symbol") or "").upper()
-                ikey = inst.get("instrument_key")
-                if tsym and ikey:
-                    sym_map[tsym] = ikey
-        log.info(f"  BOD {segment}: {len(sym_map)} EQ instruments")
+            if inst.get("segment") != segment: continue
+            if segment == "NSE_EQ":
+                itype = inst.get("instrument_type", "")
+                # Skip non-equity types (bonds, warrants, options)
+                if itype in ("SG","GB","TB","GS","CE","PE","FF","MF"): continue
+            tsym = (inst.get("trading_symbol") or "").upper()
+            ikey = inst.get("instrument_key")
+            if not tsym or not ikey: continue
+            sym_map[tsym] = ikey
+            for suffix in NSE_SUFFIXES:
+                if tsym.endswith(suffix):
+                    base = tsym[:-len(suffix)]
+                    if base and base not in sym_map:
+                        sym_map[base] = ikey
+                    break
+        log.info(f"  BOD {segment}: {len(sym_map)} instruments (with suffix variants)")
         return sym_map
     return {}
 
@@ -228,52 +238,61 @@ async def fetch_ohlc(client, sem, sym, instrument_key, from_date, to_date):
     return sym, sorted(all_candles.values(), key=lambda x: x["d"])
 
 
-async def fetch_today_candle(client, sem, sym, instrument_key):
+async def fetch_ohlc_bulk(client, ikey_map: dict[str, str], batch_size=500) -> dict[str, dict]:
     """
-    Try 1: historical daily endpoint for today (works after market close ~4PM IST).
-    Try 2: intraday endpoint (works during market hours).
+    Upstox OHLC Quotes V3 — bulk fetch live OHLC for all stocks in 1-3 calls.
+    ikey_map: {symbol → instrument_key}
+    Returns: {symbol → candle_dict}
     """
     today = today_ist()
+    url = "https://api.upstox.com/v3/market-quote/ohlc"
+    results = {}
+    items = list(ikey_map.items())
 
-    # --- Try historical daily first ---
-    url_hist = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/day/{today}/{today}"
-    async with sem:
-        await asyncio.sleep(RATE_DELAY)
-        try:
-            r = await client.get(url_hist, headers=_upstox_headers(), timeout=30)
-            if r.status_code == 200:
-                candles_raw = (r.json().get("data") or {}).get("candles") or []
-                if candles_raw:
-                    row = candles_raw[0]
-                    return sym, {"d": today, "o": row[1], "h": row[2],
-                                 "l": row[3], "c": row[4], "v": row[5], "oi": 0}
-        except httpx.RequestError:
-            pass
-
-    # --- Fallback: intraday (during market hours) ---
-    url_intra = f"{UPSTOX_BASE}/historical-candle/intraday/{instrument_key}/day"
-    for attempt in range(RETRY):
-        async with sem:
-            await asyncio.sleep(RATE_DELAY)
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i+batch_size]
+        ikeys = ",".join(ikey for _, ikey in batch)
+        for attempt in range(RETRY):
             try:
-                r = await client.get(url_intra, headers=_upstox_headers(), timeout=30)
+                r = await client.get(url, headers=_upstox_headers(),
+                                     params={"instrument_key": ikeys, "interval": "1d"},
+                                     timeout=30)
             except httpx.RequestError as e:
+                log.warning(f"  OHLC bulk error ({e}), retry {attempt+1}")
                 await asyncio.sleep(2 ** attempt); continue
-        if r.status_code == 401: log.error("❌ UPSTOX_TOKEN invalid"); sys.exit(1)
-        if r.status_code == 429: await asyncio.sleep(30 * (attempt+1)); continue
-        if r.status_code in (502,503,504): await asyncio.sleep(2**attempt); continue
-        if r.status_code != 200: return sym, None
-        try: payload = r.json()
-        except: return sym, None
-        candles_raw = (payload.get("data") or {}).get("candles") or []
-        if not candles_raw: return sym, None
-        o = candles_raw[-1][1]
-        h = max(row[2] for row in candles_raw)
-        l = min(row[3] for row in candles_raw)
-        c = candles_raw[0][4]
-        v = sum(row[5] for row in candles_raw)
-        return sym, {"d": today, "o": o, "h": h, "l": l, "c": c, "v": v, "oi": 0}
-    return sym, None
+            if r.status_code == 401: log.error("❌ UPSTOX_TOKEN invalid"); sys.exit(1)
+            if r.status_code == 429:
+                await asyncio.sleep(30 * (attempt+1)); continue
+            if r.status_code in (502,503,504):
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code != 200: break
+            try: data = r.json().get("data") or {}
+            except: break
+
+            # Build reverse map: instrument_key → symbol
+            ikey_to_sym = {ikey: sym for sym, ikey in batch}
+
+            for ikey, quote in data.items():
+                # V3 response key format: "NSE_EQ:RELIANCE" or instrument_key
+                # Find matching symbol
+                sym = ikey_to_sym.get(ikey)
+                if not sym:
+                    # Try matching by stripping exchange prefix
+                    clean = ikey.replace(":", "|")
+                    sym = ikey_to_sym.get(clean)
+                if not sym: continue
+
+                live = quote.get("live_ohlc") or quote.get("ohlc") or {}
+                vol  = quote.get("volume") or 0
+                if not live: continue
+                o = live.get("open"); h = live.get("high")
+                l = live.get("low");  c = live.get("close")
+                if None in (o, h, l, c): continue
+                results[sym] = {"d": today, "o": o, "h": h, "l": l, "c": c, "v": vol, "oi": 0}
+            log.info(f"  OHLC bulk [{min(i+batch_size,len(items))}/{len(items)}]: {len(results)} fetched")
+            break
+
+    return results
 
 
 # ══════════════════════════════════════════════════════════════
@@ -428,32 +447,24 @@ async def run_today() -> None:
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
         all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
         log.info(f"Universe: {len(all_ikeys)} stocks")
-        chunk_task = asyncio.create_task(download_all_chunks(client))
-        sem = asyncio.Semaphore(TODAY_CONCURRENCY)
-        results = await asyncio.gather(*[fetch_today_candle(client,sem,sym,ikey) for sym,ikey in all_ikeys.items()])
-        fetched = {sym:c for sym,c in results if c}
+
+        # Fetch chunks + bulk OHLC concurrently
+        fetched, all_data = await asyncio.gather(
+            fetch_ohlc_bulk(client, all_ikeys),
+            download_all_chunks(client),
+        )
         log.info(f"Fetched today candles: {len(fetched)}")
-        all_data = await chunk_task
-        suspicious = []
+
+        if not fetched:
+            log.warning("⚠ No candles fetched — market may be closed or API issue")
+
         for sym, c in fetched.items():
-            hist = all_data.get(sym)
-            if not hist or not hist.get("d"): continue
-            last_idx = len(hist["d"]) - 1
-            if (c["o"]==hist["o"][last_idx] and c["h"]==hist["h"][last_idx] and
-                    c["l"]==hist["l"][last_idx] and c["c"]==hist["c"][last_idx]):
-                suspicious.append(sym)
-        log.info(f"Duplicate candles: {len(suspicious)}")
-        if len(suspicious) / max(len(fetched), 1) > 0.10:
-            log.warning(f"⚠ High duplicate ratio — retrying in 20s")
-            await asyncio.sleep(20)
-            retry_results = await asyncio.gather(*[fetch_today_candle(client,sem,sym,all_ikeys[sym]) for sym in suspicious])
-            for sym, c in retry_results:
-                if c: fetched[sym] = c
-        for sym, c in fetched.items(): upsert_candle(all_data, sym, c)
-        delta = {sym:c for sym,c in fetched.items() if c["d"]==today}
+            upsert_candle(all_data, sym, c)
+
+        delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json", json.dumps({"date":today,"stocks":delta})),
+            r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
         )
         log.info(f"✅ delta: {len(delta)} stocks")
     log.info("━━━ Today complete ━━━")
