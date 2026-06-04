@@ -265,8 +265,21 @@ async def fetch_ohlc_bulk(client, ikey_map: dict[str, str], batch_size=500) -> d
                 await asyncio.sleep(30 * (attempt+1)); continue
             if r.status_code in (502,503,504):
                 await asyncio.sleep(2 ** attempt); continue
-            if r.status_code != 200: break
-            try: data = r.json().get("data") or {}
+            if r.status_code != 200:
+                log.warning(f"  OHLC bulk HTTP {r.status_code}: {r.text[:200]}")
+                break
+            try:
+                raw = r.json()
+                log.info(f"  OHLC bulk raw keys: {list(raw.keys())} status={raw.get('status')}")
+                if i == 0:
+                    # Log first item of data to understand structure
+                    data_raw = raw.get("data") or {}
+                    if data_raw:
+                        first_key = next(iter(data_raw))
+                        log.info(f"  OHLC bulk sample key={first_key} val={str(data_raw[first_key])[:300]}")
+                    else:
+                        log.warning(f"  OHLC bulk data empty, full response: {str(raw)[:500]}")
+                data = raw.get("data") or {}
             except: break
 
             # Build reverse map: instrument_key → symbol
