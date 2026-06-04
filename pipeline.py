@@ -302,24 +302,31 @@ async def fetch_ohlc_bulk(client, ikey_map: dict[str, str], batch_size=500) -> d
                 data = raw.get("data") or {}
             except: break
 
-            # Build reverse map: instrument_key → symbol
-            ikey_to_sym = {ikey: sym for sym, ikey in batch}
+            # Response key format: "NSE_EQ:SYMBOL" (colon + trading symbol)
+            # Also build instrument_token → symbol map as fallback
+            itoken_to_sym = {}
+            for sym, ikey in batch:
+                # instrument_key = "NSE_EQ|ISIN", instrument_token in response = "NSE_EQ|ISIN"
+                itoken_to_sym[ikey] = sym
 
-            for ikey, quote in data.items():
-                # V3 response key format: "NSE_EQ:RELIANCE" or instrument_key
-                # Find matching symbol
-                sym = ikey_to_sym.get(ikey)
+            for resp_key, quote in data.items():
+                # Try 1: "NSE_EQ:SYMBOL" → extract symbol after colon
+                sym = None
+                if ":" in resp_key:
+                    trading_sym = resp_key.split(":", 1)[1].upper()
+                    # Find in our batch by trading symbol
+                    sym = next((s for s, _ in batch if s == trading_sym), None)
+                # Try 2: instrument_token field in quote
                 if not sym:
-                    # Try matching by stripping exchange prefix
-                    clean = ikey.replace(":", "|")
-                    sym = ikey_to_sym.get(clean)
+                    itoken = quote.get("instrument_token") or ""
+                    sym = itoken_to_sym.get(itoken)
                 if not sym: continue
 
-                live = quote.get("live_ohlc") or quote.get("ohlc") or {}
-                vol  = quote.get("volume") or 0
+                live = quote.get("live_ohlc") or {}
                 if not live: continue
                 o = live.get("open"); h = live.get("high")
                 l = live.get("low");  c = live.get("close")
+                vol = live.get("volume") or quote.get("volume") or 0
                 if None in (o, h, l, c): continue
                 results[sym] = {"d": today, "o": o, "h": h, "l": l, "c": c, "v": vol, "oi": 0}
             log.info(f"  OHLC bulk [{min(i+batch_size,len(items))}/{len(items)}]: {len(results)} fetched")
