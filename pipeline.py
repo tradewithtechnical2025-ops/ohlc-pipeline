@@ -1726,67 +1726,140 @@ def _vcp_zigzag(piv):
         else: z.append(p)
     return z
 
-def _detect_vcp(hist, lookback=90, swing_window=3, min_contractions=2, max_contractions=6,
-                max_base_depth=0.40, max_final_depth=0.12, tighten_tol=0.01,
-                max_dist_from_pivot=0.10, require_uptrend=True):
-    highs = hist.get("h") or []; lows = hist.get("l") or []
-    closes = hist.get("c") or []; vols = hist.get("v") or []
+def _detect_vcp(hist, lookback=150, swing_window=4, min_contractions=2, max_contractions=5,
+                max_base_depth=0.35, max_final_depth=0.10, tighten_tol=0.02,
+                max_dist_from_pivot=0.08, min_prior_move=0.25, max_52wh_dist=0.20):
+
+    highs  = hist.get("h") or []
+    lows   = hist.get("l") or []
+    closes = hist.get("c") or []
+    vols   = hist.get("v") or []
     n = len(closes)
-    if n < max(lookback, 50): return None
+
+    if n < 60: return None
     if any(x is None for x in (closes[-1], highs[-1], lows[-1])): return None
+
     last_close = closes[-1]
-    if require_uptrend:
-        sma50 = _vcp_sma(closes, 50)
-        sma150 = _vcp_sma(closes, 150) if n >= 150 else _vcp_sma(closes, min(n, 100))
-        if sma50 is None or sma150 is None: return None
-        if not (last_close > sma50 > sma150): return None
-    start = n - lookback
+
+    # ---- 1. 52W high proximity ----
+    w52_highs = [h for h in highs[-252:] if h is not None]
+    if not w52_highs: return None
+    w52_high = max(w52_highs)
+    if last_close < w52_high * (1 - max_52wh_dist):
+        return None
+
+    # ---- 2. Pivots within lookback ----
+    lb = min(lookback, n)
+    start = n - lb
     h_w = highs[start:]; l_w = lows[start:]
     piv = _vcp_zigzag(_vcp_find_pivots(h_w, l_w, swing_window))
     piv = [(i + start, p, k) for (i, p, k) in piv]
     if len(piv) < 3: return None
+
+    # Base starts at highest H in lookback window
     h_pivots = [p for p in piv if p[2] == "H"]
     if not h_pivots: return None
     base_high = max(h_pivots, key=lambda x: x[1])
     seq = [p for p in piv if p[0] >= base_high[0]]
-    if seq[0][2] != "H": return None
-    contractions = []; i = 0
+    if not seq or seq[0][2] != "H": return None
+
+    # ---- 3. Prior move — from lowest point before base to base_high ----
+    search_start = max(0, base_high[0] - 252)
+    prior_lows = [lows[i] for i in range(search_start, base_high[0]) if lows[i] is not None]
+    if not prior_lows: return None
+    prior_low = min(prior_lows)
+    prior_move = (base_high[1] - prior_low) / prior_low
+    if prior_move < min_prior_move: return None
+
+    # ---- 4. Build contractions (H -> next L) ----
+    contractions = []
+    i = 0
     while i < len(seq) - 1:
-        if seq[i][2] == "H" and seq[i + 1][2] == "L":
-            hi, hp = seq[i][0], seq[i][1]; li, lp = seq[i + 1][0], seq[i + 1][1]
-            if hp > 0: contractions.append((hi, hp, li, lp, (hp - lp) / hp))
+        if seq[i][2] == "H" and seq[i+1][2] == "L":
+            hi, hp = seq[i][0], seq[i][1]
+            li, lp = seq[i+1][0], seq[i+1][1]
+            n_bars = li - hi
+            if hp > 0 and n_bars >= 2:
+                contractions.append((hi, hp, li, lp, (hp - lp) / hp))
             i += 2
-        else: i += 1
+        else:
+            i += 1
+
     if len(contractions) < min_contractions: return None
+
+    # ---- 5. Find longest tightening run ending at most recent contraction ----
     depths = [c[4] for c in contractions]
-    run_end = len(depths) - 1; j = run_end - 1
-    while j >= 0 and depths[j] >= depths[j + 1] - tighten_tol: j -= 1
-    run = contractions[j + 1:]; run_depths = [c[4] for c in run]
+    run_end = len(depths) - 1
+    j = run_end - 1
+    while j >= 0 and depths[j] >= depths[j+1] - tighten_tol:
+        j -= 1
+    run = contractions[j+1:]
+    run_depths = [c[4] for c in run]
+
     if not (min_contractions <= len(run) <= max_contractions): return None
-    base_depth = max(run_depths); final_depth = run_depths[-1]
-    if base_depth > max_base_depth or final_depth > max_final_depth: return None
+
+    # ---- 6. Strictly decreasing depths ----
+    for k in range(1, len(run_depths)):
+        if run_depths[k] >= run_depths[k-1]:
+            return None
+
+    base_depth   = run_depths[0]
+    final_depth  = run_depths[-1]
+    if base_depth > max_base_depth: return None
+    if final_depth > max_final_depth: return None
+
+    # ---- 7. Pivot (buy point) ----
     pivot_price = run[-1][1]
     if pivot_price <= 0: return None
     dist = (pivot_price - last_close) / pivot_price
     if dist > max_dist_from_pivot or dist < -0.02: return None
+
+    # ---- 8. Volume dry-up in last contraction — mandatory ----
     def _leg_vol(c):
-        a, b = c[0], c[2]; seg = [v for v in vols[a:b + 1] if v]
-        return _mean(seg) if seg else 0
-    first_vol = _leg_vol(run[0]); last_vol = _leg_vol(run[-1])
-    vol_dryup = last_vol < first_vol if first_vol else False
+        a, b = c[0], c[2]
+        seg = [v for v in vols[a:b+1] if v]
+        return sum(seg) / len(seg) if seg else 0
+
+    first_vol = _leg_vol(run[0])
+    last_vol  = _leg_vol(run[-1])
+    vol_dryup = last_vol < first_vol * 0.75 if first_vol else False
+    if not vol_dryup: return None
+
+    # ---- 9. Base length check ----
+    base_start = run[0][0]; base_end = run[-1][2]
+    base_len = base_end - base_start
+    if base_len < 10: return None
+
+    # ---- 10. Score ----
     score = 0
     score += min(len(run), 4) * 10
     score += max(0, (max_final_depth - final_depth) / max_final_depth) * 25
-    score += 20 if vol_dryup else 0
+    score += max(0, (0.25 - (last_vol / first_vol if first_vol else 1)) / 0.25) * 20
     score += max(0, (max_dist_from_pivot - abs(dist)) / max_dist_from_pivot) * 15
+    score += min(prior_move / 1.0, 1.0) * 10
     score = round(min(score, 100), 1)
-    return {"is_vcp": True, "contractions": len(run),
-            "depths_pct": [round(d * 100, 1) for d in run_depths],
-            "base_depth_pct": round(base_depth * 100, 1),
-            "final_depth_pct": round(final_depth * 100, 1),
-            "pivot": round(pivot_price, 2),
-            "dist_from_pivot_pct": round(dist * 100, 2),
-            "vol_dryup": vol_dryup, "score": score}
+
+    return {
+        "is_vcp"             : True,
+        "contractions"       : len(run),
+        "depths_pct"         : [round(d * 100, 1) for d in run_depths],
+        "base_depth_pct"     : round(base_depth * 100, 1),
+        "final_depth_pct"    : round(final_depth * 100, 1),
+        "pivot"              : round(pivot_price, 2),
+        "pivot_date"         : hist["d"][run[-1][0]] if hist.get("d") else None,   # ← pivot H date
+        "base_start_date"    : hist["d"][run[0][0]]  if hist.get("d") else None,   # ← first contraction H date
+        "base_end_date"      : hist["d"][run[-1][2]] if hist.get("d") else None,   # ← last contraction L date
+        "contraction_dates"  : [                                                    # ← har contraction H/L date
+            {"h_date": hist["d"][c[0]], "h_price": round(c[1], 2),
+             "l_date": hist["d"][c[2]], "l_price": round(c[3], 2)}
+            for c in run if hist.get("d")
+        ],
+        "dist_from_pivot_pct": round(dist * 100, 2),
+        "vol_dryup"          : vol_dryup,
+        "prior_move_pct"     : round(prior_move * 100, 1),
+        "base_len"           : base_len,
+        "score"              : score,
+    }
 async def run_vcp_scan() -> None:
     
     today = today_ist()
