@@ -37,7 +37,7 @@ STATUSES    = ["upcoming", "open", "closed", "listed"]
 ISSUE_TYPES = ["regular", "sme"]
 
 # Listed IPOs: keep only last N days from listing_date
-LISTED_LOOKBACK_DAYS = 90
+LISTED_LOOKBACK_DAYS = 365
 
 # Max records per page (Upstox max = 30)
 PAGE_SIZE = 30
