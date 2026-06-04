@@ -15,6 +15,7 @@ Usage:
   python pipeline.py ep_scan
   python pipeline.py hlr_scan
   python pipeline.py pattern_scan
+  python pipeline.py vcp_scan
 """
 
 import asyncio
@@ -1691,7 +1692,34 @@ async def run_pattern_scan() -> None:
         await r2_upload(client,"pattern_signals.json",json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}))
     log.info("━━━ Pattern Scan complete ━━━")
 
+# ══════════════════════════════════════════════════════════════
+# VCP SCAN
+# ══════════════════════════════════════════════════════════════
 
+async def run_vcp_scan() -> None:
+    from vcp_detector import _detect_vcp
+    today = today_ist()
+    log.info(f"━━━ VCP Scan  {today} ━━━")
+    async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+        all_data = await download_all_chunks(client)
+        log.info(f"Loaded {len(all_data)} stocks")
+        signals = []
+        for sym, s in all_data.items():
+            if not _check_liquidity(s["v"], s["c"], len(s["c"])):
+                continue
+            r = _detect_vcp(s)
+            if r:
+                signals.append({"symbol": sym, **r})
+        signals.sort(key=lambda x: x["score"], reverse=True)
+        log.info(f"VCP signals: {len(signals)}")
+        await r2_upload(client, "vcp_signals.json", json.dumps({
+            "updated": today,
+            "count": len(signals),
+            "signals": signals,
+        }))
+    log.info("━━━ VCP Scan complete ━━━")
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
@@ -1718,6 +1746,7 @@ if __name__ == "__main__":
         case "ep_scan":       asyncio.run(run_ep_scan())
         case "hlr_scan":      asyncio.run(run_hlr_scan())
         case "pattern_scan":  asyncio.run(run_pattern_scan())
+        case "vcp_scan":      asyncio.run(run_vcp_scan())
         case _:
             print(__doc__)
             sys.exit(1)
