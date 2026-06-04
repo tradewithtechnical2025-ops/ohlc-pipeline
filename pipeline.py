@@ -37,17 +37,14 @@ WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 
-UPSTOX_BASE       = "https://api.upstox.com/v2"
-UPSTOX_SEARCH_URL = f"{UPSTOX_BASE}/instruments/search"
-FINEDGE_BASE      = "https://data.finedgeapi.com/api/v1"
+UPSTOX_BASE  = "https://api.upstox.com/v2"
+FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 ROLLING_DAYS       = 548
 R2_CHUNKS          = 8
 CONCURRENCY        = 5
 RATE_DELAY         = 0.4
 RETRY              = 5
-SEARCH_CONCURRENCY = 3
-SEARCH_DELAY       = 0.3
 FUND_CONCURRENCY   = 4
 FINEDGE_DELAY      = 0.25
 TODAY_CONCURRENCY  = 10
@@ -73,60 +70,83 @@ INDEX_SYMBOLS = {
 }
 
 # ══════════════════════════════════════════════════════════════
-# INSTRUMENT MAP
+# INSTRUMENT MAP  (BOD instruments file — no rate limit)
 # ══════════════════════════════════════════════════════════════
 
-async def _search_instrument(client, sem, symbol, exchange="NSE"):
-    params = {"query": symbol, "exchange": exchange, "instrument_type": "EQ"}
-    async with sem:
-        await asyncio.sleep(SEARCH_DELAY)
+NSE_BOD_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+BSE_BOD_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
+
+
+async def _load_bod_map(client, url, segment) -> dict[str, str]:
+    """
+    Downloads Upstox BOD instruments .json.gz, returns {trading_symbol → instrument_key}
+    for EQ instruments only.
+    """
+    import gzip
+    for attempt in range(RETRY):
         try:
-            r = await client.get(UPSTOX_SEARCH_URL, headers=_upstox_headers(), params=params, timeout=15)
+            r = await client.get(url, headers=_upstox_headers(), timeout=60, follow_redirects=True)
         except httpx.RequestError as e:
-            log.warning(f"  [Search] {symbol}: {e}"); return symbol, None
-    if r.status_code == 401: log.error("❌ UPSTOX_TOKEN invalid"); sys.exit(1)
-    if r.status_code != 200: return symbol, None
-    try: items = r.json().get("data") or []
-    except: return symbol, None
-    seg_key = f"{exchange}_EQ"
-    for item in items:
-        if item.get("segment") == seg_key and (item.get("trading_symbol") or "").upper() == symbol:
-            return symbol, item.get("instrument_key")
-    for item in items:
-        if item.get("segment") == seg_key and item.get("instrument_key"):
-            return symbol, item.get("instrument_key")
-    return symbol, None
+            log.warning(f"  BOD download error ({e}), retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        if r.status_code != 200:
+            log.warning(f"  BOD {url} → HTTP {r.status_code}, retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        try:
+            instruments = json.loads(gzip.decompress(r.content))
+        except Exception as e:
+            log.warning(f"  BOD decompress error: {e}"); return {}
+        sym_map = {}
+        for inst in instruments:
+            if inst.get("segment") == segment and inst.get("instrument_type") == "EQ":
+                tsym = (inst.get("trading_symbol") or "").upper()
+                ikey = inst.get("instrument_key")
+                if tsym and ikey:
+                    sym_map[tsym] = ikey
+        log.info(f"  BOD {segment}: {len(sym_map)} EQ instruments")
+        return sym_map
+    return {}
 
 
 async def build_isin_map(client):
+    log.info("Building instrument map from Upstox BOD files…")
+
+    # Download NSE + BSE BOD files concurrently
+    nse_bod, bse_bod = await asyncio.gather(
+        _load_bod_map(client, NSE_BOD_URL, "NSE_EQ"),
+        _load_bod_map(client, BSE_BOD_URL, "BSE_EQ"),
+    )
+
+    # Download classification.json from R2
     log.info("Fetching classification.json from R2…")
     master = await r2_download(client, "classification.json")
     if not master or not isinstance(master, list):
         raise RuntimeError("classification.json missing or invalid in R2!")
-    nse_syms = []; bse_syms = []; bse_meta_raw = {}
+
+    nse_map = {}; bse_map = {}; bse_meta_raw = {}
+    nse_miss = []; bse_miss = []
+
     for stock in master:
-        sym = str(stock.get("symbol", "")).strip().upper()
+        sym      = str(stock.get("symbol", "")).strip().upper()
         exchange = str(stock.get("exchange", "")).strip()
-        name = str(stock.get("name", "")).strip()
+        name     = str(stock.get("name", "")).strip()
         if not sym: continue
-        if exchange == "NSE": nse_syms.append(sym)
-        elif exchange == "BSE": bse_syms.append(sym); bse_meta_raw[sym] = {"name": name}
-    log.info(f"  classification → NSE:{len(nse_syms)}  BSE:{len(bse_syms)}")
-    sem = asyncio.Semaphore(SEARCH_CONCURRENCY)
-    nse_map = {}; bse_map = {}
-    for i in range(0, len(nse_syms), 200):
-        batch = nse_syms[i:i+200]
-        results = await asyncio.gather(*[_search_instrument(client, sem, sym, "NSE") for sym in batch])
-        for sym, ikey in results:
+
+        if exchange == "NSE":
+            ikey = nse_bod.get(sym)
             if ikey: nse_map[sym] = ikey
-        log.info(f"  NSE [{min(i+200,len(nse_syms))}/{len(nse_syms)}] resolved:{len(nse_map)}")
-    for i in range(0, len(bse_syms), 200):
-        batch = bse_syms[i:i+200]
-        results = await asyncio.gather(*[_search_instrument(client, sem, sym, "BSE") for sym in batch])
-        for sym, ikey in results:
+            else: nse_miss.append(sym)
+        elif exchange == "BSE":
+            bse_meta_raw[sym] = {"name": name}
+            ikey = bse_bod.get(sym)
             if ikey: bse_map[sym] = ikey
-        log.info(f"  BSE [{min(i+200,len(bse_syms))}/{len(bse_syms)}] resolved:{len(bse_map)}")
-    log.info(f"✓ NSE: {len(nse_map)}  BSE: {len(bse_map)}")
+            else: bse_miss.append(sym)
+
+    log.info(f"✓ NSE: {len(nse_map)} resolved, {len(nse_miss)} not found in BOD")
+    log.info(f"✓ BSE: {len(bse_map)} resolved, {len(bse_miss)} not found in BOD")
+    if nse_miss: log.info(f"  NSE missing sample: {nse_miss[:10]}")
+    if bse_miss: log.info(f"  BSE missing sample: {bse_miss[:10]}")
+
     return nse_map, bse_map, bse_meta_raw
 
 
@@ -209,13 +229,34 @@ async def fetch_ohlc(client, sem, sym, instrument_key, from_date, to_date):
 
 
 async def fetch_today_candle(client, sem, sym, instrument_key):
-    """Upstox intraday → aggregate to single day candle."""
-    url = f"{UPSTOX_BASE}/historical-candle/intraday/{instrument_key}/day"
+    """
+    Try 1: historical daily endpoint for today (works after market close ~4PM IST).
+    Try 2: intraday endpoint (works during market hours).
+    """
+    today = today_ist()
+
+    # --- Try historical daily first ---
+    url_hist = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/day/{today}/{today}"
+    async with sem:
+        await asyncio.sleep(RATE_DELAY)
+        try:
+            r = await client.get(url_hist, headers=_upstox_headers(), timeout=30)
+            if r.status_code == 200:
+                candles_raw = (r.json().get("data") or {}).get("candles") or []
+                if candles_raw:
+                    row = candles_raw[0]
+                    return sym, {"d": today, "o": row[1], "h": row[2],
+                                 "l": row[3], "c": row[4], "v": row[5], "oi": 0}
+        except httpx.RequestError:
+            pass
+
+    # --- Fallback: intraday (during market hours) ---
+    url_intra = f"{UPSTOX_BASE}/historical-candle/intraday/{instrument_key}/day"
     for attempt in range(RETRY):
         async with sem:
             await asyncio.sleep(RATE_DELAY)
             try:
-                r = await client.get(url, headers=_upstox_headers(), timeout=30)
+                r = await client.get(url_intra, headers=_upstox_headers(), timeout=30)
             except httpx.RequestError as e:
                 await asyncio.sleep(2 ** attempt); continue
         if r.status_code == 401: log.error("❌ UPSTOX_TOKEN invalid"); sys.exit(1)
@@ -226,13 +267,12 @@ async def fetch_today_candle(client, sem, sym, instrument_key):
         except: return sym, None
         candles_raw = (payload.get("data") or {}).get("candles") or []
         if not candles_raw: return sym, None
-        today = today_ist()
         o = candles_raw[-1][1]
         h = max(row[2] for row in candles_raw)
         l = min(row[3] for row in candles_raw)
         c = candles_raw[0][4]
         v = sum(row[5] for row in candles_raw)
-        return sym, {"d":today,"o":o,"h":h,"l":l,"c":c,"v":v,"oi":0}
+        return sym, {"d": today, "o": o, "h": h, "l": l, "c": c, "v": v, "oi": 0}
     return sym, None
 
 
