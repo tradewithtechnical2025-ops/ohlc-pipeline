@@ -1788,7 +1788,7 @@ def _detect_vcp(hist, lookback=90, swing_window=3, min_contractions=2, max_contr
             "dist_from_pivot_pct": round(dist * 100, 2),
             "vol_dryup": vol_dryup, "score": score}
 async def run_vcp_scan() -> None:
-    from vcp_detector import _detect_vcp
+    
     today = today_ist()
     log.info(f"━━━ VCP Scan  {today} ━━━")
     async with httpx.AsyncClient() as client:
