@@ -1797,7 +1797,15 @@ def _detect_vcp(hist, lookback=150, swing_window=4, min_contractions=2, max_cont
     run_depths = [c[4] for c in run]
 
     if not (min_contractions <= len(run) <= max_contractions): return None
-
+    # ---- 4b. No contraction low must be broken by subsequent price ----
+    for k in range(len(run) - 1):
+        low_k = run[k][3]  # L price of contraction k
+        # check if any candle after this contraction's low broke below it
+        check_from = run[k][2]  # low index of contraction k
+        check_to   = n          # till today
+        for idx in range(check_from + 1, check_to):
+            if lows[idx] is not None and lows[idx] < low_k:
+                return None     # VCP failed — previous low broken
     # ---- 6. Strictly decreasing depths ----
     for k in range(1, len(run_depths)):
         if run_depths[k] >= run_depths[k-1]:
