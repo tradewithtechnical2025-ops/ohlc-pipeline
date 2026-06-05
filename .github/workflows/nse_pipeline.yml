@@ -1,0 +1,28 @@
+name: NSE Pipeline
+
+on:
+  schedule:
+    # 9:00 PM IST = 15:30 UTC, Mon-Fri
+    - cron: "30 15 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests boto3
+
+      - name: Run pipeline
+        env:
+          R2_ENDPOINT:          ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET:            ${{ secrets.R2_BUCKET }}
+          AWS_ACCESS_KEY_ID:    ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: python pipeline_nse.py
