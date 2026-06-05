@@ -6,12 +6,12 @@ Fetches from NSE archives:
   - bulk.csv                     → latest bulk deals
   - block.csv                    → latest block deals
 
-Saves to R2 via Worker:
-  nse/bands.json         → EQ+BE symbols with current band + next-day change if any
-  nse/bulk.json          → latest bulk deals
-  nse/block.json         → latest block deals
-  nse/bulk_history.json  → symbol-wise accumulated bulk history
-  nse/block_history.json → symbol-wise accumulated block history
+Saves to R2 via Worker (FLAT keys — no slashes, worker slash-rejection safe):
+  nse_bands.json         → EQ+BE symbols with current band + next-day change if any
+  nse_bulk.json          → latest bulk deals
+  nse_block.json         → latest block deals
+  nse_bulk_history.json  → symbol-wise accumulated bulk history
+  nse_block_history.json → symbol-wise accumulated block history
 """
 
 import asyncio
@@ -232,19 +232,19 @@ async def run():
     block_clean = clean_deals(block_rows)
     print(f"  Bulk: {len(bulk_clean)}  Block: {len(block_clean)}")
 
-    # ── Upload to R2 ──────────────────────────────────────────────────────────
+    # ── Upload to R2 (FLAT keys) ──────────────────────────────────────────────
     print("\n[5] Uploading to R2...")
     async with httpx.AsyncClient() as client:
 
         await asyncio.gather(
-            r2_put(client, "nse/bands.json",  bands_out),
-            r2_put(client, "nse/bulk.json",   bulk_clean),
-            r2_put(client, "nse/block.json",  block_clean),
+            r2_put(client, "nse_bands.json",  bands_out),
+            r2_put(client, "nse_bulk.json",   bulk_clean),
+            r2_put(client, "nse_block.json",  block_clean),
         )
 
         bulk_hist, block_hist = await asyncio.gather(
-            r2_get(client, "nse/bulk_history.json"),
-            r2_get(client, "nse/block_history.json"),
+            r2_get(client, "nse_bulk_history.json"),
+            r2_get(client, "nse_block_history.json"),
         )
         bulk_hist  = bulk_hist  or {}
         block_hist = block_hist or {}
@@ -267,8 +267,8 @@ async def run():
         print(f"  History — bulk +{b1}  block +{b2}")
 
         await asyncio.gather(
-            r2_put(client, "nse/bulk_history.json",  bulk_hist),
-            r2_put(client, "nse/block_history.json", block_hist),
+            r2_put(client, "nse_bulk_history.json",  bulk_hist),
+            r2_put(client, "nse_block_history.json", block_hist),
         )
 
     print("\n✅ pipeline_nse.py complete")
