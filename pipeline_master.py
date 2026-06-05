@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+import gzip
 
 import httpx
 
@@ -17,7 +18,7 @@ WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
-
+UPSTOX_BSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
 OUTPUT_FILE     = "master.json"
 BSE_OUTPUT_FILE = "bse.json"        # full BSE universe
 
@@ -147,7 +148,19 @@ async def fetch_symbols(client):
     print(f"✅ Fetched {len(data)} raw symbols")
 
     return data
+    
+async def fetch_upstox_bse(client):
 
+    print("📡 Fetching Upstox BSE master...")
+
+    r = await client.get(UPSTOX_BSE_URL, timeout=120)
+    r.raise_for_status()
+
+    data = json.loads(gzip.decompress(r.content))
+
+    print(f"✅ Loaded {len(data)} BSE instruments")
+
+    return data
 
 # =========================================================
 # BUILD MASTER  (NSE-centric, filtered)
@@ -252,7 +265,7 @@ async def build_master(client, data, quotes):
 # BUILD BSE MASTER  (full BSE universe, NO liquidity filter)
 # =========================================================
 
-def build_bse_master(data, quotes, only_exclusive=False):
+def build_bse_master(data, quotes, upstox_map, only_exclusive=False):
     """
     Full BSE universe from stock-symbols data.
     Sirf price > MIN_BSE_PRICE waale. No-quote stocks (price=None) bhi skip.
@@ -276,6 +289,13 @@ def build_bse_master(data, quotes, only_exclusive=False):
         bse_code = str(stock.get("bse_code") or "").strip()
         if not bse_code:
             continue                                  # BSE pe listed hi nahi
+        info = upstox_map.get(bse_code)
+
+        if not info:
+            continue
+        # Mainboard only
+        if info.get("segment") != "BSE_EQ":
+            continue
 
         nse_code = str(stock.get("nse_code") or "").strip()
         if only_exclusive and nse_code:
@@ -305,6 +325,7 @@ def build_bse_master(data, quotes, only_exclusive=False):
 
         out.append({
             "symbol":        sym or bse_code,
+            "trading_symbol": info.get("trading_symbol"),
             "name":          name,
             "exchange":      "BSE",
             "bse_code":      bse_code,
@@ -337,6 +358,14 @@ async def main():
     async with httpx.AsyncClient(headers=HEADERS) as client:
 
         data = await fetch_symbols(client)
+        upstox_data = await fetch_upstox_bse(client)
+        upstox_map = {
+            str(x["exchange_token"]): {
+                "segment": x.get("segment"),
+                "trading_symbol": x.get("trading_symbol")
+            }
+            for x in upstox_data
+        }
 
         # Single quote call — dono builders ke liye reuse
         print()
@@ -351,7 +380,7 @@ async def main():
         await r2_upload(client, OUTPUT_FILE, master)
 
         # Full BSE universe
-        bse = build_bse_master(data, quotes, only_exclusive=BSE_ONLY_EXCLUSIVE)
+        bse = build_bse_master(data, quotes, upstox_map, only_exclusive=BSE_ONLY_EXCLUSIVE)
         await r2_upload(client, BSE_OUTPUT_FILE, bse)
 
         print()
