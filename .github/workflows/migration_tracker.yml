@@ -1,0 +1,36 @@
+name: Migration Tracker
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # Daily at 8:30 AM IST
+    - cron: "0 3 * * *"
+
+jobs:
+  migrations:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: |
+          pip install httpx
+
+      - name: Run Migration Tracker
+        env:
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+
+        run: |
+          python pipeline_migrations.py
