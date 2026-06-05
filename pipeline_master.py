@@ -153,7 +153,16 @@ async def fetch_upstox_bse(client):
 
     print("📡 Fetching Upstox BSE master...")
 
-    r = await client.get(UPSTOX_BSE_URL, timeout=120)
+    r = await client.get(
+        UPSTOX_BSE_URL,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+            "Referer": "https://upstox.com/"
+        },
+        follow_redirects=True,
+        timeout=120
+    )
     r.raise_for_status()
 
     data = json.loads(gzip.decompress(r.content))
