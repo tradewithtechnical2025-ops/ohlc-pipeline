@@ -87,6 +87,7 @@ async def fetch_profile(client, sem, stock):
     base = {
         "symbol":        sym,
         "bse_code":      stock.get("bse_code"),
+        "trading_symbol":  stock.get("trading_symbol"),
         "exchange":      "BSE",
         "name":          stock.get("name", ""),     # naam universe se (profile se nahi)
         "sector":        "",
