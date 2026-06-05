@@ -105,6 +105,7 @@ async def fetch_profile(client, sem, stock):
     # Profile jo deta hai wahi — no manual modification
     base.update({
         "name":          d.get("name") or base["name"],
+        "trading_symbol":  d.get("trading_symbol",""),
         "sector":        d.get("sector", ""),
         "industry":      d.get("industry", ""),
         "sub_industry":  d.get("sub_industry", ""),
