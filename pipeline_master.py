@@ -27,6 +27,7 @@ MIN_MARKET_CAP_CR = 10
 MIN_PRICE = 10
 MIN_TURNOVER_CR = 1
 MIN_BSE_PRICE = 20          # BSE master: sirf price > 20 waale
+MIN_BSE_MCAP_CR = 100       # BSE master: market cap >= 100 cr (tune as needed)
 
 # Agar sirf BSE-only stocks chahiye (jo NSE pe nahi), to True kar do.
 # False = har BSE-listed stock (dual-listed bhi) -> "full BSE universe"
@@ -268,6 +269,7 @@ def build_bse_master(data, quotes, only_exclusive=False):
     out         = []
     no_quote    = 0
     below_price = 0
+    below_mcap  = 0
 
     for stock in data:
 
@@ -297,6 +299,9 @@ def build_bse_master(data, quotes, only_exclusive=False):
         if price <= MIN_BSE_PRICE:
             below_price += 1
             continue                                  # price <= 20 -> skip
+        if mcap is None or mcap < MIN_BSE_MCAP_CR:
+            below_mcap += 1
+            continue                                  # mcap < threshold -> skip
 
         out.append({
             "symbol":        sym or bse_code,
@@ -313,9 +318,10 @@ def build_bse_master(data, quotes, only_exclusive=False):
 
     out.sort(key=lambda x: (x["market_cap_cr"] or 0), reverse=True)
 
-    print(f"  ✓ BSE stocks (price > {MIN_BSE_PRICE}) : {len(out)}")
+    print(f"  ✓ BSE stocks (final)         : {len(out)}")
     print(f"  ✗ No quote / price = 0       : {no_quote}")
     print(f"  ✗ Price <= {MIN_BSE_PRICE}             : {below_price}")
+    print(f"  ✗ MCAP < {MIN_BSE_MCAP_CR} cr           : {below_mcap}")
     print(f"    mode                       : {'BSE-only' if only_exclusive else 'all BSE-listed'}")
     print("=" * 50)
 
