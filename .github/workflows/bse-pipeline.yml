@@ -51,3 +51,15 @@ jobs:
           cache: pip
       - run: pip install httpx
       - run: python bse_ohlc.py daily          # bse.json -> bse_ohlc_*.json (+ delta)
+
+  bse_pattern:
+    needs: bse_ohlc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install httpx
+      - run: python bse_pattern.py             # bse_ohlc_* -> bse_pattern_signals.json
