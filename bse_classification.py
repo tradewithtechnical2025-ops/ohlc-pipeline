@@ -3,10 +3,13 @@
 BSE Classification — sector/industry from Finedge company-profile API.
 Profile jo deta hai wahi store hota hai (koi manual mapping nahi).
 
-Input : bse.json   (R2)  — BSE universe (price>20, mcap>=100cr)
-Output: bse_classification.json (R2)
+- Saare BSE stocks INCLUDE hote hain (jinka profile nahi, woh blank sector +
+  profile_found=False ke saath, naam bse.json se).
+- Re-run safe: jinka profile mil chuka (profile_found=True) woh skip; baaki
+  (naye + failed) dobara attempt — transient recover + future fill.
 
-Re-run safe: pehle se done stocks skip, har batch pe checkpoint upload.
+Input : bse.json   (R2)
+Output: bse_classification.json (R2)
 """
 
 import asyncio
@@ -78,23 +81,38 @@ async def r2_upload(client, filename, data):
 
 
 async def fetch_profile(client, sem, stock):
+    """Hamesha ek record return karta hai. Profile na mile to blank sector."""
     sym = stock["symbol"]
-    d = await finedge_get(client, sem, f"company-profile/{sym}")
-    if not d:
-        return sym, None
-    # Profile jo deta hai wahi — no manual modification
-    return sym, {
+
+    base = {
         "symbol":        sym,
         "bse_code":      stock.get("bse_code"),
         "exchange":      "BSE",
-        "name":          d.get("name") or stock.get("name", ""),
+        "name":          stock.get("name", ""),     # naam universe se (profile se nahi)
+        "sector":        "",
+        "industry":      "",
+        "sub_industry":  "",
+        "macro_sector":  "",
+        "market_cap_cr": stock.get("market_cap_cr"),
+        "profile_found": False,
+    }
+
+    d = await finedge_get(client, sem, f"company-profile/{sym}")
+    if not d:
+        return sym, base                            # no profile -> include blank
+
+    # Profile jo deta hai wahi — no manual modification
+    base.update({
+        "name":          d.get("name") or base["name"],
         "sector":        d.get("sector", ""),
         "industry":      d.get("industry", ""),
         "sub_industry":  d.get("sub_industry", ""),
         "macro_sector":  d.get("macro_sector", ""),
         "market_cap_cr": d.get("market_cap") if d.get("market_cap") is not None
-                         else stock.get("market_cap_cr"),
-    }
+                         else base["market_cap_cr"],
+        "profile_found": True,
+    })
+    return sym, base
 
 
 async def main():
@@ -105,36 +123,42 @@ async def main():
             raise RuntimeError("bse.json not found / empty in R2")
         print(f"📋 BSE universe: {len(bse)} stocks")
 
-        # Re-run safe: existing classification load karo
+        # Existing load (dict by symbol)
         existing = await r2_download(client, OUT_FILE)
-        out  = list(existing) if isinstance(existing, list) else []
-        done = {x.get("symbol") for x in out}
-        todo = [s for s in bse if s.get("symbol") not in done]
-        print(f"Already done: {len(done)}  Remaining: {len(todo)}")
+        by_sym = {}
+        if isinstance(existing, list):
+            by_sym = {x.get("symbol"): x for x in existing if x.get("symbol")}
+
+        # Profile mil chuka = skip. Naye + blank (profile_found False) = dobara attempt.
+        done_ok = {s for s, r in by_sym.items() if r.get("profile_found")}
+        todo = [s for s in bse if s.get("symbol") not in done_ok]
+        print(f"With profile (skip): {len(done_ok)}  To attempt: {len(todo)}")
 
         if not todo:
-            print("✅ Sab already done!")
+            print("✅ Sab ke profile already mil chuke!")
             return
 
         sem = asyncio.Semaphore(CONCURRENCY)
-        ok = fail = 0
+        got = blank = 0
 
         for i in range(0, len(todo), BATCH):
             batch   = todo[i:i + BATCH]
             results = await asyncio.gather(*[fetch_profile(client, sem, s) for s in batch])
             for sym, rec in results:
-                if rec:
-                    out.append(rec); ok += 1
+                by_sym[sym] = rec                   # include hamesha (update bhi)
+                if rec["profile_found"]:
+                    got += 1
                 else:
-                    fail += 1; print(f"  ✗ {sym}: no profile")
+                    blank += 1
             done_n = min(i + BATCH, len(todo))
-            print(f"  {done_n}/{len(todo)}  ✓{ok}  ✗{fail}")
-            # checkpoint upload (crash-safe)
-            await r2_upload(client, OUT_FILE, out)
+            print(f"  {done_n}/{len(todo)}  profile✓{got}  blank✗{blank}")
+            await r2_upload(client, OUT_FILE, list(by_sym.values()))   # checkpoint
 
-        # final upload
-        await r2_upload(client, OUT_FILE, out)
-        print(f"🎉 BSE classification: ✓{ok}  ✗{fail}  → {OUT_FILE} ({len(out)} total)")
+        await r2_upload(client, OUT_FILE, list(by_sym.values()))
+        total       = len(by_sym)
+        with_prof   = sum(1 for r in by_sym.values() if r.get("profile_found"))
+        print(f"🎉 BSE classification → {OUT_FILE}")
+        print(f"   Total: {total}  |  with profile: {with_prof}  |  blank: {total - with_prof}")
 
 
 if __name__ == "__main__":
