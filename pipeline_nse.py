@@ -147,11 +147,15 @@ async def run():
         nse, f"{NSE_BASE}/sec_list_{{}}.csv", today, direction="prev"
     )
 
-    # 2. eq_band_changes — for next trading day, fallback to next+1 etc
+    # 2. eq_band_changes — optional, NSE uploads this only after ~8 PM IST
     print(f"\n[2] eq_band_changes (next day: {next_day})...")
-    chg_rows, chg_date = fetch_with_fallback(
-        nse, f"{NSE_BASE}/eq_band_changes_{{}}.csv", next_day, direction="next"
-    )
+    try:
+        chg_rows, chg_date = fetch_with_fallback(
+            nse, f"{NSE_BASE}/eq_band_changes_{{}}.csv", next_day, direction="next", max_tries=2
+        )
+    except RuntimeError:
+        print("  ⚠ eq_band_changes not available yet — skipping changes")
+        chg_rows, chg_date = [], next_day
 
     # 3. bulk + block (static URLs, always latest)
     print("\n[3] bulk.csv...")
