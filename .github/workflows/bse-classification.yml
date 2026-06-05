@@ -1,0 +1,26 @@
+name: BSE Classification
+
+on:
+  workflow_dispatch:        # manual (classification roz nahi chahiye)
+
+concurrency:
+  group: bse-classification
+  cancel-in-progress: false
+
+# Ye script sirf 3 vars padhti hai
+env:
+  FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+  WORKER_URL:    ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+
+jobs:
+  bse_classification:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install httpx
+      - run: python bse_classification.py
