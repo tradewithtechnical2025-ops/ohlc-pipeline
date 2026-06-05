@@ -1,0 +1,53 @@
+name: BSE Pipeline
+
+on:
+  schedule:
+    # 4:20 PM IST = 10:50 UTC, Mon–Fri
+    - cron: "50 10 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: bse-pipeline
+  cancel-in-progress: false
+
+# Teeno scripts sirf ye 3 vars padhti hain (UPSTOX nahi chahiye)
+env:
+  FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+  WORKER_URL:    ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+
+jobs:
+  master:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install httpx
+      - run: python pipeline_master.py        # -> master.json + bse.json
+
+  bse_classification:
+    needs: master
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install httpx
+      - run: python bse_classification.py      # bse.json -> bse_classification.json
+
+  bse_ohlc:
+    needs: bse_classification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install httpx
+      - run: python bse_ohlc.py daily          # bse.json -> bse_ohlc_*.json (+ delta)
