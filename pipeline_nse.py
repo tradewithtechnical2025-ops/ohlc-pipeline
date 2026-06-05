@@ -1,10 +1,10 @@
 """
 pipeline_nse.py
 Fetches from NSE archives:
-  - sec_list_DDMMYYYY.csv   → today's circuit bands (EQ+BE only)
+  - sec_list_DDMMYYYY.csv        → today's circuit bands (EQ+BE only)
   - eq_band_changes_DDMMYYYY.csv → next trading day's changes (EQ+BE only)
-  - bulk.csv                → latest bulk deals
-  - block.csv               → latest block deals
+  - bulk.csv                     → latest bulk deals
+  - block.csv                    → latest block deals
 
 Saves to R2 via Worker:
   nse/bands.json         → EQ+BE symbols with current band + next-day change if any
@@ -19,7 +19,6 @@ import csv
 import io
 import json
 import os
-import sys
 import time
 from datetime import date, timedelta
 
@@ -40,13 +39,13 @@ NSE_HEADERS = {
     "Accept":     "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ── NSE Holidays 2025-2026 ────────────────────────────────────────────────────
+# ── NSE Holidays 2026 ─────────────────────────────────────────────────────────
 NSE_HOLIDAYS = {
     date(2026, 1, 26),
     date(2026, 3, 25),
     date(2026, 4, 14),
     date(2026, 4, 18),
-    date(2026, 5, 1),
+    date(2026, 5,  1),
     date(2026, 8, 15),
     date(2026, 10, 2),
     date(2026, 11, 4),
@@ -62,53 +61,17 @@ def next_trading_day(d: date) -> date:
         nxt += timedelta(days=1)
     return nxt
 
-def fmt(d: date) -> str:
-    return d.strftime("%d%m%Y")
-
-
-# ── NSE fetch (sync requests via httpx) ──────────────────────────────────────
-def nse_get_csv(session: httpx.Client, url: str, retries=3) -> list[dict]:
-    for attempt in range(retries):
-        try:
-            r = session.get(url, timeout=30)
-            r.raise_for_status()
-            text = r.content.decode("utf-8-sig").strip()
-            if "NO RECORDS" in text.splitlines()[:3]:
-                return []
-            reader = csv.DictReader(io.StringIO(text))
-            rows = [row for row in reader]
-            print(f"  ✓ {url.split('/')[-1]} → {len(rows)} rows")
-            return rows
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                print(f"  404: {url.split('/')[-1]}")
-                raise  # let caller handle 404 fallback
-            print(f"  Attempt {attempt+1} failed: {e}")
-            time.sleep(3 * (attempt + 1))
-        except Exception as e:
-            print(f"  Attempt {attempt+1} failed: {e}")
-            time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"Failed to fetch: {url}")
-
 def prev_trading_day(d: date) -> date:
     prv = d - timedelta(days=1)
     while not is_trading_day(prv):
         prv -= timedelta(days=1)
     return prv
 
-def nse_get_csv_with_fallback(session: httpx.Client, base_url_tpl: str, d: date, max_back=5) -> tuple[list[dict], date]:
-    """Try date d, fallback to previous trading days if 404."""
-    cur = d
-    for _ in range(max_back):
-        url = base_url_tpl.format(fmt(cur))
-        try:
-            rows = nse_get_csv(session, url)
-            return rows, cur
-        except (httpx.HTTPStatusError, RuntimeError):
-            print(f"  Falling back from {cur}...")
-            cur = prev_trading_day(cur)
-    raise RuntimeError(f"Could not fetch {base_url_tpl} for last {max_back} trading days")
+def fmt(d: date) -> str:
+    return d.strftime("%d%m%Y")
 
+
+# ── NSE fetch ─────────────────────────────────────────────────────────────────
 def make_nse_session() -> httpx.Client:
     client = httpx.Client(headers=NSE_HEADERS, follow_redirects=True, timeout=30)
     try:
@@ -117,6 +80,41 @@ def make_nse_session() -> httpx.Client:
     except Exception:
         pass
     return client
+
+def fetch_csv_url(session: httpx.Client, url: str) -> list[dict] | None:
+    """Returns rows or None on 404. Raises on other errors."""
+    try:
+        r = session.get(url, timeout=30)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig").strip()
+        if "NO RECORDS" in text.splitlines()[:3]:
+            return []
+        rows = list(csv.DictReader(io.StringIO(text)))
+        print(f"  ✓ {url.split('/')[-1]} → {len(rows)} rows")
+        return rows
+    except httpx.HTTPStatusError:
+        raise
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+def fetch_with_fallback(session: httpx.Client, tpl: str, start: date, direction: str = "prev", max_tries: int = 5) -> tuple[list[dict], date]:
+    """
+    tpl: url template with {} for date string e.g. f"{NSE_BASE}/sec_list_{{}}.csv"
+    direction: "prev" = go back, "next" = go forward on 404
+    """
+    cur = start
+    for i in range(max_tries):
+        url = tpl.format(fmt(cur))
+        rows = fetch_csv_url(session, url)
+        if rows is not None:
+            if i > 0:
+                print(f"  ⚠ Fell back to {cur}")
+            return rows, cur
+        print(f"  404 for {cur}, trying {'previous' if direction=='prev' else 'next'} trading day...")
+        cur = prev_trading_day(cur) if direction == "prev" else next_trading_day(cur)
+    raise RuntimeError(f"Could not fetch after {max_tries} attempts: {tpl}")
 
 
 # ── Worker R2 helpers ─────────────────────────────────────────────────────────
@@ -141,24 +139,30 @@ async def run():
     next_day = next_trading_day(today)
     print(f"Today: {today}  |  Next trading day: {next_day}")
 
-    # ── 1. Fetch from NSE (sync) ──────────────────────────────────────────────
     nse = make_nse_session()
 
+    # 1. sec_list — fallback to prev trading day if today not uploaded yet
     print("\n[1] sec_list (today's bands)...")
-    sec_rows = nse_get_csv(nse, f"{NSE_BASE}/sec_list_{fmt(today)}.csv")
+    sec_rows, sec_date = fetch_with_fallback(
+        nse, f"{NSE_BASE}/sec_list_{{}}.csv", today, direction="prev"
+    )
 
+    # 2. eq_band_changes — for next trading day, fallback to next+1 etc
     print(f"\n[2] eq_band_changes (next day: {next_day})...")
-    chg_rows = nse_get_csv(nse, f"{NSE_BASE}/eq_band_changes_{fmt(next_day)}.csv")
+    chg_rows, chg_date = fetch_with_fallback(
+        nse, f"{NSE_BASE}/eq_band_changes_{{}}.csv", next_day, direction="next"
+    )
 
+    # 3. bulk + block (static URLs, always latest)
     print("\n[3] bulk.csv...")
-    bulk_rows = nse_get_csv(nse, f"{NSE_BASE}/bulk.csv")
+    bulk_rows = fetch_csv_url(nse, f"{NSE_BASE}/bulk.csv") or []
 
     print("\n[4] block.csv...")
-    block_rows = nse_get_csv(nse, f"{NSE_BASE}/block.csv")
+    block_rows = fetch_csv_url(nse, f"{NSE_BASE}/block.csv") or []
 
     nse.close()
 
-    # ── 2. Process bands ──────────────────────────────────────────────────────
+    # ── Process bands ─────────────────────────────────────────────────────────
     bands = {}
     for row in sec_rows:
         series = row.get("Series", "").strip()
@@ -193,13 +197,13 @@ async def run():
             bands[sym] = {"series": "?", "circuit": chg["from"], "change": chg}
 
     bands_out = {
-        "date":             today.isoformat(),
-        "next_trading_day": next_day.isoformat(),
+        "date":             sec_date.isoformat(),
+        "next_trading_day": chg_date.isoformat(),
         "data":             [{"symbol": s, **v} for s, v in sorted(bands.items())],
     }
     print(f"\n  Bands: {len(bands)} symbols  |  Changes: {len(changes)}")
 
-    # ── 3. Process bulk/block ─────────────────────────────────────────────────
+    # ── Process bulk/block ────────────────────────────────────────────────────
     def clean_deals(rows, has_remarks=False):
         out = []
         for r in rows:
@@ -224,20 +228,22 @@ async def run():
     block_clean = clean_deals(block_rows)
     print(f"  Bulk: {len(bulk_clean)}  Block: {len(block_clean)}")
 
-    # ── 4. Upload to R2 ───────────────────────────────────────────────────────
+    # ── Upload to R2 ──────────────────────────────────────────────────────────
     print("\n[5] Uploading to R2...")
     async with httpx.AsyncClient() as client:
 
-        # bands, bulk, block — straight upload
         await asyncio.gather(
             r2_put(client, "nse/bands.json",  bands_out),
             r2_put(client, "nse/bulk.json",   bulk_clean),
             r2_put(client, "nse/block.json",  block_clean),
         )
 
-        # bulk history
-        bulk_hist  = await r2_get(client, "nse/bulk_history.json")  or {}
-        block_hist = await r2_get(client, "nse/block_history.json") or {}
+        bulk_hist, block_hist = await asyncio.gather(
+            r2_get(client, "nse/bulk_history.json"),
+            r2_get(client, "nse/block_history.json"),
+        )
+        bulk_hist  = bulk_hist  or {}
+        block_hist = block_hist or {}
 
         def merge_history(hist: dict, deals: list) -> int:
             added = 0
