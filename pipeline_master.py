@@ -18,13 +18,18 @@ WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
-OUTPUT_FILE = "master.json"
+OUTPUT_FILE     = "master.json"
+BSE_OUTPUT_FILE = "bse.json"        # full BSE universe
 
 RATE_DELAY = 0.20
 RETRY = 3
 MIN_MARKET_CAP_CR = 10
 MIN_PRICE = 10
 MIN_TURNOVER_CR = 1
+
+# Agar sirf BSE-only stocks chahiye (jo NSE pe nahi), to True kar do.
+# False = har BSE-listed stock (dual-listed bhi) -> "full BSE universe"
+BSE_ONLY_EXCLUSIVE = True
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -143,10 +148,10 @@ async def fetch_symbols(client):
 
 
 # =========================================================
-# BUILD MASTER
+# BUILD MASTER  (NSE-centric, filtered)
 # =========================================================
 
-async def build_master(client, data):
+async def build_master(client, data, quotes):
 
     print()
     print("=" * 50)
@@ -161,16 +166,6 @@ async def build_master(client, data):
             stock_map[sym] = stock
 
     print(f"  📋 stock_map built : {len(stock_map)} symbols")
-    print()
-
-    # Single API call — returns full universe
-    print(f"📡 Fetching quotes (single call)...")
-    quotes = await finedge_get(client, "quote?symbol=RELIANCE")
-
-    if not quotes:
-        raise RuntimeError("quote fetch failed")
-
-    print(f"✅ Got {len(quotes)} quotes from API")
     print()
 
     # Process all returned quotes
@@ -235,34 +230,8 @@ async def build_master(client, data):
 
     master.sort(key=lambda x: x["market_cap_cr"], reverse=True)
 
-    # Debug — breakdown of bad symbol rejections
-    from collections import Counter
-    reject_reasons  = Counter()
-    reject_samples  = {}
-    for symbol, q in quotes.items():
-        stock = stock_map.get(symbol)
-        name  = stock.get("name") if stock else q.get("name") or symbol
-        if is_bad_symbol(symbol, name):
-            if symbol.isdigit():
-                reason = "NUMERIC"
-            elif symbol.endswith("-RE"):
-                reason = "-RE"
-            else:
-                # Find which keyword matched
-                reason = "KEYWORD:?"
-                for kw in BAD_KEYWORDS:
-                    pattern = r'' + re.escape(kw) + r''
-                    if re.search(pattern, symbol) or (name and re.search(pattern, name)):
-                        reason = f"KEYWORD:{kw}"
-                        break
-            reject_reasons[reason] += 1
-            if reason not in reject_samples:
-                reject_samples[reason] = []
-            if len(reject_samples[reason]) < 5:
-                reject_samples[reason].append(symbol)
-
     print("=" * 50)
-    print("               Summary")
+    print("               Summary (master)")
     print("=" * 50)
     print(f"  ✓ Final Stocks         : {len(master)}")
     print(f"    — Enriched           : {enriched}")
@@ -274,12 +243,76 @@ async def build_master(client, data):
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
 
-    print()
-    print("🔎 Bad Symbol Breakdown:")
-    for reason, count in reject_reasons.most_common():
-        print(f"  {reason:20s} : {count:5d}  samples={reject_samples.get(reason, [])}")
-
     return master
+
+
+# =========================================================
+# BUILD BSE MASTER  (full BSE universe, NO liquidity filter)
+# =========================================================
+
+def build_bse_master(data, quotes, only_exclusive=False):
+    """
+    Full BSE universe from stock-symbols data.
+    Koi mcap/price/turnover filter NAHI. Numeric BSE codes bhi rakhe jaate hain.
+
+    only_exclusive=True  -> sirf BSE-only (jo NSE pe listed nahi)
+    only_exclusive=False -> har BSE-listed stock (dual-listed bhi)
+    """
+    print()
+    print("=" * 50)
+    print("     Building BSE Universe")
+    print("=" * 50)
+
+    out      = []
+    no_quote = 0
+
+    for stock in data:
+
+        bse_code = str(stock.get("bse_code") or "").strip()
+        if not bse_code:
+            continue                                  # BSE pe listed hi nahi
+
+        nse_code = str(stock.get("nse_code") or "").strip()
+        if only_exclusive and nse_code:
+            continue                                  # dual-listed skip
+
+        sym  = str(stock.get("symbol") or "").strip().upper()
+        name = stock.get("name") or ""
+
+        # Quote dhoondho — alpha symbol ya bse_code, dono try (jo mile)
+        q = quotes.get(sym) or quotes.get(bse_code) or {}
+        try:
+            price = float(q.get("current_price") or 0) or None
+            mcap  = float(q.get("market_cap")    or 0) or None
+            vol   = float(q.get("volume")        or 0) or None
+        except Exception:
+            price = mcap = vol = None
+
+        if price is None:
+            no_quote += 1
+
+        out.append({
+            "symbol":        sym or bse_code,
+            "name":          name,
+            "exchange":      "BSE",
+            "bse_code":      bse_code,
+            "nse_code":      nse_code or None,
+            "dual_listed":   bool(nse_code),
+            "consolidated_ind": stock.get("consolidated_ind", False),
+            "market_cap_cr": mcap,
+            "price":         price,
+            "volume":        vol,
+        })
+
+    out.sort(key=lambda x: (x["market_cap_cr"] or 0), reverse=True)
+
+    print(f"  ✓ BSE stocks total     : {len(out)}")
+    print(f"    — with price (quote) : {len(out) - no_quote}")
+    print(f"    — no quote (price=0) : {no_quote}")
+    print(f"    — mode               : {'BSE-only' if only_exclusive else 'all BSE-listed'}")
+    print("=" * 50)
+
+    return out
 
 
 # =========================================================
@@ -292,12 +325,24 @@ async def main():
 
         data = await fetch_symbols(client)
 
-        master = await build_master(client, data)
+        # Single quote call — dono builders ke liye reuse
+        print()
+        print("📡 Fetching quotes (single call)...")
+        quotes = await finedge_get(client, "quote?symbol=RELIANCE")
+        if not quotes:
+            raise RuntimeError("quote fetch failed")
+        print(f"✅ Got {len(quotes)} quotes from API")
 
+        # NSE-centric filtered master
+        master = await build_master(client, data, quotes)
         await r2_upload(client, OUTPUT_FILE, master)
 
+        # Full BSE universe
+        bse = build_bse_master(data, quotes, only_exclusive=BSE_ONLY_EXCLUSIVE)
+        await r2_upload(client, BSE_OUTPUT_FILE, bse)
+
         print()
-        print("🎉 Done — master.json uploaded successfully")
+        print(f"🎉 Done — {OUTPUT_FILE} ({len(master)}) + {BSE_OUTPUT_FILE} ({len(bse)}) uploaded")
 
 
 if __name__ == "__main__":
