@@ -79,10 +79,35 @@ def nse_get_csv(session: httpx.Client, url: str, retries=3) -> list[dict]:
             rows = [row for row in reader]
             print(f"  ✓ {url.split('/')[-1]} → {len(rows)} rows")
             return rows
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                print(f"  404: {url.split('/')[-1]}")
+                raise  # let caller handle 404 fallback
+            print(f"  Attempt {attempt+1} failed: {e}")
+            time.sleep(3 * (attempt + 1))
         except Exception as e:
             print(f"  Attempt {attempt+1} failed: {e}")
             time.sleep(3 * (attempt + 1))
     raise RuntimeError(f"Failed to fetch: {url}")
+
+def prev_trading_day(d: date) -> date:
+    prv = d - timedelta(days=1)
+    while not is_trading_day(prv):
+        prv -= timedelta(days=1)
+    return prv
+
+def nse_get_csv_with_fallback(session: httpx.Client, base_url_tpl: str, d: date, max_back=5) -> tuple[list[dict], date]:
+    """Try date d, fallback to previous trading days if 404."""
+    cur = d
+    for _ in range(max_back):
+        url = base_url_tpl.format(fmt(cur))
+        try:
+            rows = nse_get_csv(session, url)
+            return rows, cur
+        except (httpx.HTTPStatusError, RuntimeError):
+            print(f"  Falling back from {cur}...")
+            cur = prev_trading_day(cur)
+    raise RuntimeError(f"Could not fetch {base_url_tpl} for last {max_back} trading days")
 
 def make_nse_session() -> httpx.Client:
     client = httpx.Client(headers=NSE_HEADERS, follow_redirects=True, timeout=30)
