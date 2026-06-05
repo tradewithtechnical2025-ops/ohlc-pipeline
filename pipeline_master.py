@@ -26,6 +26,7 @@ RETRY = 3
 MIN_MARKET_CAP_CR = 10
 MIN_PRICE = 10
 MIN_TURNOVER_CR = 1
+MIN_BSE_PRICE = 20          # BSE master: sirf price > 20 waale
 
 # Agar sirf BSE-only stocks chahiye (jo NSE pe nahi), to True kar do.
 # False = har BSE-listed stock (dual-listed bhi) -> "full BSE universe"
@@ -253,7 +254,8 @@ async def build_master(client, data, quotes):
 def build_bse_master(data, quotes, only_exclusive=False):
     """
     Full BSE universe from stock-symbols data.
-    Koi mcap/price/turnover filter NAHI. Numeric BSE codes bhi rakhe jaate hain.
+    Sirf price > MIN_BSE_PRICE waale. No-quote stocks (price=None) bhi skip.
+    Numeric BSE codes rakhe jaate hain (mcap/turnover filter nahi).
 
     only_exclusive=True  -> sirf BSE-only (jo NSE pe listed nahi)
     only_exclusive=False -> har BSE-listed stock (dual-listed bhi)
@@ -263,8 +265,9 @@ def build_bse_master(data, quotes, only_exclusive=False):
     print("     Building BSE Universe")
     print("=" * 50)
 
-    out      = []
-    no_quote = 0
+    out         = []
+    no_quote    = 0
+    below_price = 0
 
     for stock in data:
 
@@ -290,6 +293,10 @@ def build_bse_master(data, quotes, only_exclusive=False):
 
         if price is None:
             no_quote += 1
+            continue                                  # quote nahi -> skip
+        if price <= MIN_BSE_PRICE:
+            below_price += 1
+            continue                                  # price <= 20 -> skip
 
         out.append({
             "symbol":        sym or bse_code,
@@ -306,10 +313,10 @@ def build_bse_master(data, quotes, only_exclusive=False):
 
     out.sort(key=lambda x: (x["market_cap_cr"] or 0), reverse=True)
 
-    print(f"  ✓ BSE stocks total     : {len(out)}")
-    print(f"    — with price (quote) : {len(out) - no_quote}")
-    print(f"    — no quote (price=0) : {no_quote}")
-    print(f"    — mode               : {'BSE-only' if only_exclusive else 'all BSE-listed'}")
+    print(f"  ✓ BSE stocks (price > {MIN_BSE_PRICE}) : {len(out)}")
+    print(f"  ✗ No quote / price = 0       : {no_quote}")
+    print(f"  ✗ Price <= {MIN_BSE_PRICE}             : {below_price}")
+    print(f"    mode                       : {'BSE-only' if only_exclusive else 'all BSE-listed'}")
     print("=" * 50)
 
     return out
