@@ -108,7 +108,7 @@ SECTOR_GROUP_MAP = {
     "Carbon Black":                             "Chemicals",
     "Printing Inks":                            "Chemicals",
     "Trading - Chemicals":                      "Chemicals",
-    "Explosives":                               "Chemicals",
+    "Explosives":                               "Explosives",
 
     # ── Cement ──
     "Cement & Cement Products":                 "Cement",
@@ -136,14 +136,14 @@ SECTOR_GROUP_MAP = {
     "Water Supply & Management":                "Environmental Services",
 
     # ── IT Services ──
-    "Computers - Software & Consulting":        "IT Services",
-    "IT Enabled Services":                      "IT Services",
+    "Computers - Software & Consulting":        "Information Technology",
+    "IT Enabled Services":                      "Information Technology",
 
     # ── Software ──
-    "Software Products":                        "Software",
+    "Software Products":                        "Information Technology",
 
     # ── IT Hardware ──
-    "Computers Hardware & Equipments":          "IT Hardware",
+    "Computers Hardware & Equipments":          "Information Technology",
 
     # ── Power ──
     "Power Generation":                         "Power",
@@ -425,8 +425,8 @@ INDUSTRY_MAP = {
     "Biotechnology": "Biotech",
     "Hospital": "Hospitals",
     "Computers Hardware & Equipments": "IT Hardware",
-    "Computers - Software & Consulting": "IT Consulting",
-    "IT Enabled Services": "IT Enabled Services",
+    "Computers - Software & Consulting": "IT Services",
+    "IT Enabled Services": "IT Services",
     "Software Products": "Software Products",
     "Industrial Products": "Industrial Products",
     "Packaging": "Packaging",
