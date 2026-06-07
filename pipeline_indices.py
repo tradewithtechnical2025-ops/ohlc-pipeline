@@ -87,6 +87,24 @@ BAD_KEYWORDS = [
     "VAR",
 
     "BETA",
+
+    # Shariah indices
+    "SHA",
+
+    # TMC (Total Market Cap) variants
+    "TMC",
+
+    # Foreign Portfolio Investor index
+    "FPI",
+
+    # SME Emerge
+    "EMERGE",
+
+    # Nifty Rural
+    "RURAL",
+
+    # Nifty Waves
+    "WAVES",
 ]
 
 
@@ -98,10 +116,30 @@ BAD_TYPES = {
 }
 
 
+# Manual blacklist for duplicates/niche not caught by keywords
+MANUAL_BLACKLIST = {
+
+    "NIFFINSER255",    # duplicate of NIFFINSER
+    "NIFFINSEREXB",    # FinServ Ex-Bank (niche)
+    "NIFHEA2",         # duplicate of NIFHEAIND
+    "NIFINDCORGRO4",   # Tata Group 25% Cap (too specific)
+    "NIFMIDFINSER",    # MidSmall FinServ (too granular)
+    "NIFMIDHEA",       # MidSmall Healthcare (too granular)
+    "NIFMIDITTEL",     # MidSmall IT & Telecom (too granular)
+    "SNSXBBGEFS",      # BSE Select Business Groups (obscure)
+    "SNSXBSE30",       # duplicate of SNSXSENSEX
+    "SNSXIND150",      # overlap with BSE 200
+    "SNSXINSLDR",      # BSE Sector Leaders (barely tracked)
+}
+
+
 def is_bad_index(symbol, index_name):
 
     symbol = str(symbol).upper()
     index_name = str(index_name).upper()
+
+    if symbol in MANUAL_BLACKLIST:
+        return True
 
     return any(
         k in symbol or k in index_name
