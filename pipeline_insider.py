@@ -16,7 +16,7 @@ UP_HEADERS = {
     "Content-Type": "application/json"
 }
 
-RSS_URL = "https://nsearchives.nseindia.com/content/RSS/InsiderTrading.xml"
+RSS_URL = "https://archives.nseindia.com/content/RSS/InsiderTrading.xml"
 
 
 async def r2_put(client, filename, data):
