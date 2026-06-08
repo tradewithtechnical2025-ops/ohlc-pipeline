@@ -22,7 +22,7 @@ BATCH_SIZE  = 25
 RATE_DELAY  = 0.25
 RETRY       = 3
 
-MIN_MARKET_CAP_CR = 50
+MIN_MARKET_CAP_CR = 10
 
 # =========================================================
 # SECTOR GROUP MAP
