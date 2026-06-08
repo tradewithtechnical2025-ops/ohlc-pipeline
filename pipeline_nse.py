@@ -24,6 +24,90 @@ from datetime import date, timedelta
 
 import httpx
 
+from collections import defaultdict
+
+def parse_qty(v):
+    try:
+        return int(float(str(v).replace(",", "")))
+    except:
+        return 0
+
+def build_bulk_summary(deals):
+    agg = defaultdict(lambda: {"buy_qty": 0, "sell_qty": 0})
+    for d in deals:
+        key = (d["symbol"], d["client"])
+        qty = parse_qty(d["qty"])
+        if d["side"].upper() == "BUY":
+            agg[key]["buy_qty"] += qty
+        else:
+            agg[key]["sell_qty"] += qty
+
+    out = []
+    for (symbol, client), v in agg.items():
+        buy_qty = v["buy_qty"]
+        sell_qty = v["sell_qty"]
+        net_qty = buy_qty - sell_qty
+        gross = max(buy_qty, sell_qty)
+
+        if gross == 0:
+            continue
+
+        if abs(net_qty) <= gross * 0.10:
+            signal = "TRADING_ACTIVITY"
+        elif net_qty > 0:
+            signal = "ACCUMULATION"
+        else:
+            signal = "DISTRIBUTION"
+
+        out.append({
+            "symbol": symbol,
+            "client": client,
+            "buy_qty": buy_qty,
+            "sell_qty": sell_qty,
+            "net_qty": net_qty,
+            "signal": signal
+        })
+
+    return sorted(out, key=lambda x: abs(x["net_qty"]), reverse=True)
+
+def build_block_summary(deals):
+    by_symbol = defaultdict(lambda: {
+        "buyers": [],
+        "sellers": [],
+        "buy_qty": 0,
+        "sell_qty": 0
+    })
+
+    for d in deals:
+        sym = d["symbol"]
+        qty = parse_qty(d["qty"])
+
+        row = {
+            "client": d["client"],
+            "qty": qty,
+            "price": d["price"]
+        }
+
+        if d["side"].upper() == "BUY":
+            by_symbol[sym]["buyers"].append(row)
+            by_symbol[sym]["buy_qty"] += qty
+        else:
+            by_symbol[sym]["sellers"].append(row)
+            by_symbol[sym]["sell_qty"] += qty
+
+    out = []
+    for sym, v in by_symbol.items():
+        out.append({
+            "symbol": sym,
+            "buy_qty": v["buy_qty"],
+            "sell_qty": v["sell_qty"],
+            "buyers": v["buyers"],
+            "sellers": v["sellers"],
+            "signal": "INSTITUTIONAL_TRANSFER"
+        })
+    return out
+
+
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
@@ -232,14 +316,22 @@ async def run():
     block_clean = clean_deals(block_rows)
     print(f"  Bulk: {len(bulk_clean)}  Block: {len(block_clean)}")
 
+    bulk_summary  = build_bulk_summary(bulk_clean)
+    block_summary = build_block_summary(block_clean)
+
+    print(f"  Bulk Summary: {len(bulk_summary)}")
+    print(f"  Block Summary: {len(block_summary)}")
+
     # ── Upload to R2 (FLAT keys) ──────────────────────────────────────────────
     print("\n[5] Uploading to R2...")
     async with httpx.AsyncClient() as client:
 
         await asyncio.gather(
-            r2_put(client, "nse_bands.json",  bands_out),
-            r2_put(client, "nse_bulk.json",   bulk_clean),
-            r2_put(client, "nse_block.json",  block_clean),
+            r2_put(client, "nse_bands.json", bands_out),
+            r2_put(client, "nse_bulk.json", bulk_clean),
+            r2_put(client, "nse_block.json", block_clean),
+            r2_put(client, "nse_bulk_summary.json", bulk_summary),
+            r2_put(client, "nse_block_summary.json", block_summary),
         )
 
         bulk_hist, block_hist = await asyncio.gather(
