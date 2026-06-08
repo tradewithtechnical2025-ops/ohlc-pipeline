@@ -25,7 +25,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: pip install httpx
-      - run: python pipeline.py daily          # classification*.json
+      - run: python pipeline_classification.py classification          # classification*.json
   
   daily:
     runs-on: ubuntu-latest
