@@ -50,3 +50,6 @@ jobs:
 
       - name: EP Scan
         run: python pipeline.py ep_scan
+
+      - name: Indices Pipeline
+        run: python pipeline_indices.py
