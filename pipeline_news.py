@@ -25,9 +25,9 @@ FEEDS = [
     ("nse_board",         "NSE Board Meetings",      "https://nsearchives.nseindia.com/content/RSS/Board_Meetings.xml"),
     ("nse_corp_actions",  "NSE Corporate Actions",   "https://nsearchives.nseindia.com/content/RSS/Corporate_action.xml"),
     # Market News
-    ("mc_news",           "Moneycontrol",            "https://www.moneycontrol.com/rss/latestnews.xml"),
+    ("et_markets",         "Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
     ("mint_markets",      "LiveMint Markets",        "https://www.livemint.com/rss/markets"),
-    ("cnbctv18",          "CNBC TV18 Markets",       "https://www.cnbctv18.com/commonfeeds/v1/eng/rss/market.xml"),
+   
 ]
 
 # R2 output files
