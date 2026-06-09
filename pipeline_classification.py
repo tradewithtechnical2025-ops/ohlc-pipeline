@@ -505,9 +505,22 @@ INDUSTRY_MAP = {
 }
 
 # =========================================================
+# Sub-industries where description override is SKIPPED
+# sector_group and display_industry will always come from
+# the sub_industry map for these categories
+# =========================================================
+
+DESCRIPTION_OVERRIDE_EXEMPT = {
+    "Private Sector Bank",
+    "Public Sector Bank",
+    "Other Bank",
+}
+
+# =========================================================
 # DESCRIPTION-BASED OVERRIDES
 # Scans company description for keywords
 # Priority: description > sub_industry map
+# NOTE: Does NOT apply to sub_industries in DESCRIPTION_OVERRIDE_EXEMPT
 # =========================================================
 
 # Format: ([keywords], sector_group, display_industry)
@@ -705,12 +718,34 @@ for _theme, _syms in _THEME_SYMBOLS.items():
 # CLASSIFICATION HELPERS
 # =========================================================
 
-def get_description_overrides(description: str):
-    """Extract sector_group, display_industry, themes from description."""
+def get_description_overrides(description: str, profile: dict = None):
+    """
+    Extract sector_group, display_industry, themes from description.
+
+    If the stock's sub_industry is in DESCRIPTION_OVERRIDE_EXEMPT (e.g. banks),
+    sector_group and display_industry overrides are skipped — the sub_industry
+    map already gives the correct values. Themes are still extracted from
+    description for all stocks.
+    """
     if not description:
         return None, None, []
 
     desc = description.lower()
+
+    # Always extract themes regardless of exempt status
+    themes = []
+    for keywords, theme_list in DESCRIPTION_THEME_MAP:
+        if any(kw in desc for kw in keywords):
+            for t in theme_list:
+                if t not in themes:
+                    themes.append(t)
+
+    # Skip sector/industry override for exempt sub_industries
+    if profile:
+        sub_ind = (profile.get("sub_industry") or "").strip()
+        if sub_ind in DESCRIPTION_OVERRIDE_EXEMPT:
+            return None, None, themes
+
     sector_group = None
     display_industry = None
 
@@ -719,13 +754,6 @@ def get_description_overrides(description: str):
             sector_group = sg
             display_industry = di
             break
-
-    themes = []
-    for keywords, theme_list in DESCRIPTION_THEME_MAP:
-        if any(kw in desc for kw in keywords):
-            for t in theme_list:
-                if t not in themes:
-                    themes.append(t)
 
     return sector_group, display_industry, themes
 
@@ -750,18 +778,19 @@ def classify(symbol: str, profile: dict) -> tuple[str, str, list[str]]:
     """
     Returns (sector_group, display_industry, themes)
     Priority: description keywords > sub_industry map
+    Exception: sub_industries in DESCRIPTION_OVERRIDE_EXEMPT always use
+               the sub_industry map for sector_group and display_industry.
     Themes: description keywords + manual symbol list (merged, deduplicated)
     """
     description = profile.get("description", "")
 
-    # Get description-based overrides
-    desc_sg, desc_di, desc_themes = get_description_overrides(description)
+    # Pass profile so exempt sub_industries are handled correctly
+    desc_sg, desc_di, desc_themes = get_description_overrides(description, profile)
 
-    # Sector group & display industry
     sector_group     = desc_sg or get_sector_group(profile)
     display_industry = desc_di or get_display_industry(profile)
 
-    # Themes: manual list only
+    # Themes: manual list only (description themes removed per original design)
     all_themes = SYMBOL_THEMES.get(symbol, [])
 
     return sector_group, display_industry, all_themes
