@@ -1004,7 +1004,7 @@ def _build_group_rs_history(classification, rs_history_json, field_name):
         output.append({"date":dt,"groups":groups})
     return output
 
-def _calculate_mswing(all_data, history_days=60):
+def _calculate_mswing(all_data, history_days=90):
     result={}
     for sym, s in all_data.items():
         closes=s["c"]; n=len(closes); history=[]
@@ -1419,7 +1419,7 @@ async def run_ep_scan() -> None:
                 sym=sig["symbol"]; sc=screener.get(sym,{}); fund=fund_lookup.get(sym,{})
                 sig.update({"sales_ch":sc.get("sales_ch",""),"eps_ch":sc.get("eps_ch",""),"patterns":sc.get("patterns",""),"sector":sc.get("sector",""),"rs":sc.get("rs",""),"ltp":sc.get("ltp","")})
                 pl_qtr=fund.get("pl_quarterly",[]); sig["q_name"]=pl_qtr[0].get("header","") if pl_qtr else ""
-        rs_data=_calculate_rs(all_data,history_days=60)
+        rs_data=_calculate_rs(all_data,history_days=90)
         rs_history_list=_build_rs_history_json(all_data,rs_data)
         for sig in signals: sig["rs_calc"]=rs_data.get(sig["symbol"],{}).get("rs")
         for sig in pr_signals: sig["rs_calc"]=rs_data.get(sig["symbol"],{}).get("rs")
