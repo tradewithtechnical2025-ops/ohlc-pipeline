@@ -19,47 +19,97 @@ BROWSER_HEADERS = {
     "Accept": "application/xml, text/xml, */*",
 }
 
-def parse_xml_trade(xml_text: str) -> dict:
-    """Parse NSE insider trading XBRL XML and extract trade fields."""
+# NSE insider trading XBRL namespace
+NS = "http://www.bseindia.com/xbrl/co/2017-09-15/in-bse-co"
+
+def parse_xml_trade(xml_text: str) -> list[dict]:
+    """
+    Parse NSE/BSE insider trading XBRL XML.
+    Returns a list of disclosures (one filing can have multiple trades).
+    """
     try:
         root = ET.fromstring(xml_text)
-        # Strip namespace for easier tag matching
-        ns = ""
-        if root.tag.startswith("{"):
-            ns = root.tag.split("}")[0] + "}"
 
-        def g(tag):
-            # Try with namespace first, then without
-            el = root.find(f".//{ns}{tag}")
-            if el is None:
-                el = root.find(f".//{tag}")
-            return el.text.strip() if el is not None and el.text else ""
+        def g(tag, ctx_id=None):
+            """Find tag value, optionally filtered by contextRef."""
+            for el in root.iter(f"{{{NS}}}{tag}"):
+                if ctx_id is None or el.get("contextRef") == ctx_id:
+                    return el.text.strip() if el.text else ""
+            return ""
 
-        return {
-            "insider_name":       g("nameOfThePerson") or g("NameOfThePerson") or g("name"),
-            "insider_category":   g("categoryOfPerson") or g("CategoryOfPerson"),
-            "designation":        g("typeOfSecurity") or "",   # sometimes designation is here
-            "security_type":      g("typeOfSecurity") or g("TypeOfSecurity"),
-            "transaction_type":   g("typeOfTransaction") or g("TypeOfTransaction"),  # Buy/Sell
-            "trade_date":         g("dateOfAllotmentAcquisitionFromTo") or g("dateOfIntimationToCompany") or g("DateOfTransaction"),
-            "qty":                g("numberOfSecuritiesTransacted") or g("NumberOfSecuritiesTransacted"),
-            "price":              g("valueOfSecuritiesTransacted") or g("pricePerUnit") or "",
-            "pre_holding_pct":    g("percentageOfShareholdingBeforeAcquisition") or g("PreShareholding"),
-            "post_holding_pct":   g("percentageOfShareholdingAfterAcquisition") or g("PostShareholding"),
-            "exchange":           g("exchange") or g("Exchange") or "NSE",
-            "remarks":            g("remarks") or g("Remarks") or "",
-        }
+        # MainI context — company-level fields
+        company       = g("NameOfTheCompany", "MainI")
+        symbol        = g("Symbol", "MainI")
+        isin          = g("ISINCode", "MainI")
+        signatory     = g("NameOfTheSignatory", "MainI")
+        designation   = g("DesignationOfSignatory", "MainI")
+        date_filing   = g("DateOfFiling", "MainI")
+        regulation    = g("DisclosureUnderRegulation", "MainI")
+        revised       = g("RevisedFilling", "MainI")
+
+        # Collect all Disclosure contexts (Disclosure1, Disclosure2, ...)
+        ctx_ids = []
+        for ctx in root.iter("{http://www.xbrl.org/2003/instance}context"):
+            cid = ctx.get("id", "")
+            if cid.startswith("Disclosure"):
+                ctx_ids.append(cid)
+
+        disclosures = []
+        for cid in ctx_ids:
+            disclosures.append({
+                "symbol":           symbol,
+                "company":          company,
+                "isin":             isin,
+                "date_filing":      date_filing,
+                "regulation":       regulation,
+                "revised":          revised,
+                "signatory":        signatory,
+                "signatory_desig":  designation,
+                # Trade-level fields
+                "insider_name":     g("NameOfThePerson", cid),
+                "insider_category": g("CategoryOfPerson", cid),
+                "instrument":       g("TypeOfInstrument", cid),
+                "transaction_type": g("SecuritiesAcquiredOrDisposedTransactionType", cid),  # Buy/Sell
+                "mode":             g("ModeOfAcquisitionOrDisposal", cid),                  # Market Purchase etc
+                "qty":              g("SecuritiesAcquiredOrDisposedNumberOfSecurity", cid),
+                "value_inr":        g("SecuritiesAcquiredOrDisposedValueOfSecurity", cid),
+                "trade_date_from":  g("DateOfAllotmentAdviceOrAcquisitionOfSharesOrSaleOfSharesSpecifyFromDate", cid),
+                "trade_date_to":    g("DateOfAllotmentAdviceOrAcquisitionOfSharesOrSaleOfSharesSpecifyToDate", cid),
+                "intimation_date":  g("DateOfIntimationToCompany", cid),
+                "exchange":         g("ExchangeOnWhichTheTradeWasExecuted", cid),
+                "pre_qty":          g("SecuritiesHeldPriorToAcquisitionOrDisposalNumberOfSecurity", cid),
+                "pre_pct":          g("SecuritiesHeldPriorToAcquisitionOrDisposalPercentageOfShareholding", cid),
+                "post_qty":         g("SecuritiesHeldPostAcquistionOrDisposalNumberOfSecurity", cid),
+                "post_pct":         g("SecuritiesHeldPostAcquistionOrDisposalPercentageOfShareholding", cid),
+            })
+
+        return disclosures if disclosures else [{"parse_error": "No Disclosure contexts found"}]
+
     except Exception as e:
-        return {"parse_error": str(e)}
+        return [{"parse_error": str(e)}]
 
 
-async def fetch_xml(client: httpx.AsyncClient, url: str) -> dict:
+async def fetch_xml(client: httpx.AsyncClient, rss_item: dict) -> list[dict]:
+    xml_url  = rss_item["xml_url"]
+    html_url = rss_item["html_url"]
+    published = rss_item["published"]
     try:
-        r = await client.get(url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
+        r = await client.get(xml_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
         r.raise_for_status()
-        return parse_xml_trade(r.text)
+        disclosures = parse_xml_trade(r.text)
+        # Attach rss-level fields to each disclosure
+        for d in disclosures:
+            d["published"] = published
+            d["xml_url"]   = xml_url
+            d["html_url"]  = html_url
+        return disclosures
     except Exception as e:
-        return {"fetch_error": str(e)}
+        return [{
+            "published":   published,
+            "xml_url":     xml_url,
+            "html_url":    html_url,
+            "fetch_error": str(e)
+        }]
 
 
 async def r2_put(client, filename, data):
@@ -74,60 +124,52 @@ async def r2_put(client, filename, data):
     print(f"✓ Uploaded {filename}")
 
 
+def parse_desc(desc: str) -> dict:
+    """Extract symbol, regulation, html_url from pipe-separated description."""
+    parts = [p.strip() for p in desc.split("|")]
+    html_file = parts[5] if len(parts) > 5 else ""
+    return {
+        "symbol":     parts[0] if len(parts) > 0 else "",
+        "regulation": parts[3] if len(parts) > 3 else "",
+        "html_url":   f"https://nsearchives.nseindia.com/corporate/xbrl/{html_file}" if html_file else "",
+    }
+
+
 async def run():
     print("Fetching RSS...")
     async with httpx.AsyncClient() as fetch_client:
         rss_resp = await fetch_client.get(
-            RSS_URL,
-            headers=BROWSER_HEADERS,
-            timeout=30,
-            follow_redirects=True
+            RSS_URL, headers=BROWSER_HEADERS, timeout=30, follow_redirects=True
         )
         rss_resp.raise_for_status()
     feed = feedparser.parse(rss_resp.content)
     print(f"RSS Items: {len(feed.entries)}")
 
-    # Parse description field: SYMBOL|Company|...|html_file|...
-    def parse_desc(desc: str) -> dict:
-        parts = [p.strip() for p in desc.split("|")]
-        return {
-            "symbol":     parts[0] if len(parts) > 0 else "",
-            "regulation": parts[3] if len(parts) > 3 else "",
-            "html_url":   f"https://nsearchives.nseindia.com/corporate/xbrl/{parts[5]}" if len(parts) > 5 else "",
-        }
-
-    # Build base items from RSS
-    base_items = []
+    rss_items = []
     for entry in feed.entries:
         desc_data = parse_desc(entry.get("description", ""))
-        base_items.append({
-            "company":    entry.get("title", ""),
-            "symbol":     desc_data["symbol"],
-            "regulation": desc_data["regulation"],
-            "published":  entry.get("published", ""),
-            "xml_url":    entry.get("link", ""),
-            "html_url":   desc_data["html_url"],
+        rss_items.append({
+            "published": entry.get("published", ""),
+            "xml_url":   entry.get("link", ""),
+            "html_url":  desc_data["html_url"],
         })
 
-    # Fetch all XMLs concurrently
-    print("Fetching XML details...")
+    print("Fetching & parsing XMLs...")
     async with httpx.AsyncClient() as client:
-        xml_tasks = [fetch_xml(client, item["xml_url"]) for item in base_items]
-        xml_results = await asyncio.gather(*xml_tasks)
+        tasks = [fetch_xml(client, item) for item in rss_items]
+        results = await asyncio.gather(*tasks)
 
-        # Merge
-        items = []
-        for base, trade in zip(base_items, xml_results):
-            items.append({**base, **trade})
+        # Flatten — each XML can have multiple disclosures
+        all_items = [d for disclosures in results for d in disclosures]
 
-        ok  = sum(1 for t in xml_results if "fetch_error" not in t and "parse_error" not in t)
-        err = len(xml_results) - ok
-        print(f"XML parsed: {ok} ok, {err} errors")
+        ok  = sum(1 for d in all_items if "fetch_error" not in d and "parse_error" not in d)
+        err = len(all_items) - ok
+        print(f"Disclosures: {ok} ok, {err} errors")
 
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "count": len(items),
-            "items": items
+            "count": len(all_items),
+            "items": all_items
         }
 
         await r2_put(client, "nse_insider_trading.json", payload)
