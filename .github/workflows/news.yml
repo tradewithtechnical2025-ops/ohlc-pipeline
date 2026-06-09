@@ -1,0 +1,35 @@
+name: Market Data Pipeline
+
+on:
+  schedule:
+    # Every 15 min, 9AM-4PM IST (3:30-10:30 UTC), weekdays
+    - cron: '*/15 3-11 * * 1-5'
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  run-pipelines:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx feedparser
+
+      - name: Run Insider Trading Pipeline
+        run: python pipeline_insider.py
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+
+      - name: Run News Pipeline
+        run: python pipeline_news.py
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
