@@ -19,6 +19,7 @@ WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 UPSTOX_BSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
+UPSTOX_NSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 OUTPUT_FILE     = "master.json"
 BSE_OUTPUT_FILE = "bse.json"        # full BSE universe
 
@@ -148,13 +149,14 @@ async def fetch_symbols(client):
     print(f"✅ Fetched {len(data)} raw symbols")
 
     return data
-    
-async def fetch_upstox_bse(client):
 
-    print("📡 Fetching Upstox BSE master...")
+
+async def fetch_upstox_master(client, url, label):
+
+    print(f"📡 Fetching Upstox {label} master...")
 
     r = await client.get(
-        UPSTOX_BSE_URL,
+        url,
         headers={
             "User-Agent": "Mozilla/5.0",
             "Accept": "*/*",
@@ -167,7 +169,7 @@ async def fetch_upstox_bse(client):
 
     data = json.loads(gzip.decompress(r.content))
 
-    print(f"✅ Loaded {len(data)} BSE instruments")
+    print(f"✅ Loaded {len(data)} {label} instruments")
 
     return data
 
@@ -175,7 +177,7 @@ async def fetch_upstox_bse(client):
 # BUILD MASTER  (NSE-centric, filtered)
 # =========================================================
 
-async def build_master(client, data, quotes):
+async def build_master(client, data, quotes, nse_name_map):
 
     print()
     print("=" * 50)
@@ -198,12 +200,23 @@ async def build_master(client, data, quotes):
     filtered_mcap     = 0
     filtered_price    = 0
     filtered_turnover = 0
+    upstox_named      = 0
 
     for symbol, q in quotes.items():
 
         # Enrich from stock_map if available
         stock    = stock_map.get(symbol)
-        name     = stock.get("name")     if stock else q.get("name") or symbol
+
+        # Name fallback chain:
+        # Finedge stock-symbols -> Finedge quote -> Upstox NSE master -> symbol
+        name = (stock.get("name") if stock else None) or q.get("name")
+        if not name:
+            name = nse_name_map.get(symbol)
+            if name:
+                upstox_named += 1
+        if not name:
+            name = symbol
+
         nse_code = stock.get("nse_code") if stock else symbol
         bse_code = stock.get("bse_code") if stock else None
         exchange = "NSE" if nse_code else "BSE"
@@ -260,6 +273,7 @@ async def build_master(client, data, quotes):
     print(f"  ✓ Final Stocks         : {len(master)}")
     print(f"    — Enriched           : {enriched}")
     print(f"    — Quote-only         : {quote_only}")
+    print(f"    — Upstox-named       : {upstox_named}")
     print(f"  ✗ Bad Symbol Filtered  : {filtered_bad}")
     print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
     print(f"  ✗ Price Rejected       : {filtered_price}")
@@ -367,7 +381,8 @@ async def main():
     async with httpx.AsyncClient(headers=HEADERS) as client:
 
         data = await fetch_symbols(client)
-        upstox_data = await fetch_upstox_bse(client)
+
+        upstox_data = await fetch_upstox_master(client, UPSTOX_BSE_URL, "BSE")
         upstox_map = {
             str(x["exchange_token"]): {
                 "segment": x.get("segment"),
@@ -375,6 +390,15 @@ async def main():
             }
             for x in upstox_data
         }
+
+        # Upstox NSE master — naye listings (e.g. CMRGREEN) ke names ke liye
+        upstox_nse = await fetch_upstox_master(client, UPSTOX_NSE_URL, "NSE")
+        nse_name_map = {
+            str(x.get("trading_symbol", "")).strip().upper(): x.get("name")
+            for x in upstox_nse
+            if x.get("segment") == "NSE_EQ" and x.get("instrument_type") == "EQ"
+        }
+        print(f"  📋 NSE name map: {len(nse_name_map)} symbols")
 
         # Single quote call — dono builders ke liye reuse
         print()
@@ -385,7 +409,7 @@ async def main():
         print(f"✅ Got {len(quotes)} quotes from API")
 
         # NSE-centric filtered master
-        master = await build_master(client, data, quotes)
+        master = await build_master(client, data, quotes, nse_name_map)
         await r2_upload(client, OUTPUT_FILE, master)
 
         # Full BSE universe
