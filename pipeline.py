@@ -972,6 +972,18 @@ def _calculate_mansfield_rs(all_data, index_maps):
         result[sym]=stock_metrics
     return result
 
+# ══════════════════════════════════════════════════════════════
+# PATCH — pipeline.py mein _build_group_rs_history() ko isse REPLACE karein
+#
+# Bug: date_cols sirf rs_history_json[0] (pehli row) se nikalte the.
+#      Agar pehla stock new listing hai (<63 din data → poori history None),
+#      toh us row mein sirf "Stock Name" hota hai → date_cols=[] → output []
+#      → sector_group_rs_history.json / industry_rs_history.json 0.0 KB.
+#
+# Fix: sabse zyada keys wali row (full history) se date columns derive karo,
+#      + empty hone par warning log.
+# ══════════════════════════════════════════════════════════════
+
 def _build_group_rs_history(classification, rs_history_json, field_name):
     if not classification or not isinstance(classification, list): return []
     group_map={}
@@ -980,7 +992,14 @@ def _build_group_rs_history(classification, rs_history_json, field_name):
         if not sym or not group: continue
         group_map.setdefault(group,[]).append(sym)
     if not rs_history_json: return []
-    sample=rs_history_json[0]; date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    # FIX: pehli row pe bharosa mat karo — woh new-listing ho sakti hai jiski
+    # poori history None hai (sirf "Stock Name" key). Sabse zyada date
+    # columns wali row choose karo taaki full date range mile.
+    sample=max(rs_history_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_rs_history({field_name}): no date columns found — empty output")
+        return []
     output=[]
     for dt in date_cols:
         stocks={}
