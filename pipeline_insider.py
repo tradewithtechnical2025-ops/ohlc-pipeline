@@ -112,16 +112,40 @@ async def fetch_xml(client: httpx.AsyncClient, rss_item: dict) -> list[dict]:
         }]
 
 
-async def r2_put(client, filename, data):
-    body = json.dumps(data, ensure_ascii=False).encode()
-    r = await client.post(
-        f"{WORKER_URL}?file={filename}",
-        headers=UP_HEADERS,
-        content=body,
-        timeout=120
+def trade_key(d: dict) -> tuple:
+    """
+    Unique key for a trade. Includes pre/post holdings so that two genuine
+    same-day trades with identical qty/value still get distinct keys
+    (second trade's pre_qty == first trade's post_qty).
+    Duplicate re-filings have identical pre/post → deduped.
+    """
+    return (
+        d.get("symbol", ""),
+        d.get("insider_name", "").strip().upper(),
+        d.get("trade_date_from", ""),
+        d.get("trade_date_to", ""),
+        d.get("transaction_type", ""),
+        d.get("qty", ""),
+        d.get("value_inr", ""),
+        d.get("pre_qty", ""),
+        d.get("post_qty", ""),
     )
-    r.raise_for_status()
-    print(f"✓ Uploaded {filename}")
+
+
+def dedup_trades(items: list[dict]) -> list[dict]:
+    """Keep first occurrence (RSS is latest-first, so latest published wins)."""
+    seen = set()
+    out = []
+    for d in items:
+        if "fetch_error" in d or "parse_error" in d:
+            out.append(d)
+            continue
+        key = trade_key(d)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
 
 
 def parse_desc(desc: str) -> dict:
@@ -133,6 +157,18 @@ def parse_desc(desc: str) -> dict:
         "regulation": parts[3] if len(parts) > 3 else "",
         "html_url":   f"https://nsearchives.nseindia.com/corporate/xbrl/{html_file}" if html_file else "",
     }
+
+
+async def r2_put(client, filename, data):
+    body = json.dumps(data, ensure_ascii=False).encode()
+    r = await client.post(
+        f"{WORKER_URL}?file={filename}",
+        headers=UP_HEADERS,
+        content=body,
+        timeout=120
+    )
+    r.raise_for_status()
+    print(f"✓ Uploaded {filename}")
 
 
 async def run():
@@ -161,6 +197,10 @@ async def run():
 
         # Flatten — each XML can have multiple disclosures
         all_items = [d for disclosures in results for d in disclosures]
+
+        before = len(all_items)
+        all_items = dedup_trades(all_items)
+        print(f"Dedup: {before} → {len(all_items)}")
 
         ok  = sum(1 for d in all_items if "fetch_error" not in d and "parse_error" not in d)
         err = len(all_items) - ok
