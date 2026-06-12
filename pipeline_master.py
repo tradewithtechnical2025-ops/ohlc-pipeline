@@ -17,9 +17,17 @@ FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
+# Optional — naye listings (jo Finedge cover nahi karta) ke quotes ke liye
+UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
+
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 UPSTOX_BSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
 UPSTOX_NSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+UPSTOX_OHLC_URL = "https://api.upstox.com/v3/market-quote/ohlc"
+
+# Optional — agar set hai to Finedge se missing NSE stocks (naye listings
+# jaise CMRGREEN) Upstox OHLC se inject honge
+UPSTOX_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
 OUTPUT_FILE     = "master.json"
 BSE_OUTPUT_FILE = "bse.json"        # full BSE universe
 
@@ -173,6 +181,52 @@ async def fetch_upstox_master(client, url, label):
 
     return data
 
+
+# =========================================================
+# UPSTOX QUOTES  (missing/new listings ke liye)
+# =========================================================
+
+async def fetch_upstox_quotes(client, instrument_keys):
+    """
+    Upstox v2 bulk market quotes — 500 keys per call.
+    Returns {TRADING_SYMBOL: quote_dict}
+    """
+    out = {}
+
+    for i in range(0, len(instrument_keys), 500):
+
+        batch = instrument_keys[i:i + 500]
+
+        try:
+            r = await client.get(
+                "https://api.upstox.com/v2/market-quote/quotes",
+                params={"instrument_key": ",".join(batch)},
+                headers={
+                    "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+                    "Accept": "application/json",
+                },
+                timeout=60,
+            )
+        except Exception as e:
+            print(f"  ⚠️  Upstox quote network error: {e}")
+            continue
+
+        if r.status_code != 200:
+            print(f"  ❌ Upstox quotes HTTP {r.status_code}: {r.text[:120]}")
+            continue
+
+        payload = r.json().get("data", {}) or {}
+
+        for k, v in payload.items():
+            # key format: "NSE_EQ:SYMBOL"
+            sym = str(v.get("symbol") or k.split(":")[-1]).strip().upper()
+            if sym:
+                out[sym] = v
+
+        await asyncio.sleep(0.3)
+
+    return out
+
 # =========================================================
 # BUILD MASTER  (NSE-centric, filtered)
 # =========================================================
@@ -201,6 +255,7 @@ async def build_master(client, data, quotes, nse_name_map):
     filtered_price    = 0
     filtered_turnover = 0
     upstox_named      = 0
+    new_listings      = 0
 
     for symbol, q in quotes.items():
 
@@ -209,11 +264,17 @@ async def build_master(client, data, quotes, nse_name_map):
 
         # Name fallback chain:
         # Finedge stock-symbols -> Finedge quote -> Upstox NSE master -> symbol
-        name = (stock.get("name") if stock else None) or q.get("name")
-        if not name:
-            name = nse_name_map.get(symbol)
-            if name:
+        name = (stock.get("name") if stock else None) or q.get("name") or ""
+        name = str(name).strip()
+
+        # Agar name missing hai YA symbol ke barabar hai (Finedge naye
+        # listings ke liye symbol ko hi name bana deta hai) -> Upstox try karo
+        if not name or name.upper() == symbol.upper():
+            upstox_name = nse_name_map.get(symbol)
+            if upstox_name:
+                name = upstox_name
                 upstox_named += 1
+
         if not name:
             name = symbol
 
@@ -235,7 +296,10 @@ async def build_master(client, data, quotes, nse_name_map):
 
         turnover_cr = (price * volume) / 1e7
 
-        if market_cap < MIN_MARKET_CAP_CR:
+        # Upstox-sourced quotes (naye listings) mein market_cap nahi hota
+        is_upstox_src = bool(q.get("_source") == "upstox")
+
+        if not is_upstox_src and market_cap < MIN_MARKET_CAP_CR:
             filtered_mcap += 1
             continue
 
@@ -247,6 +311,9 @@ async def build_master(client, data, quotes, nse_name_map):
             filtered_turnover += 1
             continue
 
+        if is_upstox_src:
+            new_listings += 1
+
         master.append({
             "symbol":           symbol,
             "name":             name,
@@ -254,10 +321,11 @@ async def build_master(client, data, quotes, nse_name_map):
             "bse_code":         bse_code,
             "nse_code":         nse_code,
             "consolidated_ind": stock.get("consolidated_ind", False) if stock else False,
-            "market_cap_cr":    market_cap,
+            "market_cap_cr":    market_cap if not is_upstox_src else None,
             "price":            price,
             "volume":           volume,
             "turnover_cr":      round(turnover_cr, 2),
+            "new_listing":      is_upstox_src,
         })
 
     # Stats
@@ -265,7 +333,7 @@ async def build_master(client, data, quotes, nse_name_map):
     enriched     = sum(1 for s in master if stock_map.get(s["symbol"]))
     quote_only   = len(master) - enriched
 
-    master.sort(key=lambda x: x["market_cap_cr"], reverse=True)
+    master.sort(key=lambda x: (x["market_cap_cr"] or 0), reverse=True)
 
     print("=" * 50)
     print("               Summary (master)")
@@ -274,6 +342,7 @@ async def build_master(client, data, quotes, nse_name_map):
     print(f"    — Enriched           : {enriched}")
     print(f"    — Quote-only         : {quote_only}")
     print(f"    — Upstox-named       : {upstox_named}")
+    print(f"    — New listings (Upstox): {new_listings}")
     print(f"  ✗ Bad Symbol Filtered  : {filtered_bad}")
     print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
     print(f"  ✗ Price Rejected       : {filtered_price}")
@@ -373,6 +442,168 @@ def build_bse_master(data, quotes, upstox_map, only_exclusive=False):
 
 
 # =========================================================
+# UPSTOX INJECTION  (Finedge se missing NSE stocks)
+# =========================================================
+
+async def fetch_upstox_ohlc(client, instrument_keys):
+    """Upstox V3 bulk OHLC — batches of 500. Returns {NSE_EQ:SYMBOL -> data}."""
+
+    out = {}
+
+    for i in range(0, len(instrument_keys), 500):
+
+        batch = instrument_keys[i:i + 500]
+
+        r = await client.get(
+            UPSTOX_OHLC_URL,
+            params={"instrument_key": ",".join(batch), "interval": "1d"},
+            headers={
+                "Authorization": f"Bearer {UPSTOX_TOKEN}",
+                "Accept": "application/json",
+            },
+            timeout=60,
+        )
+
+        if r.status_code != 200:
+            print(f"  ⚠️  Upstox OHLC HTTP {r.status_code} (batch {i // 500 + 1})")
+            continue
+
+        out.update(r.json().get("data") or {})
+
+    return out
+
+
+def find_missing_nse(upstox_nse, quotes):
+    """NSE_EQ equities jo Finedge quotes mein nahi hain (naye listings etc.)."""
+
+    missing = []
+
+    for x in upstox_nse:
+
+        if x.get("segment") != "NSE_EQ":
+            continue
+        if x.get("instrument_type") != "EQ":
+            continue
+
+        tsym = str(x.get("trading_symbol") or "").strip().upper()
+        if not tsym or tsym in quotes:
+            continue
+
+        # SME / series / RE suffixes skip (-SM, -ST, -RE, -BE etc.)
+        if "-" in tsym:
+            continue
+
+        if is_bad_symbol(tsym, x.get("name")):
+            continue
+
+        missing.append(x)
+
+    return missing
+
+
+async def inject_missing_from_upstox(client, master, upstox_nse, quotes):
+    """Missing NSE stocks ko Upstox OHLC se price/volume leke master mein add karo.
+    Market cap Upstox se nahi milta — in stocks ke liye mcap filter skip,
+    mcap = 0 (sort mein bottom pe aayenge)."""
+
+    print()
+    print("=" * 50)
+    print("     Upstox Injection (missing NSE)")
+    print("=" * 50)
+
+    if not UPSTOX_TOKEN:
+        print("  ⚠️  UPSTOX_ACCESS_TOKEN not set — injection skipped")
+        print("=" * 50)
+        return 0
+
+    existing = {s["symbol"] for s in master}
+    missing  = [x for x in find_missing_nse(upstox_nse, quotes)
+                if str(x.get("trading_symbol") or "").strip().upper() not in existing]
+
+    print(f"  📋 Missing from Finedge : {len(missing)}")
+
+    if not missing:
+        print("=" * 50)
+        return 0
+
+    key_map = {}
+    for x in missing:
+        ikey = x.get("instrument_key")
+        tsym = str(x.get("trading_symbol") or "").strip().upper()
+        if ikey and tsym:
+            key_map[tsym] = {"ikey": ikey, "name": str(x.get("name") or "").strip()}
+
+    ohlc = await fetch_upstox_ohlc(client, [v["ikey"] for v in key_map.values()])
+    print(f"  📡 Upstox OHLC received : {len(ohlc)}")
+
+    injected       = 0
+    no_data        = 0
+    below_price    = 0
+    below_turnover = 0
+
+    # Response keys: "NSE_EQ:SYMBOL"
+    ohlc_by_sym = {}
+    for k, v in ohlc.items():
+        sym = k.split(":")[-1].strip().upper()
+        ohlc_by_sym[sym] = v
+
+    for tsym, info in key_map.items():
+
+        d = ohlc_by_sym.get(tsym)
+        if not d:
+            no_data += 1
+            continue
+
+        candle = d.get("live_ohlc") or d.get("prev_ohlc") or {}
+
+        try:
+            price = float(d.get("last_price") or candle.get("close") or 0)
+            vol   = float(candle.get("volume") or 0)
+        except Exception:
+            no_data += 1
+            continue
+
+        if price <= 0:
+            no_data += 1
+            continue
+
+        if price < MIN_PRICE:
+            below_price += 1
+            continue
+
+        turnover_cr = (price * vol) / 1e7
+
+        if turnover_cr < MIN_TURNOVER_CR:
+            below_turnover += 1
+            continue
+
+        master.append({
+            "symbol":           tsym,
+            "name":             info["name"] or tsym,
+            "exchange":         "NSE",
+            "bse_code":         None,
+            "nse_code":         tsym,
+            "consolidated_ind": False,
+            "market_cap_cr":    0,          # Upstox se mcap nahi milta
+            "price":            price,
+            "volume":           vol,
+            "turnover_cr":      round(turnover_cr, 2),
+            "source":           "upstox",
+        })
+        injected += 1
+
+    master.sort(key=lambda x: x["market_cap_cr"], reverse=True)
+
+    print(f"  ✓ Injected              : {injected}")
+    print(f"  ✗ No OHLC data          : {no_data}")
+    print(f"  ✗ Price Rejected        : {below_price}")
+    print(f"  ✗ Turnover Rejected     : {below_turnover}")
+    print("=" * 50)
+
+    return injected
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
@@ -393,11 +624,14 @@ async def main():
 
         # Upstox NSE master — naye listings (e.g. CMRGREEN) ke names ke liye
         upstox_nse = await fetch_upstox_master(client, UPSTOX_NSE_URL, "NSE")
-        nse_name_map = {
-            str(x.get("trading_symbol", "")).strip().upper(): x.get("name")
-            for x in upstox_nse
-            if x.get("segment") == "NSE_EQ" and x.get("instrument_type") == "EQ"
-        }
+        nse_name_map = {}
+        for x in upstox_nse:
+            if x.get("segment") != "NSE_EQ":
+                continue
+            tsym = str(x.get("trading_symbol") or "").strip().upper()
+            nm   = str(x.get("name") or "").strip()
+            if tsym and nm and tsym not in nse_name_map:
+                nse_name_map[tsym] = nm
         print(f"  📋 NSE name map: {len(nse_name_map)} symbols")
 
         # Single quote call — dono builders ke liye reuse
@@ -410,6 +644,10 @@ async def main():
 
         # NSE-centric filtered master
         master = await build_master(client, data, quotes, nse_name_map)
+
+        # Finedge se missing stocks (naye listings) Upstox se inject karo
+        await inject_missing_from_upstox(client, master, upstox_nse, quotes)
+
         await r2_upload(client, OUTPUT_FILE, master)
 
         # Full BSE universe
