@@ -41,6 +41,35 @@ OUTPUT_MAP = {
 }
 
 
+# Summary patterns to drop (routine regulatory noise, not news)
+NOISE_PATTERNS = [
+    "Net Asset Value",
+]
+
+def is_noise(item: dict) -> bool:
+    summary = item.get("summary", "")
+    return any(p in summary for p in NOISE_PATTERNS)
+
+
+def dedup_items(items: list[dict]) -> list[dict]:
+    """
+    Dedup by link + title + summary, NOT published.
+    NSE re-publishes the same announcement with updated timestamps (NTPC type)
+    — those are duplicates. But NAV updates share one generic link with
+    different summaries — those are distinct and must be kept.
+    Items must be sorted newest-first before calling, so latest published wins.
+    """
+    seen = set()
+    out = []
+    for it in items:
+        key = (it.get("link", ""), it.get("title", ""), it.get("summary", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
 async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str) -> tuple[str, list[dict]]:
     try:
         r = await client.get(url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
@@ -112,8 +141,20 @@ async def run():
             for sk in source_keys:
                 items.extend(result_map.get(sk, []))
 
-            # Newest first (merged sources ke liye zaroori)
+            # Newest first (merged sources ke liye zaroori, aur dedup
+            # latest published wala instance rakhta hai)
             items.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+
+            before = len(items)
+            items = [it for it in items if not is_noise(it)]
+            dropped_noise = before - len(items)
+
+            before_dedup = len(items)
+            items = dedup_items(items)
+            dropped_dup = before_dedup - len(items)
+
+            if dropped_noise or dropped_dup:
+                print(f"  {filename}: -{dropped_noise} noise, -{dropped_dup} dup → {len(items)}")
 
             uploads.append((filename, make_payload(items)))
 
