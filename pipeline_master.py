@@ -43,6 +43,9 @@ MIN_BSE_MCAP_CR = 100       # BSE master: market cap >= 100 cr (tune as needed)
 # False = har BSE-listed stock (dual-listed bhi) -> "full BSE universe"
 BSE_ONLY_EXCLUSIVE = True
 
+# In symbols ko pipeline ke har stage pe trace karo (debug ke liye)
+DEBUG_SYMBOLS = ["CMRGREEN"]
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
@@ -76,6 +79,32 @@ def is_bad_symbol(symbol, name):
             return True
 
     return False
+
+
+def debug_trace_upstox(upstox_nse, quotes):
+    """DEBUG_SYMBOLS ko Upstox master + Finedge quotes mein trace karo."""
+
+    for ds in DEBUG_SYMBOLS:
+
+        key = ds.upper().replace(" ", "")
+        prefix = key[:5]
+
+        matches = [
+            x for x in upstox_nse
+            if prefix in str(x.get("trading_symbol") or "").upper().replace(" ", "")
+            or prefix in str(x.get("name") or "").upper().replace(" ", "")
+        ]
+
+        print(f"  🔍 DEBUG {ds}: {len(matches)} Upstox NSE entries matched")
+
+        for m in matches[:8]:
+            print(
+                f"      tsym={m.get('trading_symbol')!r} | seg={m.get('segment')} | "
+                f"type={m.get('instrument_type')} | name={m.get('name')!r} | "
+                f"ikey={m.get('instrument_key')}"
+            )
+
+        print(f"      in Finedge quotes : {key in quotes}")
 
 
 # =========================================================
@@ -536,21 +565,34 @@ async def inject_missing_from_upstox(client, master, upstox_nse, quotes):
     ohlc = await fetch_upstox_ohlc(client, [v["ikey"] for v in key_map.values()])
     print(f"  📡 Upstox OHLC received : {len(ohlc)}")
 
-    injected       = 0
-    no_data        = 0
-    below_price    = 0
-    below_turnover = 0
-
     # Response keys: "NSE_EQ:SYMBOL"
     ohlc_by_sym = {}
     for k, v in ohlc.items():
         sym = k.split(":")[-1].strip().upper()
         ohlc_by_sym[sym] = v
 
+    for ds in DEBUG_SYMBOLS:
+        key = ds.upper().replace(" ", "")
+        print(
+            f"  🔍 DEBUG {ds}: in key_map={key in key_map} | "
+            f"ohlc mila={key in ohlc_by_sym}"
+        )
+        if key in ohlc_by_sym:
+            print(f"      ohlc data: {json.dumps(ohlc_by_sym[key])[:300]}")
+
+    injected       = 0
+    no_data        = 0
+    below_price    = 0
+    below_turnover = 0
+
     for tsym, info in key_map.items():
+
+        is_debug = tsym in {d.upper().replace(" ", "") for d in DEBUG_SYMBOLS}
 
         d = ohlc_by_sym.get(tsym)
         if not d:
+            if is_debug:
+                print(f"  🔍 DEBUG {tsym}: REJECTED — no OHLC data")
             no_data += 1
             continue
 
@@ -560,22 +602,33 @@ async def inject_missing_from_upstox(client, master, upstox_nse, quotes):
             price = float(d.get("last_price") or candle.get("close") or 0)
             vol   = float(candle.get("volume") or 0)
         except Exception:
+            if is_debug:
+                print(f"  🔍 DEBUG {tsym}: REJECTED — price/vol parse fail")
             no_data += 1
             continue
 
         if price <= 0:
+            if is_debug:
+                print(f"  🔍 DEBUG {tsym}: REJECTED — price <= 0")
             no_data += 1
             continue
 
         if price < MIN_PRICE:
+            if is_debug:
+                print(f"  🔍 DEBUG {tsym}: REJECTED — price {price} < {MIN_PRICE}")
             below_price += 1
             continue
 
         turnover_cr = (price * vol) / 1e7
 
         if turnover_cr < MIN_TURNOVER_CR:
+            if is_debug:
+                print(f"  🔍 DEBUG {tsym}: REJECTED — turnover {turnover_cr:.2f} < {MIN_TURNOVER_CR}")
             below_turnover += 1
             continue
+
+        if is_debug:
+            print(f"  🔍 DEBUG {tsym}: ✅ INJECTED @ {price} (turnover {turnover_cr:.2f} cr)")
 
         master.append({
             "symbol":           tsym,
@@ -641,6 +694,9 @@ async def main():
         if not quotes:
             raise RuntimeError("quote fetch failed")
         print(f"✅ Got {len(quotes)} quotes from API")
+
+        # Debug trace — DEBUG_SYMBOLS kahan hain check karo
+        debug_trace_upstox(upstox_nse, quotes)
 
         # NSE-centric filtered master
         master = await build_master(client, data, quotes, nse_name_map)
