@@ -2,9 +2,11 @@ import asyncio
 import json
 import os
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import feedparser
 import httpx
+
+HISTORY_DAYS = 365  # retention window for history
 
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
@@ -159,6 +161,27 @@ def parse_desc(desc: str) -> dict:
     }
 
 
+async def r2_get_existing(client, filename) -> list[dict]:
+    """Fetch existing history from R2. Returns [] if file doesn't exist yet."""
+    try:
+        r = await client.get(
+            f"{WORKER_URL}?file={filename}",
+            headers={"X-Secret-Token": WORKER_TOKEN},
+            timeout=60
+        )
+        if r.status_code == 404:
+            print("No existing history file, starting fresh")
+            return []
+        r.raise_for_status()
+        data = r.json()
+        items = data.get("items", [])
+        print(f"Existing history: {len(items)} items")
+        return items
+    except Exception as e:
+        print(f"⚠ Could not fetch existing history ({e}), starting fresh")
+        return []
+
+
 async def r2_put(client, filename, data):
     body = json.dumps(data, ensure_ascii=False).encode()
     r = await client.post(
@@ -192,24 +215,43 @@ async def run():
 
     print("Fetching & parsing XMLs...")
     async with httpx.AsyncClient() as client:
-        tasks = [fetch_xml(client, item) for item in rss_items]
+        # Fetch existing history first — skip XMLs already processed
+        existing = await r2_get_existing(client, "nse_insider_trading.json")
+        known_urls = {d.get("xml_url", "") for d in existing}
+        new_rss = [it for it in rss_items if it["xml_url"] not in known_urls]
+        print(f"New XMLs to fetch: {len(new_rss)} (skipped {len(rss_items) - len(new_rss)} known)")
+
+        if not new_rss:
+            print("Nothing new, skipping upload")
+            return
+
+        tasks = [fetch_xml(client, item) for item in new_rss]
         results = await asyncio.gather(*tasks)
 
         # Flatten — each XML can have multiple disclosures
-        all_items = [d for disclosures in results for d in disclosures]
+        new_items = [d for disclosures in results for d in disclosures]
 
-        before = len(all_items)
-        all_items = dedup_trades(all_items)
-        print(f"Dedup: {before} → {len(all_items)}")
+        ok  = sum(1 for d in new_items if "fetch_error" not in d and "parse_error" not in d)
+        err = len(new_items) - ok
+        print(f"This run: {ok} ok, {err} errors")
 
-        ok  = sum(1 for d in all_items if "fetch_error" not in d and "parse_error" not in d)
-        err = len(all_items) - ok
-        print(f"Disclosures: {ok} ok, {err} errors")
+        # Merge with existing history (new first → latest published wins on dedup)
+        clean_new = [d for d in new_items if "fetch_error" not in d and "parse_error" not in d]
+        merged = dedup_trades(clean_new + existing)
+        added = len(merged) - len(existing)
+        print(f"History: {len(existing)} + {added} new = {len(merged)}")
+
+        # Retention: keep last HISTORY_DAYS of filings
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
+        merged = [d for d in merged if d.get("date_filing", "") >= cutoff]
+
+        # Sort: latest filing first, then published desc
+        merged.sort(key=lambda d: (d.get("date_filing", ""), d.get("published", "")), reverse=True)
 
         payload = {
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "count": len(all_items),
-            "items": all_items
+            "count": len(merged),
+            "items": merged
         }
 
         await r2_put(client, "nse_insider_trading.json", payload)
