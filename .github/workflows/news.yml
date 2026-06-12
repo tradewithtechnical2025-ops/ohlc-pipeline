@@ -1,14 +1,14 @@
 name: Market Data Pipeline
 on:
-  schedule:
-    # Every 15 min, 6:00 AM - 10:00 PM IST (00:30-16:30 UTC), weekdays
-    - cron: '30,45 0 * * 1-5'      # 6:00, 6:15 AM IST
-    - cron: '*/15 1-15 * * 1-5'    # 6:30 AM - 9:15 PM IST
-    - cron: '0,15,30 16 * * 1-5'   # 9:30, 9:45, 10:00 PM IST
-  workflow_dispatch:  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'fast = news+insider only, full = IPO bhi'
+        default: 'fast'
 jobs:
   run-pipelines:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,6 +16,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
       - name: Install dependencies
         run: pip install httpx feedparser
       - name: Run Insider Trading Pipeline
@@ -29,6 +30,7 @@ jobs:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
       - name: Run IPO scan
+        if: ${{ github.event.inputs.mode == 'full' }}
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           WORKER_URL:   ${{ secrets.WORKER_URL }}
