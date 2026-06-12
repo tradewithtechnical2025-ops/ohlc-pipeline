@@ -1,4 +1,5 @@
 import asyncio
+import calendar
 import json
 import os
 from datetime import datetime, timezone
@@ -25,18 +26,18 @@ FEEDS = [
     ("nse_board",         "NSE Board Meetings",      "https://nsearchives.nseindia.com/content/RSS/Board_Meetings.xml"),
     ("nse_corp_actions",  "NSE Corporate Actions",   "https://nsearchives.nseindia.com/content/RSS/Corporate_action.xml"),
     # Market News
-    ("et_markets",         "Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
-    ("mint_markets",      "LiveMint Markets",        "https://www.livemint.com/rss/markets"),
-   
+    ("et_markets",   "Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+    ("mint_markets", "LiveMint Markets",        "https://www.livemint.com/rss/markets"),
 ]
 
-# R2 output files
+# source_key(s) -> R2 output file
+# Single key = individual file, list = merged file
 OUTPUT_MAP = {
-    "nse_results":       "nse_results_feed.json",
-    "nse_announcements": "nse_announcements.json",
-    "nse_board":         "nse_board_meetings.json",
-    "nse_corp_actions":  "nse_corp_actions.json",
-    "market_news":       "market_news.json",   # merged: mc + mint + cnbc
+    "nse_results_feed.json":   ["nse_results"],
+    "nse_announcements.json":  ["nse_announcements"],
+    "nse_board_meetings.json": ["nse_board"],
+    "nse_corp_actions.json":   ["nse_corp_actions"],
+    "market_news.json":        ["et_markets", "mint_markets"],
 }
 
 
@@ -47,13 +48,24 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
         feed = feedparser.parse(r.content)
         items = []
         for entry in feed.entries:
+
+            # Epoch timestamp for reliable cross-source sorting
+            ts = 0
+            parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+            if parsed:
+                try:
+                    ts = calendar.timegm(parsed)
+                except Exception:
+                    ts = 0
+
             items.append({
-                "source":      label,
-                "source_key":  source_key,
-                "title":       entry.get("title", "").strip(),
-                "link":        entry.get("link", ""),
-                "published":   entry.get("published", ""),
-                "summary":     entry.get("summary", entry.get("description", "")).strip()[:300],
+                "source":       label,
+                "source_key":   source_key,
+                "title":        entry.get("title", "").strip(),
+                "link":         entry.get("link", ""),
+                "published":    entry.get("published", ""),
+                "published_ts": ts,
+                "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
             })
         print(f"  ✓ {label}: {len(items)} items")
         return source_key, items
@@ -94,21 +106,16 @@ async def run():
 
         uploads = []
 
-        # NSE individual files
-        for source_key, filename in [
-            ("nse_results",       "nse_results_feed.json"),
-            ("nse_announcements", "nse_announcements.json"),
-            ("nse_board",         "nse_board_meetings.json"),
-            ("nse_corp_actions",  "nse_corp_actions.json"),
-        ]:
-            items = result_map.get(source_key, [])
-            uploads.append((filename, make_payload(items)))
+        for filename, source_keys in OUTPUT_MAP.items():
 
-        # Market news — merge mc + mint + cnbc, sort by source
-        news_items = []
-        for sk in ["mc_news", "mint_markets", "cnbctv18"]:
-            news_items.extend(result_map.get(sk, []))
-        uploads.append(("market_news.json", make_payload(news_items)))
+            items = []
+            for sk in source_keys:
+                items.extend(result_map.get(sk, []))
+
+            # Newest first (merged sources ke liye zaroori)
+            items.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+
+            uploads.append((filename, make_payload(items)))
 
         # Upload all concurrently
         print("\nUploading to R2...")
