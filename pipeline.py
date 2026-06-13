@@ -1174,13 +1174,20 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         for sym in syms:
             if sym not in result_map or date_str>result_map[sym]: result_map[sym]=date_str
     feed=[]
-    for sym,s in all_data.items():
-        dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
-        if n<20: continue
-        ltp=closes[-1]; prev_cls=closes[-2] if n>=2 else None
-        pct_ch=round((ltp-prev_cls)/prev_cls*100,2) if ltp and prev_cls else None
-        vol=volumes[-1]
-        if not ltp: continue
+   for sym, s in all_data.items():
+        dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]
+        closes=s["c"]; volumes=s["v"]; n=len(dates)
+        
+        if n < 2: continue   # 20 → 2, sirf pct_ch ke liye prev candle chahiye
+        
+        # Last valid close (None nahi)
+        ltp = next((v for v in reversed(closes) if v), None)
+        if not ltp: continue  # genuinely no price data ever
+        
+        prev_cls = next((closes[i] for i in range(n-2, -1, -1) if closes[i]), None)
+        today_close = closes[-1]  # None if stock didn't trade today
+        pct_ch = round((today_close - prev_cls) / prev_cls * 100, 2) if today_close and prev_cls else None
+        vol = volumes[-1] or 0
         w52_highs=[v for v in highs[-252:] if v is not None]; w52_lows=[v for v in lows[-252:] if v is not None]
         high52=max(w52_highs) if w52_highs else None; low52=min(w52_lows) if w52_lows else None
         whd52=round((ltp-high52)/high52*100,2) if high52 else None
