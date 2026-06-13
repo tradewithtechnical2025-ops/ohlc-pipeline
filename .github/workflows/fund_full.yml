@@ -1,0 +1,39 @@
+name: Fundamentals Full Fetch
+
+on:
+  workflow_dispatch:
+    inputs:
+      part:
+        description: 'Part to run (0 = all, 1-10 = specific part)'
+        required: false
+        default: '0'
+
+jobs:
+  fund_full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run Fundamentals Full
+        env:
+          UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:    ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+        run: |
+          PART="${{ github.event.inputs.part }}"
+          if [ "$PART" = "0" ]; then
+            python pipeline.py fund_full
+          else
+            python pipeline.py fund_full_$PART
+          fi
