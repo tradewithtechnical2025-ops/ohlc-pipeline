@@ -1174,7 +1174,7 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         for sym in syms:
             if sym not in result_map or date_str>result_map[sym]: result_map[sym]=date_str
     feed=[]
-   for sym, s in all_data.items():
+    for sym, s in all_data.items():
         dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]
         closes=s["c"]; volumes=s["v"]; n=len(dates)
         
