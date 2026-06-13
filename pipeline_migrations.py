@@ -24,6 +24,9 @@ HEADERS    = {"User-Agent": "Mozilla/5.0"}
 DL_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 UP_HEADERS = {"X-Secret-Token": WORKER_TOKEN, "Content-Type": "application/json"}
 
+# Keywords that indicate bonds / NCDs / debentures in BSE_EQ
+BOND_KEYWORDS = {"%", "NCD", "BOND", "DEBENTURE", "PVT", "SR-", "TRANCHE", "SERIES"}
+
 # =========================================================
 # DATE HELPERS
 # =========================================================
@@ -68,14 +71,37 @@ async def fetch_upstox(client, url, label):
     print(f"📡 Fetching Upstox {label} master...")
     r = await client.get(
         url,
-        headers={"User-Agent": "Mozilla/5.0", "Accept": "*/*", "Referer": "https://upstox.com/"},
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "*/*",
+            "Referer": "https://upstox.com/",
+        },
         follow_redirects=True,
         timeout=120,
     )
     r.raise_for_status()
     data = json.loads(gzip.decompress(r.content))
-    print(f"✅ Loaded {len(data)} {label} instruments")
+    print(f"✅ Loaded {len(data)} {label} raw instruments")
     return data
+
+# =========================================================
+# BOND FILTER
+# =========================================================
+
+def is_bond(x):
+    """
+    Returns True for bonds / NCDs / debentures that sneak
+    into BSE_EQ segment.
+    - Symbol starts with digit  e.g. 775IRFC33
+    - Name contains bond keywords e.g. IRFC-7.75%-15-4-33-PVT
+    """
+    sym  = (x.get("trading_symbol") or "")
+    name = (x.get("name") or "").upper()
+    if sym and sym[0].isdigit():
+        return True
+    if any(k in name for k in BOND_KEYWORDS):
+        return True
+    return False
 
 # =========================================================
 # SNAPSHOT BUILDERS
@@ -84,7 +110,7 @@ async def fetch_upstox(client, url, label):
 def build_bse_snapshot(data):
     """
     Key    : exchange_token
-    Filter : BSE_EQ or BSE_SME + ISIN starts with INE
+    Filter : BSE_EQ / BSE_SME  +  INE ISIN  +  not a bond
     """
     out = {}
     for x in data:
@@ -93,6 +119,8 @@ def build_bse_snapshot(data):
             continue
         isin = str(x.get("isin") or "")
         if not isin.startswith("INE"):
+            continue
+        if is_bond(x):
             continue
         token = str(x.get("exchange_token") or "").strip()
         if not token:
@@ -109,8 +137,8 @@ def build_bse_snapshot(data):
 
 def build_nse_snapshot(data):
     """
-    Key    : isin (for cross-matching with BSE)
-    Filter : NSE_EQ + ISIN starts with INE
+    Key    : isin  (for cross-matching with BSE)
+    Filter : NSE_EQ  +  INE ISIN
     """
     out = {}
     for x in data:
@@ -197,7 +225,7 @@ def detect_delisted_nse(old_nse, new_nse, date):
 
 def detect_bse_to_nse(old_nse, new_nse, new_bse, date):
     """
-    Newly appeared on NSE today AND already exists on BSE
+    Newly on NSE today  AND  already on BSE
     = BSE-only stock got NSE listing
     """
     bse_by_isin = {v["isin"]: v for v in new_bse.values()}
@@ -205,7 +233,7 @@ def detect_bse_to_nse(old_nse, new_nse, new_bse, date):
     for isin in sorted(set(new_nse) - set(old_nse)):
         bse = bse_by_isin.get(isin)
         if not bse:
-            continue  # pure new NSE listing, not BSE->NSE
+            continue  # pure new NSE IPO, not BSE->NSE
         nse = new_nse[isin]
         out.append({
             "event":       "BSE_TO_NSE",
@@ -264,21 +292,22 @@ def detect_sme_to_nse(old_nse, new_nse, old_bse, date):
 # ROLLING APPEND  (180 days)
 # =========================================================
 
-def append_events(existing, new_events):
-    cutoff = (
+def cutoff_date():
+    return (
         datetime.now(timezone.utc) - timedelta(days=EVENTS_RETENTION_DAYS)
     ).strftime("%Y-%m-%d")
-    filtered = [e for e in existing if e.get("date", "") >= cutoff]
+
+
+def append_events(existing, new_events):
+    cut = cutoff_date()
+    filtered = [e for e in existing if e.get("date", "") >= cut]
     filtered.extend(new_events)
     return filtered
 
 
 def append_summary(existing, new_entry):
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=EVENTS_RETENTION_DAYS)
-    ).strftime("%Y-%m-%d")
-    filtered = [e for e in existing if e.get("date", "") >= cutoff]
-    # replace if same date already exists
+    cut = cutoff_date()
+    filtered = [e for e in existing if e.get("date", "") >= cut]
     filtered = [e for e in filtered if e.get("date") != new_entry["date"]]
     filtered.append(new_entry)
     filtered.sort(key=lambda x: x["date"])
@@ -296,6 +325,8 @@ async def main():
     print("=" * 60)
     print("      MIGRATION TRACKER")
     print("=" * 60)
+    print(f"Date : {today}")
+    print("=" * 60)
 
     async with httpx.AsyncClient(headers=HEADERS) as client:
 
@@ -312,7 +343,7 @@ async def main():
             print("\n⚠️  First Run — saving baseline, no reports today.")
 
         # --------------------------------------------------
-        # Fetch today
+        # Fetch today from Upstox
         # --------------------------------------------------
 
         bse_raw = await fetch_upstox(client, UPSTOX_BSE_URL, "BSE")
@@ -321,8 +352,8 @@ async def main():
         new_bse = build_bse_snapshot(bse_raw)
         new_nse = build_nse_snapshot(nse_raw)
 
-        print(f"📊 BSE equity : {len(new_bse)} stocks")
-        print(f"📊 NSE equity : {len(new_nse)} stocks")
+        print(f"\n📊 BSE equity stocks : {len(new_bse)}")
+        print(f"📊 NSE equity stocks : {len(new_nse)}")
 
         # --------------------------------------------------
         # Save today as new snapshot (overwrites yesterday)
