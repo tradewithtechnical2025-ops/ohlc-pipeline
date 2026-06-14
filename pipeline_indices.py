@@ -283,7 +283,7 @@ def parse_index_returns(rows, valid_symbols):
         symbol = normalize_index_symbol(row.get("index_symbol"))
         if symbol not in valid_symbols:
             skipped += 1; continue
-        dates = row.get("dates", {})
+        dates = row.get("dates") or {}
         ret = {}
         for p in PERIODS:
             raw = row.get(p)
