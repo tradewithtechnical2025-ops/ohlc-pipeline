@@ -1,4 +1,4 @@
-name: Events Pipeline
+name: Corporate Pipeline
 
 on:
   workflow_dispatch:
@@ -29,8 +29,9 @@ jobs:
       - name: Run Events Pipeline
         env:
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-
+        
         run: |
           python pipeline_events.py
