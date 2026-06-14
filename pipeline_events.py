@@ -1,748 +1,288 @@
 #!/usr/bin/env python3
+"""
+Corporate Actions Pipeline — GitHub Actions
+Fetches corporate actions for all NSE stocks from Upstox per-ISIN endpoint
+and uploads to R2 as corporate_actions.json
+
+Usage:
+  python pipeline_corporate_actions.py
+"""
 
 import asyncio
 import json
+import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import httpx
 
-FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
-WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
-WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
+UPSTOX_TOKEN = os.environ["UPSTOX_TOKEN"]
+WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
-WORKER_HEADERS = {
-    "X-Secret-Token": WORKER_TOKEN,
-    "Content-Type": "application/json",
-}
+UPSTOX_BASE    = "https://api.upstox.com/v2"
+WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
-
-# ─────────────────────────────────────────────
-# Helpers
-# ─────────────────────────────────────────────
+CONCURRENCY  = 50
+DELAY        = 0.1
+RETRY        = 3
 
 TYPE_MAP = {
-
-    "dividend": "Dividend",
-    "final dividend": "Final Dividend",
-    "interim dividend": "Interim Dividend",
-    "special dividend": "Special Dividend",
-
-    "bonus": "Bonus",
-    "bonus issue": "Bonus",
-
-    "split": "Split",
-    "stock split": "Split",
-
-    "rights": "Rights",
-    "rights issue": "Rights",
-
-    "buyback": "Buyback",
-
-    "merger": "Merger",
-    "demerger": "Demerger",
+    "dividend"        : "Dividend",
+    "bonus"           : "Bonus",
+    "bonus issue"     : "Bonus",
+    "split"           : "Split",
+    "stock split"     : "Split",
+    "rights"          : "Rights",
+    "rights issue"    : "Rights",
+    "buyback"         : "Buyback",
+    "merger"          : "Merger",
+    "demerger"        : "Demerger",
 }
-
 
 VALID_TYPES = {
-    "Dividend",
-    "Final Dividend",
-    "Interim Dividend",
-    "Special Dividend",
-    "Bonus",
-    "Split",
-    "Rights",
-    "Buyback",
-    "Merger",
-    "Demerger",
+    "Dividend", "Bonus", "Split", "Rights", "Buyback", "Merger", "Demerger"
 }
 
 
-KEYWORDS = [
-    "presentation",
-    "transcript",
-    "concall",
-    "conference call",
-    "earnings call",
-    "analyst meet",
-    "investor meet",
-]
+# ──────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────
+
+def _headers():
+    return {
+        "Accept"       : "application/json",
+        "Authorization": f"Bearer {UPSTOX_TOKEN}",
+    }
 
 
 def normalize_type(v):
-
-    v = str(v).strip().lower()
-
-    return TYPE_MAP.get(v, v.title())
+    return TYPE_MAP.get(str(v).strip().lower(), str(v).strip().title())
 
 
-def clean_float(v):
+def parse_date(v):
+    """'14 Aug 2025' → '2025-08-14'  |  already ISO → passthrough  |  None → ''"""
+    if not v:
+        return ""
+    v = str(v).strip()
+    if not v:
+        return ""
+    # Already ISO
+    if len(v) == 10 and v[4] == "-":
+        return v
+    # "14 Aug 2025"
+    for fmt in ("%d %b %Y", "%d-%b-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return v
 
+
+def extract_event_detail(event_details, name):
+    """event_details list mein se `name` key wali value nikalo."""
+    for item in (event_details or []):
+        if str(item.get("name", "")).strip().lower() == name.lower():
+            return item.get("value")
+    return None
+
+
+def parse_action(raw):
+    """Single raw action dict → normalized dict (or None if invalid)."""
+
+    action_type = normalize_type(raw.get("name", ""))
+    if action_type not in VALID_TYPES:
+        return None
+
+    details = raw.get("event_details") or []
+
+    # Dates
+    ex_date           = parse_date(
+        extract_event_detail(details, "Ex dividend date")
+        or extract_event_detail(details, "Ex date")
+        or raw.get("expiry_date")
+    )
+    record_date       = parse_date(extract_event_detail(details, "Record date"))
+    announcement_date = parse_date(extract_event_detail(details, "Announcement date"))
+
+    # Sub-type (Final / Interim / Special)
+    sub_type = extract_event_detail(details, "Dividend type") or ""
+
+    # Amount
+    amount = raw.get("amount")
     try:
-        return float(
-            str(v).replace(",", "")
-        )
-    except:
-        return 0
+        amount = float(amount) if amount not in (None, "") else None
+    except (ValueError, TypeError):
+        amount = None
+
+    # Ratio (bonus / split)
+    ratio = raw.get("ratio")
+    if ratio == "":
+        ratio = None
+
+    # Dividend %
+    div_pct = extract_event_detail(details, "Dividend %")
+    try:
+        div_pct = float(div_pct) if div_pct not in (None, "") else None
+    except (ValueError, TypeError):
+        div_pct = None
+
+    # Detail text
+    detail = extract_event_detail(details, "Details") or ""
+
+    return {
+        "type"             : action_type,
+        "sub_type"         : sub_type,
+        "announcement_date": announcement_date,
+        "ex_date"          : ex_date,
+        "record_date"      : record_date,
+        "amount"           : amount,
+        "div_pct"          : div_pct,
+        "ratio"            : ratio,
+        "detail"           : detail,
+    }
 
 
-# ─────────────────────────────────────────────
-# R2 Helpers
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# R2
+# ──────────────────────────────────────────────
 
 async def r2_download(client, filename):
-
-    url = f"{WORKER_URL}/{filename}"
-
     r = await client.get(
-        url,
+        f"{WORKER_URL}/{filename}",
         headers=WORKER_HEADERS,
         timeout=120,
     )
-
     if r.status_code != 200:
-        return {}
-
+        return None
     try:
         return r.json()
-    except:
-        return {}
+    except Exception:
+        return None
 
 
 async def r2_upload(client, filename, data):
-
-    url = f"{WORKER_URL}?file={filename}"
-
+    payload = json.dumps(data, separators=(",", ":")).encode()
     r = await client.post(
-        url,
-        headers=WORKER_HEADERS,
-        content=json.dumps(data).encode(),
+        f"{WORKER_URL}?file={filename}",
+        headers={**WORKER_HEADERS, "Content-Type": "application/json"},
+        content=payload,
         timeout=120,
     )
-
     if r.status_code != 200:
-        raise RuntimeError(f"{filename} upload failed")
+        raise RuntimeError(f"Upload failed {filename}: HTTP {r.status_code}")
+    log.info(f"  ↑ {filename} ({len(payload)/1024:.1f} KB)")
 
 
-# ─────────────────────────────────────────────
-# Corporate Actions
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
+# Fetch per ISIN
+# ──────────────────────────────────────────────
 
-async def fetch_corporate_actions(client):
-
-    today = datetime.now().date()
-
-    start = today - timedelta(days=30)
-    end   = today + timedelta(days=90)
-
-    all_rows = []
-
-    current = start
-
-    while current < end:
-
-        chunk_end = min(
-            current + timedelta(days=29),
-            end
-        )
-
-        from_date = current.strftime(
-            "%d-%b-%Y"
-        )
-
-        to_date = chunk_end.strftime(
-            "%d-%b-%Y"
-        )
-
-        print(
-            f"[CA] {from_date} -> {to_date}"
-        )
-
-        url = f"{FINEDGE_BASE}/corporate-actions/all"
-
-        params = {
-            "from_date": from_date,
-            "to_date": to_date,
-            "token": FINEDGE_TOKEN,
-        }
-
-        try:
-
-            r = await client.get(
-                url,
-                params=params,
-                timeout=120,
-            )
-
-            if r.status_code != 200:
-
-                print(
-                    f"[CA] Failed {from_date} -> {to_date}"
-                )
-
-                current = chunk_end + timedelta(days=1)
+async def fetch_ca_for_isin(client, sem, symbol, isin):
+    url = f"{UPSTOX_BASE}/fundamentals/{isin}/corporate-actions"
+    async with sem:
+        await asyncio.sleep(DELAY)
+        for attempt in range(RETRY):
+            try:
+                r = await client.get(url, headers=_headers(), timeout=20)
+            except httpx.RequestError as e:
+                await asyncio.sleep(2 ** attempt)
                 continue
-
-            data = r.json()
-
-            if isinstance(data, list):
-
-                all_rows.extend(data)
-
-        except Exception as e:
-
-            print(
-                f"[CA] Error: {e}"
-            )
-
-        current = chunk_end + timedelta(days=1)
-
-    return all_rows
-
-
-def parse_corporate_actions(rows):
-
-    output = {}
-
-    for row in rows:
-
-        symbol = str(
-            row.get("symbol", "")
-        ).strip().upper()
-
-        if not symbol:
-            continue
-
-        if symbol.isdigit():
-            continue
-
-        action_type = normalize_type(
-            row.get("action", "")
-        )
-
-        if action_type not in VALID_TYPES:
-            continue
-
-        item = {
-
-            "date": row.get("ex_date"),
-
-            "timestamp": row.get(
-                "timestamp_unix"
-            ),
-
-            "type": action_type,
-
-            "sub_type": normalize_type(
-                row.get("dividend_type", "")
-            ),
-
-            "value": row.get("amount"),
-
-            "text": row.get("subject"),
-        }
-
-        output.setdefault(symbol, [])
-        output[symbol].append(item)
-
-    for symbol in output:
-
-        output[symbol].sort(
-            key=lambda x: x["timestamp"]
-        )
-
-    return output
-
-
-def merge_history(old, new):
-
-    merged = old.copy()
-
-    for symbol, actions in new.items():
-
-        merged.setdefault(symbol, [])
-
-        existing = {
-
-            (
-                x.get("date"),
-                x.get("type"),
-                x.get("text"),
-            )
-
-            for x in merged[symbol]
-        }
-
-        for item in actions:
-
-            key = (
-                item.get("date"),
-                item.get("type"),
-                item.get("text"),
-            )
-
-            if key not in existing:
-
-                merged[symbol].append(item)
-
-    return merged
-
-
-# ─────────────────────────────────────────────
-# Results Calendar
-# ─────────────────────────────────────────────
-
-async def fetch_results_calendar(client):
-
-    today = datetime.now().date()
-
-    from_date = (
-        today - timedelta(days=7)
-    ).strftime("%Y-%m-%d")
-
-    to_date = (
-        today + timedelta(days=30)
-    ).strftime("%Y-%m-%d")
-
-    url = f"{FINEDGE_BASE}/results-calendar"
-
-    params = {
-        "from_date": from_date,
-        "to_date": to_date,
-        "token": FINEDGE_TOKEN,
-    }
-
-    r = await client.get(
-        url,
-        params=params,
-        timeout=120,
-    )
-
-    r.raise_for_status()
-
-    return r.json()
-
-
-def parse_results_calendar(rows):
-
-    output = {}
-
-    for row in rows:
-
-        symbol = str(
-            row.get("symbol", "")
-        ).strip().upper()
-
-        if not symbol:
-            continue
-
-        if symbol.isdigit():
-            continue
-
-        output[symbol] = {
-
-            "name": row.get(
-                "company_name"
-            ),
-
-            "date": row.get(
-                "expected_result_date"
-            )
-        }
-
-    return output
-
-
-# ─────────────────────────────────────────────
-# IPO Calendar
-# ─────────────────────────────────────────────
-
-async def fetch_ipo_calendar(client):
-
-    today = datetime.now().date()
-
-    from_date = (
-        today - timedelta(days=7)
-    ).strftime("%Y-%m-%d")
-
-    to_date = (
-        today + timedelta(days=30)
-    ).strftime("%Y-%m-%d")
-
-    url = f"{FINEDGE_BASE}/ipo-calendar"
-
-    params = {
-        "from_date": from_date,
-        "to_date": to_date,
-        "token": FINEDGE_TOKEN,
-    }
-
-    r = await client.get(
-        url,
-        params=params,
-        timeout=120,
-    )
-
-    r.raise_for_status()
-
-    data = r.json()
-
-    return data.get("data", [])
-
-
-def parse_ipo_calendar(rows):
-
-    output = {}
-
-    for row in rows:
-
-        symbol = str(
-            row.get("symbol", "")
-        ).strip().upper()
-
-        if not symbol:
-            continue
-
-        output[symbol] = {
-
-            "name": row.get(
-                "company_name"
-            ),
-
-            "status": row.get(
-                "ipo_status"
-            ),
-
-            "start_date": row.get(
-                "start_date"
-            ),
-
-            "end_date": row.get(
-                "end_date"
-            ),
-
-            "price_range": row.get(
-                "price_range"
-            ),
-
-            "issue_size": row.get(
-                "issue_size"
-            ),
-
-            "subscription": clean_float(
-                row.get("subscription")
-            ),
-
-            "security_type": row.get(
-                "security_type"
-            ),
-
-            "exchange": row.get(
-                "exchange"
-            ),
-        }
-
-    return output
-
-
-# ─────────────────────────────────────────────
-# Filings
-# ─────────────────────────────────────────────
-
-async def fetch_filings_chunk(
-    client,
-    endpoint,
-    from_date,
-    to_date
-):
-
-    url = f"{FINEDGE_BASE}/{endpoint}"
-
-    params = {
-        "from_date": from_date,
-        "to_date": to_date,
-        "token": FINEDGE_TOKEN,
-    }
-
-    try:
-
-        r = await client.get(
-            url,
-            params=params,
-            timeout=120,
-        )
-
-        if r.status_code != 200:
-            return []
-
-        data = r.json()
-
-        if isinstance(data, list):
-            return data
-
-        return []
-
-    except:
-        return []
-
-
-async def fetch_filings(client):
-
-    today = datetime.now().date()
-
-    start = today - timedelta(days=30)
-    end   = today
-
-    all_rows = []
-
-    current = start
-
-    while current < end:
-
-        chunk_end = min(
-            current + timedelta(days=6),
-            end
-        )
-
-        from_date = current.strftime(
-            "%Y-%m-%d"
-        )
-
-        to_date = chunk_end.strftime(
-            "%Y-%m-%d"
-        )
-
-        print(
-            f"[FILINGS] {from_date} -> {to_date}"
-        )
-
-        pres = await fetch_filings_chunk(
-            client,
-            "investor-presentations",
-            from_date,
-            to_date
-        )
-
-        tran = await fetch_filings_chunk(
-            client,
-            "investor-call-transcripts",
-            from_date,
-            to_date
-        )
-
-        all_rows.extend(pres)
-        all_rows.extend(tran)
-
-        current = chunk_end + timedelta(days=1)
-
-    return all_rows
-
-
-def detect_filing_type(text):
-
-    text = text.lower()
-
-    if "presentation" in text:
-        return "Presentation"
-
-    if "transcript" in text:
-        return "Transcript"
-
-    if "concall" in text:
-        return "Transcript"
-
-    if "conference call" in text:
-        return "Transcript"
-
-    if "earnings call" in text:
-        return "Transcript"
-
-    return "Filing"
-
-
-def parse_filings(rows):
-
-    output = {}
-
-    for row in rows:
-
-        symbol = str(
-            row.get("stock_symbol", "")
-        ).strip().upper()
-
-        if not symbol:
-            continue
-
-        if symbol.isdigit():
-            continue
-
-        text = str(
-            row.get("description", "")
-        )
-
-        text_l = text.lower()
-
-        if not any(
-            k in text_l
-            for k in KEYWORDS
-        ):
-            continue
-
-        item = {
-
-            "date": row.get("ex_date"),
-
-            "timestamp": row.get(
-                "timestamp_unix"
-            ),
-
-            "type": detect_filing_type(
-                text
-            ),
-
-            "title": text,
-
-            "pdf": row.get(
-                "pdf_file_link"
-            ),
-        }
-
-        output.setdefault(symbol, [])
-        output[symbol].append(item)
-
-    return output
-
-
-# ─────────────────────────────────────────────
+            if r.status_code == 401:
+                log.error("❌ UPSTOX_TOKEN invalid")
+                raise SystemExit(1)
+            if r.status_code == 429:
+                log.warning(f"  429 — waiting 30s ({symbol})")
+                await asyncio.sleep(30)
+                continue
+            if r.status_code == 404:
+                return symbol, []
+            if r.status_code != 200:
+                return symbol, []
+            try:
+                data = r.json()
+                return symbol, data.get("data") or []
+            except Exception:
+                return symbol, []
+    return symbol, []
+
+
+# ──────────────────────────────────────────────
 # Main
-# ─────────────────────────────────────────────
+# ──────────────────────────────────────────────
 
-async def main():
+async def run():
+
+    log.info("━━━ Corporate Actions Pipeline ━━━")
 
     async with httpx.AsyncClient() as client:
 
-        # ─────────────────────────
-        # Corporate Actions
-        # ─────────────────────────
+        # Step 1: master.json se symbol → ISIN map
+        log.info("Downloading master.json…")
+        master = await r2_download(client, "master.json")
+        if not master:
+            raise RuntimeError("master.json download failed")
 
-        print(
-            "\n=== Corporate Actions ==="
-        )
+        isin_map = {
+            s["symbol"]: s["isin"]
+            for s in master
+            if s.get("isin")
+        }
+        log.info(f"  {len(isin_map)} symbols with ISIN")
 
-        ca_rows = await fetch_corporate_actions(
-            client
-        )
+        # Step 2: concurrent fetch
+        log.info(f"Fetching corporate actions ({CONCURRENCY} concurrent)…")
+        sem     = asyncio.Semaphore(CONCURRENCY)
+        tasks   = [
+            fetch_ca_for_isin(client, sem, symbol, isin)
+            for symbol, isin in isin_map.items()
+        ]
+        results = await asyncio.gather(*tasks)
 
-        ca_parsed = parse_corporate_actions(
-            ca_rows
-        )
+        # Step 3: parse + build output
+        output      = {}
+        total_acts  = 0
+        empty_syms  = 0
+        skipped     = 0
 
-        await r2_upload(
-            client,
-            "corporate_actions_upcoming.json",
-            ca_parsed
-        )
+        for symbol, raw_list in results:
+            if not raw_list:
+                empty_syms += 1
+                continue
 
-        history = await r2_download(
-            client,
-            "corporate_actions_history.json"
-        )
+            parsed = []
+            for raw in raw_list:
+                item = parse_action(raw)
+                if item is None:
+                    skipped += 1
+                    continue
+                parsed.append(item)
 
-        merged = merge_history(
-            history,
-            ca_parsed
-        )
+            if parsed:
+                # Sort by ex_date desc (latest first)
+                parsed.sort(key=lambda x: x["ex_date"] or "", reverse=True)
+                output[symbol] = parsed
+                total_acts += len(parsed)
 
-        await r2_upload(
-            client,
-            "corporate_actions_history.json",
-            merged
-        )
+        log.info(f"  Symbols with actions : {len(output)}")
+        log.info(f"  Total actions        : {total_acts}")
+        log.info(f"  Empty / no data      : {empty_syms}")
+        log.info(f"  Skipped (bad type)   : {skipped}")
 
-        print(
-            "✅ Corporate Actions Uploaded"
-        )
+        # Step 4: upload
+        await r2_upload(client, "corporate_actions.json", output)
 
-        # ─────────────────────────
-        # Results Calendar
-        # ─────────────────────────
-
-        print(
-            "\n=== Results Calendar ==="
-        )
-
-        rc_rows = await fetch_results_calendar(
-            client
-        )
-
-        rc_parsed = parse_results_calendar(
-            rc_rows
-        )
-
-        await r2_upload(
-            client,
-            "results_calendar.json",
-            rc_parsed
-        )
-
-        print(
-            "✅ Results Calendar Uploaded"
-        )
-
-        # ─────────────────────────
-        # IPO Calendar
-        # ─────────────────────────
-
-        print(
-            "\n=== IPO Calendar ==="
-        )
-
-        ipo_rows = await fetch_ipo_calendar(
-            client
-        )
-
-        ipo_parsed = parse_ipo_calendar(
-            ipo_rows
-        )
-
-        await r2_upload(
-            client,
-            "ipo_calendar.json",
-            ipo_parsed
-        )
-
-        print(
-            "✅ IPO Calendar Uploaded"
-        )
-
-        # ─────────────────────────
-        # Filings
-        # ─────────────────────────
-
-        print(
-            "\n=== Filings ==="
-        )
-
-        filings_rows = await fetch_filings(
-            client
-        )
-
-        filings_parsed = parse_filings(
-            filings_rows
-        )
-
-        await r2_upload(
-            client,
-            "filings_index.json",
-            filings_parsed
-        )
-
-        print(
-            "✅ Filings Uploaded"
-        )
+    log.info("✅ corporate_actions.json uploaded")
+    log.info("━━━ Done ━━━")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run())
