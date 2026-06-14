@@ -259,7 +259,7 @@ def parse_index_daily(rows, valid_symbols):
 
 
 # ─────────────────────────────────────────────
-# Index Returns
+# Index Returns — Finedge se fetch, sign fix
 # ─────────────────────────────────────────────
 
 async def fetch_index_returns(client):
@@ -271,6 +271,11 @@ async def fetch_index_returns(client):
 
 
 def parse_index_returns(rows, valid_symbols):
+    """
+    Finedge returns sign galat deta hai — * -1 fix.
+    Dates bhi store karo for frontend display.
+    Structure: { "1M": {"v": 1.04, "d": "2026-05-13"}, ... }
+    """
     output = {}
     PERIODS = ["1M", "3M", "6M", "1Y", "3Y", "5Y", "7Y", "10Y"]
     skipped = 0
@@ -278,7 +283,19 @@ def parse_index_returns(rows, valid_symbols):
         symbol = normalize_index_symbol(row.get("index_symbol"))
         if symbol not in valid_symbols:
             skipped += 1; continue
-        output[symbol] = {p: row.get(p) for p in PERIODS}
+        dates = row.get("dates", {})
+        ret = {}
+        for p in PERIODS:
+            raw = row.get(p)
+            if raw is None:
+                continue
+            ret[p] = {
+                "v": round(-1 * raw, 2),          # sign fix
+                "d": dates.get(p) or None,         # base date
+            }
+        # last_date bhi store karo
+        ret["last_date"] = dates.get("last_date") or None
+        output[symbol] = ret
     print(f"✓ Returns indices: {len(output)}")
     print(f"✓ Skipped noisy returns: {skipped}")
     return output
