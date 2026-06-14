@@ -188,34 +188,34 @@ async def fetch_index_master(client):
     return r.json()
 
 
-def parse_index_master(rows):
+def parse_index_returns(rows, valid_symbols):
+    FLIP = {"1M", "3M", "6M"}          # sign ulta
+    CAGR = {"3Y": 3, "5Y": 5, "7Y": 7, "10Y": 10}  # CAGR → absolute
+    ASIS = {"1Y"}                        # as-is
     output = {}
     skipped = 0
     for row in rows:
-        raw_symbol = str(row.get("index_symbol", "")).strip()
-        symbol = normalize_index_symbol(raw_symbol)
-        if not symbol:
+        symbol = normalize_index_symbol(row.get("index_symbol"))
+        if symbol not in valid_symbols:
             skipped += 1; continue
-        index_name    = str(row.get("index_name", ""))
-        index_sub_type = str(row.get("index_sub_type", ""))
-        constituents  = row.get("constituents") or []
-        if is_bad_index(symbol, index_name):
-            skipped += 1; continue
-        if index_sub_type in BAD_TYPES:
-            skipped += 1; continue
-        if not constituents or len(constituents) < 5:
-            skipped += 1; continue
-        output[symbol] = {
-            "api_symbol" : raw_symbol,
-            "name"       : row.get("index_name"),
-            "type"       : index_sub_type,
-            "index_type" : row.get("index_type"),
-            "exchange"   : row.get("exchange"),
-            "description": row.get("description"),
-            "constituents": constituents,
-        }
-    print(f"✓ Clean indices: {len(output)}")
-    print(f"✓ Removed noisy indices: {skipped}")
+        dates = row.get("dates") or {}
+        ret = {}
+        for p in list(FLIP) + list(ASIS) + list(CAGR):
+            raw = row.get(p)
+            if raw is None:
+                continue
+            if p in FLIP:
+                v = round(-1 * raw, 2)
+            elif p in CAGR:
+                years = CAGR[p]
+                v = round((pow(1 + raw/100, years) - 1) * 100, 2)
+            else:
+                v = round(raw, 2)
+            ret[p] = {"v": v, "d": dates.get(p) or None}
+        ret["last_date"] = dates.get("last_date") or None
+        output[symbol] = ret
+    print(f"✓ Returns indices: {len(output)}")
+    print(f"✓ Skipped noisy returns: {skipped}")
     return output
 
 
