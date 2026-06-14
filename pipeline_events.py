@@ -3,9 +3,6 @@
 Corporate Actions Pipeline — GitHub Actions
 Fetches corporate actions for all NSE stocks from Upstox per-ISIN endpoint
 and uploads to R2 as corporate_actions.json
-
-Usage:
-  python pipeline_corporate_actions.py
 """
 
 import asyncio
@@ -31,21 +28,20 @@ WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 UPSTOX_BASE    = "https://api.upstox.com/v2"
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
-CONCURRENCY  = 5
-DELAY        = 1
-RETRY        = 3
+DELAY   = 0.5   # seconds between each request (sequential)
+RETRY   = 2     # retries only on network error, NOT on 429
 
 TYPE_MAP = {
-    "dividend"        : "Dividend",
-    "bonus"           : "Bonus",
-    "bonus issue"     : "Bonus",
-    "split"           : "Split",
-    "stock split"     : "Split",
-    "rights"          : "Rights",
-    "rights issue"    : "Rights",
-    "buyback"         : "Buyback",
-    "merger"          : "Merger",
-    "demerger"        : "Demerger",
+    "dividend"     : "Dividend",
+    "bonus"        : "Bonus",
+    "bonus issue"  : "Bonus",
+    "split"        : "Split",
+    "stock split"  : "Split",
+    "rights"       : "Rights",
+    "rights issue" : "Rights",
+    "buyback"      : "Buyback",
+    "merger"       : "Merger",
+    "demerger"     : "Demerger",
 }
 
 VALID_TYPES = {
@@ -69,16 +65,11 @@ def normalize_type(v):
 
 
 def parse_date(v):
-    """'14 Aug 2025' → '2025-08-14'  |  already ISO → passthrough  |  None → ''"""
     if not v:
         return ""
     v = str(v).strip()
-    if not v:
-        return ""
-    # Already ISO
     if len(v) == 10 and v[4] == "-":
         return v
-    # "14 Aug 2025"
     for fmt in ("%d %b %Y", "%d-%b-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
@@ -87,8 +78,7 @@ def parse_date(v):
     return v
 
 
-def extract_event_detail(event_details, name):
-    """event_details list mein se `name` key wali value nikalo."""
+def extract_detail(event_details, name):
     for item in (event_details or []):
         if str(item.get("name", "")).strip().lower() == name.lower():
             return item.get("value")
@@ -96,47 +86,36 @@ def extract_event_detail(event_details, name):
 
 
 def parse_action(raw):
-    """Single raw action dict → normalized dict (or None if invalid)."""
-
     action_type = normalize_type(raw.get("name", ""))
     if action_type not in VALID_TYPES:
         return None
 
     details = raw.get("event_details") or []
 
-    # Dates
-    ex_date           = parse_date(
-        extract_event_detail(details, "Ex dividend date")
-        or extract_event_detail(details, "Ex date")
+    ex_date = parse_date(
+        extract_detail(details, "Ex dividend date")
+        or extract_detail(details, "Ex date")
         or raw.get("expiry_date")
     )
-    record_date       = parse_date(extract_event_detail(details, "Record date"))
-    announcement_date = parse_date(extract_event_detail(details, "Announcement date"))
+    record_date       = parse_date(extract_detail(details, "Record date"))
+    announcement_date = parse_date(extract_detail(details, "Announcement date"))
+    sub_type          = extract_detail(details, "Dividend type") or ""
 
-    # Sub-type (Final / Interim / Special)
-    sub_type = extract_event_detail(details, "Dividend type") or ""
-
-    # Amount
     amount = raw.get("amount")
     try:
         amount = float(amount) if amount not in (None, "") else None
     except (ValueError, TypeError):
         amount = None
 
-    # Ratio (bonus / split)
-    ratio = raw.get("ratio")
-    if ratio == "":
-        ratio = None
+    ratio = raw.get("ratio") or None
 
-    # Dividend %
-    div_pct = extract_event_detail(details, "Dividend %")
+    div_pct = extract_detail(details, "Dividend %")
     try:
         div_pct = float(div_pct) if div_pct not in (None, "") else None
     except (ValueError, TypeError):
         div_pct = None
 
-    # Detail text
-    detail = extract_event_detail(details, "Details") or ""
+    detail = extract_detail(details, "Details") or ""
 
     return {
         "type"             : action_type,
@@ -183,36 +162,67 @@ async def r2_upload(client, filename, data):
 
 
 # ──────────────────────────────────────────────
-# Fetch per ISIN
+# Fetch — sequential, no retry on 429
 # ──────────────────────────────────────────────
 
-async def fetch_ca_for_isin(client, sem, symbol, isin):
-    url = f"{UPSTOX_BASE}/fundamentals/{isin}/corporate-actions"
-    async with sem:
+async def fetch_all(client, isin_map):
+    output    = {}
+    skipped   = 0
+    errors    = 0
+    total     = len(isin_map)
+
+    items = list(isin_map.items())
+
+    for idx, (symbol, isin) in enumerate(items, 1):
+
         await asyncio.sleep(DELAY)
-        for attempt in range(RETRY):
-            try:
-                r = await client.get(url, headers=_headers(), timeout=20)
-            except httpx.RequestError as e:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            if r.status_code == 401:
-                log.error("❌ UPSTOX_TOKEN invalid")
-                raise SystemExit(1)
-            if r.status_code == 429:
-                log.warning(f"  429 — waiting 30s ({symbol})")
-                await asyncio.sleep(30)
-                continue
-            if r.status_code == 404:
-                return symbol, []
-            if r.status_code != 200:
-                return symbol, []
-            try:
-                data = r.json()
-                return symbol, data.get("data") or []
-            except Exception:
-                return symbol, []
-    return symbol, []
+
+        url = f"{UPSTOX_BASE}/fundamentals/{isin}/corporate-actions"
+
+        try:
+            r = await client.get(url, headers=_headers(), timeout=20)
+        except httpx.RequestError as e:
+            log.warning(f"  Network error {symbol}: {e}")
+            errors += 1
+            continue
+
+        if r.status_code == 401:
+            log.error("❌ UPSTOX_TOKEN invalid")
+            raise SystemExit(1)
+
+        if r.status_code == 429:
+            # Skip — do not retry, just move on
+            log.warning(f"  429 skip {symbol} ({idx}/{total})")
+            skipped += 1
+            continue
+
+        if r.status_code == 404:
+            continue
+
+        if r.status_code != 200:
+            errors += 1
+            continue
+
+        try:
+            raw_list = r.json().get("data") or []
+        except Exception:
+            errors += 1
+            continue
+
+        parsed = []
+        for raw in raw_list:
+            item = parse_action(raw)
+            if item:
+                parsed.append(item)
+
+        if parsed:
+            parsed.sort(key=lambda x: x["ex_date"] or "", reverse=True)
+            output[symbol] = parsed
+
+        if idx % 100 == 0:
+            log.info(f"  Progress: {idx}/{total} | found={len(output)} skipped={skipped}")
+
+    return output, skipped, errors
 
 
 # ──────────────────────────────────────────────
@@ -225,7 +235,6 @@ async def run():
 
     async with httpx.AsyncClient() as client:
 
-        # Step 1: master.json se symbol → ISIN map
         log.info("Downloading master.json…")
         master = await r2_download(client, "master.json")
         if not master:
@@ -238,46 +247,15 @@ async def run():
         }
         log.info(f"  {len(isin_map)} symbols with ISIN")
 
-        # Step 2: concurrent fetch
-        log.info(f"Fetching corporate actions ({CONCURRENCY} concurrent)…")
-        sem     = asyncio.Semaphore(CONCURRENCY)
-        tasks   = [
-            fetch_ca_for_isin(client, sem, symbol, isin)
-            for symbol, isin in isin_map.items()
-        ]
-        results = await asyncio.gather(*tasks)
+        log.info(f"Fetching corporate actions (sequential, {DELAY}s delay)…")
+        output, skipped, errors = await fetch_all(client, isin_map)
 
-        # Step 3: parse + build output
-        output      = {}
-        total_acts  = 0
-        empty_syms  = 0
-        skipped     = 0
-
-        for symbol, raw_list in results:
-            if not raw_list:
-                empty_syms += 1
-                continue
-
-            parsed = []
-            for raw in raw_list:
-                item = parse_action(raw)
-                if item is None:
-                    skipped += 1
-                    continue
-                parsed.append(item)
-
-            if parsed:
-                # Sort by ex_date desc (latest first)
-                parsed.sort(key=lambda x: x["ex_date"] or "", reverse=True)
-                output[symbol] = parsed
-                total_acts += len(parsed)
-
+        total_acts = sum(len(v) for v in output.values())
         log.info(f"  Symbols with actions : {len(output)}")
         log.info(f"  Total actions        : {total_acts}")
-        log.info(f"  Empty / no data      : {empty_syms}")
-        log.info(f"  Skipped (bad type)   : {skipped}")
+        log.info(f"  Skipped (429)        : {skipped}")
+        log.info(f"  Errors               : {errors}")
 
-        # Step 4: upload
         await r2_upload(client, "corporate_actions.json", output)
 
     log.info("✅ corporate_actions.json uploaded")
