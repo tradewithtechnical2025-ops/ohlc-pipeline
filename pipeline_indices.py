@@ -61,7 +61,6 @@ MANUAL_BLACKLIST = {
 # ─────────────────────────────────────────────
 
 INDEX_CATEGORIES = {
-    # ── Major ──────────────────────────────────
     "NIFTY50"    : ("major",    "Nifty 50"),
     "NIFNEX50"   : ("major",    "Nifty Next 50"),
     "NIF100"     : ("major",    "Nifty 100"),
@@ -79,7 +78,6 @@ INDEX_CATEGORIES = {
     "NIFTOTMAR"  : ("major",    "Nifty Total Market"),
     "NIFIPO"     : ("major",    "Nifty IPO"),
     "NIFMIDSEL2" : ("major",    "Nifty Midcap Select"),
-    # ── Sectoral ───────────────────────────────
     "NIFBAN"     : ("sectoral", "Nifty Bank"),
     "NIFPRIBAN"  : ("sectoral", "Nifty Private Bank"),
     "NIFPSUBAN"  : ("sectoral", "Nifty PSU Bank"),
@@ -107,7 +105,6 @@ INDEX_CATEGORIES = {
     "NIFMOB"     : ("sectoral", "Nifty Mobility"),
     "NIFCORHOU"  : ("sectoral", "Nifty Core Housing"),
     "NIFHOU"     : ("sectoral", "Nifty Housing"),
-    # ── Thematic ───────────────────────────────
     "NIFINDDEF"    : ("thematic", "Nifty India Defence"),
     "NIFEVNEWAGEA" : ("thematic", "Nifty EV & New Age Auto"),
     "NIFINDDIG2"   : ("thematic", "Nifty India Digital"),
@@ -126,7 +123,6 @@ INDEX_CATEGORIES = {
 def build_index_map(master_parsed):
     index_map = {}
     counts = {"major": 0, "sectoral": 0, "thematic": 0}
-
     for symbol, meta in master_parsed.items():
         if symbol not in INDEX_CATEGORIES:
             continue
@@ -144,7 +140,6 @@ def build_index_map(master_parsed):
                 "stocks"  : stocks,
             }
             counts[category] += 1
-
     print(f"✓ index_map: {len(index_map)} indices "
           f"(major:{counts['major']} "
           f"sectoral:{counts['sectoral']} "
@@ -188,31 +183,34 @@ async def fetch_index_master(client):
     return r.json()
 
 
-def parse_index_returns(rows, valid_symbols):
-    CAGR = {"3Y": 3, "5Y": 5, "7Y": 7, "10Y": 10}
-    ASIS = {"1M", "3M", "6M", "1Y"}
-    ALL  = list(ASIS) + list(CAGR)
+def parse_index_master(rows):
     output = {}
     skipped = 0
     for row in rows:
-        symbol = normalize_index_symbol(row.get("index_symbol"))
-        if symbol not in valid_symbols:
+        raw_symbol = str(row.get("index_symbol", "")).strip()
+        symbol = normalize_index_symbol(raw_symbol)
+        if not symbol:
             skipped += 1; continue
-        dates = row.get("dates") or {}
-        ret = {}
-        for p in ALL:
-            raw = row.get(p)
-            if raw is None:
-                continue
-            if p in CAGR:
-                v = round((pow(1 + raw / 100, CAGR[p]) - 1) * 100, 2)
-            else:
-                v = round(raw, 2)
-            ret[p] = {"v": v, "d": dates.get(p) or None}
-        ret["last_date"] = dates.get("last_date") or None
-        output[symbol] = ret
-    print(f"✓ Returns indices: {len(output)}")
-    print(f"✓ Skipped noisy returns: {skipped}")
+        index_name     = str(row.get("index_name", ""))
+        index_sub_type = str(row.get("index_sub_type", ""))
+        constituents   = row.get("constituents") or []
+        if is_bad_index(symbol, index_name):
+            skipped += 1; continue
+        if index_sub_type in BAD_TYPES:
+            skipped += 1; continue
+        if not constituents or len(constituents) < 5:
+            skipped += 1; continue
+        output[symbol] = {
+            "api_symbol" : raw_symbol,
+            "name"       : row.get("index_name"),
+            "type"       : index_sub_type,
+            "index_type" : row.get("index_type"),
+            "exchange"   : row.get("exchange"),
+            "description": row.get("description"),
+            "constituents": constituents,
+        }
+    print(f"✓ Clean indices: {len(output)}")
+    print(f"✓ Removed noisy indices: {skipped}")
     return output
 
 
@@ -256,7 +254,7 @@ def parse_index_daily(rows, valid_symbols):
 
 
 # ─────────────────────────────────────────────
-# Index Returns — Finedge se fetch, sign fix
+# Index Returns
 # ─────────────────────────────────────────────
 
 async def fetch_index_returns(client):
@@ -269,16 +267,13 @@ async def fetch_index_returns(client):
 
 def parse_index_returns(rows, valid_symbols):
     """
-    Finedge sign/type issues:
-      1M, 3M, 6M  → sign ulta  (* -1)
-      1Y           → as-is (sahi hai)
-      3Y, 5Y, 7Y, 10Y → CAGR deta hai, absolute mein convert karo
+    Finedge ne fix kar diya sign issue.
+    3Y/5Y/7Y/10Y = CAGR → absolute convert karo.
     Structure: { "1M": {"v": 1.04, "d": "2026-05-13"}, ... }
     """
-    FLIP = {"1M", "3M", "6M"}
     CAGR = {"3Y": 3, "5Y": 5, "7Y": 7, "10Y": 10}
-    ASIS = {"1Y"}
-    ALL  = list(FLIP) + list(ASIS) + list(CAGR)
+    ASIS = {"1M", "3M", "6M", "1Y"}
+    ALL  = list(ASIS) + list(CAGR)
     output = {}
     skipped = 0
     for row in rows:
@@ -291,9 +286,7 @@ def parse_index_returns(rows, valid_symbols):
             raw = row.get(p)
             if raw is None:
                 continue
-            if p in FLIP:
-                v = round(-1 * raw, 2)
-            elif p in CAGR:
+            if p in CAGR:
                 v = round((pow(1 + raw / 100, CAGR[p]) - 1) * 100, 2)
             else:
                 v = round(raw, 2)
@@ -356,37 +349,31 @@ async def main():
         print(" INDEX PIPELINE STARTED")
         print("=================================\n")
 
-        # ── Index Master ──────────────────────
         print("=== INDEX MASTER ===")
         master_rows = await fetch_index_master(client)
         if isinstance(master_rows, dict):
             master_rows = master_rows.get("data", [])
         master_parsed = parse_index_master(master_rows)
         valid_symbols = set(master_parsed.keys())
-
         await r2_upload(client, "index_master.json", master_parsed)
         print("✅ index_master.json uploaded\n")
 
-        # ── Index Map (frontend — categorized) ─
         index_map = build_index_map(master_parsed)
         await r2_upload(client, "index_map.json", index_map)
         print(f"✅ index_map.json uploaded ({len(index_map)} indices)\n")
 
-        # ── Daily Feed ────────────────────────
         print("=== INDEX DAILY FEED ===")
         daily_rows   = await fetch_index_daily(client)
         daily_parsed = parse_index_daily(daily_rows, valid_symbols)
         await r2_upload(client, "index_daily.json", daily_parsed)
         print("✅ index_daily.json uploaded\n")
 
-        # ── Returns ───────────────────────────
         print("=== INDEX RETURNS ===")
         returns_rows   = await fetch_index_returns(client)
         returns_parsed = parse_index_returns(returns_rows, valid_symbols)
         await r2_upload(client, "index_returns.json", returns_parsed)
         print("✅ index_returns.json uploaded\n")
 
-        # ── Historical ────────────────────────
         print("=== INDEX HISTORICAL ===")
         symbols = sorted(master_parsed.items())
         total = len(symbols)
