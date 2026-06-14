@@ -31,8 +31,8 @@ WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 UPSTOX_BASE    = "https://api.upstox.com/v2"
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
-CONCURRENCY  = 50
-DELAY        = 0.1
+CONCURRENCY  = 10
+DELAY        = 0.5
 RETRY        = 3
 
 TYPE_MAP = {
