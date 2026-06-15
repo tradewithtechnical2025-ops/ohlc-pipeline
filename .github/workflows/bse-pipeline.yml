@@ -1,9 +1,7 @@
 name: BSE Pipeline
 
 on:
-  schedule:
-    # 4:20 PM IST = 10:50 UTC, Mon–Fri
-    - cron: "50 10 * * 1-5"
+  
   workflow_dispatch:
 
 concurrency:
