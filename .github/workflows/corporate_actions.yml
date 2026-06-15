@@ -3,9 +3,7 @@ name: Corporate Pipeline
 on:
   workflow_dispatch:
 
-  schedule:
-    # Daily at 6:30 AM IST
-    - cron: "0 1 * * *"
+  
 
 jobs:
   events:
