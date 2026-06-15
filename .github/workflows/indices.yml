@@ -3,9 +3,7 @@ name: Indices Pipeline
 on:
   workflow_dispatch:
 
-  schedule:
-    # Daily at 3:30 PM IST
-    - cron: "0 10 * * *"
+  
 
 jobs:
   indices:
