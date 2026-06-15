@@ -1,9 +1,7 @@
 name: NSE Pipeline
 
 on:
-  schedule:
-    # 9:00 PM IST = 15:30 UTC, Mon-Fri
-    - cron: "30 15 * * 1-5"
+  
   workflow_dispatch:
 
 jobs:
