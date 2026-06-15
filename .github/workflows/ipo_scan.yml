@@ -1,8 +1,7 @@
 name: IPO Scan
 
 on:
-  schedule:
-    - cron: '30 11 * * *'   # 5:00 PM IST daily
+     
   workflow_dispatch:
 
 jobs:
