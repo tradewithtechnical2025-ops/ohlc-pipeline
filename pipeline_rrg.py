@@ -30,21 +30,14 @@ R2_PREFIX     = "index_history"   # folder in R2 where index JSONs live
 
 BENCHMARK_SYM = "NIFTY50"
 
-# Symbol → Display name mapping
-# Only meaningful broad sector indices for RRG
+# Import display names directly from pipeline_indices
+from pipeline_indices import INDEX_CATEGORIES
+
+# Sectoral + Thematic indices for RRG
 RRG_SECTORS = {
-    "NIFBAN":    "Bank",
-    "NIFIT":     "IT",
-    "NIFFMC":    "FMCG",
-    "NIFAUT":    "Auto",
-    "NIFPHA":    "Pharma",
-    "NIFOILGAS": "Oil & Gas",
-    "NIFMET":    "Metal",
-    "NIFREA":    "Realty",
-    "NIFPSE":    "PSE",
-    "NIFENE":    "Energy",
-    "NIFHEAIND": "Healthcare",
-    "NIFINDCON": "Consumption",
+    sym: meta[1]
+    for sym, meta in INDEX_CATEGORIES.items()
+    if meta[0] in ("sectoral", "thematic")
 }
 
 # JdK parameters (modified for ~1yr data)
@@ -53,11 +46,11 @@ LONG_EMA_WEEKS  = 52
 MOM_EMA_WEEKS   = 10
 TAIL_WEEKS      = 12   # weeks of history to store for chart tails
 
-# Multiple benchmark support — easy to extend later
+# Multiple benchmark support
 BENCHMARKS = {
-    "NIFTY50":  "Nifty 50",
-    "NIF500":   "Nifty 500",
-    "NIF200":   "Nifty 200",
+    "NIFTY50": "Nifty 50",
+    "NIF500":  "Nifty 500",
+    "NIF200":  "Nifty 200",
 }
 
 # ── Worker Helpers ────────────────────────────────────────────────────────────
@@ -65,8 +58,8 @@ BENCHMARKS = {
 async def fetch_json_from_r2(client, key):
     """Fetch and parse a JSON file from R2 via Worker."""
     try:
-        url = f"{WORKER_URL}/{key}"
-        r   = await client.get(url, headers=WORKER_HEADERS, timeout=30)
+        url = f"{WORKER_URL}?file={key}"
+        r   = await client.get(url, headers=WORKER_HEADERS, timeout=60)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -75,15 +68,16 @@ async def fetch_json_from_r2(client, key):
 
 async def upload_json_to_r2(client, key, data):
     """Upload dict as JSON to R2 via Worker."""
-    body    = json.dumps(data, separators=(",", ":"))
-    payload = {"key": key, "value": body}
-    r = await client.post(
-        WORKER_URL,
+    url  = f"{WORKER_URL}?file={key}"
+    body = json.dumps(data).encode()
+    r    = await client.post(
+        url,
         headers=WORKER_HEADERS,
-        json=payload,
-        timeout=60,
+        content=body,
+        timeout=300,
     )
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"{key} upload failed: {r.status_code} {r.text}")
     print(f"  [OK] Uploaded {key} ({len(body)/1024:.1f} KB)")
 
 # ── Data Helpers ──────────────────────────────────────────────────────────────
@@ -197,7 +191,7 @@ async def main():
                 continue
 
             bench_weekly = parse_daily_to_weekly(bench_raw)
-            if bench_weekly is None or len(bench_weekly) < 60:
+            if bench_weekly is None or len(bench_weekly) < 50:
                 print(f"  [SKIP] Not enough benchmark data: {len(bench_weekly) if bench_weekly is not None else 0} weeks")
                 continue
 
