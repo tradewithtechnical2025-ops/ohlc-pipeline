@@ -25,7 +25,7 @@ DL_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 UP_HEADERS = {"X-Secret-Token": WORKER_TOKEN, "Content-Type": "application/json"}
 
 # Keywords that indicate bonds / NCDs / debentures in BSE_EQ
-BOND_KEYWORDS = {"%", "NCD", "BOND", "DEBENTURE", "PVT", "SR-", "TRANCHE", "SERIES"}
+BOND_KEYWORDS = {"%", "NCD", "BOND", "DEBENTURE", "PVT", "SR-", "TRANCHE", "SERIES","-RE"}
 
 # =========================================================
 # DATE HELPERS
