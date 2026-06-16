@@ -214,6 +214,61 @@ def fetch_with_fallback(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Participant OI CSV fetch — handles NSE title row + trailing-space headers
+
+def fetch_oi_csv(session: httpx.Client, url: str) -> list[dict] | None:
+    """
+    NSE fao_participant_oi CSV has a title row as line 0, then the real header,
+    then data. Standard fetch_csv_url would use the title as DictReader header.
+    This function strips the title row and normalises column header whitespace.
+    Returns rows or None on 404.
+    """
+    try:
+        r = session.get(url, timeout=30)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        text = r.content.decode("utf-8-sig").strip()
+        lines = text.splitlines()
+        # Drop any leading lines that are not the real header
+        # Real header starts with "Client Type"
+        start = next(
+            (i for i, l in enumerate(lines) if l.strip().startswith("Client Type")),
+            None,
+        )
+        if start is None:
+            print(f"  ⚠ fao_participant_oi: real header not found in {url.split('/')[-1]}")
+            return []
+        # Strip trailing spaces from each header field
+        header_fields = [f.strip() for f in lines[start].split(",")]
+        lines[start] = ",".join(header_fields)
+        clean_text = "\n".join(lines[start:])
+        rows = list(csv.DictReader(io.StringIO(clean_text)))
+        print(f"  ✓ {url.split('/')[-1]} → {len(rows)} rows")
+        return rows
+    except httpx.HTTPStatusError:
+        raise
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
+def fetch_oi_with_fallback(
+    session: httpx.Client, start: date, max_tries: int = 5
+) -> tuple[list[dict], date]:
+    cur = start
+    for i in range(max_tries):
+        url  = f"{NSCCL_BASE}/fao_participant_oi_{fmt(cur)}.csv"
+        rows = fetch_oi_csv(session, url)
+        if rows is not None:
+            if i > 0:
+                print(f"  ⚠ Fell back to {cur}")
+            return rows, cur
+        print(f"  404 for {cur}, trying previous trading day...")
+        cur = prev_trading_day(cur)
+    raise RuntimeError(f"Could not fetch fao_participant_oi after {max_tries} attempts")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Participant OI parser
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -231,20 +286,12 @@ _OI_PARTICIPANTS = {"Client", "DII", "FII", "Pro"}
 
 def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
     """
-    Returns a dict ready to store:
-    {
-      "date": "2026-06-15",
-      "participants": {
-        "FII":    { "fut_idx_long": ..., "fut_idx_short": ..., ... , "total_long": ..., "total_short": ..., "net": ... },
-        "DII":    { ... },
-        "Client": { ... },
-        "Pro":    { ... },
-      }
-    }
+    Expects rows already cleaned by fetch_oi_csv:
+      - title row stripped, real header is row 0 of DictReader
+      - column header whitespace already normalised
     """
-    # NSE CSV has trailing spaces in some column headers — normalise all keys
-    def _norm(row):
-        return {k.strip(): v for k, v in row.items()}
+    if not rows:
+        return {"date": as_of.isoformat(), "participants": {}}
 
     def _int(row, col):
         raw = row.get(col, "0").strip().replace(",", "")
@@ -254,8 +301,7 @@ def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
             return 0
 
     participants = {}
-    for _row in rows:
-        row   = _norm(_row)
+    for row in rows:
         ptype = row.get("Client Type", "").strip()
         if ptype not in _OI_PARTICIPANTS:
             continue
@@ -419,13 +465,7 @@ async def run():
     # ── 5. Participant OI — fallback up to 5 previous trading days ────────────
     print(f"\n[5] fao_participant_oi (today: {today})...")
     try:
-        oi_rows, oi_date = fetch_with_fallback(
-            nse,
-            f"{NSCCL_BASE}/fao_participant_oi_{{}}.csv",
-            today,
-            direction="prev",
-            max_tries=5,
-        )
+        oi_rows, oi_date = fetch_oi_with_fallback(nse, today, max_tries=5)
         print(f"  Participant OI date resolved to: {oi_date}")
     except RuntimeError:
         print("  ⚠ fao_participant_oi not available — skipping OI update")
