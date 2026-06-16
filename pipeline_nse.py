@@ -242,6 +242,10 @@ def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
       }
     }
     """
+    # NSE CSV has trailing spaces in some column headers — normalise all keys
+    def _norm(row):
+        return {k.strip(): v for k, v in row.items()}
+
     def _int(row, col):
         raw = row.get(col, "0").strip().replace(",", "")
         try:
@@ -250,7 +254,8 @@ def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
             return 0
 
     participants = {}
-    for row in rows:
+    for _row in rows:
+        row   = _norm(_row)
         ptype = row.get("Client Type", "").strip()
         if ptype not in _OI_PARTICIPANTS:
             continue
@@ -474,7 +479,7 @@ async def run():
         out = []
         for r in rows:
             sym = r.get("Symbol", "").strip()
-            if not sym or sym == "NO RECORDS":
+            if not sym or sym.upper() in ("NO RECORDS", "SYMBOL", "-"):
                 continue
             d = {
                 "date":   r.get("Date", "").strip(),
@@ -559,7 +564,9 @@ async def run():
         block_date_str      = block_clean[0]["date"] if block_clean else None
         existing_block_date = existing_block[0]["date"] if existing_block else None
 
-        if block_date_str and block_date_str == existing_block_date:
+        if not block_clean:
+            print("  ✓ block: no deals today — skipping")
+        elif block_date_str and block_date_str == existing_block_date:
             print(f"  ✓ block: {block_date_str} already current — skipping snapshot + history")
         else:
             upload_tasks.append(r2_put(client, "nse_block.json",         block_clean))
