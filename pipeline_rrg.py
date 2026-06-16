@@ -30,8 +30,48 @@ R2_PREFIX     = "index_history"   # folder in R2 where index JSONs live
 
 BENCHMARK_SYM = "NIFTY50"
 
-# Import display names directly from pipeline_indices
-from pipeline_indices import INDEX_CATEGORIES
+# Copied from pipeline_indices.py — sectoral + thematic only
+INDEX_CATEGORIES = {
+    "NIFBAN"     : ("sectoral", "Nifty Bank"),
+    "NIFPRIBAN"  : ("sectoral", "Nifty Private Bank"),
+    "NIFPSUBAN"  : ("sectoral", "Nifty PSU Bank"),
+    "NIFIT"      : ("sectoral", "Nifty IT"),
+    "NIFAUT"     : ("sectoral", "Nifty Auto"),
+    "NIFPHA"     : ("sectoral", "Nifty Pharma"),
+    "NIFHEAIND"  : ("sectoral", "Nifty Healthcare"),
+    "NIFFMC"     : ("sectoral", "Nifty FMCG"),
+    "NIFMET"     : ("sectoral", "Nifty Metal"),
+    "NIFREA"     : ("sectoral", "Nifty Realty"),
+    "NIFMED"     : ("sectoral", "Nifty Media"),
+    "NIFFINSER"  : ("sectoral", "Nifty Financial Services"),
+    "NIFCONDUR"  : ("sectoral", "Nifty Consumer Durables"),
+    "NIFCHE"     : ("sectoral", "Nifty Chemicals"),
+    "NIFOILGAS"  : ("sectoral", "Nifty Oil & Gas"),
+    "NIFENE"     : ("sectoral", "Nifty Energy"),
+    "NIFCOM"     : ("sectoral", "Nifty Commodities"),
+    "NIFINF"     : ("sectoral", "Nifty Infrastructure"),
+    "NIFSERSEC"  : ("sectoral", "Nifty Services"),
+    "NIFPSE"     : ("sectoral", "Nifty PSE"),
+    "NIFCPS"     : ("sectoral", "Nifty CPSE"),
+    "NIFMNC"     : ("sectoral", "Nifty MNC"),
+    "NIFCAPMAR"  : ("sectoral", "Nifty Capital Markets"),
+    "NIFTRALOG"  : ("sectoral", "Nifty Transport & Logistics"),
+    "NIFMOB"     : ("sectoral", "Nifty Mobility"),
+    "NIFCORHOU"  : ("sectoral", "Nifty Core Housing"),
+    "NIFHOU"     : ("sectoral", "Nifty Housing"),
+    "NIFINDDEF"    : ("thematic", "Nifty India Defence"),
+    "NIFEVNEWAGEA" : ("thematic", "Nifty EV & New Age Auto"),
+    "NIFINDDIG2"   : ("thematic", "Nifty India Digital"),
+    "NIFINDINT"    : ("thematic", "Nifty India Internet"),
+    "NIFINDMAN"    : ("thematic", "Nifty India Manufacturing"),
+    "NIFINDCON"    : ("thematic", "Nifty India Consumption"),
+    "NIFINDNEWAGE" : ("thematic", "Nifty New Age Consumption"),
+    "NIFINDTOU"    : ("thematic", "Nifty India Tourism"),
+    "NIFNONCYCCON" : ("thematic", "Nifty Non-Cyclical Consumer"),
+    "NIFINDINFLOG" : ("thematic", "Nifty Infra & Logistics"),
+    "NIFINDSEL5CO" : ("thematic", "Nifty Select 5 Corp Groups"),
+    "NIFMIDINDCON" : ("thematic", "Nifty MidSmall Consumption"),
+}
 
 # Sectoral + Thematic indices for RRG
 RRG_SECTORS = {
