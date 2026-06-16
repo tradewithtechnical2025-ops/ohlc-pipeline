@@ -96,68 +96,16 @@ BENCHMARKS = {
     "NIF200":  "Nifty 200",
 }
 
-# ── Finedge API symbol mapping (same as pipeline_indices.py) ─────────────────
-# RRG needs api_symbol (original Finedge name) to fetch historical data
-# These match what pipeline_indices.py stores in index_master.json
-
-FINEDGE_API_SYMBOLS = {
-    # Benchmarks
-    "NIFTY50": "Nifty 50",
-    "NIF500":  "Nifty 500",
-    "NIF200":  "Nifty 200",
-    # Sectoral
-    "NIFBAN":    "Nifty Bank",
-    "NIFPRIBAN": "Nifty Private Bank",
-    "NIFPSUBAN": "Nifty PSU Bank",
-    "NIFIT":     "Nifty IT",
-    "NIFAUT":    "Nifty Auto",
-    "NIFPHA":    "Nifty Pharma",
-    "NIFHEAIND": "Nifty Healthcare",
-    "NIFFMC":    "Nifty FMCG",
-    "NIFMET":    "Nifty Metal",
-    "NIFREA":    "Nifty Realty",
-    "NIFMED":    "Nifty Media",
-    "NIFFINSER": "Nifty Financial Services",
-    "NIFCONDUR": "Nifty Consumer Durables",
-    "NIFCHE":    "Nifty Chemicals",
-    "NIFOILGAS": "Nifty Oil & Gas",
-    "NIFENE":    "Nifty Energy",
-    "NIFCOM":    "Nifty Commodities",
-    "NIFINF":    "Nifty Infrastructure",
-    "NIFSERSEC": "Nifty Services",
-    "NIFPSE":    "Nifty PSE",
-    "NIFCPS":    "Nifty CPSE",
-    "NIFMNC":    "Nifty MNC",
-    "NIFCAPMAR": "Nifty Capital Markets",
-    "NIFTRALOG": "Nifty Transport & Logistics",
-    "NIFMOB":    "Nifty Mobility",
-    "NIFCORHOU": "Nifty Core Housing",
-    "NIFHOU":    "Nifty Housing",
-    # Thematic
-    "NIFINDDEF":    "Nifty India Defence",
-    "NIFEVNEWAGEA": "Nifty EV & New Age Auto",
-    "NIFINDDIG2":   "Nifty India Digital",
-    "NIFINDINT":    "Nifty India Internet",
-    "NIFINDMAN":    "Nifty India Manufacturing",
-    "NIFINDCON":    "Nifty India Consumption",
-    "NIFINDNEWAGE": "Nifty New Age Consumption",
-    "NIFINDTOU":    "Nifty India Tourism",
-    "NIFNONCYCCON": "Nifty Non-Cyclical Consumer",
-    "NIFINDINFLOG": "Nifty Infra & Logistics",
-    "NIFINDSEL5CO": "Nifty Select 5 Corp Groups",
-    "NIFMIDINDCON": "Nifty MidSmall Consumption",
-}
-
 # ── Finedge Fetch ─────────────────────────────────────────────────────────────
 
-async def fetch_history_from_finedge(client, api_symbol):
-    """Fetch 18 months of daily history from Finedge API."""
+async def fetch_history_from_finedge(client, symbol):
+    """Fetch 18 months of daily history from Finedge API using normalized symbol."""
     today     = datetime.now().date()
-    from_date = (today - timedelta(days=548)).strftime("%Y-%m-%d")   # ~18 months
+    from_date = (today - timedelta(days=548)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
     url    = f"{FINEDGE_BASE}/index/market-price/historical"
     params = {
-        "index_symbol": api_symbol,
+        "index_symbol": symbol,
         "from_date":    from_date,
         "to_date":      to_date,
         "token":        FINEDGE_TOKEN,
@@ -172,7 +120,7 @@ async def fetch_history_from_finedge(client, api_symbol):
             "close": row.get("close_price"),
         } for row in rows if row.get("close_price")]
     except Exception as e:
-        print(f"    [WARN] Finedge fetch failed for {api_symbol}: {e}")
+        print(f"    [WARN] Finedge fetch failed for {symbol}: {e}")
         return []
 
 # ── Worker Upload ─────────────────────────────────────────────────────────────
@@ -296,8 +244,7 @@ async def main():
         for bench_sym, bench_name in BENCHMARKS.items():
             print(f"\nBenchmark: {bench_name} ({bench_sym})")
 
-            api_sym   = FINEDGE_API_SYMBOLS.get(bench_sym, bench_sym)
-            bench_raw = await fetch_history_from_finedge(client, api_sym)
+            bench_raw = await fetch_history_from_finedge(client, bench_sym)
             if not bench_raw:
                 print(f"  [SKIP] Benchmark {bench_sym} — no data from Finedge")
                 continue
@@ -315,8 +262,7 @@ async def main():
             for sym, display_name in RRG_SECTORS.items():
                 print(f"  Processing {display_name} ({sym})...")
 
-                sec_api_sym  = FINEDGE_API_SYMBOLS.get(sym, sym)
-                sector_raw   = await fetch_history_from_finedge(client, sec_api_sym)
+                sector_raw = await fetch_history_from_finedge(client, sym)
                 if not sector_raw:
                     print(f"    [SKIP] No data for {sym}")
                     continue
