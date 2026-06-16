@@ -15,18 +15,21 @@ import httpx
 import asyncio
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 WORKER_URL     = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN   = os.environ["WORKER_TOKEN"]
+FINEDGE_TOKEN  = os.environ["FINEDGE_TOKEN"]
+
 WORKER_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
     "Content-Type": "application/json",
 }
 
-R2_PREFIX     = "index_history"   # folder in R2 where index JSONs live
+FINEDGE_BASE  = "https://data.finedgeapi.com/api/v1"
+R2_PREFIX     = "index_history"
 
 BENCHMARK_SYM = "NIFTY50"
 
@@ -93,18 +96,86 @@ BENCHMARKS = {
     "NIF200":  "Nifty 200",
 }
 
-# ── Worker Helpers ────────────────────────────────────────────────────────────
+# ── Finedge API symbol mapping (same as pipeline_indices.py) ─────────────────
+# RRG needs api_symbol (original Finedge name) to fetch historical data
+# These match what pipeline_indices.py stores in index_master.json
 
-async def fetch_json_from_r2(client, key):
-    """Fetch and parse a JSON file from R2 via Worker."""
+FINEDGE_API_SYMBOLS = {
+    # Benchmarks
+    "NIFTY50": "Nifty 50",
+    "NIF500":  "Nifty 500",
+    "NIF200":  "Nifty 200",
+    # Sectoral
+    "NIFBAN":    "Nifty Bank",
+    "NIFPRIBAN": "Nifty Private Bank",
+    "NIFPSUBAN": "Nifty PSU Bank",
+    "NIFIT":     "Nifty IT",
+    "NIFAUT":    "Nifty Auto",
+    "NIFPHA":    "Nifty Pharma",
+    "NIFHEAIND": "Nifty Healthcare",
+    "NIFFMC":    "Nifty FMCG",
+    "NIFMET":    "Nifty Metal",
+    "NIFREA":    "Nifty Realty",
+    "NIFMED":    "Nifty Media",
+    "NIFFINSER": "Nifty Financial Services",
+    "NIFCONDUR": "Nifty Consumer Durables",
+    "NIFCHE":    "Nifty Chemicals",
+    "NIFOILGAS": "Nifty Oil & Gas",
+    "NIFENE":    "Nifty Energy",
+    "NIFCOM":    "Nifty Commodities",
+    "NIFINF":    "Nifty Infrastructure",
+    "NIFSERSEC": "Nifty Services",
+    "NIFPSE":    "Nifty PSE",
+    "NIFCPS":    "Nifty CPSE",
+    "NIFMNC":    "Nifty MNC",
+    "NIFCAPMAR": "Nifty Capital Markets",
+    "NIFTRALOG": "Nifty Transport & Logistics",
+    "NIFMOB":    "Nifty Mobility",
+    "NIFCORHOU": "Nifty Core Housing",
+    "NIFHOU":    "Nifty Housing",
+    # Thematic
+    "NIFINDDEF":    "Nifty India Defence",
+    "NIFEVNEWAGEA": "Nifty EV & New Age Auto",
+    "NIFINDDIG2":   "Nifty India Digital",
+    "NIFINDINT":    "Nifty India Internet",
+    "NIFINDMAN":    "Nifty India Manufacturing",
+    "NIFINDCON":    "Nifty India Consumption",
+    "NIFINDNEWAGE": "Nifty New Age Consumption",
+    "NIFINDTOU":    "Nifty India Tourism",
+    "NIFNONCYCCON": "Nifty Non-Cyclical Consumer",
+    "NIFINDINFLOG": "Nifty Infra & Logistics",
+    "NIFINDSEL5CO": "Nifty Select 5 Corp Groups",
+    "NIFMIDINDCON": "Nifty MidSmall Consumption",
+}
+
+# ── Finedge Fetch ─────────────────────────────────────────────────────────────
+
+async def fetch_history_from_finedge(client, api_symbol):
+    """Fetch 18 months of daily history from Finedge API."""
+    today     = datetime.now().date()
+    from_date = (today - timedelta(days=548)).strftime("%Y-%m-%d")   # ~18 months
+    to_date   = today.strftime("%Y-%m-%d")
+    url    = f"{FINEDGE_BASE}/index/market-price/historical"
+    params = {
+        "index_symbol": api_symbol,
+        "from_date":    from_date,
+        "to_date":      to_date,
+        "token":        FINEDGE_TOKEN,
+    }
     try:
-        url = f"{WORKER_URL}?file={key}"
-        r   = await client.get(url, headers=WORKER_HEADERS, timeout=60)
-        r.raise_for_status()
-        return r.json()
+        r = await client.get(url, params=params, timeout=300)
+        if r.status_code != 200:
+            return []
+        rows = r.json().get("rows") or []
+        return [{
+            "date":  row.get("quote_date"),
+            "close": row.get("close_price"),
+        } for row in rows if row.get("close_price")]
     except Exception as e:
-        print(f"  [WARN] Could not fetch {key}: {e}")
-        return None
+        print(f"    [WARN] Finedge fetch failed for {api_symbol}: {e}")
+        return []
+
+# ── Worker Upload ─────────────────────────────────────────────────────────────
 
 async def upload_json_to_r2(client, key, data):
     """Upload dict as JSON to R2 via Worker."""
@@ -225,9 +296,10 @@ async def main():
         for bench_sym, bench_name in BENCHMARKS.items():
             print(f"\nBenchmark: {bench_name} ({bench_sym})")
 
-            bench_raw = await fetch_json_from_r2(client, f"{R2_PREFIX}/{bench_sym}.json")
+            api_sym   = FINEDGE_API_SYMBOLS.get(bench_sym, bench_sym)
+            bench_raw = await fetch_history_from_finedge(client, api_sym)
             if not bench_raw:
-                print(f"  [SKIP] Benchmark {bench_sym} not found")
+                print(f"  [SKIP] Benchmark {bench_sym} — no data from Finedge")
                 continue
 
             bench_weekly = parse_daily_to_weekly(bench_raw)
@@ -243,9 +315,10 @@ async def main():
             for sym, display_name in RRG_SECTORS.items():
                 print(f"  Processing {display_name} ({sym})...")
 
-                sector_raw = await fetch_json_from_r2(client, f"{R2_PREFIX}/{sym}.json")
+                sec_api_sym  = FINEDGE_API_SYMBOLS.get(sym, sym)
+                sector_raw   = await fetch_history_from_finedge(client, sec_api_sym)
                 if not sector_raw:
-                    print(f"    [SKIP] {sym}.json not found")
+                    print(f"    [SKIP] No data for {sym}")
                     continue
 
                 sector_weekly = parse_daily_to_weekly(sector_raw)
@@ -272,7 +345,7 @@ async def main():
                     "weeks": len(rs_df),
                 })
 
-                print(f"    RS Ratio={latest['rs']:.2f}  RS Mom={latest['rm']:.2f}  Weeks={len(rs_df)}")
+                print(f"    RS={latest['rs']:.2f}  RM={latest['rm']:.2f}  Weeks={len(rs_df)}")
 
             output["benchmarks"][bench_sym] = {
                 "name":    bench_name,
