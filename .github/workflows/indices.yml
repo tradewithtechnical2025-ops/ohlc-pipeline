@@ -1,34 +1,30 @@
 name: Indices Pipeline
-
 on:
   workflow_dispatch:
-
   
-
 jobs:
   indices:
-
     runs-on: ubuntu-latest
-
     steps:
-
       - name: Checkout Repo
         uses: actions/checkout@v4
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install Dependencies
         run: |
-          pip install httpx
-
+          pip install httpx boto3 pandas numpy
       - name: Run Indices Pipeline
         env:
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-
         run: |
           python pipeline_indices.py
+      - name: Run RRG Pipeline
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: |
+          python pipeline_rrg.py
