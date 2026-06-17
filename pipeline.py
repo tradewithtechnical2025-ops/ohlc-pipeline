@@ -1618,7 +1618,7 @@ def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullbac
             "macd":round(macd_line[i],4),"macd_signal":round(macd_signal[i],4)})
     return signals
 
-def _detect_hlr(all_data,swing_n=5,cluster_pct=2.0,near_pct=4.0,consol_days=5,consol_pct=4.0):
+def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,consol_pct=4.0):
     signals=[]
     for sym,s in all_data.items():
         dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
