@@ -1655,8 +1655,7 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
         for (level,zone_low,touches,is_zone,touch_pts,cluster_tag) in levels:
             dist_pct=(level-curr_close)/level*100
             if cluster_tag=="BO":
-                vol_ok=(vol_spike is None) or (vol_spike>=2.0)
-                state="BO" if vol_ok else "Near HLR"
+                state="BO"
             elif 0<=dist_pct<=near_pct: state="Consolidating near HLR" if is_consol else "Near HLR"
             else: continue
             signals.append({"symbol":sym,"state":state,"resistance":round(level,2),"zone_low":round(zone_low,2),
