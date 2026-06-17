@@ -1768,7 +1768,117 @@ async def run_pattern_scan() -> None:
         log.info(f"Total: {len(signals)} signals")
         await r2_upload(client,"pattern_signals.json",json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}))
     log.info("━━━ Pattern Scan complete ━━━")
+#-----------------
+def _calc_sma(closes, period):
+    n = len(closes)
+    sma = [None] * n
+    for i in range(period - 1, n):
+        window = closes[i - period + 1:i + 1]
+        if any(v is None for v in window):
+            continue
+        sma[i] = sum(window) / period
+    return sma
 
+
+def _detect_stage2(all_data, sma_fast=50, sma_mid=150, sma_long=200,
+                    slope_lookback=25, pct_above_low_min=30.0, pct_below_high_max=25.0):
+    """
+    Stage 2 (Advancing) — Minervini-style trend template, RS condition dropped.
+    Rules (all must pass):
+      1. close > sma50 > sma150 > sma200   (stacked order)
+      2. sma200 today > sma200 N bars ago  (long-term trend up)
+      3. close >= pct_above_low_min% above 52w low
+      4. close within pct_below_high_max% of 52w high
+
+    Returns:
+      current_signals  -> list of stocks in Stage 2 as of latest bar
+      breadth_history  -> [{date, count}] date-wise total Stage 2 stocks (full history)
+    """
+    current_signals = []
+    breadth = {}
+
+    for sym, s in all_data.items():
+        dates, closes, highs, lows, volumes = s["d"], s["c"], s["h"], s["l"], s["v"]
+        n = len(dates)
+        if n < sma_long + slope_lookback + 5:
+            continue
+        if not _check_liquidity(volumes, closes, n):
+            continue
+
+        sma50  = _calc_sma(closes, sma_fast)
+        sma150 = _calc_sma(closes, sma_mid)
+        sma200 = _calc_sma(closes, sma_long)
+
+        start = sma_long + slope_lookback
+        last_flag = None
+        last_detail = None
+
+        for i in range(start, n):
+            c, s50, s150, s200 = closes[i], sma50[i], sma150[i], sma200[i]
+            if None in (c, s50, s150, s200):
+                continue
+            s200_prev = sma200[i - slope_lookback]
+            if s200_prev is None:
+                continue
+
+            lo_start = max(0, i - 251)
+            wl = [v for v in lows[lo_start:i + 1] if v is not None]
+            wh = [v for v in highs[lo_start:i + 1] if v is not None]
+            if not wl or not wh:
+                continue
+            low52, high52 = min(wl), max(wh)
+            if low52 <= 0 or high52 <= 0:
+                continue
+
+            pct_off_low  = (c - low52) / low52 * 100
+            pct_off_high = (high52 - c) / high52 * 100
+
+            is_s2 = (c > s50 > s150 > s200) and (s200 > s200_prev) \
+                    and (pct_off_low >= pct_above_low_min) \
+                    and (pct_off_high <= pct_below_high_max)
+
+            if is_s2:
+                d = dates[i]
+                breadth[d] = breadth.get(d, 0) + 1
+
+            if i == n - 1:
+                last_flag = is_s2
+                last_detail = {
+                    "symbol": sym, "date": dates[i], "close": round(c, 2),
+                    "sma50": round(s50, 2), "sma150": round(s150, 2), "sma200": round(s200, 2),
+                    "pct_off_low": round(pct_off_low, 2), "pct_off_high": round(pct_off_high, 2),
+                }
+
+        if last_flag:
+            current_signals.append(last_detail)
+
+    breadth_history = [{"date": d, "count": cnt} for d, cnt in sorted(breadth.items())]
+    return current_signals, breadth_history
+async def run_stage2_scan() -> None:
+    today = today_ist()
+    log.info(f"━━━ Stage 2 Scan  {today} ━━━")
+    async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+        all_data = await download_all_chunks(client)
+        log.info(f"Loaded {len(all_data)} stocks")
+
+        signals, breadth_history = _detect_stage2(all_data)
+        signals.sort(key=lambda x: x["pct_off_high"])  # closest to 52w high first
+
+        log.info(f"Stage 2 stocks today: {len(signals)}")
+        if breadth_history:
+            log.info(f"Breadth history: {len(breadth_history)} dates, latest count {breadth_history[-1]['count']}")
+
+        await asyncio.gather(
+            r2_upload(client, "stage2_signals.json", json.dumps({
+                "updated": today, "count": len(signals), "signals": signals,
+            })),
+            r2_upload(client, "stage2_breadth.json", json.dumps({
+                "updated": today, "history": breadth_history,
+            })),
+        )
+    log.info("━━━ Stage 2 Scan complete ━━━")
 # ══════════════════════════════════════════════════════════════
 # VCP SCAN
 # ══════════════════════════════════════════════════════════════
@@ -1995,6 +2105,7 @@ if __name__ == "__main__":
         case "ep_scan":       asyncio.run(run_ep_scan())
         case "hlr_scan":      asyncio.run(run_hlr_scan())
         case "pattern_scan":  asyncio.run(run_pattern_scan())
+        case "stage2_scan":   asyncio.run(run_stage2_scan())
         case "vcp_scan":      asyncio.run(run_vcp_scan())
         case _:
             print(__doc__)
