@@ -6,6 +6,7 @@ Fetches from NSE archives:
   - bulk.csv                        → latest bulk deals
   - block.csv                       → latest block deals
   - fao_participant_oi_DDMMYYYY.csv → participant-wise F&O OI (FII/DII/Client/Pro)
+  - fiidiiTradeReact?csv=true       → FII/DII cash provisional (buy/sell/net in Rs Cr)
 
 Saves to R2 via Worker (FLAT keys — no slashes, worker slash-rejection safe):
   nse_bands.json              → EQ+BE symbols with current band + next-day change if any
@@ -15,6 +16,8 @@ Saves to R2 via Worker (FLAT keys — no slashes, worker slash-rejection safe):
   nse_block_history.json      → symbol-wise accumulated block history
   nse_participant_oi.json     → latest single-day participant OI snapshot
   nse_participant_oi_hist.json → rolling 60-day participant OI history (sorted asc)
+  nse_fii_dii.json             → latest FII/DII cash provisional snapshot (Rs Cr)
+  nse_fii_dii_hist.json        → rolling 180-day FII/DII cash history (sorted asc)
 """
 
 import asyncio
@@ -22,8 +25,9 @@ import csv
 import io
 import json
 import os
+import re
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import httpx
 
@@ -113,6 +117,7 @@ UP_HEADERS = {"X-Secret-Token": WORKER_TOKEN, "Content-Type": "application/json"
 
 NSE_BASE  = "https://archives.nseindia.com/content/equities"
 NSCCL_BASE = "https://archives.nseindia.com/content/nsccl"
+NSE_API_BASE = "https://www.nseindia.com/api"
 
 NSE_HEADERS = {
     "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -122,7 +127,8 @@ NSE_HEADERS = {
     "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-OI_HISTORY_DAYS = 60   # rolling window
+OI_HISTORY_DAYS = 60        # rolling window for participant OI
+FII_DII_HISTORY_DAYS = 180  # rolling window for FII/DII cash trend
 
 # ── NSE Holidays 2026 ─────────────────────────────────────────────────────────
 NSE_HOLIDAYS = {
@@ -354,6 +360,96 @@ def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FII/DII cash provisional fetch
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_fii_dii(session: httpx.Client) -> list[dict]:
+    """
+    Fetches daily FII/DII cash-market provisional figures (Rs Crores) from
+    NSE's API. Returns raw CSV rows as dicts — column names from NSE vary in
+    casing/spacing (category/Category, buyValue/'Buy Value' etc.), so
+    parse_fii_dii() below normalises them rather than assuming exact keys.
+    """
+    url = f"{NSE_API_BASE}/fiidiiTradeReact?csv=true"
+    headers = {**NSE_HEADERS, "Accept": "text/csv,application/json,text/plain,*/*"}
+    r = session.get(url, headers=headers, timeout=30)
+    r.raise_for_status()
+    text = r.content.decode("utf-8-sig").strip()
+    if not text:
+        return []
+    rows = list(csv.DictReader(io.StringIO(text)))
+    print(f"  ✓ fiidiiTradeReact → {len(rows)} rows")
+    return rows
+
+
+def _norm_key(k: str) -> str:
+    """
+    NSE's CSV headers come as e.g. 'BUY VALUE \n(₹ Crores)' — strip everything
+    except lowercase a-z/0-9 so 'BUY VALUE \n(₹ Crores)' → 'buyvaluecrores'.
+    """
+    return re.sub(r"[^a-z0-9]", "", k.lower())
+
+
+def _find_value(norm: dict, needle: str):
+    """Returns the value of the first normalised key containing `needle`."""
+    for k, v in norm.items():
+        if needle in k:
+            return v
+    return None
+
+
+def _parse_nse_date(s: str) -> str:
+    """Converts NSE's date string (e.g. '17-Jun-26' or '17-Jun-2026') to ISO YYYY-MM-DD."""
+    s = s.strip()
+    for fmt_str in ("%d-%b-%y", "%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(s, fmt_str).date().isoformat()
+        except ValueError:
+            continue
+    return s  # fallback: leave as-is if format is unrecognised
+
+
+def parse_fii_dii(rows: list[dict]) -> dict:
+    """
+    Normalises NSE's FII/DII cash CSV into a clean snapshot:
+      {"date": "YYYY-MM-DD", "fii": {buy, sell, net}, "dii": {buy, sell, net}}
+    Values are in Rs Crores. Robust to NSE's multi-line/unit-suffixed headers,
+    e.g. 'CATEGORY \n', 'BUY VALUE \n(₹ Crores)', dates like '17-Jun-26'.
+    """
+    out = {"date": None, "fii": None, "dii": None}
+
+    def _num(v):
+        try:
+            return float(str(v).replace(",", "").strip())
+        except:
+            return 0.0
+
+    for row in rows:
+        norm = {_norm_key(k): v for k, v in row.items()}
+
+        category = (_find_value(norm, "category") or "").strip().upper()
+        row_date = (_find_value(norm, "date") or "").strip()
+
+        buy  = _num(_find_value(norm, "buyvalue"))
+        sell = _num(_find_value(norm, "sellvalue"))
+        net  = _num(_find_value(norm, "netvalue"))
+        if net == 0.0 and (buy or sell):
+            net = buy - sell
+
+        entry = {"buy": buy, "sell": sell, "net": net}
+
+        if row_date and not out["date"]:
+            out["date"] = _parse_nse_date(row_date)
+
+        if category.startswith("FII") or category.startswith("FPI"):
+            out["fii"] = entry
+        elif category.startswith("DII") or category.startswith("MF"):
+            out["dii"] = entry
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Worker R2 helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -383,11 +479,12 @@ async def r2_put(client: httpx.AsyncClient, filename: str, data):
 
 def merge_oi_history(hist: list, new_entry: dict, max_days: int = OI_HISTORY_DAYS) -> list:
     """
-    hist: list of daily OI dicts sorted ascending by date
-    new_entry: parsed dict for today (has "date" key)
+    hist: list of daily dicts sorted ascending by ISO "date" key
+    new_entry: parsed dict for today (has "date" key, ISO format)
     Returns updated list with:
       - duplicate dates replaced (idempotent re-runs)
       - oldest entries pruned so only max_days remain
+    Generic — reused for both participant-OI and FII/DII cash history.
     """
     target_date = new_entry["date"]
 
@@ -396,10 +493,10 @@ def merge_oi_history(hist: list, new_entry: dict, max_days: int = OI_HISTORY_DAY
     if target_date in existing_dates:
         idx = existing_dates.index(target_date)
         hist[idx] = new_entry
-        print(f"  OI history: updated existing entry for {target_date}")
+        print(f"  history: updated existing entry for {target_date}")
     else:
         hist.append(new_entry)
-        print(f"  OI history: added new entry for {target_date}")
+        print(f"  history: added new entry for {target_date}")
 
     # Sort ascending
     hist.sort(key=lambda x: x["date"])
@@ -408,7 +505,7 @@ def merge_oi_history(hist: list, new_entry: dict, max_days: int = OI_HISTORY_DAY
     if len(hist) > max_days:
         removed = len(hist) - max_days
         hist = hist[-max_days:]
-        print(f"  OI history: pruned {removed} old entries, keeping {len(hist)} days")
+        print(f"  history: pruned {removed} old entries, keeping {len(hist)} days")
 
     return hist
 
@@ -470,6 +567,28 @@ async def run():
     except RuntimeError:
         print("  ⚠ fao_participant_oi not available — skipping OI update")
         oi_rows, oi_date = [], today
+
+    # ── 6. FII/DII cash provisional ────────────────────────────────────────────
+    print("\n[6] fiidiiTradeReact (FII/DII cash)...")
+    fii_dii_snapshot = None
+    try:
+        fii_dii_rows = fetch_fii_dii(nse)
+        if fii_dii_rows:
+            fii_dii_snapshot = parse_fii_dii(fii_dii_rows)
+            if fii_dii_snapshot.get("date") and (fii_dii_snapshot.get("fii") or fii_dii_snapshot.get("dii")):
+                fii = fii_dii_snapshot.get("fii") or {}
+                dii = fii_dii_snapshot.get("dii") or {}
+                print(f"  FII net: {fii.get('net', 0):+,.2f} Cr   "
+                      f"DII net: {dii.get('net', 0):+,.2f} Cr   ({fii_dii_snapshot['date']})")
+            else:
+                print(f"  ⚠ fii_dii: couldn't parse category/values. "
+                      f"Raw columns: {list(fii_dii_rows[0].keys())}")
+                fii_dii_snapshot = None
+        else:
+            print("  ⚠ fii_dii: empty response — skipping")
+    except Exception as e:
+        print(f"  ⚠ fii_dii fetch failed: {e} — skipping")
+        fii_dii_snapshot = None
 
     nse.close()
 
@@ -552,7 +671,7 @@ async def run():
         print("  ⚠ No OI rows — skipping OI upload")
 
     # ── Upload to R2 ──────────────────────────────────────────────────────────
-    print("\n[6] Uploading to R2...")
+    print("\n[7] Uploading to R2...")
     async with httpx.AsyncClient() as client:
 
         # ── Fetch all existing snapshots + histories in one parallel round-trip
@@ -563,6 +682,7 @@ async def run():
             bulk_hist,
             block_hist,
             oi_hist,
+            fii_dii_hist,
         ) = await asyncio.gather(
             r2_get(client, "nse_bands.json"),
             r2_get(client, "nse_bulk.json"),
@@ -570,11 +690,13 @@ async def run():
             r2_get(client, "nse_bulk_history.json"),
             r2_get(client, "nse_block_history.json"),
             r2_get(client, "nse_participant_oi_hist.json"),
+            r2_get(client, "nse_fii_dii_hist.json"),
         )
 
-        bulk_hist  = bulk_hist  or {}
-        block_hist = block_hist or {}
-        oi_hist    = oi_hist    or []
+        bulk_hist    = bulk_hist    or {}
+        block_hist   = block_hist   or {}
+        oi_hist      = oi_hist      or []
+        fii_dii_hist = fii_dii_hist or []
 
         upload_tasks = []
 
@@ -634,6 +756,26 @@ async def run():
                 upload_tasks.append(r2_put(client, "nse_participant_oi_hist.json", oi_hist))
         else:
             print("  ⚠ No OI snapshot — skipping OI uploads")
+
+        # ── FII/DII cash snapshot + history ─────────────────────────────────────
+        if fii_dii_snapshot and fii_dii_snapshot.get("date"):
+            fd_date_str = fii_dii_snapshot["date"]
+
+            # Snapshot always uploaded so frontend shows latest available date
+            upload_tasks.append(r2_put(client, "nse_fii_dii.json", fii_dii_snapshot))
+
+            # History — only append if genuinely new trading day
+            existing_fd_dates = {e["date"] for e in fii_dii_hist}
+            if fd_date_str in existing_fd_dates:
+                print(f"  ✓ FII/DII history: {fd_date_str} already present — history unchanged")
+                if fii_dii_hist:
+                    print(f"    Data available: {len(fii_dii_hist)} days  "
+                          f"({fii_dii_hist[0]['date']} → {fii_dii_hist[-1]['date']})")
+            else:
+                fii_dii_hist = merge_oi_history(fii_dii_hist, fii_dii_snapshot, max_days=FII_DII_HISTORY_DAYS)
+                upload_tasks.append(r2_put(client, "nse_fii_dii_hist.json", fii_dii_hist))
+        else:
+            print("  ⚠ No FII/DII snapshot — skipping FII/DII uploads")
 
         # ── Fire all pending uploads in parallel ──────────────────────────────
         if upload_tasks:
