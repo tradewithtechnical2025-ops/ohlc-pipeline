@@ -208,7 +208,17 @@ def prev_trading_day(d: str) -> str:
 
 def rolling_cutoff(anchor: str) -> str:
     return (date.fromisoformat(anchor) - timedelta(days=ROLLING_DAYS)).isoformat()
-
+def _is_week_complete(today_d: str) -> bool:
+    """True agar today_d ke baad is ISO week mein koi trading day nahi bacha."""
+    dt_today = date.fromisoformat(today_d)
+    iso_year, iso_week, iso_weekday = dt_today.isocalendar()
+    for delta in range(1, 8 - iso_weekday + 1):  # Sunday tak check
+        candidate = dt_today + timedelta(days=delta)
+        if candidate.isocalendar()[:2] != (iso_year, iso_week):
+            break
+        if is_trading_day(candidate.isoformat()):
+            return False
+    return True
 
 # ══════════════════════════════════════════════════════════════
 # UPSTOX OHLC FETCHERS
@@ -1731,8 +1741,11 @@ def _detect_patterns(all_data,min_volume=2500,coil_min_babies=3,tight_close_week
                 signals.append({"symbol":sym,"pattern":f"{baby_count} Bar MCP" if baby_count<=6 else "Mini Coil","date":today_d,"mcp_high":round(m_high,2),"mcp_low":round(m_low,2),"baby_count":baby_count,"coil_state":coil_state,"mother_date":dates[m_idx]})
         weekly=_build_weekly(dates,opens,highs,lows,closes,volumes)
         if not weekly: continue
-        current_week=dt.fromisoformat(today_d).isocalendar()[:2]
-        past_weeks=sorted(k for k in weekly if k<current_week)
+        current_week = dt.fromisoformat(today_d).isocalendar()[:2]
+        if _is_week_complete(today_d):
+            past_weeks = sorted(k for k in weekly if k <= current_week)
+        else:
+            past_weeks = sorted(k for k in weekly if k < current_week)
         if len(past_weeks)<2: continue
         lw=weekly[past_weeks[-1]]; lw2=weekly[past_weeks[-2]]
         if lw["h"]<=lw2["h"] and lw["l"]>=lw2["l"]:
