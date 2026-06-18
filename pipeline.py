@@ -455,6 +455,8 @@ def upsert_candle(all_data, sym, c):
 # OHLC PIPELINE MODES
 # ══════════════════════════════════════════════════════════════
 
+MIN_HISTORY_DAYS = 260  # ~1 trading year — covers EMA200, RS 252-day lookback, 52W high/low
+
 async def run_daily() -> None:
     today = today_ist()
     prev = prev_trading_day(today); cutoff = rolling_cutoff(today)
@@ -466,25 +468,28 @@ async def run_daily() -> None:
         all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
         live = set(all_ikeys)
 
-        # Load existing store FIRST so we know who's actually new
-        # vs already tracked — required to decide fetch window.
         all_data = await download_all_chunks(client)
-        already_have = set(all_data.keys())
 
-        new_entrants = live - already_have   # never tracked before (or re-entering after a prune)
-        existing     = live & already_have   # already has history — just needs today's candle
+        # Needs backfill = never tracked OR suspiciously little history —
+        # this covers genuinely-new entrants AND stocks already bitten by
+        # the old 1-day-only merge bug sitting in the store right now.
+        needs_backfill = {
+            sym for sym in live
+            if len((all_data.get(sym) or {}).get("d", [])) < MIN_HISTORY_DAYS
+        }
+        existing = live - needs_backfill
 
-        if new_entrants:
-            sample = sorted(new_entrants)[:15]
-            log.info(f"🆕 {len(new_entrants)} new entrant(s) — deep backfill ({cutoff} → {today}): {sample}{'…' if len(new_entrants) > 15 else ''}")
+        if needs_backfill:
+            sample = sorted(needs_backfill)[:15]
+            log.info(f"🆕 {len(needs_backfill)} symbol(s) need deep backfill ({cutoff} → {today}): {sample}{'…' if len(needs_backfill) > 15 else ''}")
 
         async def _fetch_for(symbols, from_date):
             tasks = [fetch_ohlc(client, sem, sym, all_ikeys[sym], from_date, today) for sym in symbols]
             return await asyncio.gather(*tasks)
 
         backfill_results, incremental_results = await asyncio.gather(
-            _fetch_for(new_entrants, cutoff),   # full 548-day window — new stocks only
-            _fetch_for(existing, prev),         # normal 1-day incremental — everyone else
+            _fetch_for(needs_backfill, cutoff),
+            _fetch_for(existing, prev),
         )
         fetched = {sym: c for sym, c in [*backfill_results, *incremental_results] if c}
         log.info(f"✓ {len(fetched)} fetched  ✗ {len(live) - len(fetched)} no data")
