@@ -463,18 +463,36 @@ async def run_daily() -> None:
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        from_date = prev; to_date = today
-        nse_results, bse_results = await asyncio.gather(
-            asyncio.gather(*[fetch_ohlc(client,sem,sym,ikey,from_date,to_date) for sym,ikey in ISIN_MAP.items()]),
-            asyncio.gather(*[fetch_ohlc(client,sem,sym,ikey,from_date,to_date) for sym,ikey in BSE_ISIN_MAP.items()]),
-        )
-        fetched = {sym:c for sym,c in [*nse_results,*bse_results] if c}
-        log.info(f"✓ {len(fetched)} fetched  ✗ {len(ISIN_MAP)+len(BSE_ISIN_MAP)-len(fetched)} no data")
+        all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
+        live = set(all_ikeys)
+
+        # Load existing store FIRST so we know who's actually new
+        # vs already tracked — required to decide fetch window.
         all_data = await download_all_chunks(client)
-        live = set(ISIN_MAP) | set(BSE_ISIN_MAP)
+        already_have = set(all_data.keys())
+
+        new_entrants = live - already_have   # never tracked before (or re-entering after a prune)
+        existing     = live & already_have   # already has history — just needs today's candle
+
+        if new_entrants:
+            sample = sorted(new_entrants)[:15]
+            log.info(f"🆕 {len(new_entrants)} new entrant(s) — deep backfill ({cutoff} → {today}): {sample}{'…' if len(new_entrants) > 15 else ''}")
+
+        async def _fetch_for(symbols, from_date):
+            tasks = [fetch_ohlc(client, sem, sym, all_ikeys[sym], from_date, today) for sym in symbols]
+            return await asyncio.gather(*tasks)
+
+        backfill_results, incremental_results = await asyncio.gather(
+            _fetch_for(new_entrants, cutoff),   # full 548-day window — new stocks only
+            _fetch_for(existing, prev),         # normal 1-day incremental — everyone else
+        )
+        fetched = {sym: c for sym, c in [*backfill_results, *incremental_results] if c}
+        log.info(f"✓ {len(fetched)} fetched  ✗ {len(live) - len(fetched)} no data")
+
         pruned = [s for s in list(all_data) if s not in live]
         for s in pruned: del all_data[s]
         if pruned: log.info(f"🗑  Pruned {len(pruned)} stocks")
+
         total_new = 0; delta = {}
         for sym, candles in fetched.items():
             total_new += merge_candles_into(all_data, sym, candles, cutoff)
@@ -485,7 +503,7 @@ async def run_daily() -> None:
         log.info(f"Rolling: dropped {dropped} old candles")
         await asyncio.gather(
             upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json", json.dumps({"date":today,"stocks":delta})),
+            r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
         )
     log.info("━━━ Daily complete ━━━")
 
