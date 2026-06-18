@@ -1066,6 +1066,7 @@ def _build_mswing_json(all_data, mswing_data):
 
 PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo"]
 HLR_STATE_KEYS={"BO":"hlr_bo","Near HLR":"hlr_near","Consolidating near HLR":"hlr_consol"}
+GAP_STATE_KEYS={"Near Gap":"gap_near","Consolidating near Gap":"gap_consol","Gap Filled":"gap_just_filled"}
 
 def _build_pattern_day(feed):
     day={}
@@ -1075,16 +1076,31 @@ def _build_pattern_day(feed):
     for state,key in HLR_STATE_KEYS.items():
         syms=[r["symbol"] for r in feed if r.get("hlr_state")==state]
         if syms: day[key]=syms
+    for state,key in GAP_STATE_KEYS.items():
+        syms=[r["symbol"] for r in feed if r.get("gap_fill")==state]
+        if syms: day[key]=syms
     return day
 
-async def backup_pattern_history(client, feed, today):
+async def backup_pattern_history(client, feed, today, gap_history=None):
     fname=f"pattern_history_{today[:4]}.json"; day=_build_pattern_day(feed)
+    if gap_history:
+        gap_new=[]; gap_filled=[]
+        for sym,events in gap_history.items():
+            for e in events:
+                if e["gap_date"]==today: gap_new.append({"symbol":sym,"gap_pct":e["gap_pct"],"gap_top":e["gap_top"]})
+                if e.get("fill_date")==today: gap_filled.append({"symbol":sym,"gap_pct":e["gap_pct"],"gap_top":e["gap_top"],"gap_date":e["gap_date"]})
+        if gap_new: day["gap_new"]=gap_new
+        if gap_filled: day["gap_filled"]=gap_filled
     if not day: log.info(f"  🗄  pattern backup: no patterns on {today}, skip"); return
     hist=await r2_download(client,fname)
     if not isinstance(hist,dict): hist={}
     hist[today]=day
     await r2_upload(client,fname,json.dumps(hist,separators=(",",":")))
-    n_sym=len({s for v in day.values() for s in v})
+    all_syms=set()
+    for k,v in day.items():
+        if k in ("gap_new","gap_filled"): all_syms.update(x.get("symbol") for x in v)
+        else: all_syms.update(v)
+    n_sym=len(all_syms)
     log.info(f"  🗄  pattern_history: {today} → {fname}  ({len(day)} signals, {n_sym} stocks, {len(hist)} dates)")
 
 def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0, volume_lookback=20, max_consolidation=30, max_ep_age_days=30):
@@ -1170,11 +1186,77 @@ def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,vol
 
 
 # ══════════════════════════════════════════════════════════════
+# GAP-FILL DETECTOR  — full history, CLOSING-basis fill check
+# ══════════════════════════════════════════════════════════════
+
+def _detect_gap_signals(all_data, min_gap_pct=2.0, near_pct=5.0):
+    """
+    Gap-down detector — scans FULL available history (no day cap, was n-120).
+    A gap is "filled" only when a subsequent CLOSE >= gap_top (intraday high
+    touching it does NOT count anymore).
+
+    Returns:
+      gap_state   : {symbol: {state, gap_date, gap_pct, gap_top, dist_pct?, fill_date?}}
+                    -> single "current" gap per symbol, consumed by screener_feed.
+                       state ∈ {"Near Gap","Consolidating near Gap","Gap Filled"}
+                       "Gap Filled" fires only on the day the close crosses gap_top
+                       (i.e. fill_date == today), so it's a one-day event flag.
+      gap_history : {symbol: [{gap_date, prev_date, gap_pct, gap_top, filled, fill_date}, ...]}
+                    -> ALL gap-down events ever found for the stock — feed this into
+                       backup_pattern_history() for backtesting (dated, with gap_pct).
+    """
+    gap_state={}; gap_history={}
+    for sym, s in all_data.items():
+        dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; n=len(dates)
+        if n < 3: continue
+        events=[]
+        for i in range(1, n):                              # full history, no n-120 floor
+            prev_low=lows[i-1]; today_high=highs[i]
+            if prev_low is None or today_high is None: continue
+            if today_high>=prev_low: continue                # no gap-down
+            gap_pct=(prev_low-today_high)/prev_low*100
+            if gap_pct<min_gap_pct: continue
+            gap_top=prev_low
+            fill_date=None
+            for j in range(i, n):                             # CLOSING-basis fill check
+                if closes[j] is not None and closes[j]>=gap_top:
+                    fill_date=dates[j]; break
+            events.append({"gap_date":dates[i],"prev_date":dates[i-1],
+                "gap_pct":round(gap_pct,2),"gap_top":round(gap_top,2),
+                "filled":fill_date is not None,"fill_date":fill_date})
+        if not events: continue
+        gap_history[sym]=events
+
+        ltp=next((v for v in reversed(closes) if v is not None), None)
+        if ltp is None: continue
+        today_d=dates[-1]
+
+        just_filled=next((e for e in reversed(events) if e["filled"] and e["fill_date"]==today_d), None)
+        if just_filled:
+            gap_state[sym]={"state":"Gap Filled","gap_date":just_filled["gap_date"],
+                "gap_pct":just_filled["gap_pct"],"gap_top":just_filled["gap_top"],
+                "fill_date":just_filled["fill_date"]}
+            continue
+
+        open_gap=next((e for e in reversed(events) if not e["filled"]), None)
+        if open_gap:
+            gap_top=open_gap["gap_top"]
+            dist_pct=(gap_top-ltp)/gap_top*100
+            if 0<=dist_pct<=near_pct:
+                recent_near=all(closes[j] is not None and abs((gap_top-closes[j])/gap_top*100)<=near_pct
+                    for j in range(max(0,n-6),n-1))
+                gap_state[sym]={"state":"Consolidating near Gap" if recent_near else "Near Gap",
+                    "gap_date":open_gap["gap_date"],"gap_pct":open_gap["gap_pct"],
+                    "gap_top":gap_top,"dist_pct":round(dist_pct,2)}
+    return gap_state, gap_history
+
+
+# ══════════════════════════════════════════════════════════════
 # _build_screener_feed
 # ══════════════════════════════════════════════════════════════
 
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
-    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None):
+    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None):
     cls_map={}
     for x in (classification or []):
         sym=x.get("symbol") or x.get("nse_code")
@@ -1313,21 +1395,8 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             if baby_count>=3 and intact: seen_mothers.add(mk); mcp_high=mh; mcp_low=ml; break
         mcp_flag=mcp_high is not None
         launchpad=bool(mcp_flag and ema10 and ema21 and ema50 and mcp_low<=ema10<=mcp_high and mcp_low<=ema21<=mcp_high and mcp_low<=ema50<=mcp_high)
-        gap_fill_state=None
-        for i in range(n-2,max(0,n-120),-1):
-            if i==0: break
-            prev_low=lows[i-1]; today_high=highs[i]
-            if prev_low is None or today_high is None: continue
-            if today_high>=prev_low: continue
-            gap_pct=(prev_low-today_high)/prev_low*100
-            if gap_pct<2.0: continue
-            gap_top=prev_low
-            filled=any(highs[j] and highs[j]>=gap_top for j in range(i+1,n-1))
-            if filled: continue
-            dist_pct=(gap_top-ltp)/gap_top*100
-            if 0<=dist_pct<=5.0:
-                recent_near=all(highs[j] and lows[j] and abs((gap_top-closes[j])/gap_top*100)<=5.0 for j in range(max(0,n-6),n-1) if closes[j])
-                gap_fill_state="Consolidating near Gap" if recent_near else "Near Gap"; break
+        gap_info=(gap_map or {}).get(sym,{})
+        gap_fill_state=gap_info.get("state")
         rs_info=rs_data.get(sym,{}); ms_info=mswing_data.get(sym,{})
         cls_info=cls_map.get(sym,{}); sh_info=sheet_data.get(sym,{})
         IDX_SHORT={"nifty50":"n50","nifty500":"n500","smallmid400":"sm400"}
@@ -1351,7 +1420,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             **rs_idx,"sales_ch":None,"eps_ch":None,"patterns":"","results":result_date,
             "vd":vd,"hvq":hvq,"hvm":hvm,"hvy":hvy,"lvq":lvq,"lvm":lvm,"lvy":lvy,"to":turnover,
             "vol_footprint":vol_footprint,"atr_tightness":atr_tightness,"bs":bs,"pp":pp,
-            "mcp":mcp_flag,"mcp_high":mcp_high,"mcp_low":mcp_low,"launchpad":launchpad,"gap_fill":gap_fill_state,
+            "mcp":mcp_flag,"mcp_high":mcp_high,"mcp_low":mcp_low,"launchpad":launchpad,
+            "gap_fill":gap_fill_state,"gap_date":gap_info.get("gap_date"),"gap_pct":gap_info.get("gap_pct"),
+            "gap_top":gap_info.get("gap_top"),"gap_fill_date":gap_info.get("fill_date"),
             "ib":"Inside Bar" in (pat_map or {}).get(sym,set()),"dib":"Double Inside Bar" in (pat_map or {}).get(sym,set()),
             "nr7":"NR7" in (pat_map or {}).get(sym,set()),"wib":"Weekly IB" in (pat_map or {}).get(sym,set()),
             "w_dib":"Weekly Double IB" in (pat_map or {}).get(sym,set()),"w_nr7":"Weekly NR7" in (pat_map or {}).get(sym,set()),
@@ -1523,7 +1594,8 @@ async def run_ep_scan() -> None:
             sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
         for sig in pr_signals:
             sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
-        screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map)
+        gap_state,gap_history=_detect_gap_signals(all_data)
+        screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state)
         ep_pat_map={}
         for sig in signals: ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
         for row in screener_feed:
@@ -1557,7 +1629,7 @@ async def run_ep_scan() -> None:
             r2_upload(client,"sector_group_rs_history.json",json.dumps(sector_group_rs_history)),
             r2_upload(client,"industry_rs_history.json",json.dumps(industry_rs_history)),
             r2_upload(client,"screener_feed.json",json.dumps(screener_feed)),
-            backup_pattern_history(client,screener_feed,today),
+            backup_pattern_history(client,screener_feed,today,gap_history=gap_history),
         )
         log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
     log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
