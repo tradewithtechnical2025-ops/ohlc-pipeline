@@ -1,0 +1,35 @@
+name: Fundamentals Full Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Space-separated NSE symbols"
+        required: false
+        default: "ITC SBIN"
+
+jobs:
+  test-fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run full fundamentals test fetch
+        env:
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+        run: python pipeline_fundamentals_full.py test ${{ github.event.inputs.symbols }}
+
+      - name: Upload result JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: fundamentals-full-test
+          path: output/fundamentals_full_test.json
