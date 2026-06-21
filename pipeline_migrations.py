@@ -586,6 +586,16 @@ async def main():
         bse_raw = await fetch_upstox(client, UPSTOX_BSE_URL, "BSE")
         nse_raw = await fetch_upstox(client, UPSTOX_NSE_URL, "NSE")
 
+        # Diagnostic: confirm what segment values Upstox actually uses for
+        # NSE instruments — specifically whether NSE_SME (Emerge) shows up
+        # at all. Cheap to leave in permanently; only prints when something
+        # looks off (zero SME found) so it doesn't clutter normal runs.
+        from collections import Counter
+        nse_segment_counts = Counter(str(x.get("segment") or "").upper() for x in nse_raw)
+        if nse_segment_counts.get("NSE_SME", 0) == 0:
+            print(f"⚠️  Diagnostic: 0 raw instruments with segment=='NSE_SME' in Upstox's NSE feed. "
+                  f"All segment values seen: {dict(nse_segment_counts)}")
+
         new_bse = build_bse_snapshot(bse_raw)
         new_nse = build_nse_snapshot(nse_raw)
 
