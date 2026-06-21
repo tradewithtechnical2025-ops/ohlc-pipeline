@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 """
-Finedge Fundamentals — PRODUCTION pipeline (v1)
+Finedge Fundamentals — PRODUCTION pipeline (v2)
 =================================================
 Symbols: SBIN, TCS, ITC, SBILIFE (hardcoded — change SYMBOLS list to extend)
 
 Decisions baked in (from testing phase):
-  - PL  periods : annual, quarterly, ttm        (halfyearly dropped — redundant)
-  - BS  periods : annual, quarterly             (ttm/ytd not meaningful — point-in-time)
-  - CF  periods : annual, quarterly, ytd        (ttm not offered by Finedge for cf)
-  - Both statement_types (c + s) fetched always — banking ratios like CET1/NPA
-    are ONLY populated in standalone, never in consolidated.
-  - shareholdings/pattern endpoint REMOVED — cuts 1 call/symbol, not needed right now.
-  - Full history kept (no row-count trimming) — set ROWS_LIMIT env var to cap if needed.
-  - PL/BS get an alias-resolved "core" object (handles bank vs non-bank field-naming,
-    e.g. revenueFromOperations vs n/a, profitBeforeTax vs profitLossBeforeTax) PLUS
-    the full untouched "raw" rows — so nothing is lost even for schemas we haven't
-    seen yet (e.g. SBILIFE/insurance, which may not match either alias set well).
-  - CF / ratios / basic_financials / growth_metrics / annual_price_ratios stored as
-    raw full rows — their schemas were consistent enough across bank/non-bank in
-    testing to not need alias mapping.
+  - PL  periods : annual (full), quarterly (last 12), ttm (1 row)
+  - BS  periods : annual (full), quarterly (last 12)
+  - CF  periods : annual (full), quarterly (last 12), ytd (last 12)
+  - PL + basic-financials: BOTH statement_types (c + s) fetched always — banking
+    ratios like CET1/NPA are ONLY populated in standalone, even when consolidated
+    rows exist (so a c→s *fallback* would never trigger — we need both, always).
+  - BS / CF / ratios / growth_metrics / annual_price_ratios: SINGLE statement_type
+    — try consolidated (c) first, fall back to standalone (s) only if c returns
+    no rows at all. These schemas didn't show the "populated-but-zero" issue in
+    testing, so a real fallback (not a forced dual-fetch) is safe here and halves
+    the call count for these endpoints.
+  - shareholdings/pattern endpoint REMOVED — not needed right now.
+  - PL/BS get an alias-resolved "core" object (handles bank vs non-bank field-naming)
+    PLUS the full untouched "raw" rows — nothing lost even for schemas not yet
+    mapped (e.g. SBILIFE/insurance).
+
+API calls per symbol: profile(1) + PL(6) + basic_financials(2) + BS(~2-4) +
+CF(~3-6) + ratios(~4-8) + growth(~1-2) + price_ratios(~1-2)
+≈ 20-31 depending on how often the c→s fallback triggers (best case ~20).
 
 Usage:
   python pipeline_fundamentals_prod.py run
@@ -42,19 +47,21 @@ FINEDGE_BASE  = "https://data.finedgeapi.com/api/v1"
 FINEDGE_DELAY = 0.25
 RETRY         = 5
 
-SYMBOLS     = ["SBIN", "TCS", "ITC", "SBILIFE"]
-PL_PERIODS  = ["annual", "quarterly", "ttm"]
-BS_PERIODS  = ["annual", "quarterly"]
-CF_PERIODS  = ["annual", "quarterly", "ytd"]
-RATIO_TYPES = ["pr", "le", "li", "ef"]
-STYPES      = ["c", "s"]
+SYMBOLS      = ["SBIN", "TCS", "ITC", "SBILIFE"]
+PL_PERIODS   = ["annual", "quarterly", "ttm"]
+BS_PERIODS   = ["annual", "quarterly"]
+CF_PERIODS   = ["annual", "quarterly", "ytd"]
+RATIO_TYPES  = ["pr", "le", "li", "ef"]
 
-ROWS_LIMIT = os.environ.get("ROWS_LIMIT")
-ROWS_LIMIT = int(ROWS_LIMIT) if ROWS_LIMIT else None  # None = full history, no trimming
+QUARTERLY_CAP = 12   # quarterly/ytd periods trimmed to most recent N rows; annual/ttm stay full
 
 HERE = Path(__file__).parent
 OUT_DIR = HERE / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _period_limit(period):
+    return QUARTERLY_CAP if period in ("quarterly", "ytd") else None
 
 
 # ══════════════════════════════════════════════════════════════
@@ -85,10 +92,6 @@ async def _finedge_get(client, sem, path, params):
             except Exception:
                 return None
     return None
-
-
-def _trim(rows):
-    return rows[:ROWS_LIMIT] if ROWS_LIMIT else rows
 
 
 # ══════════════════════════════════════════════════════════════
@@ -154,7 +157,7 @@ CORE_BS_ALIASES = {
     "advances":       ["advances"],
     "deposits":       ["deposits"],
     # non-bank-only
-    "inventories":      ["inventories"],
+    "inventories":       ["inventories"],
     "trade_receivables": ["tradeReceivablesCurrent"],
     "trade_payables":    ["tradePayablesCurrent"],
 }
@@ -204,17 +207,21 @@ def _build_bs_core(row):
 
 
 # ══════════════════════════════════════════════════════════════
-# FETCH FUNCTIONS
+# FETCH — DUAL statement_type (always both c + s)
+#   used for: PL, basic_financials
 # ══════════════════════════════════════════════════════════════
 
-async def _fetch_financials_all(client, sem, sym, code, periods, build_core_fn=None):
+async def _fetch_financials_dual(client, sem, sym, code, periods, build_core_fn=None):
     out = {}
     for period in periods:
+        limit = _period_limit(period)
         out[period] = {}
-        for stype in STYPES:
+        for stype in ("c", "s"):
             d = await _finedge_get(client, sem, f"financials/{sym}",
                                     {"statement_type": stype, "statement_code": code, "period": period})
-            rows = _trim((d or {}).get("financials", []))
+            rows = (d or {}).get("financials", [])
+            if limit:
+                rows = rows[:limit]
             if build_core_fn:
                 out[period][stype] = {"core": [build_core_fn(r) for r in rows], "raw": rows}
             else:
@@ -222,38 +229,71 @@ async def _fetch_financials_all(client, sem, sym, code, periods, build_core_fn=N
     return out
 
 
-async def _fetch_ratios_all(client, sem, sym):
+async def _fetch_basic_financials_dual(client, sem, sym):
+    out = {}
+    for stype in ("c", "s"):
+        d = await _finedge_get(client, sem, f"basic-financials/{sym}", {"statement_type": stype, "statement_code": "pl"})
+        out[stype] = (d or {}).get("ratios", [])
+    return out
+
+
+# ══════════════════════════════════════════════════════════════
+# FETCH — SINGLE statement_type, c preferred, fallback to s only
+# if c returns zero rows
+#   used for: BS, CF, ratios, growth_metrics, annual_price_ratios
+# ══════════════════════════════════════════════════════════════
+
+async def _fetch_financials_single(client, sem, sym, code, periods, build_core_fn=None):
+    out = {}
+    for period in periods:
+        limit = _period_limit(period)
+        rows, stype_used = [], None
+        for stype in ("c", "s"):
+            d = await _finedge_get(client, sem, f"financials/{sym}",
+                                    {"statement_type": stype, "statement_code": code, "period": period})
+            r = (d or {}).get("financials", [])
+            if r:
+                rows, stype_used = r, stype
+                break
+        if limit:
+            rows = rows[:limit]
+        entry = {"stype_used": stype_used, "raw": rows}
+        if build_core_fn:
+            entry["core"] = [build_core_fn(r) for r in rows]
+        out[period] = entry
+    return out
+
+
+async def _fetch_ratios_single(client, sem, sym):
     out = {}
     for rtype in RATIO_TYPES:
-        out[rtype] = {}
-        for stype in STYPES:
+        rows, stype_used = [], None
+        for stype in ("c", "s"):
             d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type": stype, "ratio_type": rtype})
-            out[rtype][stype] = _trim((d or {}).get("ratios", []))
+            r = (d or {}).get("ratios", [])
+            if r:
+                rows, stype_used = r, stype
+                break
+        out[rtype] = {"stype_used": stype_used, "raw": rows}
     return out
 
 
-async def _fetch_basic_financials(client, sem, sym):
-    out = {}
-    for stype in STYPES:
-        d = await _finedge_get(client, sem, f"basic-financials/{sym}", {"statement_type": stype, "statement_code": "pl"})
-        out[stype] = _trim((d or {}).get("ratios", []))
-    return out
-
-
-async def _fetch_growth_metrics(client, sem, sym):
-    out = {}
-    for stype in STYPES:
+async def _fetch_growth_metrics_single(client, sem, sym):
+    for stype in ("c", "s"):
         d = await _finedge_get(client, sem, f"financial-metrics/{sym}", {"statement_type": stype, "ratio_type": "gr"})
-        out[stype] = (d or {}).get("financial_metrics")
-    return out
+        fm = (d or {}).get("financial_metrics")
+        if fm:
+            return {"stype_used": stype, "data": fm}
+    return {"stype_used": None, "data": None}
 
 
-async def _fetch_annual_price_ratios(client, sem, sym):
-    out = {}
-    for stype in STYPES:
+async def _fetch_annual_price_ratios_single(client, sem, sym):
+    for stype in ("c", "s"):
         d = await _finedge_get(client, sem, f"annual-price-ratios/{sym}", {"statement_type": stype})
-        out[stype] = _trim((d or {}).get("price_ratios", []))
-    return out
+        rows = (d or {}).get("price_ratios", [])
+        if rows:
+            return {"stype_used": stype, "raw": rows}
+    return {"stype_used": None, "raw": []}
 
 
 async def _fetch_profile_raw(client, sem, sym):
@@ -269,14 +309,14 @@ async def fetch_one_symbol(client, sem, sym):
     profile = await _fetch_profile_raw(client, sem, sym)
     company_type = _classify_company(profile)
 
-    pl, bs, cf, ratios, basic, growth, price_ratios = await asyncio.gather(
-        _fetch_financials_all(client, sem, sym, "pl", PL_PERIODS, build_core_fn=_build_pl_core),
-        _fetch_financials_all(client, sem, sym, "bs", BS_PERIODS, build_core_fn=_build_bs_core),
-        _fetch_financials_all(client, sem, sym, "cf", CF_PERIODS),   # raw only — schema consistent
-        _fetch_ratios_all(client, sem, sym),
-        _fetch_basic_financials(client, sem, sym),
-        _fetch_growth_metrics(client, sem, sym),
-        _fetch_annual_price_ratios(client, sem, sym),
+    pl, basic, bs, cf, ratios, growth, price_ratios = await asyncio.gather(
+        _fetch_financials_dual(client, sem, sym, "pl", PL_PERIODS, build_core_fn=_build_pl_core),
+        _fetch_basic_financials_dual(client, sem, sym),
+        _fetch_financials_single(client, sem, sym, "bs", BS_PERIODS, build_core_fn=_build_bs_core),
+        _fetch_financials_single(client, sem, sym, "cf", CF_PERIODS),
+        _fetch_ratios_single(client, sem, sym),
+        _fetch_growth_metrics_single(client, sem, sym),
+        _fetch_annual_price_ratios_single(client, sem, sym),
     )
 
     obj = {
@@ -285,10 +325,10 @@ async def fetch_one_symbol(client, sem, sym):
         "fetched_at": datetime.now().isoformat(timespec="seconds"),
         "profile": profile,
         "pl": pl,
+        "basic_financials": basic,
         "bs": bs,
         "cf": cf,
         "ratios": ratios,
-        "basic_financials": basic,
         "growth_metrics": growth,
         "annual_price_ratios": price_ratios,
     }
