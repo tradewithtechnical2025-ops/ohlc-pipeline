@@ -1,40 +1,47 @@
 #!/usr/bin/env python3
 """
-Finedge Fundamentals — PRODUCTION pipeline (v2)
-=================================================
-Symbols: SBIN, TCS, ITC, SBILIFE (hardcoded — change SYMBOLS list to extend)
+Finedge Fundamentals — PRODUCTION pipeline (v3, R2-wired)
+============================================================
+Standalone pipeline — does NOT touch pipeline.py or fundamentals.json.
+Writes to R2 as PER-SYMBOL files: fundamentals_full/{SYMBOL}.json
+(not one combined blob — keeps per-page load light, see size discussion).
 
-Decisions baked in (from testing phase):
-  - PL  periods : annual (full), quarterly (last 12), ttm (1 row)
-  - BS  periods : annual (full), quarterly (last 12)
-  - CF  periods : annual (full), quarterly (last 12), ytd (last 12)
-  - PL + basic-financials: BOTH statement_types (c + s) fetched always — banking
-    ratios like CET1/NPA are ONLY populated in standalone, even when consolidated
-    rows exist (so a c→s *fallback* would never trigger — we need both, always).
-  - BS / CF / ratios / growth_metrics / annual_price_ratios: SINGLE statement_type
-    — try consolidated (c) first, fall back to standalone (s) only if c returns
-    no rows at all. These schemas didn't show the "populated-but-zero" issue in
-    testing, so a real fallback (not a forced dual-fetch) is safe here and halves
-    the call count for these endpoints.
-  - shareholdings/pattern endpoint REMOVED — not needed right now.
-  - PL/BS get an alias-resolved "core" object (handles bank vs non-bank field-naming)
-    PLUS the full untouched "raw" rows — nothing lost even for schemas not yet
-    mapped (e.g. SBILIFE/insurance).
+Stock universe: read from classification.json (already in R2, same source
+pipeline.py uses for sector/industry), filtered to NSE equities, ETFs excluded
+(same ETF filter pattern as run_fund_full in pipeline.py).
 
-API calls per symbol: profile(1) + PL(6) + basic_financials(2) + BS(~2-4) +
-CF(~3-6) + ratios(~4-8) + growth(~1-2) + price_ratios(~1-2)
-≈ 20-31 depending on how often the c→s fallback triggers (best case ~20).
+Modes:
+  python pipeline_fundamentals_prod.py full          → all NSE stocks
+  python pipeline_fundamentals_prod.py full_1         (1..10)
+                                                       → 1/10th of universe each,
+                                                         for chunked GitHub Actions runs
+  python pipeline_fundamentals_prod.py daily          → ONLY stocks with a result
+                                                         today (via Finedge
+                                                         results-calendar), updates
+                                                         just those per-symbol files
+  python pipeline_fundamentals_prod.py local SYM SYM  → local-only test (no R2),
+                                                         saves to output/fundamentals_prod.json
 
-Usage:
-  python pipeline_fundamentals_prod.py run
-      → fetches all SYMBOLS, saves to output/fundamentals_prod.json
-  python pipeline_fundamentals_prod.py run SBIN TCS
-      → override symbol list via CLI args
+Data-shape decisions (locked in from testing phase):
+  - PL  periods : annual (full), quarterly (last 12), ttm (1 row) — BOTH stypes (c+s)
+  - basic_financials — BOTH stypes (c+s)
+    (PL + basic_financials need dual fetch — CET1/NPA-type fields are populated
+     ONLY in standalone, even when consolidated rows exist, so a c→s fallback
+     would never trigger; we need both, always, for these two.)
+  - BS  periods : annual (full), quarterly (last 12) — SINGLE stype (c, fallback s)
+  - CF  periods : annual (full), quarterly (last 12), ytd (last 12) — SINGLE stype,
+    CORE-ONLY (cfo/cfi/cff/net_cash_flow/capex/fcf/dividends_paid/pbt) —
+    raw ~100-field granular rows dropped entirely for size.
+  - ratios/growth_metrics/annual_price_ratios — SINGLE stype (c, fallback s)
+  - shareholdings/pattern — REMOVED (not needed right now)
+  - PL/BS get an alias-resolved "core" object (bank vs non-bank field-naming)
+    PLUS full "raw" rows (schemas not yet mapped, e.g. insurance, still captured).
 """
 
 import asyncio, json, logging, os, sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 import httpx
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
@@ -42,26 +49,99 @@ log = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
+WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 FINEDGE_BASE  = "https://data.finedgeapi.com/api/v1"
+WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
 FINEDGE_DELAY = 0.25
 RETRY         = 5
+CONCURRENCY   = 4
+TOTAL_PARTS   = 10
 
-SYMBOLS      = ["SBIN", "TCS", "ITC", "SBILIFE"]
-PL_PERIODS   = ["annual", "quarterly", "ttm"]
-BS_PERIODS   = ["annual", "quarterly"]
-CF_PERIODS   = ["annual", "quarterly", "ytd"]
-RATIO_TYPES  = ["pr", "le", "li", "ef"]
+PL_PERIODS    = ["annual", "quarterly", "ttm"]
+BS_PERIODS    = ["annual", "quarterly"]
+CF_PERIODS    = ["annual", "quarterly", "ytd"]
+RATIO_TYPES   = ["pr", "le", "li", "ef"]
+QUARTERLY_CAP = 12
 
-QUARTERLY_CAP = 12   # quarterly/ytd periods trimmed to most recent N rows; annual/ttm stay full
+ETF_ENDSWITH = ("ETF", "BEES", "LIQUID", "GILT", "IETF", "MMQS", "TOTAL")
+ETF_CONTAINS = ("NIFTY", "BANKEX", "MSCIN")
 
 HERE = Path(__file__).parent
 OUT_DIR = HERE / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _is_etf(sym):
+    s = sym.upper()
+    return any(s.endswith(k) for k in ETF_ENDSWITH) or any(k in s for k in ETF_CONTAINS)
+
+
 def _period_limit(period):
     return QUARTERLY_CAP if period in ("quarterly", "ytd") else None
+
+
+def today_ist() -> str:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+
+
+def is_trading_day(d: str) -> bool:
+    # weekday check only — holiday file optional, not bundled with this standalone pipeline
+    holidays_path = HERE / "nse_holidays.json"
+    holidays = set()
+    if holidays_path.exists():
+        try:
+            holidays = set(json.loads(holidays_path.read_text()))
+        except Exception:
+            pass
+    dt = date.fromisoformat(d)
+    return dt.weekday() < 5 and d not in holidays
+
+
+# ══════════════════════════════════════════════════════════════
+# R2 HELPERS
+# ══════════════════════════════════════════════════════════════
+
+async def r2_download(client, filename):
+    url = f"{WORKER_URL}/{filename}"
+    r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise RuntimeError(f"Download failed {filename}: HTTP {r.status_code}")
+    log.info(f"  ↓ {filename} ({len(r.content)/1024:.0f} KB)")
+    return r.json()
+
+
+async def r2_upload(client, filename, data):
+    if isinstance(data, str):
+        data = data.encode()
+    url = f"{WORKER_URL}?file={filename}"
+    r = await client.post(url, headers={**WORKER_HEADERS, "Content-Type": "application/json"}, content=data, timeout=90)
+    if r.status_code != 200:
+        raise RuntimeError(f"Upload failed {filename}: HTTP {r.status_code}")
+    log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
+
+
+async def r2_upload_symbol(client, sym, obj):
+    payload = json.dumps(obj, separators=(",", ":"))
+    await r2_upload(client, f"fundamentals_full/{sym}.json", payload)
+
+
+async def get_nse_universe(client):
+    classification = await r2_download(client, "classification.json")
+    if not classification or not isinstance(classification, list):
+        raise RuntimeError("classification.json missing or invalid in R2!")
+    symbols = []
+    for s in classification:
+        sym = str(s.get("symbol", "")).strip().upper()
+        exch = str(s.get("exchange", "")).strip()
+        if sym and exch == "NSE" and not _is_etf(sym):
+            symbols.append(sym)
+    symbols = sorted(set(symbols))
+    log.info(f"Universe: {len(symbols)} NSE equity symbols (ETFs excluded)")
+    return symbols
 
 
 # ══════════════════════════════════════════════════════════════
@@ -94,6 +174,20 @@ async def _finedge_get(client, sem, path, params):
     return None
 
 
+async def get_today_result_symbols(client, sem, valid_symbols):
+    today = today_ist()
+    next1 = (date.fromisoformat(today) + timedelta(days=1)).isoformat()
+    d = await _finedge_get(client, sem, "results-calendar", {"from_date": today, "to_date": next1})
+    if not d or not isinstance(d, list):
+        log.info("Finedge results-calendar — empty or error")
+        return []
+    valid = set(valid_symbols)
+    matched = sorted({item["symbol"] for item in d
+                       if item.get("symbol") in valid and item.get("expected_result_date") == today})
+    log.info(f"Results today ({today}): {len(matched)} stocks")
+    return matched
+
+
 # ══════════════════════════════════════════════════════════════
 # COMPANY TYPE DETECTION (from company-profile)
 # ══════════════════════════════════════════════════════════════
@@ -110,56 +204,62 @@ def _classify_company(profile):
 
 
 # ══════════════════════════════════════════════════════════════
-# CORE FIELD ALIAS RESOLUTION — PL & BS
+# CORE FIELD ALIAS RESOLUTION — PL, BS, CF
 # (handles bank vs non-bank naming differences without branching;
-#  degrades to None gracefully for schemas we haven't mapped yet,
-#  e.g. insurance — raw rows are kept alongside so nothing is lost)
+#  degrades to None gracefully for schemas not yet mapped, e.g.
+#  insurance — raw rows kept alongside for PL/BS so nothing is lost)
 # ══════════════════════════════════════════════════════════════
 
 CORE_PL_ALIASES = {
-    "year":              ["year"],
-    "period_end":        ["period_end"],
-    "period_start":      ["period_start"],
-    "sales":             ["revenueFromOperations"],
-    "pbt":               ["profitBeforeTax", "profitLossBeforeTax"],
-    "pat":               ["profitLossForPeriod", "profitLossForThePeriod"],
-    "pat_attributable":  ["profitOrLossAttributableToOwners"],
-    "eps":               ["eps"],
-    "other_income":      ["otherIncome"],
-    "finance_costs":     ["financeCosts"],
-    "depreciation":      ["depreciationAndAmortisation"],
-    "employee_cost":     ["employeeBenefitExpense", "employeesCost"],
+    "year": ["year"], "period_end": ["period_end"], "period_start": ["period_start"],
+    "sales": ["revenueFromOperations"],
+    "pbt": ["profitBeforeTax", "profitLossBeforeTax"],
+    "pat": ["profitLossForPeriod", "profitLossForThePeriod"],
+    "pat_attributable": ["profitOrLossAttributableToOwners"],
+    "eps": ["eps"],
+    "other_income": ["otherIncome"],
+    "finance_costs": ["financeCosts"],
+    "depreciation": ["depreciationAndAmortisation"],
+    "employee_cost": ["employeeBenefitExpense", "employeesCost"],
     "exceptional_items": ["exceptionalItemsBeforeTax", "exceptionalItems"],
     "minority_interest": ["nonControllingInterests", "profitLossOfMinorityInterest"],
-    "associates_share":  ["profitOrLossOfAssociates", "profitLossOfAssociates"],
-    "tax_expense":       ["taxExpense"],
-    "diluted_shares":    ["dilutedOutstandingShares"],
-    # bank-only — None for non-bank/insurance, that's expected
-    "interest_earned":   ["interestEarned"],
+    "associates_share": ["profitOrLossOfAssociates", "profitLossOfAssociates"],
+    "tax_expense": ["taxExpense"],
+    "diluted_shares": ["dilutedOutstandingShares"],
+    "interest_earned": ["interestEarned"],
     "interest_expended": ["interestExpended"],
     "provisions_loan_loss": ["provisionsForLoanLoss"],
-    "npa_pct":           ["percentageOfNpa"],
-    "gross_npa_pct":     ["percentageOfGrossNpa"],
-    "cet1_ratio":        ["cET1Ratio"],
-    "at1_ratio":         ["additionalTier1Ratio"],
+    "npa_pct": ["percentageOfNpa"],
+    "gross_npa_pct": ["percentageOfGrossNpa"],
+    "cet1_ratio": ["cET1Ratio"],
+    "at1_ratio": ["additionalTier1Ratio"],
 }
 
 CORE_BS_ALIASES = {
-    "year":           ["year"],
-    "period_end":     ["period_end"],
-    "total_assets":   ["assets"],
-    "reserves":       ["reserves"],
+    "year": ["year"], "period_end": ["period_end"],
+    "total_assets": ["assets"],
+    "reserves": ["reserves"],
     "equity_capital": ["equityCapital", "capital"],
-    "cash":           ["cashAndCashEquivalents", "cashAndBalancesWithRBI"],
-    "investments":    ["investments", "noncurrentInvestments"],
-    "fixed_assets":   ["propertyPlantAndEquipment", "fixedAssets"],
-    # bank-only
-    "advances":       ["advances"],
-    "deposits":       ["deposits"],
-    # non-bank-only
-    "inventories":       ["inventories"],
+    "cash": ["cashAndCashEquivalents", "cashAndBalancesWithRBI"],
+    "investments": ["investments", "noncurrentInvestments"],
+    "fixed_assets": ["propertyPlantAndEquipment", "fixedAssets"],
+    "advances": ["advances"],
+    "deposits": ["deposits"],
+    "inventories": ["inventories"],
     "trade_receivables": ["tradeReceivablesCurrent"],
-    "trade_payables":    ["tradePayablesCurrent"],
+    "trade_payables": ["tradePayablesCurrent"],
+}
+
+CORE_CF_ALIASES = {
+    "year": ["year"], "period_end": ["period_end"], "period_start": ["period_start"],
+    "cfo": ["cashFlowsFromOperatingActivities"],
+    "cfi": ["cashFlowsFromInvestingActivities"],
+    "cff": ["cashFlowsFromFinancingActivities"],
+    "net_cash_flow": ["netCashFlow"],
+    "capex": ["purchaseOfPPEClassifiedAsInvesting", "purchaseOfFixed&IntangibleAssets"],
+    "dividends_paid": ["dividendsPaidClassifiedAsFinancing"],
+    "interest_paid": ["interestPaidClassifiedAsFinancing"],
+    "pbt": ["profitBeforeTax", "profitBeforeExtraordinaryItemsAndTax"],
 }
 
 
@@ -206,25 +306,10 @@ def _build_bs_core(row):
     return core
 
 
-CORE_CF_ALIASES = {
-    "year":            ["year"],
-    "period_end":      ["period_end"],
-    "period_start":    ["period_start"],
-    "cfo":             ["cashFlowsFromOperatingActivities"],
-    "cfi":             ["cashFlowsFromInvestingActivities"],
-    "cff":             ["cashFlowsFromFinancingActivities"],
-    "net_cash_flow":   ["netCashFlow"],
-    "capex":           ["purchaseOfPPEClassifiedAsInvesting", "purchaseOfFixed&IntangibleAssets"],
-    "dividends_paid":  ["dividendsPaidClassifiedAsFinancing"],
-    "interest_paid":   ["interestPaidClassifiedAsFinancing"],
-    "pbt":             ["profitBeforeTax", "profitBeforeExtraordinaryItemsAndTax"],
-}
-
-
 def _build_cf_core(row):
     core = _resolve_aliases(row, CORE_CF_ALIASES)
     if core.get("cfo") is not None and core.get("capex") is not None:
-        core["fcf"] = core["cfo"] + core["capex"]   # capex already negative in source data
+        core["fcf"] = core["cfo"] + core["capex"]
     return core
 
 
@@ -329,7 +414,6 @@ async def _fetch_profile_raw(client, sem, sym):
 # ══════════════════════════════════════════════════════════════
 
 async def fetch_one_symbol(client, sem, sym):
-    log.info(f"→ {sym}")
     profile = await _fetch_profile_raw(client, sem, sym)
     company_type = _classify_company(profile)
 
@@ -356,25 +440,95 @@ async def fetch_one_symbol(client, sem, sym):
         "growth_metrics": growth,
         "annual_price_ratios": price_ratios,
     }
-    log.info(f"  ✓ {sym} ({company_type})")
     return sym, obj
 
 
-async def run(symbols):
+# ══════════════════════════════════════════════════════════════
+# MODE: full / full_1..10 — bulk universe, per-symbol R2 upload
+# ══════════════════════════════════════════════════════════════
+
+async def run_full(part=0):
+    sem = asyncio.Semaphore(CONCURRENCY)
+    async with httpx.AsyncClient() as client:
+        symbols = await get_nse_universe(client)
+        if part == 0:
+            chunk, label = symbols, "Full"
+        else:
+            part_size = (len(symbols) + TOTAL_PARTS - 1) // TOTAL_PARTS
+            start, end = (part - 1) * part_size, part * part_size
+            chunk, label = symbols[start:end], f"Part {part}/{TOTAL_PARTS}"
+        log.info(f"━━━ Fundamentals Full {label}  ({len(chunk)} stocks) ━━━")
+
+        ok = failed = 0
+        for i, sym in enumerate(chunk, 1):
+            try:
+                _, obj = await fetch_one_symbol(client, sem, sym)
+                await r2_upload_symbol(client, sym, obj)
+                ok += 1
+            except Exception as e:
+                failed += 1
+                log.warning(f"  ✗ {sym}: {e}")
+            if i % 25 == 0 or i == len(chunk):
+                log.info(f"  {i}/{len(chunk)}  ✓{ok}  ✗{failed}")
+    log.info(f"━━━ Fundamentals Full {label} complete — ✓{ok}  ✗{failed} ━━━")
+
+
+# ══════════════════════════════════════════════════════════════
+# MODE: daily — only stocks with a result today
+# ══════════════════════════════════════════════════════════════
+
+async def run_daily():
+    today = today_ist()
+    if not is_trading_day(today):
+        log.info(f"⏭  {today} not a trading day"); return
+    sem = asyncio.Semaphore(CONCURRENCY)
+    async with httpx.AsyncClient() as client:
+        symbols = await get_nse_universe(client)
+        result_symbols = await get_today_result_symbols(client, sem, symbols)
+        if not result_symbols:
+            log.info("No results today — exiting"); return
+        log.info(f"━━━ Fundamentals Daily  {today}  ({len(result_symbols)} stocks) ━━━")
+        ok = failed = 0
+        for sym in result_symbols:
+            try:
+                _, obj = await fetch_one_symbol(client, sem, sym)
+                await r2_upload_symbol(client, sym, obj)
+                ok += 1
+                log.info(f"  ✓ {sym}")
+            except Exception as e:
+                failed += 1
+                log.warning(f"  ✗ {sym}: {e}")
+    log.info(f"━━━ Fundamentals Daily complete — ✓{ok}  ✗{failed} ━━━")
+
+
+# ══════════════════════════════════════════════════════════════
+# MODE: local — no R2, for quick testing
+# ══════════════════════════════════════════════════════════════
+
+async def run_local(symbols):
     sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient() as client:
         results = await asyncio.gather(*[fetch_one_symbol(client, sem, sym.upper()) for sym in symbols])
     data = {sym: obj for sym, obj in results}
     out_path = OUT_DIR / "fundamentals_prod.json"
     out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
-    log.info(f"💾 Saved → {out_path}  ({out_path.stat().st_size/1024:.1f} KB)")
+    log.info(f"💾 Saved locally → {out_path}  ({out_path.stat().st_size/1024:.1f} KB)")
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode == "run":
-        syms = sys.argv[2:] or SYMBOLS
-        asyncio.run(run(syms))
+    if mode == "full":
+        asyncio.run(run_full(0))
+    elif mode.startswith("full_") and mode.split("_")[1].isdigit():
+        asyncio.run(run_full(int(mode.split("_")[1])))
+    elif mode == "daily":
+        asyncio.run(run_daily())
+    elif mode == "local":
+        syms = sys.argv[2:]
+        if not syms:
+            print("Usage: python pipeline_fundamentals_prod.py local SYM [SYM2 ...]")
+            sys.exit(1)
+        asyncio.run(run_local(syms))
     else:
         print(__doc__)
         sys.exit(1)
