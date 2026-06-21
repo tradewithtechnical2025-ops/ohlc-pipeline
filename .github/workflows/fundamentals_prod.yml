@@ -1,0 +1,44 @@
+name: Fundamentals Production (R2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Mode to run"
+        required: true
+        type: choice
+        options:
+          - full
+          - full_1
+          - full_2
+          - full_3
+          - full_4
+          - full_5
+          - full_6
+          - full_7
+          - full_8
+          - full_9
+          - full_10
+        default: full
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run fundamentals pipeline
+        env:
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline_fundamentals_prod.py ${{ github.event.inputs.mode }}
