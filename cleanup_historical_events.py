@@ -202,6 +202,7 @@ async def fetch_nse_migration_symbols(client):
 
 async def main():
     apply_changes = "--apply" in sys.argv
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     async with httpx.AsyncClient() as client:
         events = await r2_download(client, "reports/events.json") or []
@@ -236,9 +237,13 @@ async def main():
             # --- Categories 2 & 3: New Listing in NSE / BSE->NSE migration ---
             if ev in ("NEW_NSE_LISTING", "BSE_TO_NSE"):
                 date = e.get("date") or ""
+                # Upper bound is TODAY, not the feed's own latest entry —
+                # a gap (e.g. a weekend with zero genuine listings) means
+                # nothing new happened, not that the feed is stale, since
+                # we just fetched it live moments ago.
                 if not (recent_earliest and date >= recent_earliest.strftime("%Y-%m-%d")
-                        and recent_latest and date <= recent_latest.strftime("%Y-%m-%d")):
-                    unverifiable.append(e)  # outside the feed's covered window — no evidence either way
+                        and date <= today_str):
+                    unverifiable.append(e)  # before the feed's earliest entry — no evidence either way
                     continue
                 isin = e.get("isin")
                 if isin and isin in nse_recent_isins:
