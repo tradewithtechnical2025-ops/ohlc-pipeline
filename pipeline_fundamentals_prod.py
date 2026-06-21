@@ -206,6 +206,28 @@ def _build_bs_core(row):
     return core
 
 
+CORE_CF_ALIASES = {
+    "year":            ["year"],
+    "period_end":      ["period_end"],
+    "period_start":    ["period_start"],
+    "cfo":             ["cashFlowsFromOperatingActivities"],
+    "cfi":             ["cashFlowsFromInvestingActivities"],
+    "cff":             ["cashFlowsFromFinancingActivities"],
+    "net_cash_flow":   ["netCashFlow"],
+    "capex":           ["purchaseOfPPEClassifiedAsInvesting", "purchaseOfFixed&IntangibleAssets"],
+    "dividends_paid":  ["dividendsPaidClassifiedAsFinancing"],
+    "interest_paid":   ["interestPaidClassifiedAsFinancing"],
+    "pbt":             ["profitBeforeTax", "profitBeforeExtraordinaryItemsAndTax"],
+}
+
+
+def _build_cf_core(row):
+    core = _resolve_aliases(row, CORE_CF_ALIASES)
+    if core.get("cfo") is not None and core.get("capex") is not None:
+        core["fcf"] = core["cfo"] + core["capex"]   # capex already negative in source data
+    return core
+
+
 # ══════════════════════════════════════════════════════════════
 # FETCH — DUAL statement_type (always both c + s)
 #   used for: PL, basic_financials
@@ -243,7 +265,7 @@ async def _fetch_basic_financials_dual(client, sem, sym):
 #   used for: BS, CF, ratios, growth_metrics, annual_price_ratios
 # ══════════════════════════════════════════════════════════════
 
-async def _fetch_financials_single(client, sem, sym, code, periods, build_core_fn=None):
+async def _fetch_financials_single(client, sem, sym, code, periods, build_core_fn=None, keep_raw=True):
     out = {}
     for period in periods:
         limit = _period_limit(period)
@@ -257,7 +279,9 @@ async def _fetch_financials_single(client, sem, sym, code, periods, build_core_f
                 break
         if limit:
             rows = rows[:limit]
-        entry = {"stype_used": stype_used, "raw": rows}
+        entry = {"stype_used": stype_used}
+        if keep_raw:
+            entry["raw"] = rows
         if build_core_fn:
             entry["core"] = [build_core_fn(r) for r in rows]
         out[period] = entry
@@ -313,7 +337,7 @@ async def fetch_one_symbol(client, sem, sym):
         _fetch_financials_dual(client, sem, sym, "pl", PL_PERIODS, build_core_fn=_build_pl_core),
         _fetch_basic_financials_dual(client, sem, sym),
         _fetch_financials_single(client, sem, sym, "bs", BS_PERIODS, build_core_fn=_build_bs_core),
-        _fetch_financials_single(client, sem, sym, "cf", CF_PERIODS),
+        _fetch_financials_single(client, sem, sym, "cf", CF_PERIODS, build_core_fn=_build_cf_core, keep_raw=False),
         _fetch_ratios_single(client, sem, sym),
         _fetch_growth_metrics_single(client, sem, sym),
         _fetch_annual_price_ratios_single(client, sem, sym),
