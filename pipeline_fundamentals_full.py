@@ -108,7 +108,11 @@ async def _fetch_basic_financials(client, sem, sym):
     out = {}
     for stype in STYPES:
         d = await _finedge_get(client, sem, f"basic-financials/{sym}", {"statement_type": stype, "statement_code": "pl"})
-        out[stype] = (d or {}).get("ratios", [])[:ROWS_LIMIT](client, sem, sym):
+        out[stype] = (d or {}).get("ratios", [])[:ROWS_LIMIT]
+    return out
+
+
+async def _fetch_growth_metrics(client, sem, sym):
     out = {}
     for stype in STYPES:
         d = await _finedge_get(client, sem, f"financial-metrics/{sym}", {"statement_type": stype, "ratio_type": "gr"})
