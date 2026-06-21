@@ -8,6 +8,7 @@ on:
         required: true
         type: choice
         options:
+          - sync
           - backfill_summary
           - full
           - full_1
@@ -21,6 +22,10 @@ on:
           - full_9
           - full_10
         default: backfill_summary
+      symbols:
+        description: "Symbols for 'sync' mode only — space-separated (e.g. M&M J&KBANK)"
+        required: false
+        default: ""
 
 jobs:
   run-pipeline:
@@ -42,4 +47,4 @@ jobs:
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-        run: python pipeline_fundamentals_prod.py ${{ github.event.inputs.mode }}
+        run: python pipeline_fundamentals_prod.py ${{ github.event.inputs.mode }} "${{ github.event.inputs.symbols }}"
