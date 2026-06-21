@@ -1,4 +1,4 @@
-name: Fundamentals Full Test
+name: Fundamentals Production Run
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       symbols:
         description: "Space-separated NSE symbols"
         required: false
-        default: "ITC SBIN"
+        default: "SBIN TCS ITC SBILIFE"
 
 jobs:
   test-fetch:
@@ -23,13 +23,13 @@ jobs:
       - name: Install dependencies
         run: pip install httpx
 
-      - name: Run full fundamentals test fetch
+      - name: Run production fundamentals fetch
         env:
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-        run: python pipeline_fundamentals_full.py test ${{ github.event.inputs.symbols }}
+        run: python pipeline_fundamentals_prod.py run ${{ github.event.inputs.symbols }}
 
       - name: Upload result JSON
         uses: actions/upload-artifact@v4
         with:
-          name: fundamentals-full-test
-          path: output/fundamentals_full_test.json
+          name: fundamentals-prod
+          path: output/fundamentals_prod.json
