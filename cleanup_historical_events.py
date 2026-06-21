@@ -16,13 +16,16 @@ signals, applied in order (cheapest/most-certain first):
   1. Symbol ends with "-RE"  — BSE's own marker for a re-admitted /
      relisted entity (e.g. SUMEET-RE). Always a resumption, never new.
 
-  2. BSE code is below OLD_CODE_CUTOFF — BSE issues codes roughly
-     sequentially. Every confirmed resumption case found so far (RELINFRA
+  2. BSE code is below OLD_CODE_CUTOFF — ONLY applied to NEW_BSE_LISTING
+     events, since that's the only event type making a claim about BSE
+     itself. Every confirmed resumption case found so far (RELINFRA
      500390, GENSOL 542851, EDUCOMP 532696, etc.) sits well under 600000,
      while every confirmed genuine-2026 entry (CPs 731895+, RAVINDRA
-     ENERGY 751122) sits well above 730000. For NEW_NSE_LISTING events
-     (no bse_code of their own), the ISIN is cross-referenced against
-     today's BSE snapshot to find a matching code if also BSE-listed.
+     ENERGY 751122) sits well above 730000. NOT applied to NEW_NSE_LISTING
+     / BSE_TO_NSE / SME_TO_NSE — those claim something about NSE presence,
+     and a company can legitimately have an old BSE code while being
+     genuinely new to NSE (e.g. a real SME->Mainboard-NSE migration like
+     DBEIL). Those defer entirely to signal 3 below.
 
   3. NSE's own quote-equity API (metadata.listingDate) — the definitive
      fallback for pure-NSE-only resumptions that have no BSE cross-listing
@@ -111,18 +114,25 @@ def is_old_bse_code(code):
         return False
 
 
-def classify_cheap(event, isin_to_bse_code):
-    """Signals 1 & 2 — no network call. Returns a flag-reason or None."""
+def classify_cheap(event):
+    """Signal 1 (always applicable) + Signal 2 (ONLY for NEW_BSE_LISTING,
+    where the BSE code age directly answers the claim being made).
+
+    For NEW_NSE_LISTING / BSE_TO_NSE / SME_TO_NSE the claim is about NSE
+    presence — a company can legitimately have an old BSE code while being
+    genuinely new to NSE for the first time (e.g. a real SME->Mainboard-NSE
+    migration). Using BSE code age there would wrongly flag real migrations
+    like DBEIL (Deepak Builders, old BSE code, but possibly a first-ever
+    NSE listing) — so those event types defer entirely to signal 3
+    (NSE's own listingDate) instead."""
     symbol = event.get("symbol") or ""
     if is_readmission_symbol(symbol):
         return "readmission_symbol(-RE)"
 
-    bse_code = event.get("bse_code")
-    if bse_code is None and event.get("isin"):
-        bse_code = isin_to_bse_code.get(event["isin"])
-
-    if is_old_bse_code(bse_code):
-        return f"old_bse_code({bse_code})"
+    if event.get("event") == "NEW_BSE_LISTING":
+        bse_code = event.get("bse_code")
+        if is_old_bse_code(bse_code):
+            return f"old_bse_code({bse_code})"
 
     return None
 
@@ -155,20 +165,15 @@ async def main():
 
     async with httpx.AsyncClient() as client:
         events = await r2_download(client, "reports/events.json") or []
-        bse_snapshot = await r2_download(client, "snapshots/upstox_bse.json") or {}
 
-        print(f"📂 Loaded {len(events)} events, {len(bse_snapshot)} BSE snapshot entries\n")
-
-        # isin -> bse_code lookup, for NEW_NSE_LISTING events that don't
-        # carry their own bse_code but are also cross-listed on BSE.
-        isin_to_bse_code = {v["isin"]: token for token, v in bse_snapshot.items() if v.get("isin")}
+        print(f"📂 Loaded {len(events)} events\n")
 
         kept, flagged, unresolved = [], [], []
         for e in events:
             if e.get("event") not in CHECK_EVENT_TYPES:
                 kept.append(e)
                 continue
-            reason = classify_cheap(e, isin_to_bse_code)
+            reason = classify_cheap(e)
             if reason:
                 flagged.append({**e, "_flag_reason": reason})
             else:
