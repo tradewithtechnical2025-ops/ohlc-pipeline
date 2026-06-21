@@ -8,6 +8,7 @@ on:
         required: true
         type: choice
         options:
+          - backfill_summary
           - full
           - full_1
           - full_2
@@ -19,7 +20,7 @@ on:
           - full_8
           - full_9
           - full_10
-        default: full
+        default: backfill_summary
 
 jobs:
   run-pipeline:
