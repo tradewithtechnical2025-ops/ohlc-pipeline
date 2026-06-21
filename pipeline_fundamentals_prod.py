@@ -709,7 +709,7 @@ if __name__ == "__main__":
     elif mode == "backfill_summary":
         asyncio.run(run_backfill_summary())
     elif mode == "sync":
-        syms = sys.argv[2:]
+        syms = " ".join(sys.argv[2:]).split()
         if not syms:
             print("Usage: python pipeline_fundamentals_prod.py sync SYM [SYM2 ...]")
             sys.exit(1)
