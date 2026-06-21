@@ -1,0 +1,41 @@
+name: Cleanup Historical Resumption Events
+
+# Manual trigger only — this is a one-time cleanup, not a recurring job.
+# Go to: Actions tab -> "Cleanup Historical Resumption Events" -> Run workflow
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: 'Actually apply changes to R2? (leave false for dry-run first)'
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run cleanup (dry-run)
+        if: ${{ inputs.apply == false }}
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python cleanup_historical_events.py
+
+      - name: Run cleanup (APPLY — modifies R2)
+        if: ${{ inputs.apply == true }}
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python cleanup_historical_events.py --apply
