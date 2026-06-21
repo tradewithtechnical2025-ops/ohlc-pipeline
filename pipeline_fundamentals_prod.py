@@ -6,6 +6,14 @@ Standalone pipeline — does NOT touch pipeline.py or fundamentals.json.
 Writes to R2 as PER-SYMBOL files: fundamentals_full/{SYMBOL}.json
 (not one combined blob — keeps per-page load light, see size discussion).
 
+ALSO maintains one lightweight combined file: fundamentals_summary.json
+(all stocks, ~15 fields each + last 5 quarters' PL) — feeds the frontend's
+Results Comparison and Peer Comparison features, which genuinely need
+many stocks at once. Built from data already fetched for the per-symbol
+file — no extra API calls. market_cap is deliberately NOT included here
+(it's price-driven, changes daily for every stock — frontend computes it
+live as diluted_shares × ltp from screener_feed.json).
+
 Stock universe: read from classification.json (already in R2, same source
 pipeline.py uses for sector/industry), filtered to NSE equities, ETFs excluded
 (same ETF filter pattern as run_fund_full in pipeline.py).
@@ -82,6 +90,19 @@ def _period_limit(period):
     return QUARTERLY_CAP if period in ("quarterly", "ytd") else None
 
 
+_MONTHS = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _fmt_period_end(period_end):
+    if not period_end:
+        return ""
+    s = str(int(period_end))
+    if len(s) == 8:
+        m = int(s[4:6])
+        return f"{_MONTHS[m]} {s[:4]}" if 1 <= m <= 12 else s
+    return str(period_end)
+
+
 def today_ist() -> str:
     return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
 
@@ -127,6 +148,21 @@ async def r2_upload(client, filename, data):
 async def r2_upload_symbol(client, sym, obj):
     payload = json.dumps(obj, separators=(",", ":"))
     await r2_upload(client, f"fundamentals_full/{sym}.json", payload)
+
+
+SUMMARY_FILE = "fundamentals_summary.json"
+
+
+async def r2_download_summary(client):
+    d = await r2_download(client, SUMMARY_FILE)
+    if isinstance(d, dict) and "stocks" in d:
+        return d["stocks"]
+    return {}
+
+
+async def r2_upload_summary(client, stocks):
+    payload = json.dumps({"updated": today_ist(), "stocks": stocks}, separators=(",", ":"))
+    await r2_upload(client, SUMMARY_FILE, payload)
 
 
 async def get_nse_universe(client):
@@ -410,6 +446,62 @@ async def _fetch_profile_raw(client, sem, sym):
 
 
 # ══════════════════════════════════════════════════════════════
+# LIGHTWEIGHT SUMMARY ENTRY — built from data already fetched for
+# the per-symbol file, no extra API calls. Feeds fundamentals_summary.json
+# (Results Comparison + Peer Comparison on the frontend).
+#
+# NOTE: market_cap deliberately NOT stored here — it's price-driven and
+# changes every trading day for every stock, while this pipeline only
+# refreshes a stock on result-day or full bulk runs. Frontend computes
+# live market_cap = diluted_shares × ltp (ltp from screener_feed.json,
+# which IS updated daily for all stocks by the OHLC pipeline).
+# ══════════════════════════════════════════════════════════════
+
+def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
+    profile = profile or {}
+
+    diluted_shares = None
+    for period in ("ttm", "annual", "quarterly"):
+        for stype in ("c", "s"):
+            core = pl.get(period, {}).get(stype, {}).get("core", [])
+            if core and core[0].get("diluted_shares") is not None:
+                diluted_shares = core[0]["diluted_shares"]
+                break
+        if diluted_shares is not None:
+            break
+
+    q_core = (pl.get("quarterly", {}).get("c", {}).get("core")
+              or pl.get("quarterly", {}).get("s", {}).get("core") or [])
+    quarters = [{
+        "header": _fmt_period_end(row.get("period_end")),
+        "sales": row.get("sales"),
+        "eps": row.get("eps"),
+        "pat": row.get("pat"),
+        "pbt": row.get("pbt"),
+    } for row in q_core[:5]]
+
+    pr0 = (ratios.get("pr", {}).get("raw") or [{}])[0]
+    le0 = (ratios.get("le", {}).get("raw") or [{}])[0]
+    apr0 = (price_ratios.get("raw") or [{}])[0]
+
+    return {
+        "symbol": sym,
+        "name": profile.get("name"),
+        "sector": profile.get("sector"),
+        "industry": profile.get("industry"),
+        "macro_sector": profile.get("macro_sector"),
+        "diluted_shares": diluted_shares,
+        "pe": apr0.get("pe"),
+        "pb": apr0.get("pb"),
+        "roe": pr0.get("returnOnEquity"),
+        "roce": pr0.get("returnOnCapital"),
+        "ebitda_margin": pr0.get("ebitdaMargin"),
+        "de_ratio": le0.get("totalDebtToEquity"),
+        "quarters": quarters,
+    }
+
+
+# ══════════════════════════════════════════════════════════════
 # ASSEMBLE PER-SYMBOL OBJECT
 # ══════════════════════════════════════════════════════════════
 
@@ -440,7 +532,8 @@ async def fetch_one_symbol(client, sem, sym):
         "growth_metrics": growth,
         "annual_price_ratios": price_ratios,
     }
-    return sym, obj
+    summary_entry = _build_summary_entry(sym, profile, pl, ratios, price_ratios)
+    return sym, obj, summary_entry
 
 
 # ══════════════════════════════════════════════════════════════
@@ -459,17 +552,27 @@ async def run_full(part=0):
             chunk, label = symbols[start:end], f"Part {part}/{TOTAL_PARTS}"
         log.info(f"━━━ Fundamentals Full {label}  ({len(chunk)} stocks) ━━━")
 
+        # NOTE: if full_1..full_10 run truly simultaneously (parallel GitHub
+        # Actions), there's a small race window on this shared summary file —
+        # each part downloads-merges-uploads independently. Since parts touch
+        # disjoint symbol sets and we checkpoint every 25 stocks (not just at
+        # the end), the overwrite window is short, but for zero risk run the
+        # parts sequentially rather than all-at-once.
+        summary = await r2_download_summary(client)
+
         ok = failed = 0
         for i, sym in enumerate(chunk, 1):
             try:
-                _, obj = await fetch_one_symbol(client, sem, sym)
+                _, obj, summ = await fetch_one_symbol(client, sem, sym)
                 await r2_upload_symbol(client, sym, obj)
+                summary[sym] = summ
                 ok += 1
             except Exception as e:
                 failed += 1
                 log.warning(f"  ✗ {sym}: {e}")
             if i % 25 == 0 or i == len(chunk):
                 log.info(f"  {i}/{len(chunk)}  ✓{ok}  ✗{failed}")
+                await r2_upload_summary(client, summary)
     log.info(f"━━━ Fundamentals Full {label} complete — ✓{ok}  ✗{failed} ━━━")
 
 
@@ -488,16 +591,19 @@ async def run_daily():
         if not result_symbols:
             log.info("No results today — exiting"); return
         log.info(f"━━━ Fundamentals Daily  {today}  ({len(result_symbols)} stocks) ━━━")
+        summary = await r2_download_summary(client)
         ok = failed = 0
         for sym in result_symbols:
             try:
-                _, obj = await fetch_one_symbol(client, sem, sym)
+                _, obj, summ = await fetch_one_symbol(client, sem, sym)
                 await r2_upload_symbol(client, sym, obj)
+                summary[sym] = summ
                 ok += 1
                 log.info(f"  ✓ {sym}")
             except Exception as e:
                 failed += 1
                 log.warning(f"  ✗ {sym}: {e}")
+        await r2_upload_summary(client, summary)
     log.info(f"━━━ Fundamentals Daily complete — ✓{ok}  ✗{failed} ━━━")
 
 
@@ -509,10 +615,14 @@ async def run_local(symbols):
     sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient() as client:
         results = await asyncio.gather(*[fetch_one_symbol(client, sem, sym.upper()) for sym in symbols])
-    data = {sym: obj for sym, obj in results}
+    data = {sym: obj for sym, obj, _ in results}
+    summary = {sym: summ for sym, _, summ in results}
     out_path = OUT_DIR / "fundamentals_prod.json"
     out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    summary_path = OUT_DIR / "fundamentals_summary_local.json"
+    summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     log.info(f"💾 Saved locally → {out_path}  ({out_path.stat().st_size/1024:.1f} KB)")
+    log.info(f"💾 Saved locally → {summary_path}  ({summary_path.stat().st_size/1024:.1f} KB)")
 
 
 if __name__ == "__main__":
