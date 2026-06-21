@@ -134,7 +134,8 @@ def is_trading_day(d: str) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 async def r2_download(client, filename):
-    url = f"{WORKER_URL}/{filename}"
+    from urllib.parse import quote
+    url = f"{WORKER_URL}/{quote(filename, safe='/')}"
     r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
     if r.status_code == 404:
         return None
@@ -147,8 +148,8 @@ async def r2_download(client, filename):
 async def r2_upload(client, filename, data):
     if isinstance(data, str):
         data = data.encode()
-    url = f"{WORKER_URL}?file={filename}"
-    r = await client.post(url, headers={**WORKER_HEADERS, "Content-Type": "application/json"}, content=data, timeout=90)
+    r = await client.post(WORKER_URL, params={"file": filename},
+                           headers={**WORKER_HEADERS, "Content-Type": "application/json"}, content=data, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"Upload failed {filename}: HTTP {r.status_code}")
     log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
@@ -672,6 +673,31 @@ async def run_backfill_summary():
     log.info(f"━━━ Summary backfill complete — ✓{ok}  ✗{failed} ━━━")
 
 
+# ══════════════════════════════════════════════════════════════
+# MODE: sync — retry specific symbols (e.g. ones that failed earlier
+# due to the & URL-encoding bug), without rerunning a whole part.
+# ══════════════════════════════════════════════════════════════
+
+async def run_sync(symbols):
+    sem = asyncio.Semaphore(CONCURRENCY)
+    async with httpx.AsyncClient() as client:
+        summary = await r2_download_summary(client)
+        ok = failed = 0
+        for sym in symbols:
+            sym = sym.upper()
+            try:
+                _, obj, summ = await fetch_one_symbol(client, sem, sym)
+                await r2_upload_symbol(client, sym, obj)
+                summary[sym] = summ
+                ok += 1
+                log.info(f"  ✓ {sym}")
+            except Exception as e:
+                failed += 1
+                log.warning(f"  ✗ {sym}: {e}")
+        await r2_upload_summary(client, summary)
+    log.info(f"━━━ Sync complete — ✓{ok}  ✗{failed} ━━━")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode == "full":
@@ -682,6 +708,12 @@ if __name__ == "__main__":
         asyncio.run(run_daily())
     elif mode == "backfill_summary":
         asyncio.run(run_backfill_summary())
+    elif mode == "sync":
+        syms = sys.argv[2:]
+        if not syms:
+            print("Usage: python pipeline_fundamentals_prod.py sync SYM [SYM2 ...]")
+            sys.exit(1)
+        asyncio.run(run_sync(syms))
     elif mode == "local":
         syms = sys.argv[2:]
         if not syms:
