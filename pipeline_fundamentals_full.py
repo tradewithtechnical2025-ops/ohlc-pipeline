@@ -1,31 +1,30 @@
 #!/usr/bin/env python3
 """
-Finedge FULL Fundamentals — TEST pipeline (standalone)
-========================================================
-Purana pipeline.py ko BILKUL touch nahi karta, na R2 ke fundamentals.json
-ko. Yeh sirf locally JSON save karta hai taaki naya data shape test kar
-sakein, phir decide karein production mein kaise integrate karna hai.
+Finedge Fundamentals — PRODUCTION pipeline (v1)
+=================================================
+Symbols: SBIN, TCS, ITC, SBILIFE (hardcoded — change SYMBOLS list to extend)
 
-Kya fetch hota hai (har symbol ke liye, RAW — no trimming/no field drop):
-  - PL  : annual, quarterly, halfyearly, ttm   × consolidated + standalone
-  - BS  : annual, quarterly, ytd               × consolidated + standalone
-  - CF  : annual, quarterly, ytd               × consolidated + standalone
-  - Ratios: pr (profitability), le (leverage), li (liquidity), ef (efficiency)
-            × consolidated + standalone
-  - basic-financials (TTM)                     × consolidated + standalone
-  - financial-metrics (growth, ratio_type=gr)  × consolidated + standalone
-  - annual-price-ratios (PE/PB/PS history)     × consolidated + standalone
-  - shareholdings/pattern (raw columns+rows, untouched)
-  - company-profile (raw, untouched)
+Decisions baked in (from testing phase):
+  - PL  periods : annual, quarterly, ttm        (halfyearly dropped — redundant)
+  - BS  periods : annual, quarterly             (ttm/ytd not meaningful — point-in-time)
+  - CF  periods : annual, quarterly, ytd        (ttm not offered by Finedge for cf)
+  - Both statement_types (c + s) fetched always — banking ratios like CET1/NPA
+    are ONLY populated in standalone, never in consolidated.
+  - shareholdings/pattern endpoint REMOVED — cuts 1 call/symbol, not needed right now.
+  - Full history kept (no row-count trimming) — set ROWS_LIMIT env var to cap if needed.
+  - PL/BS get an alias-resolved "core" object (handles bank vs non-bank field-naming,
+    e.g. revenueFromOperations vs n/a, profitBeforeTax vs profitLossBeforeTax) PLUS
+    the full untouched "raw" rows — so nothing is lost even for schemas we haven't
+    seen yet (e.g. SBILIFE/insurance, which may not match either alias set well).
+  - CF / ratios / basic_financials / growth_metrics / annual_price_ratios stored as
+    raw full rows — their schemas were consistent enough across bank/non-bank in
+    testing to not need alias mapping.
 
 Usage:
-  python pipeline_fundamentals_full.py test ITC RELIANCE TCS
-      → fetches, saves locally to fundamentals_full_test.json
-      → NO R2 upload, NO interaction with old pipeline/fundamentals.json
-
-  python pipeline_fundamentals_full.py full
-      → (not wired yet) all NSE symbols + R2 upload to a NEW file
-        fundamentals_full.json — old fundamentals.json untouched
+  python pipeline_fundamentals_prod.py run
+      → fetches all SYMBOLS, saves to output/fundamentals_prod.json
+  python pipeline_fundamentals_prod.py run SBIN TCS
+      → override symbol list via CLI args
 """
 
 import asyncio, json, logging, os, sys
@@ -43,18 +42,24 @@ FINEDGE_BASE  = "https://data.finedgeapi.com/api/v1"
 FINEDGE_DELAY = 0.25
 RETRY         = 5
 
-PL_PERIODS  = ["annual", "quarterly", "halfyearly", "ttm"]
-BS_PERIODS  = ["annual", "quarterly", "ytd"]
+SYMBOLS     = ["SBIN", "TCS", "ITC", "SBILIFE"]
+PL_PERIODS  = ["annual", "quarterly", "ttm"]
+BS_PERIODS  = ["annual", "quarterly"]
 CF_PERIODS  = ["annual", "quarterly", "ytd"]
 RATIO_TYPES = ["pr", "le", "li", "ef"]
-STYPES      = ["c", "s"]   # consolidated, standalone — BOTH fetched (no fallback-only)
+STYPES      = ["c", "s"]
 
-ROWS_LIMIT  = int(os.environ.get("ROWS_LIMIT", "1"))  # sirf latest N period rakho — testing ke liye 1
+ROWS_LIMIT = os.environ.get("ROWS_LIMIT")
+ROWS_LIMIT = int(ROWS_LIMIT) if ROWS_LIMIT else None  # None = full history, no trimming
 
 HERE = Path(__file__).parent
 OUT_DIR = HERE / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
+# ══════════════════════════════════════════════════════════════
+# FINEDGE HELPERS
+# ══════════════════════════════════════════════════════════════
 
 async def _finedge_get(client, sem, path, params):
     params = {**params, "token": FINEDGE_TOKEN}
@@ -82,15 +87,138 @@ async def _finedge_get(client, sem, path, params):
     return None
 
 
-async def _fetch_financials_all(client, sem, sym, code, periods):
-    """Raw, UNTRIMMED financials rows — every (period × statement_type) combo."""
+def _trim(rows):
+    return rows[:ROWS_LIMIT] if ROWS_LIMIT else rows
+
+
+# ══════════════════════════════════════════════════════════════
+# COMPANY TYPE DETECTION (from company-profile)
+# ══════════════════════════════════════════════════════════════
+
+def _classify_company(profile):
+    if not profile:
+        return "other"
+    text = " ".join(str(profile.get(k, "")) for k in ("sector", "industry", "macro_sector")).lower()
+    if "bank" in text:
+        return "bank"
+    if "insurance" in text:
+        return "insurance"
+    return "other"
+
+
+# ══════════════════════════════════════════════════════════════
+# CORE FIELD ALIAS RESOLUTION — PL & BS
+# (handles bank vs non-bank naming differences without branching;
+#  degrades to None gracefully for schemas we haven't mapped yet,
+#  e.g. insurance — raw rows are kept alongside so nothing is lost)
+# ══════════════════════════════════════════════════════════════
+
+CORE_PL_ALIASES = {
+    "year":              ["year"],
+    "period_end":        ["period_end"],
+    "period_start":      ["period_start"],
+    "sales":             ["revenueFromOperations"],
+    "pbt":               ["profitBeforeTax", "profitLossBeforeTax"],
+    "pat":               ["profitLossForPeriod", "profitLossForThePeriod"],
+    "pat_attributable":  ["profitOrLossAttributableToOwners"],
+    "eps":               ["eps"],
+    "other_income":      ["otherIncome"],
+    "finance_costs":     ["financeCosts"],
+    "depreciation":      ["depreciationAndAmortisation"],
+    "employee_cost":     ["employeeBenefitExpense", "employeesCost"],
+    "exceptional_items": ["exceptionalItemsBeforeTax", "exceptionalItems"],
+    "minority_interest": ["nonControllingInterests", "profitLossOfMinorityInterest"],
+    "associates_share":  ["profitOrLossOfAssociates", "profitLossOfAssociates"],
+    "tax_expense":       ["taxExpense"],
+    "diluted_shares":    ["dilutedOutstandingShares"],
+    # bank-only — None for non-bank/insurance, that's expected
+    "interest_earned":   ["interestEarned"],
+    "interest_expended": ["interestExpended"],
+    "provisions_loan_loss": ["provisionsForLoanLoss"],
+    "npa_pct":           ["percentageOfNpa"],
+    "gross_npa_pct":     ["percentageOfGrossNpa"],
+    "cet1_ratio":        ["cET1Ratio"],
+    "at1_ratio":         ["additionalTier1Ratio"],
+}
+
+CORE_BS_ALIASES = {
+    "year":           ["year"],
+    "period_end":     ["period_end"],
+    "total_assets":   ["assets"],
+    "reserves":       ["reserves"],
+    "equity_capital": ["equityCapital", "capital"],
+    "cash":           ["cashAndCashEquivalents", "cashAndBalancesWithRBI"],
+    "investments":    ["investments", "noncurrentInvestments"],
+    "fixed_assets":   ["propertyPlantAndEquipment", "fixedAssets"],
+    # bank-only
+    "advances":       ["advances"],
+    "deposits":       ["deposits"],
+    # non-bank-only
+    "inventories":      ["inventories"],
+    "trade_receivables": ["tradeReceivablesCurrent"],
+    "trade_payables":    ["tradePayablesCurrent"],
+}
+
+
+def _resolve_aliases(row, alias_map):
+    out = {}
+    for key, aliases in alias_map.items():
+        val = None
+        for a in aliases:
+            if a in row and row[a] is not None:
+                val = row[a]
+                break
+        out[key] = val
+    return out
+
+
+def _bs_total_equity(row):
+    te = row.get("totalEquity")
+    if te is not None:
+        return te
+    cap = row.get("equityCapital", row.get("capital"))
+    res = row.get("reserves")
+    if cap is not None and res is not None:
+        return cap + res
+    return None
+
+
+def _bs_borrowings_total(row):
+    if "borrowingsCurrent" in row or "borrowingsNoncurrent" in row:
+        return (row.get("borrowingsCurrent") or 0) + (row.get("borrowingsNoncurrent") or 0)
+    return row.get("borrowings")
+
+
+def _build_pl_core(row):
+    core = _resolve_aliases(row, CORE_PL_ALIASES)
+    if core.get("interest_earned") is not None and core.get("interest_expended") is not None:
+        core["net_interest_income"] = core["interest_earned"] - core["interest_expended"]
+    return core
+
+
+def _build_bs_core(row):
+    core = _resolve_aliases(row, CORE_BS_ALIASES)
+    core["total_equity"] = _bs_total_equity(row)
+    core["borrowings_total"] = _bs_borrowings_total(row)
+    return core
+
+
+# ══════════════════════════════════════════════════════════════
+# FETCH FUNCTIONS
+# ══════════════════════════════════════════════════════════════
+
+async def _fetch_financials_all(client, sem, sym, code, periods, build_core_fn=None):
     out = {}
     for period in periods:
         out[period] = {}
         for stype in STYPES:
             d = await _finedge_get(client, sem, f"financials/{sym}",
                                     {"statement_type": stype, "statement_code": code, "period": period})
-            out[period][stype] = (d or {}).get("financials", [])[:ROWS_LIMIT]
+            rows = _trim((d or {}).get("financials", []))
+            if build_core_fn:
+                out[period][stype] = {"core": [build_core_fn(r) for r in rows], "raw": rows}
+            else:
+                out[period][stype] = rows
     return out
 
 
@@ -100,7 +228,7 @@ async def _fetch_ratios_all(client, sem, sym):
         out[rtype] = {}
         for stype in STYPES:
             d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type": stype, "ratio_type": rtype})
-            out[rtype][stype] = (d or {}).get("ratios", [])[:ROWS_LIMIT]
+            out[rtype][stype] = _trim((d or {}).get("ratios", []))
     return out
 
 
@@ -108,7 +236,7 @@ async def _fetch_basic_financials(client, sem, sym):
     out = {}
     for stype in STYPES:
         d = await _finedge_get(client, sem, f"basic-financials/{sym}", {"statement_type": stype, "statement_code": "pl"})
-        out[stype] = (d or {}).get("ratios", [])[:ROWS_LIMIT]
+        out[stype] = _trim((d or {}).get("ratios", []))
     return out
 
 
@@ -124,33 +252,36 @@ async def _fetch_annual_price_ratios(client, sem, sym):
     out = {}
     for stype in STYPES:
         d = await _finedge_get(client, sem, f"annual-price-ratios/{sym}", {"statement_type": stype})
-        out[stype] = (d or {}).get("price_ratios", [])[:ROWS_LIMIT]
+        out[stype] = _trim((d or {}).get("price_ratios", []))
     return out
 
 
-async def _fetch_shareholding_raw(client, sem, sym):
-    return await _finedge_get(client, sem, f"shareholdings/pattern/{sym}", {"period": "quarterly"})  # raw, untouched
-
-
 async def _fetch_profile_raw(client, sem, sym):
-    return await _finedge_get(client, sem, f"company-profile/{sym}", {})  # raw, untouched
+    return await _finedge_get(client, sem, f"company-profile/{sym}", {})
 
 
-async def fetch_full_fundamentals(client, sem, sym):
+# ══════════════════════════════════════════════════════════════
+# ASSEMBLE PER-SYMBOL OBJECT
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_one_symbol(client, sem, sym):
     log.info(f"→ {sym}")
-    (pl, bs, cf, ratios, basic, growth, price_ratios, shareholding, profile) = await asyncio.gather(
-        _fetch_financials_all(client, sem, sym, "pl", PL_PERIODS),
-        _fetch_financials_all(client, sem, sym, "bs", BS_PERIODS),
-        _fetch_financials_all(client, sem, sym, "cf", CF_PERIODS),
+    profile = await _fetch_profile_raw(client, sem, sym)
+    company_type = _classify_company(profile)
+
+    pl, bs, cf, ratios, basic, growth, price_ratios = await asyncio.gather(
+        _fetch_financials_all(client, sem, sym, "pl", PL_PERIODS, build_core_fn=_build_pl_core),
+        _fetch_financials_all(client, sem, sym, "bs", BS_PERIODS, build_core_fn=_build_bs_core),
+        _fetch_financials_all(client, sem, sym, "cf", CF_PERIODS),   # raw only — schema consistent
         _fetch_ratios_all(client, sem, sym),
         _fetch_basic_financials(client, sem, sym),
         _fetch_growth_metrics(client, sem, sym),
         _fetch_annual_price_ratios(client, sem, sym),
-        _fetch_shareholding_raw(client, sem, sym),
-        _fetch_profile_raw(client, sem, sym),
     )
+
     obj = {
         "symbol": sym,
+        "company_type": company_type,
         "fetched_at": datetime.now().isoformat(timespec="seconds"),
         "profile": profile,
         "pl": pl,
@@ -160,36 +291,26 @@ async def fetch_full_fundamentals(client, sem, sym):
         "basic_financials": basic,
         "growth_metrics": growth,
         "annual_price_ratios": price_ratios,
-        "shareholding": shareholding,
     }
-    n_rows = (
-        sum(len(rows) for period in pl.values() for rows in period.values())
-        + sum(len(rows) for period in bs.values() for rows in period.values())
-        + sum(len(rows) for period in cf.values() for rows in period.values())
-    )
-    log.info(f"  ✓ {sym}: {n_rows} financial rows fetched (pl+bs+cf, both statement types)")
+    log.info(f"  ✓ {sym} ({company_type})")
     return sym, obj
 
 
-async def run_test(symbols):
+async def run(symbols):
     sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient() as client:
-        results = await asyncio.gather(*[fetch_full_fundamentals(client, sem, sym.upper()) for sym in symbols])
+        results = await asyncio.gather(*[fetch_one_symbol(client, sem, sym.upper()) for sym in symbols])
     data = {sym: obj for sym, obj in results}
-    out_path = OUT_DIR / "fundamentals_full_test.json"
+    out_path = OUT_DIR / "fundamentals_prod.json"
     out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     log.info(f"💾 Saved → {out_path}  ({out_path.stat().st_size/1024:.1f} KB)")
-    log.info("⚠ R2 ko kuch upload nahi hua — purana fundamentals.json aur pipeline.py bilkul untouched.")
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
-    if mode == "test":
-        syms = sys.argv[2:]
-        if not syms:
-            print("Usage: python pipeline_fundamentals_full.py test SYMBOL [SYMBOL2 ...]")
-            sys.exit(1)
-        asyncio.run(run_test(syms))
+    if mode == "run":
+        syms = sys.argv[2:] or SYMBOLS
+        asyncio.run(run(syms))
     else:
         print(__doc__)
         sys.exit(1)
