@@ -49,6 +49,8 @@ CF_PERIODS  = ["annual", "quarterly", "ytd"]
 RATIO_TYPES = ["pr", "le", "li", "ef"]
 STYPES      = ["c", "s"]   # consolidated, standalone — BOTH fetched (no fallback-only)
 
+ROWS_LIMIT  = int(os.environ.get("ROWS_LIMIT", "1"))  # sirf latest N period rakho — testing ke liye 1
+
 HERE = Path(__file__).parent
 OUT_DIR = HERE / "output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -88,7 +90,7 @@ async def _fetch_financials_all(client, sem, sym, code, periods):
         for stype in STYPES:
             d = await _finedge_get(client, sem, f"financials/{sym}",
                                     {"statement_type": stype, "statement_code": code, "period": period})
-            out[period][stype] = (d or {}).get("financials", [])  # full rows, no [:5], no field selection
+            out[period][stype] = (d or {}).get("financials", [])[:ROWS_LIMIT]
     return out
 
 
@@ -98,7 +100,7 @@ async def _fetch_ratios_all(client, sem, sym):
         out[rtype] = {}
         for stype in STYPES:
             d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type": stype, "ratio_type": rtype})
-            out[rtype][stype] = (d or {}).get("ratios", [])
+            out[rtype][stype] = (d or {}).get("ratios", [])[:ROWS_LIMIT]
     return out
 
 
@@ -106,11 +108,7 @@ async def _fetch_basic_financials(client, sem, sym):
     out = {}
     for stype in STYPES:
         d = await _finedge_get(client, sem, f"basic-financials/{sym}", {"statement_type": stype, "statement_code": "pl"})
-        out[stype] = (d or {}).get("ratios", [])
-    return out
-
-
-async def _fetch_growth_metrics(client, sem, sym):
+        out[stype] = (d or {}).get("ratios", [])[:ROWS_LIMIT](client, sem, sym):
     out = {}
     for stype in STYPES:
         d = await _finedge_get(client, sem, f"financial-metrics/{sym}", {"statement_type": stype, "ratio_type": "gr"})
@@ -122,7 +120,7 @@ async def _fetch_annual_price_ratios(client, sem, sym):
     out = {}
     for stype in STYPES:
         d = await _finedge_get(client, sem, f"annual-price-ratios/{sym}", {"statement_type": stype})
-        out[stype] = (d or {}).get("price_ratios", [])
+        out[stype] = (d or {}).get("price_ratios", [])[:ROWS_LIMIT]
     return out
 
 
