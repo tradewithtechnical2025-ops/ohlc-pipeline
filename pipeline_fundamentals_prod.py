@@ -27,6 +27,15 @@ Modes:
                                                          today (via Finedge
                                                          results-calendar), updates
                                                          just those per-symbol files
+  python pipeline_fundamentals_prod.py backfill_summary
+                                                       → ONE-TIME: builds
+                                                         fundamentals_summary.json
+                                                         from per-symbol files
+                                                         already in R2 — NO Finedge
+                                                         calls, just R2 reads. Use
+                                                         this if full_1..10 already
+                                                         ran before summary support
+                                                         was added.
   python pipeline_fundamentals_prod.py local SYM SYM  → local-only test (no R2),
                                                          saves to output/fundamentals_prod.json
 
@@ -625,6 +634,44 @@ async def run_local(symbols):
     log.info(f"💾 Saved locally → {summary_path}  ({summary_path.stat().st_size/1024:.1f} KB)")
 
 
+# ══════════════════════════════════════════════════════════════
+# MODE: backfill_summary — one-time, builds fundamentals_summary.json
+# from per-symbol files ALREADY in R2 (fundamentals_full/{SYM}.json).
+# No Finedge API calls at all — just R2 reads. Use this once if full_1..10
+# already ran with an older pipeline version that didn't write the summary.
+# ══════════════════════════════════════════════════════════════
+
+async def _backfill_one(client, sym):
+    obj = await r2_download(client, f"fundamentals_full/{sym}.json")
+    if not obj:
+        return sym, None
+    summ = _build_summary_entry(sym, obj.get("profile"), obj.get("pl", {}),
+                                 obj.get("ratios", {}), obj.get("annual_price_ratios", {}))
+    return sym, summ
+
+
+async def run_backfill_summary():
+    BATCH = 50
+    async with httpx.AsyncClient() as client:
+        symbols = await get_nse_universe(client)
+        summary = {}
+        ok = failed = 0
+        for i in range(0, len(symbols), BATCH):
+            batch = symbols[i:i + BATCH]
+            results = await asyncio.gather(*[_backfill_one(client, sym) for sym in batch])
+            for sym, summ in results:
+                if summ:
+                    summary[sym] = summ
+                    ok += 1
+                else:
+                    failed += 1
+                    log.warning(f"  ✗ {sym}: not found in R2 (run full for this symbol first)")
+            done = min(i + BATCH, len(symbols))
+            log.info(f"  {done}/{len(symbols)}  ✓{ok}  ✗{failed}")
+            await r2_upload_summary(client, summary)
+    log.info(f"━━━ Summary backfill complete — ✓{ok}  ✗{failed} ━━━")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode == "full":
@@ -633,6 +680,8 @@ if __name__ == "__main__":
         asyncio.run(run_full(int(mode.split("_")[1])))
     elif mode == "daily":
         asyncio.run(run_daily())
+    elif mode == "backfill_summary":
+        asyncio.run(run_backfill_summary())
     elif mode == "local":
         syms = sys.argv[2:]
         if not syms:
