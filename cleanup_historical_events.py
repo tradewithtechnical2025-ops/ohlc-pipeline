@@ -10,7 +10,7 @@ registries), but the BAD entries already sitting in reports/events.json
 (from before the fix) are still there and will keep showing up in the
 frontend for up to 180 days.
 
-This script finds and removes those bad historical entries using THREE
+This script finds and removes those bad historical entries using FOUR
 signals, applied in order (cheapest/most-certain first):
 
   1. Symbol ends with "-RE"  — BSE's own marker for a re-admitted /
@@ -25,22 +25,40 @@ signals, applied in order (cheapest/most-certain first):
      / BSE_TO_NSE / SME_TO_NSE — those claim something about NSE presence,
      and a company can legitimately have an old BSE code while being
      genuinely new to NSE (e.g. a real SME->Mainboard-NSE migration like
-     DBEIL). Those defer entirely to signal 3 below.
+     DBEIL). Those defer to signals 3/4 instead.
 
-  3. NSE's own quote-equity API (metadata.listingDate) — the definitive
-     fallback for pure-NSE-only resumptions that have no BSE cross-listing
-     at all (e.g. QMSMEDI: listed 11-Oct-2022, suspended 25-Oct-2022,
-     resumed 18-Jun-2026 — neither signal 1 nor 2 catches this since it's
-     NSE-only with a "clean" symbol). Only queried for entries signals 1
-     and 2 couldn't resolve, to stay within NSE's request-rate limits.
+  3. ISIN correlation (no network) — the SAME real-world event (e.g. a
+     company resuming trading on both exchanges the same day) often gets
+     recorded as multiple separate event rows by the old detection logic
+     (one company -> NEW_BSE_LISTING + NEW_NSE_LISTING + BSE_TO_NSE, all
+     same ISIN, same/nearby date). If one of those rows is already
+     flagged by signal 1 or 2, every other row sharing that ISIN is the
+     same event and gets flagged too — this is what catches RELINFRA's
+     BSE_TO_NSE twin once its NEW_BSE_LISTING entry is flagged via the
+     BSE code check, with no NSE API call needed.
+
+  4. NSE's own quote-equity API (metadata.listingDate) — the definitive
+     fallback for pure-NSE-only resumptions with no BSE cross-listing and
+     no correlated twin row at all (e.g. QMSMEDI: listed 11-Oct-2022,
+     suspended 25-Oct-2022, resumed 18-Jun-2026). Only queried for
+     entries signals 1-3 couldn't resolve, to stay within NSE's rate
+     limits and minimise exposure to bot-blocking.
+
+Re-running after a partial cleanup: pass the previous run's flagged-file
+name(s) as extra arguments so their ISINs are included in the signal-3
+correlation set (catches twins of already-removed entries even though
+the corroborating row is no longer in the live events.json):
+
+    python cleanup_historical_events.py --apply reports/flagged_resumptions_20260621T171617Z.json
 
 Flagged entries are written to reports/flagged_resumptions_<timestamp>.json
 for review — nothing is silently lost — and removed from the live
 reports/events.json only if run with --apply.
 
 Usage:
-    python cleanup_historical_events.py            # dry run, no changes
-    python cleanup_historical_events.py --apply    # actually clean up R2
+    python cleanup_historical_events.py                              # dry run
+    python cleanup_historical_events.py --apply                      # apply
+    python cleanup_historical_events.py --apply reports/flagged_X.json  # apply + correlate against a prior flagged file
 """
 
 import asyncio
@@ -137,36 +155,55 @@ def classify_cheap(event):
     return None
 
 
-async def fetch_nse_listing_date(client, symbol):
-    """Signal 3 — NSE's own recorded original listing date for a symbol.
-    Returns YYYY-MM-DD, or None if unavailable/blocked (never raises)."""
-    try:
-        r = await client.get(
-            f"https://www.nseindia.com/api/quote-equity?symbol={symbol}",
-            headers={
-                **NSE_BROWSER_HEADERS,
-                "Accept": "application/json,text/plain,*/*",
-                "Referer": f"https://www.nseindia.com/get-quote/equity/{symbol}",
-            },
-            timeout=30,
-        )
-        if r.status_code != 200:
+async def fetch_nse_listing_date(client, symbol, retries=1):
+    """Signal 4 — NSE's own recorded original listing date for a symbol.
+    Returns YYYY-MM-DD, or None if unavailable/blocked (never raises).
+    Retries once on failure (transient blocks are common)."""
+    for attempt in range(retries + 1):
+        try:
+            r = await client.get(
+                f"https://www.nseindia.com/api/quote-equity?symbol={symbol}",
+                headers={
+                    **NSE_BROWSER_HEADERS,
+                    "Accept": "application/json,text/plain,*/*",
+                    "Referer": f"https://www.nseindia.com/get-quote/equity/{symbol}",
+                },
+                timeout=30,
+            )
+            if r.status_code != 200:
+                if attempt < retries:
+                    await asyncio.sleep(1.0)
+                    continue
+                return None
+            raw = (r.json().get("metadata") or {}).get("listingDate")
+            if not raw:
+                return None
+            return datetime.strptime(raw, "%d-%b-%Y").strftime("%Y-%m-%d")
+        except Exception:
+            if attempt < retries:
+                await asyncio.sleep(1.0)
+                continue
             return None
-        raw = (r.json().get("metadata") or {}).get("listingDate")
-        if not raw:
-            return None
-        return datetime.strptime(raw, "%d-%b-%Y").strftime("%Y-%m-%d")
-    except Exception:
-        return None
+    return None
 
 
 async def main():
     apply_changes = "--apply" in sys.argv
+    reference_files = [a for a in sys.argv[1:] if a.startswith("reports/")]
 
     async with httpx.AsyncClient() as client:
         events = await r2_download(client, "reports/events.json") or []
+        print(f"📂 Loaded {len(events)} events")
 
-        print(f"📂 Loaded {len(events)} events\n")
+        # ISINs from prior cleanup runs (already removed from events.json,
+        # but still useful to correlate against on a second pass).
+        reference_bad_isins = set()
+        for fname in reference_files:
+            prior = await r2_download(client, fname) or []
+            for e in prior:
+                if e.get("isin"):
+                    reference_bad_isins.add(e["isin"])
+            print(f"📂 Loaded {len(prior)} entries from reference file {fname}")
 
         kept, flagged, unresolved = [], [], []
         for e in events:
@@ -179,25 +216,49 @@ async def main():
             else:
                 unresolved.append(e)
 
-        print(f"After signals 1+2 (no network): {len(flagged)} flagged, {len(unresolved)} need NSE API check\n")
+        print(f"\nAfter signals 1+2 (no network): {len(flagged)} flagged, {len(unresolved)} remaining")
 
-        # Signal 3 — NSE quote-equity API, rate-limited (NSE allows ~3 req/s).
+        # Signal 3 — ISIN correlation (no network). Same real-world event
+        # often spans multiple rows (NEW_BSE_LISTING + NEW_NSE_LISTING +
+        # BSE_TO_NSE, same ISIN). If one row is already flagged, every
+        # other row sharing that ISIN is the same event.
+        confirmed_bad_isins = reference_bad_isins | {e["isin"] for e in flagged if e.get("isin")}
+        still_unresolved = []
+        for e in unresolved:
+            isin = e.get("isin")
+            if isin and isin in confirmed_bad_isins:
+                flagged.append({**e, "_flag_reason": "correlated_isin_resumption"})
+            else:
+                still_unresolved.append(e)
+        unresolved = still_unresolved
+
+        print(f"After signal 3 (ISIN correlation): {len(flagged)} flagged, {len(unresolved)} need NSE API check\n")
+
+        # Signal 4 — NSE quote-equity API, rate-limited (NSE allows ~3 req/s).
         await client.get("https://www.nseindia.com/", headers=NSE_BROWSER_HEADERS, timeout=30)
-        checked = 0
+        checked = api_resolved = api_failed = 0
         for e in unresolved:
             symbol = e.get("symbol")
             if not symbol:
                 kept.append(e)
                 continue
+
+            if checked > 0 and checked % 30 == 0:
+                # Refresh the session periodically — cookies/bot-detection
+                # state can go stale over a long run.
+                await client.get("https://www.nseindia.com/", headers=NSE_BROWSER_HEADERS, timeout=30)
+
             listing_date = await fetch_nse_listing_date(client, symbol)
             checked += 1
             if checked % 20 == 0:
-                print(f"  ...checked {checked}/{len(unresolved)} via NSE API")
-            await asyncio.sleep(0.4)  # stay well under NSE's rate limit
+                print(f"  ...checked {checked}/{len(unresolved)} via NSE API (resolved={api_resolved}, failed={api_failed})")
+            await asyncio.sleep(0.5)
 
             if not listing_date:
-                kept.append(e)  # no signal available — don't guess, keep it
+                api_failed += 1
+                kept.append({**e, "_check_status": "nse_api_failed_kept_by_default"})
                 continue
+            api_resolved += 1
             try:
                 event_date = datetime.strptime(e["date"], "%Y-%m-%d")
                 listed_dt = datetime.strptime(listing_date, "%Y-%m-%d")
@@ -210,6 +271,12 @@ async def main():
             else:
                 kept.append(e)
 
+        print(f"\nNSE API summary: {checked} checked, {api_resolved} resolved, {api_failed} failed/blocked")
+        if api_failed:
+            print(f"⚠️  {api_failed} entries kept by default because the NSE API call failed — "
+                  f"they were NOT verified as genuine, just unresolved. Re-run later to re-check them "
+                  f"(they're tagged \"_check_status\":\"nse_api_failed_kept_by_default\" in events.json).")
+
         print(f"\nTotal events checked  : {len(events)}")
         print(f"Flagged as resumption : {len(flagged)}")
         print(f"Kept                  : {len(kept)}\n")
@@ -218,6 +285,12 @@ async def main():
         for e in flagged:
             by_type[e["event"]] = by_type.get(e["event"], 0) + 1
         print("Flagged breakdown by event type:", json.dumps(by_type, indent=2))
+
+        by_reason = {}
+        for e in flagged:
+            r = e.get("_flag_reason", "").split("(")[0]
+            by_reason[r] = by_reason.get(r, 0) + 1
+        print("Flagged breakdown by signal:", json.dumps(by_reason, indent=2))
 
         print("\nSample flagged entries (first 20):")
         for e in flagged[:20]:
