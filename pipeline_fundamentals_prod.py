@@ -477,19 +477,27 @@ async def _fetch_profile_raw(client, sem, sym):
 
 def _compute_opm(row):
     """OPM from quarterly PL core row.
-    Primary:  (sales - expenses) / sales  — works when Finedge has expenditureExcludingProvisions.
-    Fallback: (pbt + depreciation + finance_costs - other_income) / sales
-              — works for virtually all companies since these 4 fields are always present.
+    Non-bank: (pbt + dep + fin_costs - other_income) / sales
+    Bank:     NIM = (interest_earned - interest_expended) / interest_earned
     Returns a decimal fraction (e.g. 0.142 = 14.2%) or None.
     """
     sales = row.get("sales")
+    interest_earned = row.get("interest_earned")
+
+    # Bank path — NIM as OPM proxy
+    if not sales and interest_earned:
+        ie = row.get("interest_expended") or 0
+        return round((interest_earned - ie) / interest_earned, 4) if interest_earned else None
+
     if not sales:
         return None
-    # Primary path
+
+    # Primary: expenses field available
     exp = row.get("expenses")
     if exp is not None:
         return round((sales - exp) / sales, 4)
-    # Fallback: add back non-operating items to PBT
+
+    # Fallback: reconstruct operating profit from available fields
     pbt  = row.get("pbt")
     dep  = row.get("depreciation")
     fin  = row.get("finance_costs")
