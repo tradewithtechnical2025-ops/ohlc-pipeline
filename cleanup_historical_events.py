@@ -279,9 +279,15 @@ async def main():
         # duplicate.
         SPECIFIC_NSE_TYPES = {"BSE_TO_NSE", "SME_TO_NSE", "SME_TO_MAINBOARD_NSE"}
         specific_isins = {e["isin"] for e in kept if e.get("event") in SPECIFIC_NSE_TYPES and e.get("isin")}
+        specific_symbols = {e["symbol"].upper() for e in kept if e.get("event") in SPECIFIC_NSE_TYPES and e.get("symbol")}
         deduped = []
         for e in kept:
-            if e.get("event") == "NEW_NSE_LISTING" and e.get("isin") in specific_isins:
+            if e.get("event") != "NEW_NSE_LISTING":
+                deduped.append(e)
+                continue
+            isin_match = bool(e.get("isin")) and e["isin"] in specific_isins
+            symbol_match = bool(e.get("symbol")) and e["symbol"].upper() in specific_symbols
+            if isin_match or symbol_match:
                 flagged.append({**e, "_flag_reason": "duplicate_of_specific_migration_tag"})
             else:
                 deduped.append(e)
