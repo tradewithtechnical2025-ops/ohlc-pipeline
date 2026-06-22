@@ -492,7 +492,7 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
               or pl.get("quarterly", {}).get("s", {}).get("core") or [])
     quarters = [{
         "header": _fmt_period_end(row.get("period_end")),
-        "sales":    row.get("sales"),
+        "sales":    row.get("sales") if row.get("sales") is not None else row.get("interest_earned"),
         "expenses": row.get("expenses"),   # needed for OPM in Results Comparison
         "eps":      row.get("eps"),
         "pat":      row.get("pat"),
