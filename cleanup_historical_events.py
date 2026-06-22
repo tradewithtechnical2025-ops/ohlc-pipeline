@@ -268,6 +268,28 @@ async def main():
 
         kept.extend(unverifiable)
 
+        # --- Dedup pass: same real-world event, two tags ---
+        # A genuine SME->Mainboard or BSE->NSE migration is, by definition,
+        # ALSO "newly on NSE" — so a generic NEW_NSE_LISTING row for the
+        # same ISIN often coexists with the more specific migration row
+        # (e.g. QMSMEDI: confirmed via NSE's official migration list AND
+        # separately backfilled as NEW_NSE_LISTING via the recent-listings
+        # feed, since that backfill didn't know about the migration row).
+        # The specific tag is strictly more informative — drop the generic
+        # duplicate.
+        SPECIFIC_NSE_TYPES = {"BSE_TO_NSE", "SME_TO_NSE", "SME_TO_MAINBOARD_NSE"}
+        specific_isins = {e["isin"] for e in kept if e.get("event") in SPECIFIC_NSE_TYPES and e.get("isin")}
+        deduped = []
+        for e in kept:
+            if e.get("event") == "NEW_NSE_LISTING" and e.get("isin") in specific_isins:
+                flagged.append({**e, "_flag_reason": "duplicate_of_specific_migration_tag"})
+            else:
+                deduped.append(e)
+        dupes_removed = len(kept) - len(deduped)
+        kept = deduped
+        if dupes_removed:
+            print(f"🔁 Dedup: removed {dupes_removed} generic NEW_NSE_LISTING row(s) duplicating a more specific migration tag")
+
         print(f"Total events checked  : {len(events)}")
         print(f"Flagged as resumption : {len(flagged)}")
         print(f"Kept                  : {len(kept) - len(unverifiable)}")
