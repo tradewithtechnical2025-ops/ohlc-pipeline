@@ -134,12 +134,12 @@ def is_trading_day(d: str) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 async def r2_download(client, filename):
-    # Use params= so httpx percent-encodes the filename automatically.
-    # This is consistent with r2_upload (POST + params) and avoids the
-    # path-append approach which can mis-handle symbols containing '&'
-    # (e.g. M&M, J&KBANK) when the Worker routes on query params.
-    r = await client.get(WORKER_URL, params={"file": filename},
-                         headers=WORKER_HEADERS, timeout=90)
+    from urllib.parse import quote
+    # Worker GET endpoint routes by URL path, NOT by ?file= query param.
+    # quote(filename, safe='/') correctly encodes & → %26 while leaving / intact,
+    # so M&M.json → fundamentals_full/M%26M.json which the Worker decodes correctly.
+    url = f"{WORKER_URL}/{quote(filename, safe='/')}"
+    r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
     if r.status_code == 404:
         return None
     if r.status_code != 200:
@@ -666,6 +666,7 @@ async def run_backfill_summary():
         symbols = await get_nse_universe(client)
         summary = {}
         ok = failed = 0
+        failed_syms = []
         for i in range(0, len(symbols), BATCH):
             batch = symbols[i:i + BATCH]
             results = await asyncio.gather(*[_backfill_one(client, sym) for sym in batch])
@@ -675,9 +676,25 @@ async def run_backfill_summary():
                     ok += 1
                 else:
                     failed += 1
+                    failed_syms.append(sym)
                     log.warning(f"  ✗ {sym}: not found in R2 (run full for this symbol first)")
             done = min(i + BATCH, len(symbols))
             log.info(f"  {done}/{len(symbols)}  ✓{ok}  ✗{failed}")
+            await r2_upload_summary(client, summary)
+        # Auto-retry any & symbols that failed (Worker path routing may not handle %26 correctly)
+        amp_syms = [s for s in failed_syms if '&' in s]
+        if amp_syms:
+            log.info(f"  Auto-syncing {len(amp_syms)} & symbols via Finedge: {amp_syms}")
+            sem = asyncio.Semaphore(CONCURRENCY)
+            for sym in amp_syms:
+                try:
+                    _, obj, summ = await fetch_one_symbol(client, sem, sym)
+                    await r2_upload_symbol(client, sym, obj)
+                    summary[sym] = summ
+                    ok += 1; failed -= 1
+                    log.info(f"  ✓ {sym} (auto-synced)")
+                except Exception as e:
+                    log.error(f"  ✗ {sym} auto-sync failed: {e}")
             await r2_upload_summary(client, summary)
     log.info(f"━━━ Summary backfill complete — ✓{ok}  ✗{failed} ━━━")
 
