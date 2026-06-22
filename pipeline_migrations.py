@@ -701,11 +701,26 @@ async def main():
 
         # Safety net #2: NSE's "Recent Listing" feed for missed equity
         # NEW_NSE_LISTING entries — restricted to equity-like series so
-        # we never accidentally backfill a bond/NCD/MF unit.
+        # we never accidentally backfill a bond/NCD/MF unit. Also skips
+        # any isin already tagged with a more specific migration type
+        # (e.g. SME_TO_MAINBOARD_NSE from the official list above) —
+        # otherwise the same real event gets double-tagged: once
+        # correctly as a migration, once redundantly as a generic new
+        # listing (this is exactly what happened with QMSMEDI).
         nse_recent = await fetch_nse_recent_listings(client)
         already_recorded_isins = {
             e.get("isin") for e in existing_events + all_events
-            if e.get("event") in ("NEW_NSE_LISTING", "NSE_RELISTING") and e.get("isin")
+            if e.get("event") in ("NEW_NSE_LISTING", "NSE_RELISTING", "BSE_TO_NSE", "SME_TO_NSE", "SME_TO_MAINBOARD_NSE")
+            and e.get("isin")
+        }
+        # SME_TO_MAINBOARD_NSE entries from the official-list scrape carry
+        # no ISIN at all (that page only has Name/Symbol/Date) — fall back
+        # to symbol matching for those, or this exclusion silently misses
+        # them and creates the exact QMSMEDI-style duplicate.
+        already_recorded_symbols = {
+            e.get("symbol", "").upper() for e in existing_events + all_events
+            if e.get("event") in ("BSE_TO_NSE", "SME_TO_NSE", "SME_TO_MAINBOARD_NSE")
+            and e.get("symbol")
         }
         recent_backfilled = 0
         for row in nse_recent:
@@ -713,6 +728,8 @@ async def main():
                 continue
             isin = row.get("isin")
             if not isin or isin in already_recorded_isins:
+                continue
+            if (row.get("symbol") or "").upper() in already_recorded_symbols:
                 continue
             try:
                 date_iso = datetime.strptime(row["listing_date"], "%d-%b-%Y").strftime("%Y-%m-%d")
