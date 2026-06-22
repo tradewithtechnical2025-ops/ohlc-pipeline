@@ -681,21 +681,24 @@ async def run_backfill_summary():
             done = min(i + BATCH, len(symbols))
             log.info(f"  {done}/{len(symbols)}  ✓{ok}  ✗{failed}")
             await r2_upload_summary(client, summary)
-        # Auto-retry any & symbols that failed (Worker path routing may not handle %26 correctly)
-        amp_syms = [s for s in failed_syms if '&' in s]
-        if amp_syms:
-            log.info(f"  Auto-syncing {len(amp_syms)} & symbols via Finedge: {amp_syms}")
+        # Auto-retry ALL symbols not found in R2 — could be new listings,
+        # migrations, or & symbols where path routing failed.
+        if failed_syms:
+            log.info(f"  Auto-syncing {len(failed_syms)} missing symbols via Finedge...")
             sem = asyncio.Semaphore(CONCURRENCY)
-            for sym in amp_syms:
+            s_ok = s_fail = 0
+            for sym in failed_syms:
                 try:
                     _, obj, summ = await fetch_one_symbol(client, sem, sym)
                     await r2_upload_symbol(client, sym, obj)
                     summary[sym] = summ
-                    ok += 1; failed -= 1
+                    ok += 1; failed -= 1; s_ok += 1
                     log.info(f"  ✓ {sym} (auto-synced)")
                 except Exception as e:
+                    s_fail += 1
                     log.error(f"  ✗ {sym} auto-sync failed: {e}")
             await r2_upload_summary(client, summary)
+            log.info(f"  Auto-sync done — ✓{s_ok}  ✗{s_fail}")
     log.info(f"━━━ Summary backfill complete — ✓{ok}  ✗{failed} ━━━")
 
 
