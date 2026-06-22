@@ -475,6 +475,31 @@ async def _fetch_profile_raw(client, sem, sym):
 # which IS updated daily for all stocks by the OHLC pipeline).
 # ══════════════════════════════════════════════════════════════
 
+def _compute_opm(row):
+    """OPM from quarterly PL core row.
+    Primary:  (sales - expenses) / sales  — works when Finedge has expenditureExcludingProvisions.
+    Fallback: (pbt + depreciation + finance_costs - other_income) / sales
+              — works for virtually all companies since these 4 fields are always present.
+    Returns a decimal fraction (e.g. 0.142 = 14.2%) or None.
+    """
+    sales = row.get("sales")
+    if not sales:
+        return None
+    # Primary path
+    exp = row.get("expenses")
+    if exp is not None:
+        return round((sales - exp) / sales, 4)
+    # Fallback: add back non-operating items to PBT
+    pbt  = row.get("pbt")
+    dep  = row.get("depreciation")
+    fin  = row.get("finance_costs")
+    oth  = row.get("other_income") or 0
+    if pbt is not None and dep is not None and fin is not None:
+        op = pbt + dep + fin - oth
+        return round(op / sales, 4)
+    return None
+
+
 def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
     profile = profile or {}
 
@@ -494,6 +519,7 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
         "header": _fmt_period_end(row.get("period_end")),
         "sales":    row.get("sales") if row.get("sales") is not None else row.get("interest_earned"),
         "expenses": row.get("expenses"),   # needed for OPM in Results Comparison
+        "opm":      _compute_opm(row),     # pre-computed so Results Comparison doesn't need expenses
         "eps":      row.get("eps"),
         "pat":      row.get("pat"),
         "pbt":      row.get("pbt"),
