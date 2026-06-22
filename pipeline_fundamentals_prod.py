@@ -258,7 +258,8 @@ def _classify_company(profile):
 
 CORE_PL_ALIASES = {
     "year": ["year"], "period_end": ["period_end"], "period_start": ["period_start"],
-    "sales": ["revenueFromOperations"],
+    "sales": ["revenueFromOperations", "income"],
+    "expenses": ["expenses", "expenditureExcludingProvisions"],
     "pbt": ["profitBeforeTax", "profitLossBeforeTax"],
     "pat": ["profitLossForPeriod", "profitLossForThePeriod"],
     "pat_attributable": ["profitOrLossAttributableToOwners"],
@@ -289,6 +290,10 @@ CORE_BS_ALIASES = {
     "cash": ["cashAndCashEquivalents", "cashAndBalancesWithRBI"],
     "investments": ["investments", "noncurrentInvestments"],
     "fixed_assets": ["propertyPlantAndEquipment", "fixedAssets"],
+    "borrowings_current": ["borrowingsCurrent"],
+    "borrowings_noncurrent": ["borrowingsNoncurrent"],
+    "current_assets": ["currentAssets"],
+    "current_liabilities": ["currentLiabilities"],
     "advances": ["advances"],
     "deposits": ["deposits"],
     "inventories": ["inventories"],
@@ -484,11 +489,12 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
               or pl.get("quarterly", {}).get("s", {}).get("core") or [])
     quarters = [{
         "header": _fmt_period_end(row.get("period_end")),
-        "sales": row.get("sales"),
-        "eps": row.get("eps"),
-        "pat": row.get("pat"),
-        "pbt": row.get("pbt"),
-    } for row in q_core[:5]]
+        "sales":    row.get("sales"),
+        "expenses": row.get("expenses"),   # needed for OPM in Results Comparison
+        "eps":      row.get("eps"),
+        "pat":      row.get("pat"),
+        "pbt":      row.get("pbt"),
+    } for row in q_core[:9]]  # 9 so YoY base (idx+4) exists for any of the 5 displayed quarters
 
     pr0 = (ratios.get("pr", {}).get("raw") or [{}])[0]
     le0 = (ratios.get("le", {}).get("raw") or [{}])[0]
