@@ -134,9 +134,12 @@ def is_trading_day(d: str) -> bool:
 # ══════════════════════════════════════════════════════════════
 
 async def r2_download(client, filename):
-    from urllib.parse import quote
-    url = f"{WORKER_URL}/{quote(filename, safe='/')}"
-    r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
+    # Use params= so httpx percent-encodes the filename automatically.
+    # This is consistent with r2_upload (POST + params) and avoids the
+    # path-append approach which can mis-handle symbols containing '&'
+    # (e.g. M&M, J&KBANK) when the Worker routes on query params.
+    r = await client.get(WORKER_URL, params={"file": filename},
+                         headers=WORKER_HEADERS, timeout=90)
     if r.status_code == 404:
         return None
     if r.status_code != 200:
