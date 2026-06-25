@@ -29,6 +29,19 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+# ── Telegram notify ──
+try:
+    from telegram_notify import PipelineStatus
+except ImportError:
+    class PipelineStatus:
+        def __init__(self, name): self.name = name
+        def add(self, *a, **k): pass
+        def set(self, *a, **k): pass
+        def warn(self, msg): pass
+        def success(self, *a, **k): pass
+        def failure(self, exc, reraise=True, **k):
+            if reraise: raise exc
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -458,121 +471,136 @@ def upsert_candle(all_data, sym, c):
 MIN_HISTORY_DAYS = 260  # ~1 trading year — covers EMA200, RS 252-day lookback, 52W high/low
 
 async def run_daily() -> None:
-    today = today_ist()
-    prev = prev_trading_day(today); cutoff = rolling_cutoff(today)
-    log.info(f"━━━ Daily  {prev} → {today}  cutoff {cutoff} ━━━")
-    sem = asyncio.Semaphore(CONCURRENCY)
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
-        live = set(all_ikeys)
+    status = PipelineStatus("run_daily")
+    try:
+        today = today_ist()
+        prev = prev_trading_day(today); cutoff = rolling_cutoff(today)
+        log.info(f"━━━ Daily  {prev} → {today}  cutoff {cutoff} ━━━")
+        sem = asyncio.Semaphore(CONCURRENCY)
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
+            live = set(all_ikeys)
 
-        all_data = await download_all_chunks(client)
+            all_data = await download_all_chunks(client)
 
-        # Needs backfill = never tracked OR suspiciously little history —
-        # this covers genuinely-new entrants AND stocks already bitten by
-        # the old 1-day-only merge bug sitting in the store right now.
-        needs_backfill = {
-            sym for sym in live
-            if len((all_data.get(sym) or {}).get("d", [])) < MIN_HISTORY_DAYS
-        }
-        existing = live - needs_backfill
+            # Needs backfill = never tracked OR suspiciously little history —
+            # this covers genuinely-new entrants AND stocks already bitten by
+            # the old 1-day-only merge bug sitting in the store right now.
+            needs_backfill = {
+                sym for sym in live
+                if len((all_data.get(sym) or {}).get("d", [])) < MIN_HISTORY_DAYS
+            }
+            existing = live - needs_backfill
 
-        if needs_backfill:
-            sample = sorted(needs_backfill)[:15]
-            log.info(f"🆕 {len(needs_backfill)} symbol(s) need deep backfill ({cutoff} → {today}): {sample}{'…' if len(needs_backfill) > 15 else ''}")
+            if needs_backfill:
+                sample = sorted(needs_backfill)[:15]
+                log.info(f"🆕 {len(needs_backfill)} symbol(s) need deep backfill ({cutoff} → {today}): {sample}{'…' if len(needs_backfill) > 15 else ''}")
 
-        async def _fetch_for(symbols, from_date):
-            tasks = [fetch_ohlc(client, sem, sym, all_ikeys[sym], from_date, today) for sym in symbols]
-            return await asyncio.gather(*tasks)
+            async def _fetch_for(symbols, from_date):
+                tasks = [fetch_ohlc(client, sem, sym, all_ikeys[sym], from_date, today) for sym in symbols]
+                return await asyncio.gather(*tasks)
 
-        backfill_results, incremental_results = await asyncio.gather(
-            _fetch_for(needs_backfill, cutoff),
-            _fetch_for(existing, prev),
-        )
-        fetched = {sym: c for sym, c in [*backfill_results, *incremental_results] if c}
-        log.info(f"✓ {len(fetched)} fetched  ✗ {len(live) - len(fetched)} no data")
+            backfill_results, incremental_results = await asyncio.gather(
+                _fetch_for(needs_backfill, cutoff),
+                _fetch_for(existing, prev),
+            )
+            fetched = {sym: c for sym, c in [*backfill_results, *incremental_results] if c}
+            log.info(f"✓ {len(fetched)} fetched  ✗ {len(live) - len(fetched)} no data")
 
-        pruned = [s for s in list(all_data) if s not in live]
-        for s in pruned: del all_data[s]
-        if pruned: log.info(f"🗑  Pruned {len(pruned)} stocks")
+            pruned = [s for s in list(all_data) if s not in live]
+            for s in pruned: del all_data[s]
+            if pruned: log.info(f"🗑  Pruned {len(pruned)} stocks")
 
-        total_new = 0; delta = {}
-        for sym, candles in fetched.items():
-            total_new += merge_candles_into(all_data, sym, candles, cutoff)
-            today_c = next((c for c in candles if c["d"] == today), None)
-            if today_c: delta[sym] = today_c
-        log.info(f"Merged: {total_new} new  Delta: {len(delta)}")
-        dropped = apply_rolling_window(all_data, cutoff)
-        log.info(f"Rolling: dropped {dropped} old candles")
-        await asyncio.gather(
-            upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
-        )
-    log.info("━━━ Daily complete ━━━")
+            total_new = 0; delta = {}
+            for sym, candles in fetched.items():
+                total_new += merge_candles_into(all_data, sym, candles, cutoff)
+                today_c = next((c for c in candles if c["d"] == today), None)
+                if today_c: delta[sym] = today_c
+            log.info(f"Merged: {total_new} new  Delta: {len(delta)}")
+            dropped = apply_rolling_window(all_data, cutoff)
+            log.info(f"Rolling: dropped {dropped} old candles")
+            await asyncio.gather(
+                upload_all_chunks(client, all_data, today),
+                r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
+            )
+        status.success()
+        log.info("━━━ Daily complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 async def run_today() -> None:
-    today = today_ist()
-    log.info(f"━━━ Today  {today} ━━━")
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
-        log.info(f"Universe: {len(all_ikeys)} stocks")
+    status = PipelineStatus("run_today")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Today  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
+            log.info(f"Universe: {len(all_ikeys)} stocks")
 
-        # Fetch chunks + bulk OHLC concurrently
-        fetched, all_data = await asyncio.gather(
-            fetch_ohlc_bulk(client, all_ikeys),
-            download_all_chunks(client),
-        )
-        log.info(f"Fetched today candles: {len(fetched)}")
+            # Fetch chunks + bulk OHLC concurrently
+            fetched, all_data = await asyncio.gather(
+                fetch_ohlc_bulk(client, all_ikeys),
+                download_all_chunks(client),
+            )
+            log.info(f"Fetched today candles: {len(fetched)}")
 
-        if not fetched:
-            log.warning("⚠ No candles fetched — market may be closed or API issue")
+            if not fetched:
+                log.warning("⚠ No candles fetched — market may be closed or API issue")
 
-        for sym, c in fetched.items():
-            upsert_candle(all_data, sym, c)
+            for sym, c in fetched.items():
+                upsert_candle(all_data, sym, c)
 
-        delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
-        await asyncio.gather(
-            upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
-        )
-        log.info(f"✅ delta: {len(delta)} stocks")
-    log.info("━━━ Today complete ━━━")
+            delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
+            await asyncio.gather(
+                upload_all_chunks(client, all_data, today),
+                r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
+            )
+            log.info(f"✅ delta: {len(delta)} stocks")
+        status.success()
+        log.info("━━━ Today complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 async def run_full() -> None:
-    today = last_trading_day()
-    start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
-    cutoff = start
-    sem = asyncio.Semaphore(CONCURRENCY); all_data = {}; failed = []
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_sym_list = list(ISIN_MAP.items()) + list(BSE_ISIN_MAP.items())
-        log.info(f"━━━ Full Load  {start} → {today}  ({len(all_sym_list)} stocks) ━━━")
-        for i in range(0, len(all_sym_list), 50):
-            chunk = all_sym_list[i:i+50]
-            results = await asyncio.gather(*[fetch_ohlc(client,sem,sym,ikey,start,today) for sym,ikey in chunk])
-            for sym, candles in results:
-                if candles:
-                    filtered = [c for c in candles if c["d"] >= cutoff]
-                    if filtered: all_data[sym] = build_stock_obj(filtered)
-                else: failed.append(sym)
-            pct = min(i+50, len(all_sym_list))
-            log.info(f"  {pct}/{len(all_sym_list)}  OK:{len(all_data)}  Failed:{len(failed)}")
-            if pct % 500 == 0: await upload_all_chunks(client, all_data, today)
-        log.info(f"✓ {len(all_data)} loaded  ✗ {len(failed)} failed")
-        if failed: (HERE/"failed_stocks.txt").write_text("\n".join(failed))
-        apply_rolling_window(all_data, cutoff)
-        await asyncio.gather(
-            upload_all_chunks(client, all_data, today),
-            r2_upload(client, "ohlc_all.json", json.dumps({"updated":today,"stocks":all_data})),
-        )
-    log.info("━━━ Full load complete ━━━")
+    status = PipelineStatus("run_full")
+    try:
+        today = last_trading_day()
+        start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
+        cutoff = start
+        sem = asyncio.Semaphore(CONCURRENCY); all_data = {}; failed = []
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_sym_list = list(ISIN_MAP.items()) + list(BSE_ISIN_MAP.items())
+            log.info(f"━━━ Full Load  {start} → {today}  ({len(all_sym_list)} stocks) ━━━")
+            for i in range(0, len(all_sym_list), 50):
+                chunk = all_sym_list[i:i+50]
+                results = await asyncio.gather(*[fetch_ohlc(client,sem,sym,ikey,start,today) for sym,ikey in chunk])
+                for sym, candles in results:
+                    if candles:
+                        filtered = [c for c in candles if c["d"] >= cutoff]
+                        if filtered: all_data[sym] = build_stock_obj(filtered)
+                    else: failed.append(sym)
+                pct = min(i+50, len(all_sym_list))
+                log.info(f"  {pct}/{len(all_sym_list)}  OK:{len(all_data)}  Failed:{len(failed)}")
+                if pct % 500 == 0: await upload_all_chunks(client, all_data, today)
+            log.info(f"✓ {len(all_data)} loaded  ✗ {len(failed)} failed")
+            if failed: (HERE/"failed_stocks.txt").write_text("\n".join(failed))
+            apply_rolling_window(all_data, cutoff)
+            await asyncio.gather(
+                upload_all_chunks(client, all_data, today),
+                r2_upload(client, "ohlc_all.json", json.dumps({"updated":today,"stocks":all_data})),
+            )
+        status.success()
+        log.info("━━━ Full load complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 async def run_status() -> None:
@@ -830,58 +858,68 @@ async def get_result_symbols_finedge(client) -> list[str]:
     return matched
 
 async def run_fund_daily() -> None:
-    today = today_ist()
-    if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
-    log.info(f"━━━ Fundamentals Daily  {today} ━━━")
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        symbols = await get_result_symbols_finedge(client)
-        if not symbols: log.info("No results today — exiting"); return
-        await save_result_calendar(client, symbols, today)
-        fund_data = await r2_download_fund(client)
-        sem = asyncio.Semaphore(FUND_CONCURRENCY)
-        results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in symbols if sym in ISIN_MAP])
-        ok = 0
-        for sym, data in results:
-            if data: fund_data[sym]=data; ok+=1; log.info(f"  ✓ {sym}")
-            else: log.warning(f"  ✗ {sym}: no data")
-        await r2_upload_fund(client, fund_data)
-    log.info("━━━ Fundamentals Daily complete ━━━")
+    status = PipelineStatus("run_fund_daily")
+    try:
+        today = today_ist()
+        if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        log.info(f"━━━ Fundamentals Daily  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            symbols = await get_result_symbols_finedge(client)
+            if not symbols: log.info("No results today — exiting"); return
+            await save_result_calendar(client, symbols, today)
+            fund_data = await r2_download_fund(client)
+            sem = asyncio.Semaphore(FUND_CONCURRENCY)
+            results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in symbols if sym in ISIN_MAP])
+            ok = 0
+            for sym, data in results:
+                if data: fund_data[sym]=data; ok+=1; log.info(f"  ✓ {sym}")
+                else: log.warning(f"  ✗ {sym}: no data")
+            await r2_upload_fund(client, fund_data)
+        status.success()
+        log.info("━━━ Fundamentals Daily complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 async def run_fund_full(part=0) -> None:
-    TOTAL_PARTS = 10; BATCH_SIZE = 20
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        nse_symbols = list(ISIN_MAP.keys()); total = len(nse_symbols)
-        part_size = (total+TOTAL_PARTS-1)//TOTAL_PARTS
-        if part == 0: start_idx,end_idx,label = 0,total,"Full"
-        else: start_idx=(part-1)*part_size; end_idx=min(part*part_size,total); label=f"Part {part}/{TOTAL_PARTS}"
-        chunk = nse_symbols[start_idx:end_idx]
-        log.info(f"━━━ Fund Full {label}  ({len(chunk)} stocks) ━━━")
-        ETF_ENDSWITH = ("ETF","BEES","LIQUID","GILT","IETF","MMQS","TOTAL")
-        ETF_CONTAINS = ("NIFTY","BANKEX","MSCIN")
-        def _is_etf(sym): s=sym.upper(); return any(s.endswith(k) for k in ETF_ENDSWITH) or any(k in s for k in ETF_CONTAINS)
-        equity_chunk = [sym for sym in chunk if not _is_etf(sym)]
-        skipped_etf = len(chunk)-len(equity_chunk)
-        if skipped_etf: log.info(f"Skipping {skipped_etf} ETFs")
-        fund_data = await r2_download_fund(client)
-        missing = [sym for sym in equity_chunk if sym not in fund_data]
-        log.info(f"Already done: {len(equity_chunk)-len(missing)}  Remaining: {len(missing)}")
-        if not missing: log.info("✅ All stocks already fetched!"); return
-        sem = asyncio.Semaphore(FUND_CONCURRENCY); ok = failed = 0
-        for i in range(0, len(missing), BATCH_SIZE):
-            batch = missing[i:i+BATCH_SIZE]
-            results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in batch])
-            for sym, data in results:
-                if data: fund_data[sym]=data; ok+=1
-                else: failed+=1; log.warning(f"  ✗ {sym}: no data")
-            pct = min(i+BATCH_SIZE, len(missing))
-            log.info(f"  {pct}/{len(missing)}  ✓{ok}  ✗{failed}")
-            if pct % 100 == 0 or pct == len(missing):
-                log.info("  💾 Checkpoint upload…"); await r2_upload_fund(client, fund_data)
-    log.info(f"━━━ Fund Full {label} complete — ✓{ok}  ✗{failed} ━━━")
+    status = PipelineStatus("run_fund_full")
+    try:
+        TOTAL_PARTS = 10; BATCH_SIZE = 20
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            nse_symbols = list(ISIN_MAP.keys()); total = len(nse_symbols)
+            part_size = (total+TOTAL_PARTS-1)//TOTAL_PARTS
+            if part == 0: start_idx,end_idx,label = 0,total,"Full"
+            else: start_idx=(part-1)*part_size; end_idx=min(part*part_size,total); label=f"Part {part}/{TOTAL_PARTS}"
+            chunk = nse_symbols[start_idx:end_idx]
+            log.info(f"━━━ Fund Full {label}  ({len(chunk)} stocks) ━━━")
+            ETF_ENDSWITH = ("ETF","BEES","LIQUID","GILT","IETF","MMQS","TOTAL")
+            ETF_CONTAINS = ("NIFTY","BANKEX","MSCIN")
+            def _is_etf(sym): s=sym.upper(); return any(s.endswith(k) for k in ETF_ENDSWITH) or any(k in s for k in ETF_CONTAINS)
+            equity_chunk = [sym for sym in chunk if not _is_etf(sym)]
+            skipped_etf = len(chunk)-len(equity_chunk)
+            if skipped_etf: log.info(f"Skipping {skipped_etf} ETFs")
+            fund_data = await r2_download_fund(client)
+            missing = [sym for sym in equity_chunk if sym not in fund_data]
+            log.info(f"Already done: {len(equity_chunk)-len(missing)}  Remaining: {len(missing)}")
+            if not missing: log.info("✅ All stocks already fetched!"); return
+            sem = asyncio.Semaphore(FUND_CONCURRENCY); ok = failed = 0
+            for i in range(0, len(missing), BATCH_SIZE):
+                batch = missing[i:i+BATCH_SIZE]
+                results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in batch])
+                for sym, data in results:
+                    if data: fund_data[sym]=data; ok+=1
+                    else: failed+=1; log.warning(f"  ✗ {sym}: no data")
+                pct = min(i+BATCH_SIZE, len(missing))
+                log.info(f"  {pct}/{len(missing)}  ✓{ok}  ✗{failed}")
+                if pct % 100 == 0 or pct == len(missing):
+                    log.info("  💾 Checkpoint upload…"); await r2_upload_fund(client, fund_data)
+        status.success()
+        log.info(f"━━━ Fund Full {label} complete — ✓{ok}  ✗{failed} ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1537,201 +1575,206 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
 # ══════════════════════════════════════════════════════════════
 
 async def run_ep_scan() -> None:
-    today=today_ist()
-    log.info(f"━━━ EP + Post-Result + RS Scan  {today} ━━━")
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP,BSE_ISIN_MAP,BSE_META
-        ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
-        today_symbols=await get_result_symbols_finedge(client)
-        if today_symbols: await save_result_calendar(client,today_symbols,today)
-        ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
-        (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
-         idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
-         hlr_raw,pb_raw,pat_raw)=await asyncio.gather(
-            asyncio.gather(*ohlc_tasks,return_exceptions=True),
-            r2_download(client,"screener.json"),r2_download_fund(client),
-            r2_download(client,"result_calendar.json"),r2_download(client,"classification.json"),
-            r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty50']}.json"),
-            r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty500']}.json"),
-            r2_download(client,f"index_history/{INDEX_SYMBOLS['smallmid400']}.json"),
-            r2_download(client,"index_daily.json"),r2_download(client,"sheet_data.json"),
-            r2_download(client,"hlr_signals.json"),r2_download(client,"pullback_signals.json"),
-            r2_download(client,"pattern_signals.json"),
-        )
-        all_data={}
-        for i,res in enumerate(ohlc_results):
-            if isinstance(res,Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
-            elif res and "stocks" in res: all_data.update(res["stocks"])
-        log.info(f"Loaded {len(all_data)} stocks")
-        screener={}
-        if isinstance(screener_raw,list):
-            for row in screener_raw:
-                sym=(row.get("Stocks","") or "").strip()
-                if not sym: continue
-                try: sc=float(row.get("SALES CH%",0))*100; sales_ch=f"+{sc:.1f}%" if sc>=0 else f"{sc:.1f}%"
-                except: sales_ch=""
-                try: ec=float(row.get("EPS CHANGE",0))*100; eps_ch=f"+{ec:.1f}%" if ec>=0 else f"{ec:.1f}%"
-                except: eps_ch=""
-                pat_cols=["NR7","WIB","DIB","MCP","W-MCP","HVQ","VD","PullBack","ATR Tightness","Volume footprint","Launchpad","HLR","BS","GAPUP","PP","HPBC","TL/HL BO","3WTC"]
-                combined=set()
-                for p in (row.get("Patterns","") or "").split("||"):
-                    p=p.strip()
-                    if p: combined.add(p)
-                for col in pat_cols:
-                    v=row.get(col,"")
-                    if v and v not in ("",None,0,"No"): combined.add(v if isinstance(v,str) else col)
-                screener[sym]={"sales_ch":sales_ch,"eps_ch":eps_ch,"patterns":"||".join(sorted(combined)),"sector":row.get("SECTOR",""),"rs":row.get("RS Rating",""),"ltp":row.get("LTP","")}
-        fund_lookup={}
-        if isinstance(fund_raw,dict): fund_lookup=fund_raw
-        elif isinstance(fund_raw,list): fund_lookup={d["symbol"]:d for d in fund_raw if d.get("symbol")}
-        result_calendar=cal_raw if isinstance(cal_raw,dict) else {}
-        classification=classification or []
-        sheet_data={}
-        if isinstance(sheet_raw,list):
-            for row in sheet_raw:
-                sym=row.get("symbol") or row.get("Stocks","")
-                if sym: sheet_data[sym]={"circuit":row.get("Circuit") or row.get("circuit"),"tv_code":row.get("TV CODE") or row.get("tv_code",""),"hpbc":row.get("HPBC") or row.get("hpbc",""),"tl_hl_bo":row.get("TL/HL BO") or row.get("tl_hl_bo","")}
-        elif isinstance(sheet_raw,dict): sheet_data=sheet_raw
-        hlr_map={}
-        if isinstance(hlr_raw,dict):
-            for sig in (hlr_raw.get("signals") or []):
-                sym=sig.get("symbol")
-                if sym:
-                    if sym not in hlr_map or sig.get("touches",0)>hlr_map[sym].get("touches",0): hlr_map[sym]=sig
-        pb_map={}
-        if isinstance(pb_raw,dict):
-            for sig in (pb_raw.get("signals") or []):
-                sym=sig.get("symbol")
-                if sym: pb_map[sym]=sig
-        pat_map={}
-        if isinstance(pat_raw,dict):
-            for sig in (pat_raw.get("signals") or []):
-                sym=sig.get("symbol"); pat=sig.get("pattern")
-                if sym and pat: pat_map.setdefault(sym,set()).add(pat)
+    status = PipelineStatus("run_ep_scan")
+    try:
+        today=today_ist()
+        log.info(f"━━━ EP + Post-Result + RS Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP,BSE_ISIN_MAP,BSE_META
+            ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
+            today_symbols=await get_result_symbols_finedge(client)
+            if today_symbols: await save_result_calendar(client,today_symbols,today)
+            ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
+            (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
+             idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
+             hlr_raw,pb_raw,pat_raw)=await asyncio.gather(
+                asyncio.gather(*ohlc_tasks,return_exceptions=True),
+                r2_download(client,"screener.json"),r2_download_fund(client),
+                r2_download(client,"result_calendar.json"),r2_download(client,"classification.json"),
+                r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty50']}.json"),
+                r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty500']}.json"),
+                r2_download(client,f"index_history/{INDEX_SYMBOLS['smallmid400']}.json"),
+                r2_download(client,"index_daily.json"),r2_download(client,"sheet_data.json"),
+                r2_download(client,"hlr_signals.json"),r2_download(client,"pullback_signals.json"),
+                r2_download(client,"pattern_signals.json"),
+            )
+            all_data={}
+            for i,res in enumerate(ohlc_results):
+                if isinstance(res,Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
+                elif res and "stocks" in res: all_data.update(res["stocks"])
+            log.info(f"Loaded {len(all_data)} stocks")
+            screener={}
+            if isinstance(screener_raw,list):
+                for row in screener_raw:
+                    sym=(row.get("Stocks","") or "").strip()
+                    if not sym: continue
+                    try: sc=float(row.get("SALES CH%",0))*100; sales_ch=f"+{sc:.1f}%" if sc>=0 else f"{sc:.1f}%"
+                    except: sales_ch=""
+                    try: ec=float(row.get("EPS CHANGE",0))*100; eps_ch=f"+{ec:.1f}%" if ec>=0 else f"{ec:.1f}%"
+                    except: eps_ch=""
+                    pat_cols=["NR7","WIB","DIB","MCP","W-MCP","HVQ","VD","PullBack","ATR Tightness","Volume footprint","Launchpad","HLR","BS","GAPUP","PP","HPBC","TL/HL BO","3WTC"]
+                    combined=set()
+                    for p in (row.get("Patterns","") or "").split("||"):
+                        p=p.strip()
+                        if p: combined.add(p)
+                    for col in pat_cols:
+                        v=row.get(col,"")
+                        if v and v not in ("",None,0,"No"): combined.add(v if isinstance(v,str) else col)
+                    screener[sym]={"sales_ch":sales_ch,"eps_ch":eps_ch,"patterns":"||".join(sorted(combined)),"sector":row.get("SECTOR",""),"rs":row.get("RS Rating",""),"ltp":row.get("LTP","")}
+            fund_lookup={}
+            if isinstance(fund_raw,dict): fund_lookup=fund_raw
+            elif isinstance(fund_raw,list): fund_lookup={d["symbol"]:d for d in fund_raw if d.get("symbol")}
+            result_calendar=cal_raw if isinstance(cal_raw,dict) else {}
+            classification=classification or []
+            sheet_data={}
+            if isinstance(sheet_raw,list):
+                for row in sheet_raw:
+                    sym=row.get("symbol") or row.get("Stocks","")
+                    if sym: sheet_data[sym]={"circuit":row.get("Circuit") or row.get("circuit"),"tv_code":row.get("TV CODE") or row.get("tv_code",""),"hpbc":row.get("HPBC") or row.get("hpbc",""),"tl_hl_bo":row.get("TL/HL BO") or row.get("tl_hl_bo","")}
+            elif isinstance(sheet_raw,dict): sheet_data=sheet_raw
+            hlr_map={}
+            if isinstance(hlr_raw,dict):
+                for sig in (hlr_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym:
+                        if sym not in hlr_map or sig.get("touches",0)>hlr_map[sym].get("touches",0): hlr_map[sym]=sig
+            pb_map={}
+            if isinstance(pb_raw,dict):
+                for sig in (pb_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym: pb_map[sym]=sig
+            pat_map={}
+            if isinstance(pat_raw,dict):
+                for sig in (pat_raw.get("signals") or []):
+                    sym=sig.get("symbol"); pat=sig.get("pattern")
+                    if sym and pat: pat_map.setdefault(sym,set()).add(pat)
 
-        # ─── FIX: fresh enrichment helpers ───
-        # Classification map — sector ke liye (sheet ki jagah)
-        cls_map_ep={}
-        for x in (classification or []):
-            sym0=x.get("symbol") or x.get("nse_code")
-            if sym0: cls_map_ep[sym0]=x
+            # ─── FIX: fresh enrichment helpers ───
+            # Classification map — sector ke liye (sheet ki jagah)
+            cls_map_ep={}
+            for x in (classification or []):
+                sym0=x.get("symbol") or x.get("nse_code")
+                if sym0: cls_map_ep[sym0]=x
 
-        def _fund_chg(fund):
-            """fundamentals.json se q_name + YoY sales/eps change strings."""
-            pl=fund.get("pl_quarterly",[])
-            q_name=pl[0].get("header","") if pl else ""
-            sales_ch=eps_ch=""
-            if pl and len(pl)>=5:
-                s0=pl[0].get("sales"); s4=pl[4].get("sales")
-                if s0 and s4:
-                    v=round((s0-s4)/s4*100,1); sales_ch=f"+{v}%" if v>=0 else f"{v}%"
-                e0=pl[0].get("eps"); e4=pl[4].get("eps")
-                if e0 and e4:
-                    v=round((e0-e4)/e4*100,1); eps_ch=f"+{v}%" if v>=0 else f"{v}%"
-            return q_name,sales_ch,eps_ch
+            def _fund_chg(fund):
+                """fundamentals.json se q_name + YoY sales/eps change strings."""
+                pl=fund.get("pl_quarterly",[])
+                q_name=pl[0].get("header","") if pl else ""
+                sales_ch=eps_ch=""
+                if pl and len(pl)>=5:
+                    s0=pl[0].get("sales"); s4=pl[4].get("sales")
+                    if s0 and s4:
+                        v=round((s0-s4)/s4*100,1); sales_ch=f"+{v}%" if v>=0 else f"{v}%"
+                    e0=pl[0].get("eps"); e4=pl[4].get("eps")
+                    if e0 and e4:
+                        v=round((e0-e4)/e4*100,1); eps_ch=f"+{v}%" if v>=0 else f"{v}%"
+                return q_name,sales_ch,eps_ch
 
-        signals=_detect_ep(all_data)
-        signals.sort(key=lambda x:(x["ep_date"],x["gap_pct"]),reverse=True)
-        for sig in signals:
-            sym=sig["symbol"]; sc=screener.get(sym,{}); ci=cls_map_ep.get(sym,{}); fund=fund_lookup.get(sym,{})
-            q_name,sales_ch,eps_ch=_fund_chg(fund)
-            sig.update({
-                "sales_ch":sales_ch or sc.get("sales_ch",""),
-                "eps_ch":eps_ch or sc.get("eps_ch",""),
-                "patterns":sc.get("patterns",""),
-                "sector":ci.get("sector_group") or sc.get("sector",""),
-                "ltp":sig["last_close"],
-                "q_name":q_name,
-            })
-            vol_x=sig.pop("vol_spike_x",1); sig["vol_pct"]=f"+{round((vol_x-1)*100)}%"
-        pr_signals=[]
-        if result_calendar:
-            pr_signals=_detect_post_result_thrust(all_data,result_calendar)
-            for sig in pr_signals:
+            signals=_detect_ep(all_data)
+            signals.sort(key=lambda x:(x["ep_date"],x["gap_pct"]),reverse=True)
+            for sig in signals:
                 sym=sig["symbol"]; sc=screener.get(sym,{}); ci=cls_map_ep.get(sym,{}); fund=fund_lookup.get(sym,{})
                 q_name,sales_ch,eps_ch=_fund_chg(fund)
-                fresh_ltp=None
-                if sym in all_data:
-                    fresh_ltp=next((v for v in reversed(all_data[sym]["c"]) if v is not None),None)
                 sig.update({
                     "sales_ch":sales_ch or sc.get("sales_ch",""),
                     "eps_ch":eps_ch or sc.get("eps_ch",""),
                     "patterns":sc.get("patterns",""),
                     "sector":ci.get("sector_group") or sc.get("sector",""),
-                    "ltp":round(fresh_ltp,2) if fresh_ltp is not None else sc.get("ltp",""),
+                    "ltp":sig["last_close"],
                     "q_name":q_name,
                 })
-        rs_data=_calculate_rs(all_data,history_days=90)
-        rs_history_list=_build_rs_history_json(all_data,rs_data)
-        # ─── FIX: rs bhi fresh calculated value se (sheet ka stale rs nahi) ───
-        for sig in signals:
-            rc=rs_data.get(sig["symbol"],{}).get("rs")
-            sig["rs_calc"]=rc
-            sig["rs"]=rc if rc is not None else sig.get("rs","")
-        for sig in pr_signals:
-            rc=rs_data.get(sig["symbol"],{}).get("rs")
-            sig["rs_calc"]=rc
-            sig["rs"]=rc if rc is not None else sig.get("rs","")
-        idx_daily=idx_daily or {}
-        index_maps={
-            "nifty50":_build_index_close_map(idx_hist_n50,idx_daily.get(INDEX_SYMBOLS["nifty50"],{}).get("close"),today),
-            "nifty500":_build_index_close_map(idx_hist_n500,idx_daily.get(INDEX_SYMBOLS["nifty500"],{}).get("close"),today),
-            "smallmid400":_build_index_close_map(idx_hist_sm400,idx_daily.get(INDEX_SYMBOLS["smallmid400"],{}).get("close"),today),
-        }
-        mansfield=_calculate_mansfield_rs(all_data,index_maps)
-        for sym in rs_data:
-            m=mansfield.get(sym,{})
-            for idx_key,metrics in m.items():
-                for k,v in metrics.items(): rs_data[sym][f"{k}_{idx_key}"]=v
-        sector_group_rs_history=_build_group_rs_history(classification,rs_history_list,"sector_group")
-        industry_rs_history=_build_group_rs_history(classification,rs_history_list,"display_industry")
-        mswing_data=_calculate_mswing(all_data,history_days=ROLLING_DAYS-50)
-        mswing_list=_build_mswing_json(all_data,mswing_data)
-        for sig in signals:
-            sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
-        for sig in pr_signals:
-            sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
-        gaps_by_sym=await update_gap_tracker(client,all_data,today)
-        gap_state=_build_gap_state(all_data,gaps_by_sym,today)
-        gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
-        screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state)
-        ep_pat_map={}
-        for sig in signals: ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
-        for row in screener_feed:
-            sym=row["symbol"]; sc=screener.get(sym,{}); fund=fund_lookup.get(sym,{})
-            pl=fund.get("pl_quarterly",[]); row["q_name"]=pl[0].get("header","") if pl else ""
-            if pl and len(pl)>=5:
-                s0=pl[0].get("sales"); s4=pl[4].get("sales")
-                row["sales_ch"]=round((s0-s4)/s4*100,1) if s0 and s4 else None
-                e0=pl[0].get("eps"); e4=pl[4].get("eps")
-                row["eps_ch"]=round((e0-e4)/e4*100,1) if e0 and e4 else None
-            else: row["sales_ch"]=None; row["eps_ch"]=None
-            pats=set()
-            for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC")]:
-                if row.get(flag): pats.add(label)
-            if row.get("gap_fill"): pats.add(row["gap_fill"])
-            if row.get("hlr_state"): pats.add(row["hlr_state"])
-            if sym in ep_pat_map: pats|=ep_pat_map[sym]
-            row["patterns"]="||".join(sorted(pats))
-        # ─── FIX: EP/PR signals mein aaj ke fresh patterns (sheet ke purane nahi) ───
-        feed_pat={row["symbol"]:row["patterns"] for row in screener_feed}
-        for sig in signals:
-            if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
-        for sig in pr_signals:
-            if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
-        await asyncio.gather(
-            r2_upload(client,"ep_signals.json",json.dumps({"updated":today,"count":len(signals),"signals":signals})),
-            r2_upload(client,"rs_ratings.json",json.dumps({"updated":today,"count":len(rs_data),"stocks":rs_data})),
-            r2_upload(client,"rs_history.json",json.dumps(rs_history_list)),
-            r2_upload(client,"mswing.json",json.dumps(mswing_list)),
-            r2_upload(client,"post_result_signals.json",json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
-            r2_upload(client,"sector_group_rs_history.json",json.dumps(sector_group_rs_history)),
-            r2_upload(client,"industry_rs_history.json",json.dumps(industry_rs_history)),
-            r2_upload(client,"screener_feed.json",json.dumps(screener_feed)),
-            backup_pattern_history(client,screener_feed,today,gap_new=gap_new,gap_filled=gap_filled),
-        )
-        log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
-    log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
+                vol_x=sig.pop("vol_spike_x",1); sig["vol_pct"]=f"+{round((vol_x-1)*100)}%"
+            pr_signals=[]
+            if result_calendar:
+                pr_signals=_detect_post_result_thrust(all_data,result_calendar)
+                for sig in pr_signals:
+                    sym=sig["symbol"]; sc=screener.get(sym,{}); ci=cls_map_ep.get(sym,{}); fund=fund_lookup.get(sym,{})
+                    q_name,sales_ch,eps_ch=_fund_chg(fund)
+                    fresh_ltp=None
+                    if sym in all_data:
+                        fresh_ltp=next((v for v in reversed(all_data[sym]["c"]) if v is not None),None)
+                    sig.update({
+                        "sales_ch":sales_ch or sc.get("sales_ch",""),
+                        "eps_ch":eps_ch or sc.get("eps_ch",""),
+                        "patterns":sc.get("patterns",""),
+                        "sector":ci.get("sector_group") or sc.get("sector",""),
+                        "ltp":round(fresh_ltp,2) if fresh_ltp is not None else sc.get("ltp",""),
+                        "q_name":q_name,
+                    })
+            rs_data=_calculate_rs(all_data,history_days=90)
+            rs_history_list=_build_rs_history_json(all_data,rs_data)
+            # ─── FIX: rs bhi fresh calculated value se (sheet ka stale rs nahi) ───
+            for sig in signals:
+                rc=rs_data.get(sig["symbol"],{}).get("rs")
+                sig["rs_calc"]=rc
+                sig["rs"]=rc if rc is not None else sig.get("rs","")
+            for sig in pr_signals:
+                rc=rs_data.get(sig["symbol"],{}).get("rs")
+                sig["rs_calc"]=rc
+                sig["rs"]=rc if rc is not None else sig.get("rs","")
+            idx_daily=idx_daily or {}
+            index_maps={
+                "nifty50":_build_index_close_map(idx_hist_n50,idx_daily.get(INDEX_SYMBOLS["nifty50"],{}).get("close"),today),
+                "nifty500":_build_index_close_map(idx_hist_n500,idx_daily.get(INDEX_SYMBOLS["nifty500"],{}).get("close"),today),
+                "smallmid400":_build_index_close_map(idx_hist_sm400,idx_daily.get(INDEX_SYMBOLS["smallmid400"],{}).get("close"),today),
+            }
+            mansfield=_calculate_mansfield_rs(all_data,index_maps)
+            for sym in rs_data:
+                m=mansfield.get(sym,{})
+                for idx_key,metrics in m.items():
+                    for k,v in metrics.items(): rs_data[sym][f"{k}_{idx_key}"]=v
+            sector_group_rs_history=_build_group_rs_history(classification,rs_history_list,"sector_group")
+            industry_rs_history=_build_group_rs_history(classification,rs_history_list,"display_industry")
+            mswing_data=_calculate_mswing(all_data,history_days=ROLLING_DAYS-50)
+            mswing_list=_build_mswing_json(all_data,mswing_data)
+            for sig in signals:
+                sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
+            for sig in pr_signals:
+                sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
+            gaps_by_sym=await update_gap_tracker(client,all_data,today)
+            gap_state=_build_gap_state(all_data,gaps_by_sym,today)
+            gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state)
+            ep_pat_map={}
+            for sig in signals: ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
+            for row in screener_feed:
+                sym=row["symbol"]; sc=screener.get(sym,{}); fund=fund_lookup.get(sym,{})
+                pl=fund.get("pl_quarterly",[]); row["q_name"]=pl[0].get("header","") if pl else ""
+                if pl and len(pl)>=5:
+                    s0=pl[0].get("sales"); s4=pl[4].get("sales")
+                    row["sales_ch"]=round((s0-s4)/s4*100,1) if s0 and s4 else None
+                    e0=pl[0].get("eps"); e4=pl[4].get("eps")
+                    row["eps_ch"]=round((e0-e4)/e4*100,1) if e0 and e4 else None
+                else: row["sales_ch"]=None; row["eps_ch"]=None
+                pats=set()
+                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC")]:
+                    if row.get(flag): pats.add(label)
+                if row.get("gap_fill"): pats.add(row["gap_fill"])
+                if row.get("hlr_state"): pats.add(row["hlr_state"])
+                if sym in ep_pat_map: pats|=ep_pat_map[sym]
+                row["patterns"]="||".join(sorted(pats))
+            # ─── FIX: EP/PR signals mein aaj ke fresh patterns (sheet ke purane nahi) ───
+            feed_pat={row["symbol"]:row["patterns"] for row in screener_feed}
+            for sig in signals:
+                if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
+            for sig in pr_signals:
+                if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
+            await asyncio.gather(
+                r2_upload(client,"ep_signals.json",json.dumps({"updated":today,"count":len(signals),"signals":signals})),
+                r2_upload(client,"rs_ratings.json",json.dumps({"updated":today,"count":len(rs_data),"stocks":rs_data})),
+                r2_upload(client,"rs_history.json",json.dumps(rs_history_list)),
+                r2_upload(client,"mswing.json",json.dumps(mswing_list)),
+                r2_upload(client,"post_result_signals.json",json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
+                r2_upload(client,"sector_group_rs_history.json",json.dumps(sector_group_rs_history)),
+                r2_upload(client,"industry_rs_history.json",json.dumps(industry_rs_history)),
+                r2_upload(client,"screener_feed.json",json.dumps(screener_feed)),
+                backup_pattern_history(client,screener_feed,today,gap_new=gap_new,gap_filled=gap_filled),
+            )
+            log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
+        status.success()
+        log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1836,47 +1879,52 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
     return signals
 
 async def run_hlr_scan() -> None:
-    today=today_ist()
-    log.info(f"━━━ HLR + Pullback Scan  {today} ━━━")
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP,BSE_ISIN_MAP,BSE_META
-        ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
-        all_data=await download_all_chunks(client)
-        log.info(f"Loaded {len(all_data)} stocks")
-        hlr_signals=_detect_hlr(all_data)
-        order={"BO":0,"Consolidating near HLR":1,"Near HLR":2}
-        hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
-        bo=sum(1 for s in hlr_signals if s["state"]=="BO")
-        consol=sum(1 for s in hlr_signals if s["state"]=="Consolidating near HLR")
-        near=sum(1 for s in hlr_signals if s["state"]=="Near HLR")
-        log.info(f"HLR — BO:{bo} Consolidating:{consol} Near:{near} Total:{len(hlr_signals)}")
-        pb_signals=_detect_pullback(all_data)
-        pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
-        # CPR
-        cpr_data = _build_cpr_data(all_data, today)
-        narrow_cpr = sum(
-            1 for v in cpr_data.values()
-            if v.get("daily", {}).get("next", {}).get("category") in ("Very Narrow", "Narrow")
-        )
-        log.info(f"CPR: {len(cpr_data)} stocks  Narrow next-day: {narrow_cpr}")
-        log.info(f"Pullback signals: {len(pb_signals)}")
-        await asyncio.gather(
-            r2_upload(client, "hlr_signals.json", json.dumps({
-                "updated": today, "count": len(hlr_signals),
-                "bo": bo, "consolidating": consol, "near": near,
-                "signals": hlr_signals,
-            })),
-            r2_upload(client, "pullback_signals.json", json.dumps({
-                "updated": today, "count": len(pb_signals),
-                "signals": pb_signals,
-            })),
-            r2_upload(client, "cpr.json", json.dumps({
-                "updated": today,
-                "count": len(cpr_data),
-                "stocks": cpr_data,
-            })),
-        )
-    log.info("━━━ HLR + Pullback Scan complete ━━━")
+    status = PipelineStatus("run_hlr_scan")
+    try:
+        today=today_ist()
+        log.info(f"━━━ HLR + Pullback Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP,BSE_ISIN_MAP,BSE_META
+            ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
+            all_data=await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+            hlr_signals=_detect_hlr(all_data)
+            order={"BO":0,"Consolidating near HLR":1,"Near HLR":2}
+            hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
+            bo=sum(1 for s in hlr_signals if s["state"]=="BO")
+            consol=sum(1 for s in hlr_signals if s["state"]=="Consolidating near HLR")
+            near=sum(1 for s in hlr_signals if s["state"]=="Near HLR")
+            log.info(f"HLR — BO:{bo} Consolidating:{consol} Near:{near} Total:{len(hlr_signals)}")
+            pb_signals=_detect_pullback(all_data)
+            pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+            # CPR
+            cpr_data = _build_cpr_data(all_data, today)
+            narrow_cpr = sum(
+                1 for v in cpr_data.values()
+                if v.get("daily", {}).get("next", {}).get("category") in ("Very Narrow", "Narrow")
+            )
+            log.info(f"CPR: {len(cpr_data)} stocks  Narrow next-day: {narrow_cpr}")
+            log.info(f"Pullback signals: {len(pb_signals)}")
+            await asyncio.gather(
+                r2_upload(client, "hlr_signals.json", json.dumps({
+                    "updated": today, "count": len(hlr_signals),
+                    "bo": bo, "consolidating": consol, "near": near,
+                    "signals": hlr_signals,
+                })),
+                r2_upload(client, "pullback_signals.json", json.dumps({
+                    "updated": today, "count": len(pb_signals),
+                    "signals": pb_signals,
+                })),
+                r2_upload(client, "cpr.json", json.dumps({
+                    "updated": today,
+                    "count": len(cpr_data),
+                    "stocks": cpr_data,
+                })),
+            )
+        status.success()
+        log.info("━━━ HLR + Pullback Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1956,20 +2004,25 @@ def _detect_patterns(all_data,min_volume=2500,coil_min_babies=3,tight_close_week
     return signals
 
 async def run_pattern_scan() -> None:
-    today=today_ist()
-    if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
-    log.info(f"━━━ Pattern Scan  {today} ━━━")
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP,BSE_ISIN_MAP,BSE_META
-        ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
-        all_data=await download_all_chunks(client)
-        log.info(f"Loaded {len(all_data)} stocks")
-        signals=_detect_patterns(all_data)
-        from collections import Counter; counts=Counter(s["pattern"] for s in signals)
-        for pat,cnt in sorted(counts.items()): log.info(f"  {pat}: {cnt}")
-        log.info(f"Total: {len(signals)} signals")
-        await r2_upload(client,"pattern_signals.json",json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}))
-    log.info("━━━ Pattern Scan complete ━━━")
+    status = PipelineStatus("run_pattern_scan")
+    try:
+        today=today_ist()
+        if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        log.info(f"━━━ Pattern Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP,BSE_ISIN_MAP,BSE_META
+            ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
+            all_data=await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+            signals=_detect_patterns(all_data)
+            from collections import Counter; counts=Counter(s["pattern"] for s in signals)
+            for pat,cnt in sorted(counts.items()): log.info(f"  {pat}: {cnt}")
+            log.info(f"Total: {len(signals)} signals")
+            await r2_upload(client,"pattern_signals.json",json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}))
+        status.success()
+        log.info("━━━ Pattern Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
 #-----------------
 def _calc_sma(closes, period):
     n = len(closes)
@@ -2057,30 +2110,35 @@ def _detect_stage2(all_data, sma_fast=50, sma_mid=150, sma_long=200,
     breadth_history = [{"date": d, "count": cnt} for d, cnt in sorted(breadth.items())]
     return current_signals, breadth_history
 async def run_stage2_scan() -> None:
-    today = today_ist()
-    log.info(f"━━━ Stage 2 Scan  {today} ━━━")
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_data = await download_all_chunks(client)
-        log.info(f"Loaded {len(all_data)} stocks")
+    status = PipelineStatus("run_stage2_scan")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Stage 2 Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
 
-        signals, breadth_history = _detect_stage2(all_data)
-        signals.sort(key=lambda x: x["pct_off_high"])  # closest to 52w high first
+            signals, breadth_history = _detect_stage2(all_data)
+            signals.sort(key=lambda x: x["pct_off_high"])  # closest to 52w high first
 
-        log.info(f"Stage 2 stocks today: {len(signals)}")
-        if breadth_history:
-            log.info(f"Breadth history: {len(breadth_history)} dates, latest count {breadth_history[-1]['count']}")
+            log.info(f"Stage 2 stocks today: {len(signals)}")
+            if breadth_history:
+                log.info(f"Breadth history: {len(breadth_history)} dates, latest count {breadth_history[-1]['count']}")
 
-        await asyncio.gather(
-            r2_upload(client, "stage2_signals.json", json.dumps({
-                "updated": today, "count": len(signals), "signals": signals,
-            })),
-            r2_upload(client, "stage2_breadth.json", json.dumps({
-                "updated": today, "history": breadth_history,
-            })),
-        )
-    log.info("━━━ Stage 2 Scan complete ━━━")
+            await asyncio.gather(
+                r2_upload(client, "stage2_signals.json", json.dumps({
+                    "updated": today, "count": len(signals), "signals": signals,
+                })),
+                r2_upload(client, "stage2_breadth.json", json.dumps({
+                    "updated": today, "history": breadth_history,
+                })),
+            )
+        status.success()
+        log.info("━━━ Stage 2 Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
 # ══════════════════════════════════════════════════════════════
 # VCP SCAN
 # ══════════════════════════════════════════════════════════════
@@ -2258,29 +2316,34 @@ def _detect_vcp(hist, lookback=150, swing_window=4, min_contractions=2, max_cont
         "score"              : score,
     }
 async def run_vcp_scan() -> None:
+    status = PipelineStatus("run_vcp_scan")
+    try:
     
-    today = today_ist()
-    log.info(f"━━━ VCP Scan  {today} ━━━")
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_data = await download_all_chunks(client)
-        log.info(f"Loaded {len(all_data)} stocks")
-        signals = []
-        for sym, s in all_data.items():
-            if not _check_liquidity(s["v"], s["c"], len(s["c"])):
-                continue
-            r = _detect_vcp(s)
-            if r:
-                signals.append({"symbol": sym, **r})
-        signals.sort(key=lambda x: x["score"], reverse=True)
-        log.info(f"VCP signals: {len(signals)}")
-        await r2_upload(client, "vcp_signals.json", json.dumps({
-            "updated": today,
-            "count": len(signals),
-            "signals": signals,
-        }))
-    log.info("━━━ VCP Scan complete ━━━")
+        today = today_ist()
+        log.info(f"━━━ VCP Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+            signals = []
+            for sym, s in all_data.items():
+                if not _check_liquidity(s["v"], s["c"], len(s["c"])):
+                    continue
+                r = _detect_vcp(s)
+                if r:
+                    signals.append({"symbol": sym, **r})
+            signals.sort(key=lambda x: x["score"], reverse=True)
+            log.info(f"VCP signals: {len(signals)}")
+            await r2_upload(client, "vcp_signals.json", json.dumps({
+                "updated": today,
+                "count": len(signals),
+                "signals": signals,
+            }))
+        status.success()
+        log.info("━━━ VCP Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 
