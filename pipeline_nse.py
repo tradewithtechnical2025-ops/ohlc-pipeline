@@ -540,6 +540,13 @@ def merge_deals_history(hist: dict, deals: list) -> int:
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _band_dir(chg: dict) -> str:
+    try:
+        return "up" if int(chg.get("to", 0)) > int(chg.get("from", 0)) else "down"
+    except (ValueError, TypeError):
+        return "down"
+
+
 async def run():
     status = PipelineStatus("pipeline_nse")
     try:
@@ -799,12 +806,19 @@ async def run():
 
         # ── Circuit change Telegram alert ──────────────────────────────
         if changes:
-            msg_lines = ["🔔 <b>NSE Circuit Changes</b>", f"Next day: <code>{chg_date.isoformat()}</code>", ""]
-            for sym, chg in sorted(changes.items()):
-                frm = chg.get("from", "?")
-                to  = chg.get("to", "?")
-                arrow = "🔺" if str(to) > str(frm) else "🔻"
-                msg_lines.append(f"{arrow} <b>{sym}</b>: {frm}% → {to}%")
+            increased = {s: c for s, c in changes.items() if _band_dir(c) == "up"}
+            decreased = {s: c for s, c in changes.items() if _band_dir(c) == "down"}
+            msg_lines = ["🔔 <b>NSE Circuit Changes</b>", f"Next day: <code>{chg_date.isoformat()}</code>"]
+            if increased:
+                msg_lines.append("")
+                msg_lines.append("🟢 <b>Band Increased</b>")
+                for sym, chg in sorted(increased.items(), key=lambda x: int(x[1].get("to", 0)), reverse=True):
+                    msg_lines.append(f"<code>{sym}</code>: {chg.get('from')}% → {chg.get('to')}%")
+            if decreased:
+                msg_lines.append("")
+                msg_lines.append("🔴 <b>Band Decreased</b>")
+                for sym, chg in sorted(decreased.items(), key=lambda x: int(x[1].get("to", 0)), reverse=True):
+                    msg_lines.append(f"<code>{sym}</code>: {chg.get('from')}% → {chg.get('to')}%")
             send_message("\n".join(msg_lines))
 
         status.set("bands", len(bands))
