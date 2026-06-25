@@ -31,6 +31,18 @@ from datetime import date, datetime, timedelta
 
 import httpx
 
+# ── Telegram notify ──
+try:
+    from telegram_notify import PipelineStatus, send_message
+except ImportError:
+    class PipelineStatus:
+        def __init__(self, name): self.name = name
+        def set(self, *a, **k): pass
+        def success(self, *a, **k): pass
+        def failure(self, exc, reraise=True, **k):
+            if reraise: raise exc
+    def send_message(text, silent=False): pass
+
 from collections import defaultdict
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -529,261 +541,281 @@ def merge_deals_history(hist: dict, deals: list) -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def run():
-    today    = date.today()
-    next_day = next_trading_day(today)
-    print(f"Today: {today}  |  Next trading day: {next_day}")
-
-    nse = make_nse_session()
-
-    # ── 1. sec_list — today's circuit bands ───────────────────────────────────
-    print("\n[1] sec_list (today's bands)...")
-    sec_rows, sec_date = fetch_with_fallback(
-        nse, f"{NSE_BASE}/sec_list_{{}}.csv", today, direction="prev"
-    )
-
-    # ── 2. eq_band_changes — optional, uploaded ~8 PM IST ────────────────────
-    print(f"\n[2] eq_band_changes (next day: {next_day})...")
+    status = PipelineStatus("pipeline_nse")
     try:
-        chg_rows, chg_date = fetch_with_fallback(
-            nse, f"{NSE_BASE}/eq_band_changes_{{}}.csv", next_day, direction="next", max_tries=2
+        today    = date.today()
+        next_day = next_trading_day(today)
+        print(f"Today: {today}  |  Next trading day: {next_day}")
+
+        nse = make_nse_session()
+
+        # ── 1. sec_list — today's circuit bands ───────────────────────────────────
+        print("\n[1] sec_list (today's bands)...")
+        sec_rows, sec_date = fetch_with_fallback(
+            nse, f"{NSE_BASE}/sec_list_{{}}.csv", today, direction="prev"
         )
-    except RuntimeError:
-        print("  ⚠ eq_band_changes not available yet — skipping")
-        chg_rows, chg_date = [], next_day
 
-    # ── 3. bulk deals ─────────────────────────────────────────────────────────
-    print("\n[3] bulk.csv...")
-    bulk_rows = fetch_csv_url(nse, f"{NSE_BASE}/bulk.csv") or []
+        # ── 2. eq_band_changes — optional, uploaded ~8 PM IST ────────────────────
+        print(f"\n[2] eq_band_changes (next day: {next_day})...")
+        try:
+            chg_rows, chg_date = fetch_with_fallback(
+                nse, f"{NSE_BASE}/eq_band_changes_{{}}.csv", next_day, direction="next", max_tries=2
+            )
+        except RuntimeError:
+            print("  ⚠ eq_band_changes not available yet — skipping")
+            chg_rows, chg_date = [], next_day
 
-    # ── 4. block deals ────────────────────────────────────────────────────────
-    print("\n[4] block.csv...")
-    block_rows = fetch_csv_url(nse, f"{NSE_BASE}/block.csv") or []
+        # ── 3. bulk deals ─────────────────────────────────────────────────────────
+        print("\n[3] bulk.csv...")
+        bulk_rows = fetch_csv_url(nse, f"{NSE_BASE}/bulk.csv") or []
 
-    # ── 5. Participant OI — fallback up to 5 previous trading days ────────────
-    print(f"\n[5] fao_participant_oi (today: {today})...")
-    try:
-        oi_rows, oi_date = fetch_oi_with_fallback(nse, today, max_tries=5)
-        print(f"  Participant OI date resolved to: {oi_date}")
-    except RuntimeError:
-        print("  ⚠ fao_participant_oi not available — skipping OI update")
-        oi_rows, oi_date = [], today
+        # ── 4. block deals ────────────────────────────────────────────────────────
+        print("\n[4] block.csv...")
+        block_rows = fetch_csv_url(nse, f"{NSE_BASE}/block.csv") or []
 
-    # ── 6. FII/DII cash provisional ────────────────────────────────────────────
-    print("\n[6] fiidiiTradeReact (FII/DII cash)...")
-    fii_dii_snapshot = None
-    try:
-        fii_dii_rows = fetch_fii_dii(nse)
-        if fii_dii_rows:
-            fii_dii_snapshot = parse_fii_dii(fii_dii_rows)
-            if fii_dii_snapshot.get("date") and (fii_dii_snapshot.get("fii") or fii_dii_snapshot.get("dii")):
-                fii = fii_dii_snapshot.get("fii") or {}
-                dii = fii_dii_snapshot.get("dii") or {}
-                print(f"  FII net: {fii.get('net', 0):+,.2f} Cr   "
-                      f"DII net: {dii.get('net', 0):+,.2f} Cr   ({fii_dii_snapshot['date']})")
-            else:
-                print(f"  ⚠ fii_dii: couldn't parse category/values. "
-                      f"Raw columns: {list(fii_dii_rows[0].keys())}")
-                fii_dii_snapshot = None
-        else:
-            print("  ⚠ fii_dii: empty response — skipping")
-    except Exception as e:
-        print(f"  ⚠ fii_dii fetch failed: {e} — skipping")
+        # ── 5. Participant OI — fallback up to 5 previous trading days ────────────
+        print(f"\n[5] fao_participant_oi (today: {today})...")
+        try:
+            oi_rows, oi_date = fetch_oi_with_fallback(nse, today, max_tries=5)
+            print(f"  Participant OI date resolved to: {oi_date}")
+        except RuntimeError:
+            print("  ⚠ fao_participant_oi not available — skipping OI update")
+            oi_rows, oi_date = [], today
+
+        # ── 6. FII/DII cash provisional ────────────────────────────────────────────
+        print("\n[6] fiidiiTradeReact (FII/DII cash)...")
         fii_dii_snapshot = None
+        try:
+            fii_dii_rows = fetch_fii_dii(nse)
+            if fii_dii_rows:
+                fii_dii_snapshot = parse_fii_dii(fii_dii_rows)
+                if fii_dii_snapshot.get("date") and (fii_dii_snapshot.get("fii") or fii_dii_snapshot.get("dii")):
+                    fii = fii_dii_snapshot.get("fii") or {}
+                    dii = fii_dii_snapshot.get("dii") or {}
+                    print(f"  FII net: {fii.get('net', 0):+,.2f} Cr   "
+                          f"DII net: {dii.get('net', 0):+,.2f} Cr   ({fii_dii_snapshot['date']})")
+                else:
+                    print(f"  ⚠ fii_dii: couldn't parse category/values. "
+                          f"Raw columns: {list(fii_dii_rows[0].keys())}")
+                    fii_dii_snapshot = None
+            else:
+                print("  ⚠ fii_dii: empty response — skipping")
+        except Exception as e:
+            print(f"  ⚠ fii_dii fetch failed: {e} — skipping")
+            fii_dii_snapshot = None
 
-    nse.close()
+        nse.close()
 
-    # ── Process bands ─────────────────────────────────────────────────────────
-    bands = {}
-    for row in sec_rows:
-        series = row.get("Series", "").strip()
-        if series not in ("EQ", "BE"):
-            continue
-        sym  = row.get("Symbol", "").strip()
-        band = row.get("Band", "").strip()
-        if sym:
-            bands[sym] = {
-                "series":  series,
-                "circuit": int(band) if band.isdigit() else band,
-            }
-
-    changes = {}
-    for row in chg_rows:
-        series = row.get("Series", "").strip()
-        if series not in ("EQ", "BE"):
-            continue
-        sym = row.get("Symbol", "").strip()
-        frm = row.get("From", "").strip()
-        to  = row.get("To", "").strip()
-        if sym:
-            changes[sym] = {
-                "from": int(frm) if frm.isdigit() else frm,
-                "to":   int(to)  if to.isdigit()  else to,
-            }
-
-    for sym, chg in changes.items():
-        if sym in bands:
-            bands[sym]["change"] = chg
-        else:
-            bands[sym] = {"series": "?", "circuit": chg["from"], "change": chg}
-
-    bands_out = {
-        "date":             sec_date.isoformat(),
-        "next_trading_day": chg_date.isoformat(),
-        "data":             [{"symbol": s, **v} for s, v in sorted(bands.items())],
-    }
-    print(f"\n  Bands: {len(bands)} symbols  |  Changes: {len(changes)}")
-
-    # ── Process bulk/block ────────────────────────────────────────────────────
-    def clean_deals(rows, has_remarks=False):
-        out = []
-        for r in rows:
-            sym = r.get("Symbol", "").strip()
-            if not sym or sym.upper() in ("NO RECORDS", "SYMBOL", "-"):
+        # ── Process bands ─────────────────────────────────────────────────────────
+        bands = {}
+        for row in sec_rows:
+            series = row.get("Series", "").strip()
+            if series not in ("EQ", "BE"):
                 continue
-            d = {
-                "date":   r.get("Date", "").strip(),
-                "symbol": sym,
-                "name":   r.get("Security Name", "").strip(),
-                "client": r.get("Client Name", "").strip(),
-                "side":   r.get("Buy/Sell", "").strip(),
-                "qty":    r.get("Quantity Traded", "").strip(),
-                "price":  r.get("Trade Price / Wght. Avg. Price", "").strip(),
-            }
-            if has_remarks:
-                d["remarks"] = r.get("Remarks", "").strip()
-            out.append(d)
-        return out
+            sym  = row.get("Symbol", "").strip()
+            band = row.get("Band", "").strip()
+            if sym:
+                bands[sym] = {
+                    "series":  series,
+                    "circuit": int(band) if band.isdigit() else band,
+                }
 
-    bulk_clean   = clean_deals(bulk_rows, has_remarks=True)
-    block_clean  = clean_deals(block_rows)
-    bulk_summary  = build_bulk_summary(bulk_clean)
-    block_summary = build_block_summary(block_clean)
-    print(f"  Bulk: {len(bulk_clean)}  Block: {len(block_clean)}")
+        changes = {}
+        for row in chg_rows:
+            series = row.get("Series", "").strip()
+            if series not in ("EQ", "BE"):
+                continue
+            sym = row.get("Symbol", "").strip()
+            frm = row.get("From", "").strip()
+            to  = row.get("To", "").strip()
+            if sym:
+                changes[sym] = {
+                    "from": int(frm) if frm.isdigit() else frm,
+                    "to":   int(to)  if to.isdigit()  else to,
+                }
 
-    # ── Process participant OI ─────────────────────────────────────────────────
-    oi_snapshot = None
-    if oi_rows:
-        oi_snapshot = parse_participant_oi(oi_rows, oi_date)
-        fii = oi_snapshot["participants"].get("FII", {})
-        dii = oi_snapshot["participants"].get("DII", {})
-        print(f"  OI parsed — FII net: {fii.get('net', 0):+,}  DII net: {dii.get('net', 0):+,}")
-    else:
-        print("  ⚠ No OI rows — skipping OI upload")
-
-    # ── Upload to R2 ──────────────────────────────────────────────────────────
-    print("\n[7] Uploading to R2...")
-    async with httpx.AsyncClient() as client:
-
-        # ── Fetch all existing snapshots + histories in one parallel round-trip
-        (
-            existing_bands,
-            existing_bulk,
-            existing_block,
-            bulk_hist,
-            block_hist,
-            oi_hist,
-            fii_dii_hist,
-        ) = await asyncio.gather(
-            r2_get(client, "nse_bands.json"),
-            r2_get(client, "nse_bulk.json"),
-            r2_get(client, "nse_block.json"),
-            r2_get(client, "nse_bulk_history.json"),
-            r2_get(client, "nse_block_history.json"),
-            r2_get(client, "nse_participant_oi_hist.json"),
-            r2_get(client, "nse_fii_dii_hist.json"),
-        )
-
-        bulk_hist    = bulk_hist    or {}
-        block_hist   = block_hist   or {}
-        oi_hist      = oi_hist      or []
-        fii_dii_hist = fii_dii_hist or []
-
-        upload_tasks = []
-
-        # ── Bands ─────────────────────────────────────────────────────────────
-        bands_date_str = sec_date.isoformat()
-        if existing_bands and existing_bands.get("date") == bands_date_str:
-            print(f"  ✓ bands: {bands_date_str} already current — skipping")
-            print(f"    Showing: {existing_bands['date']}  ({len(existing_bands.get('data', []))} symbols)")
-        else:
-            upload_tasks.append(r2_put(client, "nse_bands.json", bands_out))
-
-        # ── Bulk snapshot + summary + history ─────────────────────────────────
-        # bulk.csv carries date inside each row; use first row's date
-        bulk_date_str       = bulk_clean[0]["date"] if bulk_clean else None
-        existing_bulk_date  = existing_bulk[0]["date"] if existing_bulk else None
-
-        if bulk_date_str and bulk_date_str == existing_bulk_date:
-            print(f"  ✓ bulk: {bulk_date_str} already current — skipping snapshot + history")
-        else:
-            upload_tasks.append(r2_put(client, "nse_bulk.json",         bulk_clean))
-            upload_tasks.append(r2_put(client, "nse_bulk_summary.json", bulk_summary))
-            b1 = merge_deals_history(bulk_hist, bulk_clean)
-            print(f"  Bulk history: +{b1} new deals")
-            upload_tasks.append(r2_put(client, "nse_bulk_history.json", bulk_hist))
-
-        # ── Block snapshot + summary + history ────────────────────────────────
-        block_date_str      = block_clean[0]["date"] if block_clean else None
-        existing_block_date = existing_block[0]["date"] if existing_block else None
-
-        if not block_clean:
-            print("  ✓ block: no deals today — skipping")
-        elif block_date_str and block_date_str == existing_block_date:
-            print(f"  ✓ block: {block_date_str} already current — skipping snapshot + history")
-        else:
-            upload_tasks.append(r2_put(client, "nse_block.json",         block_clean))
-            upload_tasks.append(r2_put(client, "nse_block_summary.json", block_summary))
-            b2 = merge_deals_history(block_hist, block_clean)
-            print(f"  Block history: +{b2} new deals")
-            upload_tasks.append(r2_put(client, "nse_block_history.json", block_hist))
-
-        # ── Participant OI snapshot + history ─────────────────────────────────
-        if oi_snapshot:
-            oi_date_str = oi_snapshot["date"]
-
-            # Snapshot always uploaded so frontend shows latest available date
-            upload_tasks.append(r2_put(client, "nse_participant_oi.json", oi_snapshot))
-
-            # History — only append if genuinely new trading day
-            existing_oi_dates = {e["date"] for e in oi_hist}
-            if oi_date_str in existing_oi_dates:
-                print(f"  ✓ OI history: {oi_date_str} already present — history unchanged")
-                if oi_hist:
-                    print(f"    Data available: {len(oi_hist)} days  "
-                          f"({oi_hist[0]['date']} → {oi_hist[-1]['date']})")
+        for sym, chg in changes.items():
+            if sym in bands:
+                bands[sym]["change"] = chg
             else:
-                oi_hist = merge_oi_history(oi_hist, oi_snapshot, max_days=OI_HISTORY_DAYS)
-                upload_tasks.append(r2_put(client, "nse_participant_oi_hist.json", oi_hist))
+                bands[sym] = {"series": "?", "circuit": chg["from"], "change": chg}
+
+        bands_out = {
+            "date":             sec_date.isoformat(),
+            "next_trading_day": chg_date.isoformat(),
+            "data":             [{"symbol": s, **v} for s, v in sorted(bands.items())],
+        }
+        print(f"\n  Bands: {len(bands)} symbols  |  Changes: {len(changes)}")
+
+        # ── Process bulk/block ────────────────────────────────────────────────────
+        def clean_deals(rows, has_remarks=False):
+            out = []
+            for r in rows:
+                sym = r.get("Symbol", "").strip()
+                if not sym or sym.upper() in ("NO RECORDS", "SYMBOL", "-"):
+                    continue
+                d = {
+                    "date":   r.get("Date", "").strip(),
+                    "symbol": sym,
+                    "name":   r.get("Security Name", "").strip(),
+                    "client": r.get("Client Name", "").strip(),
+                    "side":   r.get("Buy/Sell", "").strip(),
+                    "qty":    r.get("Quantity Traded", "").strip(),
+                    "price":  r.get("Trade Price / Wght. Avg. Price", "").strip(),
+                }
+                if has_remarks:
+                    d["remarks"] = r.get("Remarks", "").strip()
+                out.append(d)
+            return out
+
+        bulk_clean   = clean_deals(bulk_rows, has_remarks=True)
+        block_clean  = clean_deals(block_rows)
+        bulk_summary  = build_bulk_summary(bulk_clean)
+        block_summary = build_block_summary(block_clean)
+        print(f"  Bulk: {len(bulk_clean)}  Block: {len(block_clean)}")
+
+        # ── Process participant OI ─────────────────────────────────────────────────
+        oi_snapshot = None
+        if oi_rows:
+            oi_snapshot = parse_participant_oi(oi_rows, oi_date)
+            fii = oi_snapshot["participants"].get("FII", {})
+            dii = oi_snapshot["participants"].get("DII", {})
+            print(f"  OI parsed — FII net: {fii.get('net', 0):+,}  DII net: {dii.get('net', 0):+,}")
         else:
-            print("  ⚠ No OI snapshot — skipping OI uploads")
+            print("  ⚠ No OI rows — skipping OI upload")
 
-        # ── FII/DII cash snapshot + history ─────────────────────────────────────
-        if fii_dii_snapshot and fii_dii_snapshot.get("date"):
-            fd_date_str = fii_dii_snapshot["date"]
+        # ── Upload to R2 ──────────────────────────────────────────────────────────
+        print("\n[7] Uploading to R2...")
+        async with httpx.AsyncClient() as client:
 
-            # Snapshot always uploaded so frontend shows latest available date
-            upload_tasks.append(r2_put(client, "nse_fii_dii.json", fii_dii_snapshot))
+            # ── Fetch all existing snapshots + histories in one parallel round-trip
+            (
+                existing_bands,
+                existing_bulk,
+                existing_block,
+                bulk_hist,
+                block_hist,
+                oi_hist,
+                fii_dii_hist,
+            ) = await asyncio.gather(
+                r2_get(client, "nse_bands.json"),
+                r2_get(client, "nse_bulk.json"),
+                r2_get(client, "nse_block.json"),
+                r2_get(client, "nse_bulk_history.json"),
+                r2_get(client, "nse_block_history.json"),
+                r2_get(client, "nse_participant_oi_hist.json"),
+                r2_get(client, "nse_fii_dii_hist.json"),
+            )
 
-            # History — only append if genuinely new trading day
-            existing_fd_dates = {e["date"] for e in fii_dii_hist}
-            if fd_date_str in existing_fd_dates:
-                print(f"  ✓ FII/DII history: {fd_date_str} already present — history unchanged")
-                if fii_dii_hist:
-                    print(f"    Data available: {len(fii_dii_hist)} days  "
-                          f"({fii_dii_hist[0]['date']} → {fii_dii_hist[-1]['date']})")
+            bulk_hist    = bulk_hist    or {}
+            block_hist   = block_hist   or {}
+            oi_hist      = oi_hist      or []
+            fii_dii_hist = fii_dii_hist or []
+
+            upload_tasks = []
+
+            # ── Bands ─────────────────────────────────────────────────────────────
+            bands_date_str = sec_date.isoformat()
+            if existing_bands and existing_bands.get("date") == bands_date_str:
+                print(f"  ✓ bands: {bands_date_str} already current — skipping")
+                print(f"    Showing: {existing_bands['date']}  ({len(existing_bands.get('data', []))} symbols)")
             else:
-                fii_dii_hist = merge_oi_history(fii_dii_hist, fii_dii_snapshot, max_days=FII_DII_HISTORY_DAYS)
-                upload_tasks.append(r2_put(client, "nse_fii_dii_hist.json", fii_dii_hist))
-        else:
-            print("  ⚠ No FII/DII snapshot — skipping FII/DII uploads")
+                upload_tasks.append(r2_put(client, "nse_bands.json", bands_out))
 
-        # ── Fire all pending uploads in parallel ──────────────────────────────
-        if upload_tasks:
-            await asyncio.gather(*upload_tasks)
-        else:
-            print("  ✓ All data already current — nothing to upload")
+            # ── Bulk snapshot + summary + history ─────────────────────────────────
+            # bulk.csv carries date inside each row; use first row's date
+            bulk_date_str       = bulk_clean[0]["date"] if bulk_clean else None
+            existing_bulk_date  = existing_bulk[0]["date"] if existing_bulk else None
 
-    print("\n✅ pipeline_nse.py complete")
+            if bulk_date_str and bulk_date_str == existing_bulk_date:
+                print(f"  ✓ bulk: {bulk_date_str} already current — skipping snapshot + history")
+            else:
+                upload_tasks.append(r2_put(client, "nse_bulk.json",         bulk_clean))
+                upload_tasks.append(r2_put(client, "nse_bulk_summary.json", bulk_summary))
+                b1 = merge_deals_history(bulk_hist, bulk_clean)
+                print(f"  Bulk history: +{b1} new deals")
+                upload_tasks.append(r2_put(client, "nse_bulk_history.json", bulk_hist))
+
+            # ── Block snapshot + summary + history ────────────────────────────────
+            block_date_str      = block_clean[0]["date"] if block_clean else None
+            existing_block_date = existing_block[0]["date"] if existing_block else None
+
+            if not block_clean:
+                print("  ✓ block: no deals today — skipping")
+            elif block_date_str and block_date_str == existing_block_date:
+                print(f"  ✓ block: {block_date_str} already current — skipping snapshot + history")
+            else:
+                upload_tasks.append(r2_put(client, "nse_block.json",         block_clean))
+                upload_tasks.append(r2_put(client, "nse_block_summary.json", block_summary))
+                b2 = merge_deals_history(block_hist, block_clean)
+                print(f"  Block history: +{b2} new deals")
+                upload_tasks.append(r2_put(client, "nse_block_history.json", block_hist))
+
+            # ── Participant OI snapshot + history ─────────────────────────────────
+            if oi_snapshot:
+                oi_date_str = oi_snapshot["date"]
+
+                # Snapshot always uploaded so frontend shows latest available date
+                upload_tasks.append(r2_put(client, "nse_participant_oi.json", oi_snapshot))
+
+                # History — only append if genuinely new trading day
+                existing_oi_dates = {e["date"] for e in oi_hist}
+                if oi_date_str in existing_oi_dates:
+                    print(f"  ✓ OI history: {oi_date_str} already present — history unchanged")
+                    if oi_hist:
+                        print(f"    Data available: {len(oi_hist)} days  "
+                              f"({oi_hist[0]['date']} → {oi_hist[-1]['date']})")
+                else:
+                    oi_hist = merge_oi_history(oi_hist, oi_snapshot, max_days=OI_HISTORY_DAYS)
+                    upload_tasks.append(r2_put(client, "nse_participant_oi_hist.json", oi_hist))
+            else:
+                print("  ⚠ No OI snapshot — skipping OI uploads")
+
+            # ── FII/DII cash snapshot + history ─────────────────────────────────────
+            if fii_dii_snapshot and fii_dii_snapshot.get("date"):
+                fd_date_str = fii_dii_snapshot["date"]
+
+                # Snapshot always uploaded so frontend shows latest available date
+                upload_tasks.append(r2_put(client, "nse_fii_dii.json", fii_dii_snapshot))
+
+                # History — only append if genuinely new trading day
+                existing_fd_dates = {e["date"] for e in fii_dii_hist}
+                if fd_date_str in existing_fd_dates:
+                    print(f"  ✓ FII/DII history: {fd_date_str} already present — history unchanged")
+                    if fii_dii_hist:
+                        print(f"    Data available: {len(fii_dii_hist)} days  "
+                              f"({fii_dii_hist[0]['date']} → {fii_dii_hist[-1]['date']})")
+                else:
+                    fii_dii_hist = merge_oi_history(fii_dii_hist, fii_dii_snapshot, max_days=FII_DII_HISTORY_DAYS)
+                    upload_tasks.append(r2_put(client, "nse_fii_dii_hist.json", fii_dii_hist))
+            else:
+                print("  ⚠ No FII/DII snapshot — skipping FII/DII uploads")
+
+            # ── Fire all pending uploads in parallel ──────────────────────────────
+            if upload_tasks:
+                await asyncio.gather(*upload_tasks)
+            else:
+                print("  ✓ All data already current — nothing to upload")
+
+        # ── Circuit change Telegram alert ──────────────────────────────
+        if changes:
+            msg_lines = ["🔔 <b>NSE Circuit Changes</b>", f"Next day: <code>{chg_date.isoformat()}</code>", ""]
+            for sym, chg in sorted(changes.items()):
+                frm = chg.get("from", "?")
+                to  = chg.get("to", "?")
+                arrow = "🔺" if str(to) > str(frm) else "🔻"
+                msg_lines.append(f"{arrow} <b>{sym}</b>: {frm}% → {to}%")
+            send_message("\n".join(msg_lines))
+
+        status.set("bands", len(bands))
+        status.set("circuit_changes", len(changes))
+        status.set("bulk_deals", len(bulk_clean))
+        status.set("block_deals", len(block_clean))
+        status.success()
+        print("\n✅ pipeline_nse.py complete")
+    except Exception as e:
+        status.failure(e)
+
 
 
 if __name__ == "__main__":
