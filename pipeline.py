@@ -2377,11 +2377,12 @@ def _build_cpr_data(all_data, today):
         if curr: daily_cpr["next"]  = _calculate_cpr(*curr, atr=atr14)
 
         # ── Weekly CPR ─────────────────────────────────────────
+        # ── Weekly CPR ─────────────────────────────────────────
         wk_map     = _resample_weekly(dates, highs, lows, closes)
         past_weeks = sorted(k for k in wk_map if k < current_week_key)
         weekly_cpr = None
         if past_weeks:
-            lw        = wk_map[past_weeks[-1]]
+            lw = wk_map[past_weeks[-1]]
             wk_sorted = [wk_map[k] for k in sorted(wk_map.keys())]
             w_trs = []
             for i in range(max(1, len(wk_sorted) - 14), len(wk_sorted)):
@@ -2390,12 +2391,18 @@ def _build_cpr_data(all_data, today):
             weekly_atr = sum(w_trs) / len(w_trs) if w_trs else None
             weekly_cpr = _calculate_cpr(lw["h"], lw["l"], lw["c"], atr=weekly_atr)
 
+        # Weekly developing — current incomplete week
+        weekly_dev_cpr = None
+        if current_week_key in wk_map:
+            cw = wk_map[current_week_key]
+            weekly_dev_cpr = _calculate_cpr(cw["h"], cw["l"], cw["c"], atr=weekly_atr)
+
         # ── Monthly CPR ────────────────────────────────────────
         mo_map      = _resample_monthly(dates, highs, lows, closes)
         past_months = sorted(k for k in mo_map if k < current_month_key)
         monthly_cpr = None
         if past_months:
-            lm        = mo_map[past_months[-1]]
+            lm = mo_map[past_months[-1]]
             mo_sorted = [mo_map[k] for k in sorted(mo_map.keys())]
             m_trs = []
             for i in range(max(1, len(mo_sorted) - 14), len(mo_sorted)):
@@ -2404,10 +2411,18 @@ def _build_cpr_data(all_data, today):
             monthly_atr = sum(m_trs) / len(m_trs) if m_trs else None
             monthly_cpr = _calculate_cpr(lm["h"], lm["l"], lm["c"], atr=monthly_atr)
 
+        # Monthly developing — current incomplete month
+        monthly_dev_cpr = None
+        if current_month_key in mo_map:
+            cm = mo_map[current_month_key]
+            monthly_dev_cpr = _calculate_cpr(cm["h"], cm["l"], cm["c"], atr=monthly_atr)
+
         result[sym] = {
-            "daily":   daily_cpr,
-            "weekly":  weekly_cpr,
-            "monthly": monthly_cpr,
+            "daily":             daily_cpr,
+            "weekly":            weekly_cpr,
+            "weekly_developing": weekly_dev_cpr,
+            "monthly":           monthly_cpr,
+            "monthly_developing": monthly_dev_cpr,
         }
 
     return result
