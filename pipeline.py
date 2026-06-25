@@ -1852,10 +1852,29 @@ async def run_hlr_scan() -> None:
         log.info(f"HLR — BO:{bo} Consolidating:{consol} Near:{near} Total:{len(hlr_signals)}")
         pb_signals=_detect_pullback(all_data)
         pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+        # CPR
+        cpr_data = _build_cpr_data(all_data, today)
+        narrow_cpr = sum(
+            1 for v in cpr_data.values()
+            if v.get("daily", {}).get("next", {}).get("category") in ("Very Narrow", "Narrow")
+        )
+        log.info(f"CPR: {len(cpr_data)} stocks  Narrow next-day: {narrow_cpr}")
         log.info(f"Pullback signals: {len(pb_signals)}")
         await asyncio.gather(
-            r2_upload(client,"hlr_signals.json",json.dumps({"updated":today,"count":len(hlr_signals),"bo":bo,"consolidating":consol,"near":near,"signals":hlr_signals})),
-            r2_upload(client,"pullback_signals.json",json.dumps({"updated":today,"count":len(pb_signals),"signals":pb_signals})),
+            r2_upload(client, "hlr_signals.json", json.dumps({
+                "updated": today, "count": len(hlr_signals),
+                "bo": bo, "consolidating": consol, "near": near,
+                "signals": hlr_signals,
+            })),
+            r2_upload(client, "pullback_signals.json", json.dumps({
+                "updated": today, "count": len(pb_signals),
+                "signals": pb_signals,
+            })),
+            r2_upload(client, "cpr.json", json.dumps({
+                "updated": today,
+                "count": len(cpr_data),
+                "stocks": cpr_data,
+            })),
         )
     log.info("━━━ HLR + Pullback Scan complete ━━━")
 
@@ -2262,6 +2281,136 @@ async def run_vcp_scan() -> None:
             "signals": signals,
         }))
     log.info("━━━ VCP Scan complete ━━━")
+
+
+
+# ══════════════════════════════════════════════════════════════
+# CPR (Central Pivot Range) — Daily / Weekly / Monthly
+# ══════════════════════════════════════════════════════════════
+
+def _calculate_cpr(high, low, close, atr=None):
+    pivot = (high + low + close) / 3
+    bc    = (pivot + low) / 2
+    tc    = (pivot + high) / 2
+    width = abs(tc - bc)
+    width_pct  = round((width / pivot) * 100, 3) if pivot else 0
+    atr_ratio  = round(width / atr, 3) if atr and atr > 0 else None
+
+    if atr_ratio is not None:
+        if atr_ratio < 0.15:   category = "Very Narrow"
+        elif atr_ratio < 0.30: category = "Narrow"
+        elif atr_ratio < 0.55: category = "Moderate"
+        else:                  category = "Wide"
+    else:
+        if width_pct < 0.25:   category = "Very Narrow"
+        elif width_pct < 0.5:  category = "Narrow"
+        elif width_pct < 1.0:  category = "Moderate"
+        else:                  category = "Wide"
+
+    result = {"p": round(pivot, 2), "bc": round(bc, 2), "tc": round(tc, 2),
+              "width_pct": width_pct, "category": category}
+    if atr_ratio is not None:
+        result["atr_ratio"] = atr_ratio
+    return result
+
+
+def _calc_atr14(highs, lows, closes, period=14):
+    n = len(closes); trs = []
+    for i in range(max(1, n - period), n):
+        h = highs[i]; l = lows[i]; pc = closes[i - 1]
+        if None in (h, l, pc): continue
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs) / len(trs) if trs else None
+
+
+def _resample_weekly(dates, highs, lows, closes):
+    weekly = {}
+    for d, h, l, c in zip(dates, highs, lows, closes):
+        if None in (h, l, c): continue
+        key = date.fromisoformat(d).isocalendar()[:2]
+        if key not in weekly:
+            weekly[key] = {"h": h, "l": l, "c": c}
+        else:
+            weekly[key]["h"] = max(weekly[key]["h"], h)
+            weekly[key]["l"] = min(weekly[key]["l"], l)
+            weekly[key]["c"] = c
+    return weekly
+
+
+def _resample_monthly(dates, highs, lows, closes):
+    monthly = {}
+    for d, h, l, c in zip(dates, highs, lows, closes):
+        if None in (h, l, c): continue
+        key = d[:7]
+        if key not in monthly:
+            monthly[key] = {"h": h, "l": l, "c": c}
+        else:
+            monthly[key]["h"] = max(monthly[key]["h"], h)
+            monthly[key]["l"] = min(monthly[key]["l"], l)
+            monthly[key]["c"] = c
+    return monthly
+
+
+def _build_cpr_data(all_data, today):
+    today_dt          = date.fromisoformat(today)
+    current_week_key  = today_dt.isocalendar()[:2]
+    current_month_key = today[:7]
+    result = {}
+
+    for sym, s in all_data.items():
+        dates  = s["d"]; highs = s["h"]; lows = s["l"]; closes = s["c"]
+        n = len(dates)
+        if n < 2: continue
+
+        # Daily ATR14
+        atr14 = _calc_atr14(highs, lows, closes)
+
+        def _candle(idx):
+            h, l, c = highs[idx], lows[idx], closes[idx]
+            return (h, l, c) if None not in (h, l, c) else None
+
+        # ── Daily CPR ──────────────────────────────────────────
+        daily_cpr = {}
+        prev = _candle(-2)
+        curr = _candle(-1)
+        if prev: daily_cpr["today"] = _calculate_cpr(*prev, atr=atr14)
+        if curr: daily_cpr["next"]  = _calculate_cpr(*curr, atr=atr14)
+
+        # ── Weekly CPR ─────────────────────────────────────────
+        wk_map     = _resample_weekly(dates, highs, lows, closes)
+        past_weeks = sorted(k for k in wk_map if k < current_week_key)
+        weekly_cpr = None
+        if past_weeks:
+            lw        = wk_map[past_weeks[-1]]
+            wk_sorted = [wk_map[k] for k in sorted(wk_map.keys())]
+            w_trs = []
+            for i in range(max(1, len(wk_sorted) - 14), len(wk_sorted)):
+                wh = wk_sorted[i]["h"]; wl = wk_sorted[i]["l"]; wpc = wk_sorted[i-1]["c"]
+                w_trs.append(max(wh - wl, abs(wh - wpc), abs(wl - wpc)))
+            weekly_atr = sum(w_trs) / len(w_trs) if w_trs else None
+            weekly_cpr = _calculate_cpr(lw["h"], lw["l"], lw["c"], atr=weekly_atr)
+
+        # ── Monthly CPR ────────────────────────────────────────
+        mo_map      = _resample_monthly(dates, highs, lows, closes)
+        past_months = sorted(k for k in mo_map if k < current_month_key)
+        monthly_cpr = None
+        if past_months:
+            lm        = mo_map[past_months[-1]]
+            mo_sorted = [mo_map[k] for k in sorted(mo_map.keys())]
+            m_trs = []
+            for i in range(max(1, len(mo_sorted) - 14), len(mo_sorted)):
+                mh = mo_sorted[i]["h"]; ml = mo_sorted[i]["l"]; mpc = mo_sorted[i-1]["c"]
+                m_trs.append(max(mh - ml, abs(mh - mpc), abs(ml - mpc)))
+            monthly_atr = sum(m_trs) / len(m_trs) if m_trs else None
+            monthly_cpr = _calculate_cpr(lm["h"], lm["l"], lm["c"], atr=monthly_atr)
+
+        result[sym] = {
+            "daily":   daily_cpr,
+            "weekly":  weekly_cpr,
+            "monthly": monthly_cpr,
+        }
+
+    return result
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
