@@ -1,55 +1,51 @@
 name: TradeWithTech Pipeline
-
 on:
   workflow_dispatch:
-
 concurrency:
   group: twt-pipeline
   cancel-in-progress: false
-
 env:
   PYTHON_VERSION: "3.11"
-  UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
-  WORKER_URL:    ${{ secrets.WORKER_URL }}
-  WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
-  FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-
+  UPSTOX_TOKEN:       ${{ secrets.UPSTOX_TOKEN }}
+  WORKER_URL:         ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN:       ${{ secrets.WORKER_TOKEN }}
+  FINEDGE_TOKEN:      ${{ secrets.FINEDGE_TOKEN }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 jobs:
   pipeline:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-
       - name: Install Dependencies
         run: |
-          pip install httpx
-
+          pip install httpx requests
       - name: Classification
         run: python pipeline_classification.py classification
-
       - name: Daily OHLC
         run: python pipeline.py daily
-
       - name: Today OHLC
         run: python pipeline.py today
-
       - name: HLR Scan
         run: python pipeline.py hlr_scan
-
       - name: Pattern Scan
         run: python pipeline.py pattern_scan
-
       - name: Fundamentals
         run: python pipeline.py fund_daily
-
       - name: EP Scan
         run: python pipeline.py ep_scan
-
       - name: Indices Pipeline
         run: python pipeline_indices.py
+
+      - name: Telegram fallback on workflow failure
+        if: failure()
+        run: |
+          MSG="❌ <b>📊 TradeWithTech Pipeline</b>%0AStatus : <code>WORKFLOW FAILURE</code>%0ATime : $(TZ='Asia/Kolkata' date '+%d %b %Y, %I:%M %p IST')%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "parse_mode=HTML" \
+            -d "text=${MSG}"
