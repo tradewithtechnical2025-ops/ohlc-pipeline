@@ -15,6 +15,7 @@ Usage:
   python pipeline.py ep_scan
   python pipeline.py hlr_scan
   python pipeline.py pattern_scan
+  python pipeline.py pattern_scan_force   # bypass trading-day gate (use after holiday-list fixes)
   python pipeline.py vcp_scan
 """
 
@@ -2003,11 +2004,12 @@ def _detect_patterns(all_data,min_volume=2500,coil_min_babies=3,tight_close_week
                     signals.append({"symbol":sym,"pattern":"Weekly Tight Close","date":today_d,"closes":[round(c,2) for c in last_n],"range_pct":round(tc_range,2)})
     return signals
 
-async def run_pattern_scan() -> None:
+async def run_pattern_scan(force: bool = False) -> None:
     status = PipelineStatus("run_pattern_scan")
     try:
         today=today_ist()
-        if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        if not force and not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        if force: log.info(f"⚠️  FORCE MODE — bypassing trading-day check for {today}")
         log.info(f"━━━ Pattern Scan  {today} ━━━")
         async with httpx.AsyncClient() as client:
             global ISIN_MAP,BSE_ISIN_MAP,BSE_META
@@ -2515,6 +2517,7 @@ if __name__ == "__main__":
         case "ep_scan":       asyncio.run(run_ep_scan())
         case "hlr_scan":      asyncio.run(run_hlr_scan())
         case "pattern_scan":  asyncio.run(run_pattern_scan())
+        case "pattern_scan_force": asyncio.run(run_pattern_scan(force=True))
         case "stage2_scan":   asyncio.run(run_stage2_scan())
         case "vcp_scan":      asyncio.run(run_vcp_scan())
         case _:
