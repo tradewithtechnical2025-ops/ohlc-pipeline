@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 
 import httpx
+from r2_manifest import upload_with_manifest
 
 FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
@@ -381,10 +382,13 @@ async def main():
             print(f"  Retry recovered: {retry_ok}/{len(failed)}")
 
         # ── Upload ───────────────────────────
-        await r2_upload(client, "shareholding.json", output)
+        manifest = await upload_with_manifest(
+            client, r2_upload, "shareholding.json", output,
+            schema_v=1, extra_meta={"symbol_count": len(output)}
+        )
 
         print(
-            f"\n✅ shareholding.json uploaded\n"
+            f"\n✅ shareholding.json uploaded (hash={manifest['hash']})\n"
             f"   Updated:   {updated + retry_ok}\n"
             f"   Preserved: {preserved + empty - retry_ok}\n"
             f"   Empty:     {empty}\n"
