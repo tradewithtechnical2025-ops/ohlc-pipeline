@@ -1,7 +1,16 @@
 name: HLR Scan
 on:
   workflow_dispatch:
-  
+    inputs:
+      pattern_mode:
+        description: 'Pattern scan mode'
+        required: false
+        default: 'pattern_scan'
+        type: choice
+        options:
+          - pattern_scan
+          - pattern_scan_force
+
 jobs:
   hlr_scan:
     runs-on: ubuntu-latest
@@ -24,4 +33,4 @@ jobs:
           WORKER_URL:    ${{ secrets.WORKER_URL }}
           WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-        run: python pipeline.py pattern_scan
+        run: python pipeline.py ${{ inputs.pattern_mode }}
