@@ -70,6 +70,49 @@ def build_manifest(data: Any, schema_v: int = 1, extra_meta: Optional[dict] = No
     return manifest
 
 
+async def upload_str_with_manifest(
+    client,
+    upload_fn: Callable[..., Awaitable[None]],
+    filename: str,
+    json_str: str,
+    schema_v: int = 1,
+    extra_meta: Optional[dict] = None,
+) -> dict:
+    """
+    Variant of upload_with_manifest() for pipelines that already serialize
+    to a JSON string BEFORE calling their upload_fn -- e.g. pipeline.py's
+    pattern of r2_upload(client, filename, json.dumps(...)), as opposed to
+    passing a raw dict/list and letting upload_fn serialize internally.
+
+    Hash is computed directly from json_str, so it always reflects exactly
+    what gets uploaded -- no risk of a second, possibly-different serialization.
+
+    Example (inside an asyncio.gather(...) batch, same as existing calls):
+
+        from r2_manifest import upload_str_with_manifest
+
+        await asyncio.gather(
+            ...,
+            upload_str_with_manifest(
+                client, r2_upload, "screener_feed.json", json.dumps(screener_feed),
+                schema_v=1, extra_meta={"stock_count": len(screener_feed)}
+            ),
+        )
+    """
+    manifest = {
+        "hash": hashlib.md5(json_str.encode()).hexdigest()[:10],
+        "schema_v": schema_v,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra_meta:
+        manifest.update(extra_meta)
+
+    await upload_fn(client, filename, json_str)
+    await upload_fn(client, manifest_filename_for(filename), json.dumps(manifest, separators=(",", ":")))
+
+    return manifest
+
+
 async def upload_with_manifest(
     client,
     upload_fn: Callable[..., Awaitable[None]],
