@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timedelta
 
 import httpx
+from r2_manifest import upload_with_manifest
 
 FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
@@ -355,23 +356,27 @@ async def main():
             master_rows = master_rows.get("data", [])
         master_parsed = parse_index_master(master_rows)
         valid_symbols = set(master_parsed.keys())
-        await r2_upload(client, "index_master.json", master_parsed)
+        await upload_with_manifest(client, r2_upload, "index_master.json", master_parsed,
+                                    schema_v=1, extra_meta={"index_count": len(master_parsed)})
         print("✅ index_master.json uploaded\n")
 
         index_map = build_index_map(master_parsed)
-        await r2_upload(client, "index_map.json", index_map)
+        await upload_with_manifest(client, r2_upload, "index_map.json", index_map,
+                                    schema_v=1, extra_meta={"index_count": len(index_map)})
         print(f"✅ index_map.json uploaded ({len(index_map)} indices)\n")
 
         print("=== INDEX DAILY FEED ===")
         daily_rows   = await fetch_index_daily(client)
         daily_parsed = parse_index_daily(daily_rows, valid_symbols)
-        await r2_upload(client, "index_daily.json", daily_parsed)
+        await upload_with_manifest(client, r2_upload, "index_daily.json", daily_parsed,
+                                    schema_v=1, extra_meta={"index_count": len(daily_parsed)})
         print("✅ index_daily.json uploaded\n")
 
         print("=== INDEX RETURNS ===")
         returns_rows   = await fetch_index_returns(client)
         returns_parsed = parse_index_returns(returns_rows, valid_symbols)
-        await r2_upload(client, "index_returns.json", returns_parsed)
+        await upload_with_manifest(client, r2_upload, "index_returns.json", returns_parsed,
+                                    schema_v=1, extra_meta={"index_count": len(returns_parsed)})
         print("✅ index_returns.json uploaded\n")
 
         print("=== INDEX HISTORICAL ===")
@@ -386,7 +391,8 @@ async def main():
                 failed += 1
                 print(f"[{i}/{total}] ✗ {symbol} | no data")
                 continue
-            await r2_upload(client, f"index_history/{symbol}.json", parsed)
+            await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
+                                        schema_v=1, extra_meta={"candle_count": len(parsed)})
             success += 1
             print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles")
 
