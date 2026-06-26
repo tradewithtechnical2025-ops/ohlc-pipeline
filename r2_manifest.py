@@ -42,14 +42,17 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 
-def compute_hash(data: Any) -> str:
+def compute_hash(data: Any, ensure_ascii: bool = True) -> str:
     """
     IMPORTANT: this must mirror the EXACT serialization your upload_fn uses,
     otherwise the hash won't reflect what's actually stored on R2.
     TradeWithTech's r2_upload() does `json.dumps(data).encode()` (default
-    separators, no sort_keys) -- this matches that exactly.
+    separators, no sort_keys, ensure_ascii=True) -- this matches that by default.
+    Pass ensure_ascii=False if your pipeline's upload_fn serializes that way
+    (e.g. json.dumps(data, ensure_ascii=False)) -- otherwise the hash would be
+    computed over different bytes than what's actually uploaded.
     """
-    return hashlib.md5(json.dumps(data).encode()).hexdigest()[:10]
+    return hashlib.md5(json.dumps(data, ensure_ascii=ensure_ascii).encode()).hexdigest()[:10]
 
 
 def manifest_filename_for(filename: str) -> str:
@@ -59,9 +62,9 @@ def manifest_filename_for(filename: str) -> str:
     return filename + ".manifest.json"
 
 
-def build_manifest(data: Any, schema_v: int = 1, extra_meta: Optional[dict] = None) -> dict:
+def build_manifest(data: Any, schema_v: int = 1, extra_meta: Optional[dict] = None, ensure_ascii: bool = True) -> dict:
     manifest = {
-        "hash": compute_hash(data),
+        "hash": compute_hash(data, ensure_ascii=ensure_ascii),
         "schema_v": schema_v,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -120,15 +123,20 @@ async def upload_with_manifest(
     data: Any,
     schema_v: int = 1,
     extra_meta: Optional[dict] = None,
+    ensure_ascii: bool = True,
 ) -> dict:
     """
     Uploads `data` via the pipeline's existing upload_fn (same signature as
     your current r2_upload: upload_fn(client, filename, data)), then uploads
     a sibling manifest file the same way.
 
+    Pass ensure_ascii=False if your upload_fn serializes with
+    json.dumps(data, ensure_ascii=False) -- otherwise the manifest hash
+    won't match the actually-uploaded bytes.
+
     Returns the manifest dict (useful for logging, e.g. hash in print statement).
     """
-    manifest = build_manifest(data, schema_v=schema_v, extra_meta=extra_meta)
+    manifest = build_manifest(data, schema_v=schema_v, extra_meta=extra_meta, ensure_ascii=ensure_ascii)
 
     await upload_fn(client, filename, data)
     await upload_fn(client, manifest_filename_for(filename), manifest)
