@@ -5,7 +5,7 @@ import json
 import os
 
 import httpx
-
+from r2_manifest import upload_with_manifest
 FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
@@ -267,13 +267,17 @@ async def main():
 
             print(f"{min(i+25, total)}/{total}")
 
-        await r2_upload(
-            client,
-            "peers.json",
-            output
+        manifest = await upload_with_manifest(
+            client, r2_upload, "peers.json", output,
+            schema_v=1,
+            extra_meta={"symbol_count": len(output)}
         )
 
-        print("✅ peers.json uploaded")
+        print(f"✅ peers.json uploaded (hash={manifest['hash']})")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
