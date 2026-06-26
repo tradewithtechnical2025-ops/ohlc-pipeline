@@ -55,7 +55,7 @@ Data-shape decisions (locked in from testing phase):
     PLUS full "raw" rows (schemas not yet mapped, e.g. insurance, still captured).
 """
 
-import asyncio, json, logging, os, sys
+import asyncio, hashlib, json, logging, os, sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -158,9 +158,19 @@ async def r2_upload(client, filename, data):
     log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
 
 
+def compute_hash(payload: str) -> str:
+    """Hash of the exact JSON string uploaded for a symbol's per-symbol file.
+    Mirrors r2_upload_symbol's serialization exactly, so the hash stored in
+    fundamentals_summary.json always reflects what's actually on R2 — this is
+    what the frontend will compare against its IndexedDB cache to decide
+    whether to refetch fundamentals_full/{SYMBOL}.json or not."""
+    return hashlib.md5(payload.encode()).hexdigest()[:10]
+
+
 async def r2_upload_symbol(client, sym, obj):
     payload = json.dumps(obj, separators=(",", ":"))
     await r2_upload(client, f"fundamentals_full/{sym}.json", payload)
+    return compute_hash(payload)
 
 
 SUMMARY_FILE = "fundamentals_summary.json"
@@ -617,7 +627,8 @@ async def run_full(part=0):
         for i, sym in enumerate(chunk, 1):
             try:
                 _, obj, summ = await fetch_one_symbol(client, sem, sym)
-                await r2_upload_symbol(client, sym, obj)
+                file_hash = await r2_upload_symbol(client, sym, obj)
+                summ["hash"] = file_hash
                 summary[sym] = summ
                 ok += 1
             except Exception as e:
@@ -649,7 +660,8 @@ async def run_daily():
         for sym in result_symbols:
             try:
                 _, obj, summ = await fetch_one_symbol(client, sem, sym)
-                await r2_upload_symbol(client, sym, obj)
+                file_hash = await r2_upload_symbol(client, sym, obj)
+                summ["hash"] = file_hash
                 summary[sym] = summ
                 ok += 1
                 log.info(f"  ✓ {sym}")
@@ -691,6 +703,14 @@ async def _backfill_one(client, sym):
         return sym, None
     summ = _build_summary_entry(sym, obj.get("profile"), obj.get("pl", {}),
                                  obj.get("ratios", {}), obj.get("annual_price_ratios", {}))
+    # Re-serialize with the same separators r2_upload_symbol uses, so this
+    # backfilled hash is consistent with hashes future live runs will produce.
+    # NOTE: since this re-serializes a downloaded-and-reparsed object rather
+    # than the original upload bytes, it's a reliable proxy but not guaranteed
+    # byte-identical to the original upload (e.g. exotic float formatting).
+    # Fine for a one-time backfill — any drift self-corrects on the next
+    # full/daily/sync run, which always hashes the freshly-built object.
+    summ["hash"] = compute_hash(json.dumps(obj, separators=(",", ":")))
     return sym, summ
 
 
@@ -724,7 +744,8 @@ async def run_backfill_summary():
             for sym in failed_syms:
                 try:
                     _, obj, summ = await fetch_one_symbol(client, sem, sym)
-                    await r2_upload_symbol(client, sym, obj)
+                    file_hash = await r2_upload_symbol(client, sym, obj)
+                    summ["hash"] = file_hash
                     summary[sym] = summ
                     ok += 1; failed -= 1; s_ok += 1
                     log.info(f"  ✓ {sym} (auto-synced)")
@@ -750,7 +771,8 @@ async def run_sync(symbols):
             sym = sym.upper()
             try:
                 _, obj, summ = await fetch_one_symbol(client, sem, sym)
-                await r2_upload_symbol(client, sym, obj)
+                file_hash = await r2_upload_symbol(client, sym, obj)
+                summ["hash"] = file_hash
                 summary[sym] = summ
                 ok += 1
                 log.info(f"  ✓ {sym}")
