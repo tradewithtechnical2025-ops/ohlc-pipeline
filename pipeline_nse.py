@@ -30,6 +30,7 @@ import time
 from datetime import date, datetime, timedelta
 
 import httpx
+from r2_manifest import upload_with_manifest
 
 # ── Telegram notify ──
 try:
@@ -727,7 +728,9 @@ async def run():
                 print(f"  ✓ bands: {bands_date_str} already current — skipping")
                 print(f"    Showing: {existing_bands['date']}  ({len(existing_bands.get('data', []))} symbols)")
             else:
-                upload_tasks.append(r2_put(client, "nse_bands.json", bands_out))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_bands.json", bands_out,
+                                                           schema_v=1, extra_meta={"symbol_count": len(bands)},
+                                                           ensure_ascii=False))
 
             # ── Bulk snapshot + summary + history ─────────────────────────────────
             # bulk.csv carries date inside each row; use first row's date
@@ -737,11 +740,16 @@ async def run():
             if bulk_date_str and bulk_date_str == existing_bulk_date:
                 print(f"  ✓ bulk: {bulk_date_str} already current — skipping snapshot + history")
             else:
-                upload_tasks.append(r2_put(client, "nse_bulk.json",         bulk_clean))
-                upload_tasks.append(r2_put(client, "nse_bulk_summary.json", bulk_summary))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_bulk.json", bulk_clean,
+                                                           schema_v=1, extra_meta={"deal_count": len(bulk_clean)},
+                                                           ensure_ascii=False))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_bulk_summary.json", bulk_summary,
+                                                           schema_v=1, extra_meta={"row_count": len(bulk_summary)},
+                                                           ensure_ascii=False))
                 b1 = merge_deals_history(bulk_hist, bulk_clean)
                 print(f"  Bulk history: +{b1} new deals")
-                upload_tasks.append(r2_put(client, "nse_bulk_history.json", bulk_hist))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_bulk_history.json", bulk_hist,
+                                                           schema_v=1, ensure_ascii=False))
 
             # ── Block snapshot + summary + history ────────────────────────────────
             block_date_str      = block_clean[0]["date"] if block_clean else None
@@ -752,18 +760,24 @@ async def run():
             elif block_date_str and block_date_str == existing_block_date:
                 print(f"  ✓ block: {block_date_str} already current — skipping snapshot + history")
             else:
-                upload_tasks.append(r2_put(client, "nse_block.json",         block_clean))
-                upload_tasks.append(r2_put(client, "nse_block_summary.json", block_summary))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_block.json", block_clean,
+                                                           schema_v=1, extra_meta={"deal_count": len(block_clean)},
+                                                           ensure_ascii=False))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_block_summary.json", block_summary,
+                                                           schema_v=1, extra_meta={"row_count": len(block_summary)},
+                                                           ensure_ascii=False))
                 b2 = merge_deals_history(block_hist, block_clean)
                 print(f"  Block history: +{b2} new deals")
-                upload_tasks.append(r2_put(client, "nse_block_history.json", block_hist))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_block_history.json", block_hist,
+                                                           schema_v=1, ensure_ascii=False))
 
             # ── Participant OI snapshot + history ─────────────────────────────────
             if oi_snapshot:
                 oi_date_str = oi_snapshot["date"]
 
                 # Snapshot always uploaded so frontend shows latest available date
-                upload_tasks.append(r2_put(client, "nse_participant_oi.json", oi_snapshot))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_participant_oi.json", oi_snapshot,
+                                                           schema_v=1, ensure_ascii=False))
 
                 # History — only append if genuinely new trading day
                 existing_oi_dates = {e["date"] for e in oi_hist}
@@ -774,7 +788,9 @@ async def run():
                               f"({oi_hist[0]['date']} → {oi_hist[-1]['date']})")
                 else:
                     oi_hist = merge_oi_history(oi_hist, oi_snapshot, max_days=OI_HISTORY_DAYS)
-                    upload_tasks.append(r2_put(client, "nse_participant_oi_hist.json", oi_hist))
+                    upload_tasks.append(upload_with_manifest(client, r2_put, "nse_participant_oi_hist.json", oi_hist,
+                                                               schema_v=1, extra_meta={"day_count": len(oi_hist)},
+                                                               ensure_ascii=False))
             else:
                 print("  ⚠ No OI snapshot — skipping OI uploads")
 
@@ -783,7 +799,8 @@ async def run():
                 fd_date_str = fii_dii_snapshot["date"]
 
                 # Snapshot always uploaded so frontend shows latest available date
-                upload_tasks.append(r2_put(client, "nse_fii_dii.json", fii_dii_snapshot))
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_fii_dii.json", fii_dii_snapshot,
+                                                           schema_v=1, ensure_ascii=False))
 
                 # History — only append if genuinely new trading day
                 existing_fd_dates = {e["date"] for e in fii_dii_hist}
@@ -794,7 +811,9 @@ async def run():
                               f"({fii_dii_hist[0]['date']} → {fii_dii_hist[-1]['date']})")
                 else:
                     fii_dii_hist = merge_oi_history(fii_dii_hist, fii_dii_snapshot, max_days=FII_DII_HISTORY_DAYS)
-                    upload_tasks.append(r2_put(client, "nse_fii_dii_hist.json", fii_dii_hist))
+                    upload_tasks.append(upload_with_manifest(client, r2_put, "nse_fii_dii_hist.json", fii_dii_hist,
+                                                               schema_v=1, extra_meta={"day_count": len(fii_dii_hist)},
+                                                               ensure_ascii=False))
             else:
                 print("  ⚠ No FII/DII snapshot — skipping FII/DII uploads")
 
