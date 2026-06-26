@@ -29,6 +29,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
+from r2_manifest import upload_str_with_manifest
 
 # ── Telegram notify ──
 try:
@@ -402,7 +403,8 @@ async def save_result_calendar(client, symbols, date_str, keep_days=60):
     cal[date_str] = symbols
     cutoff = (date.fromisoformat(date_str)-timedelta(days=keep_days)).isoformat()
     cal = {d:v for d,v in cal.items() if d >= cutoff}
-    await r2_upload(client, "result_calendar.json", json.dumps(cal))
+    await upload_str_with_manifest(client, r2_upload, "result_calendar.json", json.dumps(cal),
+                                    schema_v=1, extra_meta={"date_count": len(cal)})
 
 async def download_all_chunks(client) -> dict:
     tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
@@ -420,7 +422,10 @@ async def upload_all_chunks(client, all_data, today):
     for i in range(R2_CHUNKS):
         chunk_syms = symbols[i*size:(i+1)*size]; chunk = {s: all_data[s] for s in chunk_syms}
         payload = json.dumps({"updated":today,"chunk":i+1,"total":R2_CHUNKS,"stocks":chunk})
-        tasks.append(r2_upload(client, f"ohlc_{i+1}.json", payload))
+        tasks.append(upload_str_with_manifest(
+            client, r2_upload, f"ohlc_{i+1}.json", payload,
+            schema_v=1, extra_meta={"chunk": i+1, "total": R2_CHUNKS, "stock_count": len(chunk_syms)}
+        ))
     await asyncio.gather(*tasks)
     log.info(f"✓ {R2_CHUNKS} chunks uploaded ({n} stocks)")
 
@@ -524,7 +529,9 @@ async def run_daily() -> None:
             log.info(f"Rolling: dropped {dropped} old candles")
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
-                r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
+                upload_str_with_manifest(client, r2_upload, "ohlc_delta.json",
+                                          json.dumps({"date": today, "stocks": delta}),
+                                          schema_v=1, extra_meta={"stock_count": len(delta)}),
             )
         status.success()
         log.info("━━━ Daily complete ━━━")
@@ -559,7 +566,9 @@ async def run_today() -> None:
             delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
-                r2_upload(client, "ohlc_delta.json", json.dumps({"date": today, "stocks": delta})),
+                upload_str_with_manifest(client, r2_upload, "ohlc_delta.json",
+                                          json.dumps({"date": today, "stocks": delta}),
+                                          schema_v=1, extra_meta={"stock_count": len(delta)}),
             )
             log.info(f"✅ delta: {len(delta)} stocks")
         status.success()
@@ -596,7 +605,9 @@ async def run_full() -> None:
             apply_rolling_window(all_data, cutoff)
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
-                r2_upload(client, "ohlc_all.json", json.dumps({"updated":today,"stocks":all_data})),
+                upload_str_with_manifest(client, r2_upload, "ohlc_all.json",
+                                          json.dumps({"updated":today,"stocks":all_data}),
+                                          schema_v=1, extra_meta={"stock_count": len(all_data)}),
             )
         status.success()
         log.info("━━━ Full load complete ━━━")
@@ -1339,7 +1350,9 @@ async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days
         elif sym in gaps_by_sym: del gaps_by_sym[sym]
 
     store["updated"]=today
-    await r2_upload(client,"open_gaps.json",json.dumps(store,separators=(",",":")))
+    await upload_str_with_manifest(client, r2_upload, "open_gaps.json",
+                                    json.dumps(store,separators=(",",":")),
+                                    schema_v=1, extra_meta={"stock_count": len(gaps_by_sym)})
     log.info(f"  gap tracker: {sum(len(v) for v in gaps_by_sym.values())} open/recent gaps across {len(gaps_by_sym)} stocks  (+{new_count} new today, {filled_today_count} filled today)")
     return gaps_by_sym
 
@@ -1761,14 +1774,29 @@ async def run_ep_scan() -> None:
             for sig in pr_signals:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
             await asyncio.gather(
-                r2_upload(client,"ep_signals.json",json.dumps({"updated":today,"count":len(signals),"signals":signals})),
-                r2_upload(client,"rs_ratings.json",json.dumps({"updated":today,"count":len(rs_data),"stocks":rs_data})),
-                r2_upload(client,"rs_history.json",json.dumps(rs_history_list)),
-                r2_upload(client,"mswing.json",json.dumps(mswing_list)),
-                r2_upload(client,"post_result_signals.json",json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals})),
-                r2_upload(client,"sector_group_rs_history.json",json.dumps(sector_group_rs_history)),
-                r2_upload(client,"industry_rs_history.json",json.dumps(industry_rs_history)),
-                r2_upload(client,"screener_feed.json",json.dumps(screener_feed)),
+                upload_str_with_manifest(client, r2_upload, "ep_signals.json",
+                                          json.dumps({"updated":today,"count":len(signals),"signals":signals}),
+                                          schema_v=1, extra_meta={"count": len(signals)}),
+                upload_str_with_manifest(client, r2_upload, "rs_ratings.json",
+                                          json.dumps({"updated":today,"count":len(rs_data),"stocks":rs_data}),
+                                          schema_v=1, extra_meta={"count": len(rs_data)}),
+                upload_str_with_manifest(client, r2_upload, "rs_history.json",
+                                          json.dumps(rs_history_list),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "mswing.json",
+                                          json.dumps(mswing_list),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "post_result_signals.json",
+                                          json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals}),
+                                          schema_v=1, extra_meta={"count": len(pr_signals)}),
+                upload_str_with_manifest(client, r2_upload, "sector_group_rs_history.json",
+                                          json.dumps(sector_group_rs_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "industry_rs_history.json",
+                                          json.dumps(industry_rs_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "screener_feed.json", json.dumps(screener_feed),
+                                          schema_v=1, extra_meta={"stock_count": len(screener_feed)}),
                 backup_pattern_history(client,screener_feed,today,gap_new=gap_new,gap_filled=gap_filled),
             )
             log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
@@ -1907,20 +1935,20 @@ async def run_hlr_scan() -> None:
             log.info(f"CPR: {len(cpr_data)} stocks  Narrow next-day: {narrow_cpr}")
             log.info(f"Pullback signals: {len(pb_signals)}")
             await asyncio.gather(
-                r2_upload(client, "hlr_signals.json", json.dumps({
+                upload_str_with_manifest(client, r2_upload, "hlr_signals.json", json.dumps({
                     "updated": today, "count": len(hlr_signals),
                     "bo": bo, "consolidating": consol, "near": near,
                     "signals": hlr_signals,
-                })),
-                r2_upload(client, "pullback_signals.json", json.dumps({
+                }), schema_v=1, extra_meta={"count": len(hlr_signals)}),
+                upload_str_with_manifest(client, r2_upload, "pullback_signals.json", json.dumps({
                     "updated": today, "count": len(pb_signals),
                     "signals": pb_signals,
-                })),
-                r2_upload(client, "cpr.json", json.dumps({
+                }), schema_v=1, extra_meta={"count": len(pb_signals)}),
+                upload_str_with_manifest(client, r2_upload, "cpr.json", json.dumps({
                     "updated": today,
                     "count": len(cpr_data),
                     "stocks": cpr_data,
-                })),
+                }), schema_v=1, extra_meta={"stock_count": len(cpr_data)}),
             )
         status.success()
         log.info("━━━ HLR + Pullback Scan complete ━━━")
@@ -2020,7 +2048,9 @@ async def run_pattern_scan(force: bool = False) -> None:
             from collections import Counter; counts=Counter(s["pattern"] for s in signals)
             for pat,cnt in sorted(counts.items()): log.info(f"  {pat}: {cnt}")
             log.info(f"Total: {len(signals)} signals")
-            await r2_upload(client,"pattern_signals.json",json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}))
+            await upload_str_with_manifest(client, r2_upload, "pattern_signals.json",
+                                            json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}),
+                                            schema_v=1, extra_meta={"count": len(signals)})
         status.success()
         log.info("━━━ Pattern Scan complete ━━━")
     except Exception as e:
@@ -2130,12 +2160,12 @@ async def run_stage2_scan() -> None:
                 log.info(f"Breadth history: {len(breadth_history)} dates, latest count {breadth_history[-1]['count']}")
 
             await asyncio.gather(
-                r2_upload(client, "stage2_signals.json", json.dumps({
+                upload_str_with_manifest(client, r2_upload, "stage2_signals.json", json.dumps({
                     "updated": today, "count": len(signals), "signals": signals,
-                })),
-                r2_upload(client, "stage2_breadth.json", json.dumps({
+                }), schema_v=1, extra_meta={"count": len(signals)}),
+                upload_str_with_manifest(client, r2_upload, "stage2_breadth.json", json.dumps({
                     "updated": today, "history": breadth_history,
-                })),
+                }), schema_v=1),
             )
         status.success()
         log.info("━━━ Stage 2 Scan complete ━━━")
@@ -2337,11 +2367,11 @@ async def run_vcp_scan() -> None:
                     signals.append({"symbol": sym, **r})
             signals.sort(key=lambda x: x["score"], reverse=True)
             log.info(f"VCP signals: {len(signals)}")
-            await r2_upload(client, "vcp_signals.json", json.dumps({
+            await upload_str_with_manifest(client, r2_upload, "vcp_signals.json", json.dumps({
                 "updated": today,
                 "count": len(signals),
                 "signals": signals,
-            }))
+            }), schema_v=1, extra_meta={"count": len(signals)})
         status.success()
         log.info("━━━ VCP Scan complete ━━━")
     except Exception as e:
