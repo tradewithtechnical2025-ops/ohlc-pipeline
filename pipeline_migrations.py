@@ -410,9 +410,9 @@ def detect_delisted_nse(old_nse, new_nse, date):
     return out
 
 
-def detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, date, old_bse):
+def detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, date, old_bse, ever_seen_bse):
     bse_by_isin = {v["isin"]: v for v in new_bse.values()}
-    old_bse_by_isin = {v["isin"]: v for v in old_bse.values()}  # ADD
+    old_bse_by_isin = {v["isin"]: v for v in old_bse.values()}
     out = []
     for isin in sorted(set(new_nse) - set(old_nse)):
         if isin in ever_seen_nse:
@@ -423,7 +423,15 @@ def detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, date, old_bse):
         bse = bse_by_isin.get(isin)
         if not bse:
             continue
-        if isin not in old_bse_by_isin:   # ADD — must have been on BSE *yesterday*
+        if isin not in old_bse_by_isin:
+            continue  # must have been on BSE *yesterday*
+        # KEY FIX: BSE token must be in ever_seen_bse — i.e. BSE listing
+        # predates today. If BSE token is brand new today too, this is a
+        # simultaneous dual-listing IPO (e.g. TURTLEMINT), not a BSE->NSE
+        # migration. In that case NEW_BSE_LISTING + NEW_NSE_LISTING are
+        # the correct events, not BSE_TO_NSE.
+        bse_token = bse["exchange_token"]
+        if bse_token not in ever_seen_bse:
             continue
         out.append({
             "event":       "BSE_TO_NSE",
@@ -431,7 +439,7 @@ def detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, date, old_bse):
             "symbol":      nse["symbol"],
             "name":        nse["name"],
             "isin":        isin,
-            "bse_code":    bse["exchange_token"],
+            "bse_code":    bse_token,
             "bse_segment": bse["segment"],
         })
     return out
@@ -638,8 +646,6 @@ async def main():
                 print(f"🧹 NSE_SME bootstrap: suppressed {len(suppressed)} pre-existing Emerge stocks (newly tracked, not new listings)")
         all_events += nse_new_events
 
-        all_events += detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, today, old_bse)
-
         # Bootstrap guard: if yesterday's snapshot still has un-filtered
         # bonds in it (pre-dates the is_bond() fix on the NSE side), every
         # bond that's now correctly excluded from new_nse would otherwise
@@ -661,7 +667,7 @@ async def main():
                 print(f"🧹 NSE bond-filter bootstrap: suppressed {suppressed} false DELISTED_NSE (bonds now excluded from tracking, not real delistings)")
         all_events += delisted_nse_events
 
-        all_events += detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, today, old_bse)
+        all_events += detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, today, old_bse, ever_seen_bse)
         all_events += detect_sme_to_mainboard(old_bse, new_bse, today)
         all_events += detect_nse_sme_to_mainboard(old_nse, new_nse, today)
         all_events += detect_sme_to_nse(old_nse, new_nse, old_bse, ever_seen_nse, today)
