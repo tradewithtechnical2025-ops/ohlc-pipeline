@@ -361,23 +361,29 @@ def detect_new_bse(old_bse, new_bse, ever_seen_bse, date):
     return out
 
 
-def detect_new_nse(old_nse, new_nse, ever_seen_nse, date):
+def detect_new_nse(old_nse, new_nse, ever_seen_nse, date, new_bse=None):
     """
     NEW_NSE_LISTING   = ISIN never seen on NSE before -> genuine fresh listing
     NSE_RELISTING     = ISIN seen before, missing yesterday, back today
+    Includes bse_code when the same ISIN is also listed on BSE today.
     """
+    bse_by_isin = {v["isin"]: v for v in (new_bse or {}).values()}
     out = []
     for isin in sorted(set(new_nse) - set(old_nse)):
         s = new_nse[isin]
         event_type = "NSE_RELISTING" if isin in ever_seen_nse else "NEW_NSE_LISTING"
-        out.append({
+        ev = {
             "event":   event_type,
             "date":    date,
             "symbol":  s["symbol"],
             "name":    s["name"],
             "isin":    isin,
             "segment": s["segment"],
-        })
+        }
+        bse = bse_by_isin.get(isin)
+        if bse:
+            ev["bse_code"] = bse["exchange_token"]
+        out.append(ev)
     return out
 
 
@@ -638,7 +644,7 @@ async def main():
         # segment=NSE_SME this one time; they still get registered in
         # ever_seen_nse further below so detection is normal from here on.
         old_nse_has_sme = any(v.get("segment") == "NSE_SME" for v in old_nse.values())
-        nse_new_events = detect_new_nse(old_nse, new_nse, ever_seen_nse, today)
+        nse_new_events = detect_new_nse(old_nse, new_nse, ever_seen_nse, today, new_bse)
         if not old_nse_has_sme:
             suppressed = [e for e in nse_new_events if e.get("segment") == "NSE_SME"]
             nse_new_events = [e for e in nse_new_events if e.get("segment") != "NSE_SME"]
