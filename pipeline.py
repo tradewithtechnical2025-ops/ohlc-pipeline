@@ -543,6 +543,9 @@ async def run_today() -> None:
     status = PipelineStatus("run_today")
     try:
         today = today_ist()
+        if not is_trading_day(today):
+            log.info(f"⏭  {today} not a trading day — skipping (avoids stale/stuck live-quote data being stamped as today)")
+            return
         log.info(f"━━━ Today  {today} ━━━")
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
