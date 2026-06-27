@@ -410,25 +410,21 @@ def detect_delisted_nse(old_nse, new_nse, date):
     return out
 
 
-def detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, date):
-    """
-    Newly on NSE *Mainboard* today  AND  already on BSE  AND  genuinely
-    never on NSE before (not a resumption — that's NSE_RELISTING's job)
-    = BSE-only stock got an NSE Mainboard listing for the first time.
-    Restricted to NSE_EQ — a fresh NSE_SME listing is just a normal
-    NEW_NSE_LISTING (segment=NSE_SME), not a BSE->NSE migration.
-    """
+def detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, date, old_bse):
     bse_by_isin = {v["isin"]: v for v in new_bse.values()}
+    old_bse_by_isin = {v["isin"]: v for v in old_bse.values()}  # ADD
     out = []
     for isin in sorted(set(new_nse) - set(old_nse)):
         if isin in ever_seen_nse:
-            continue  # resumption, already captured as NSE_RELISTING — not a fresh migration
+            continue
         nse = new_nse[isin]
         if nse["segment"] != "NSE_EQ":
-            continue  # SME listing, not a mainboard cross-listing
+            continue
         bse = bse_by_isin.get(isin)
         if not bse:
-            continue  # pure new NSE IPO, not BSE->NSE
+            continue
+        if isin not in old_bse_by_isin:   # ADD — must have been on BSE *yesterday*
+            continue
         out.append({
             "event":       "BSE_TO_NSE",
             "date":        date,
@@ -642,7 +638,7 @@ async def main():
                 print(f"🧹 NSE_SME bootstrap: suppressed {len(suppressed)} pre-existing Emerge stocks (newly tracked, not new listings)")
         all_events += nse_new_events
 
-        all_events += detect_delisted_bse(old_bse, new_bse, today)
+        all_events += detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, today, old_bse)
 
         # Bootstrap guard: if yesterday's snapshot still has un-filtered
         # bonds in it (pre-dates the is_bond() fix on the NSE side), every
