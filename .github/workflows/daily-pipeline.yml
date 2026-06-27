@@ -35,12 +35,11 @@ jobs:
       - name: Pattern Scan
         run: python pipeline.py pattern_scan
       - name: Fundamentals
-        run: python pipeline.py fund_daily
+        run: python pipeline_fundamentals_prod.py daily
       - name: EP Scan
         run: python pipeline.py ep_scan
       - name: Indices Pipeline
         run: python pipeline_indices.py
-
       - name: Telegram fallback on workflow failure
         if: failure()
         run: |
