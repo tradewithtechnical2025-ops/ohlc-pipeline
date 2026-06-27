@@ -661,7 +661,7 @@ async def main():
                 print(f"🧹 NSE bond-filter bootstrap: suppressed {suppressed} false DELISTED_NSE (bonds now excluded from tracking, not real delistings)")
         all_events += delisted_nse_events
 
-        all_events += detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, today)
+        all_events += detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, today, old_bse)
         all_events += detect_sme_to_mainboard(old_bse, new_bse, today)
         all_events += detect_nse_sme_to_mainboard(old_nse, new_nse, today)
         all_events += detect_sme_to_nse(old_nse, new_nse, old_bse, ever_seen_nse, today)
