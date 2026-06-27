@@ -3,7 +3,7 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import httpx
 from r2_manifest import upload_with_manifest
@@ -266,12 +266,15 @@ async def fetch_index_returns(client):
     return r.json()
 
 
-def parse_index_returns(rows, valid_symbols):
+def parse_index_returns(rows, valid_symbols, weekly_map=None):
     """
     Finedge ne fix kar diya sign issue.
     3Y/5Y/7Y/10Y = CAGR → absolute convert karo.
     Structure: { "1M": {"v": 1.04, "d": "2026-05-13"}, ... }
+    1W is NOT from Finedge — it's computed locally (see compute_weekly_return)
+    since Finedge's price-returns API has no weekly period at all.
     """
+    weekly_map = weekly_map or {}
     CAGR = {"3Y": 3, "5Y": 5, "7Y": 7, "10Y": 10}
     ASIS = {"1M", "3M", "6M", "1Y"}
     ALL  = list(ASIS) + list(CAGR)
@@ -292,6 +295,8 @@ def parse_index_returns(rows, valid_symbols):
             else:
                 v = round(raw, 2)
             ret[p] = {"v": v, "d": dates.get(p) or None}
+        if weekly_map.get(symbol):
+            ret["1W"] = weekly_map[symbol]
         ret["last_date"] = dates.get("last_date") or None
         output[symbol] = ret
     print(f"✓ Returns indices: {len(output)}")
@@ -339,6 +344,51 @@ def parse_index_history(rows):
     } for r in rows]
 
 
+def compute_weekly_return(history):
+    """
+    1-week return — Finedge's price-returns API has no 1W period at all,
+    so it's derived locally. Uses the SAME convention as the rest of this
+    codebase's "weekly" logic (pipeline.py's _resample_weekly / Weekly IB /
+    Weekly NR7 detectors): group daily candles by ISO calendar week
+    (year, week_number) and take the LAST trading day's close within each
+    week as that week's close.
+
+    Return = latest close vs. the close of the last trading day in the
+    PREVIOUS completed ISO week — i.e. "this week so far" vs "last week".
+
+    This is naturally holiday-safe: a short week (e.g. Friday off) simply
+    ends on whichever day actually traded last (Thursday) — there's no
+    fixed "7 days" or "5 trading days" assumption anywhere.
+    """
+    if not history:
+        return None
+    rows = sorted(
+        (r for r in history if r.get("date") and r.get("close") is not None),
+        key=lambda r: r["date"]
+    )
+    if len(rows) < 2:
+        return None
+
+    week_last = {}  # (iso_year, iso_week) -> {"close":..., "date":...}
+    for r in rows:
+        try:
+            d = date.fromisoformat(r["date"][:10])
+        except (ValueError, TypeError):
+            continue
+        week_last[d.isocalendar()[:2]] = {"close": r["close"], "date": r["date"]}
+
+    weeks_sorted = sorted(week_last.keys())
+    if len(weeks_sorted) < 2:
+        return None
+
+    latest = rows[-1]
+    base = week_last[weeks_sorted[-2]]  # last trading day of the previous completed week
+    if not base.get("close"):
+        return None
+    pct = round((latest["close"] - base["close"]) / base["close"] * 100, 2)
+    return {"v": pct, "d": base["date"]}
+
+
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
@@ -373,16 +423,14 @@ async def main():
         print("✅ index_daily.json uploaded\n")
 
         print("=== INDEX RETURNS ===")
-        returns_rows   = await fetch_index_returns(client)
-        returns_parsed = parse_index_returns(returns_rows, valid_symbols)
-        await upload_with_manifest(client, r2_upload, "index_returns.json", returns_parsed,
-                                    schema_v=1, extra_meta={"index_count": len(returns_parsed)})
-        print("✅ index_returns.json uploaded\n")
+        returns_rows = await fetch_index_returns(client)
+        print(f"  fetched {len(returns_rows)} raw rows\n")
 
         print("=== INDEX HISTORICAL ===")
         symbols = sorted(master_parsed.items())
         total = len(symbols)
         success = failed = 0
+        weekly_map = {}
 
         for i, (symbol, meta) in enumerate(symbols, 1):
             rows   = await fetch_index_history_one(client, meta["api_symbol"])
@@ -391,10 +439,18 @@ async def main():
                 failed += 1
                 print(f"[{i}/{total}] ✗ {symbol} | no data")
                 continue
+            weekly = compute_weekly_return(parsed)
+            if weekly:
+                weekly_map[symbol] = weekly
             await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
                                         schema_v=1, extra_meta={"candle_count": len(parsed)})
             success += 1
             print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles")
+
+        returns_parsed = parse_index_returns(returns_rows, valid_symbols, weekly_map)
+        await upload_with_manifest(client, r2_upload, "index_returns.json", returns_parsed,
+                                    schema_v=1, extra_meta={"index_count": len(returns_parsed), "weekly_count": len(weekly_map)})
+        print("✅ index_returns.json uploaded\n")
 
         print("\n=================================")
         print(" INDEX PIPELINE COMPLETED")
