@@ -13,7 +13,6 @@ HEADERS = {
     "Authorization": f"Bearer {UPSTOX_TOKEN}",
 }
 
-# All instruments — spaces encoded as %20, | and ^ kept raw
 INSTRUMENTS = [
     {"key": "GLOBAL_INDEX|SGX%20NIFTY",  "name": "GIFT NIFTY",  "country": "India"},
     {"key": "GLOBAL_INDEX|^GSPC",         "name": "S&P 500",     "country": "America"},
@@ -30,18 +29,35 @@ INSTRUMENTS = [
     {"key": "GLOBAL_INDICATOR|CLUSD",     "name": "WTI Oil",     "country": ""},
 ]
 
-# ── Fetch V3 OHLC ─────────────────────────────────────────────────────────────
-def fetch_quotes(instruments):
-    results = {}
+# ── Fetch V3 LTP (ltp + cp + volume) ──────────────────────────────────────────
+def fetch_ltp(instruments):
+    # Also fetch OHLC from v3 for open/high/low
+    ltp_data  = {}
+    ohlc_data = {}
+
     for instr in instruments:
-        url = f"https://api.upstox.com/v3/market-quote/ohlc?instrument_key={instr['key']}&interval=1d"
-        r = requests.get(url, headers=HEADERS, timeout=15)
+        key = instr["key"]
+
+        # V3 LTP — ltp, cp (prev close), volume
+        r = requests.get(
+            f"https://api.upstox.com/v3/market-quote/ltp?instrument_key={key}",
+            headers=HEADERS, timeout=15,
+        )
         if r.status_code == 200:
-            results.update(r.json().get("data", {}))
-            print(f"  OK  {instr['name']}")
+            ltp_data.update(r.json().get("data", {}))
+            print(f"  LTP OK  {instr['name']}")
         else:
-            print(f"  ERR {instr['name']} → {r.status_code}: {r.text[:120]}")
-    return results
+            print(f"  LTP ERR {instr['name']} → {r.status_code}: {r.text[:100]}")
+
+        # V3 OHLC (1d) — open/high/low/live_ohlc
+        r2 = requests.get(
+            f"https://api.upstox.com/v3/market-quote/ohlc?instrument_key={key}&interval=1d",
+            headers=HEADERS, timeout=15,
+        )
+        if r2.status_code == 200:
+            ohlc_data.update(r2.json().get("data", {}))
+
+    return ltp_data, ohlc_data
 
 # ── Upload to R2 ───────────────────────────────────────────────────────────────
 def upload_r2(filename, payload):
@@ -49,27 +65,29 @@ def upload_r2(filename, payload):
     r = requests.post(
         f"{WORKER_URL}?file={filename}",
         headers={"X-Secret-Token": WORKER_TOKEN, "Content-Type": "application/json"},
-        data=data,
-        timeout=60,
+        data=data, timeout=60,
     )
     r.raise_for_status()
     print(f"  Uploaded {filename} ({len(data)/1024:.1f} KB) → {r.status_code}")
 
 # ── Build result entry ─────────────────────────────────────────────────────────
-def build_entry(instr, raw):
+def build_entry(instr, ltp_data, ohlc_data):
     lookup    = instr["key"].replace("%20", " ")
     colon_key = lookup.replace("|", ":")
-    quote     = raw.get(lookup) or raw.get(colon_key) or {}
 
-    if not quote:
-        print(f"  MISSING: {instr['name']}")
+    lq = ltp_data.get(lookup)  or ltp_data.get(colon_key)  or {}
+    oq = ohlc_data.get(lookup) or ohlc_data.get(colon_key) or {}
 
-    live   = quote.get("live_ohlc") or {}
-    prev_o = quote.get("prev_ohlc") or {}
-    ltp    = live.get("close")       # live_ohlc.close = current LTP
-    prev_c = prev_o.get("close")     # prev_ohlc.close = previous day close
+    ltp    = lq.get("last_price")
+    prev_c = lq.get("cp")           # V3 LTP: cp = previous day close
+    volume = lq.get("volume")
+
+    live   = oq.get("live_ohlc") or {}
     chg    = round(ltp - prev_c, 4) if ltp is not None and prev_c is not None else None
-    chg_pct = round(chg / prev_c * 100, 2) if chg is not None and prev_c and prev_c != 0 else None
+    chg_pct = round(chg / prev_c * 100, 2) if chg and prev_c else None
+
+    if not lq:
+        print(f"  MISSING: {instr['name']}")
 
     return {
         "key":        lookup,
@@ -82,17 +100,17 @@ def build_entry(instr, raw):
         "high":       live.get("high"),
         "low":        live.get("low"),
         "close":      prev_c,
-        "volume":     quote.get("volume"),
-        "ts":         quote.get("ts"),
+        "volume":     volume,
+        "ts":         lq.get("last_trade_time"),
     }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     print("=== pipeline_global.py ===")
-    print(f"Fetching {len(INSTRUMENTS)} instruments (v3 OHLC)...")
+    print(f"Fetching {len(INSTRUMENTS)} instruments (v3 LTP + OHLC)...")
 
-    raw     = fetch_quotes(INSTRUMENTS)
-    results = [build_entry(i, raw) for i in INSTRUMENTS]
+    ltp_data, ohlc_data = fetch_ltp(INSTRUMENTS)
+    results = [build_entry(i, ltp_data, ohlc_data) for i in INSTRUMENTS]
 
     output = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
