@@ -2,6 +2,8 @@ import os
 import json
 import time
 import requests
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -34,12 +36,19 @@ INSTRUMENTS = [
 
 # ── Fetch quotes ───────────────────────────────────────────────────────────────
 def fetch_quotes(keys: list[str]) -> dict:
-    """Fetch quotes for a batch of instrument keys (max 500)."""
+    """Fetch quotes — use urllib to avoid requests re-encoding | and spaces."""
     key_str = ",".join(keys)
     url = f"{QUOTE_URL}?instrument_key={key_str}"
-    r = requests.get(url, headers=HEADERS, timeout=15)
-    r.raise_for_status()
-    data = r.json()
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {UPSTOX_TOKEN}",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        raise RuntimeError(f"Upstox {e.code}: {body}") from e
     if data.get("status") != "success":
         raise ValueError(f"Upstox error: {data}")
     return data.get("data", {})
