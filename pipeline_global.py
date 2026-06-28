@@ -83,8 +83,10 @@ def build_entry(instr, raw):
 
     ohlc    = quote.get("ohlc", {})
     ltp     = quote.get("last_price")
-    prev    = ohlc.get("close")
-    chg_pct = round((ltp - prev) / prev * 100, 2) if ltp and prev and prev != 0 else None
+    chg     = quote.get("net_change")
+    # prev close = ltp - net_change (ohlc.close is current day close, not prev)
+    prev    = round(ltp - chg, 4) if ltp is not None and chg is not None else ohlc.get("close")
+    chg_pct = round(chg / prev * 100, 2) if chg is not None and prev and prev != 0 else None
 
     return {
         "key":        lookup,
