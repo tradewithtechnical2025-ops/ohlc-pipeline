@@ -371,29 +371,23 @@ def detect_new_nse(old_nse, new_nse, ever_seen_nse, date,
                    new_bse=None, old_bse=None, ever_seen_bse=None, ipo_by_isin=None):
     """
     For each ISIN newly appearing on NSE today:
-
-      1. BSE_TO_NSE        — was on BSE yesterday (old_bse) AND BSE token
-                             is in ever_seen_bse (not a same-day dual IPO).
-      2. NSE_RELISTING     — ever seen on NSE before (suspension lifted).
-      3. NEW_NSE_LISTING   — genuine fresh listing.
-                             tag="IPO"   if ISIN is in IPO data
-                             tag="OTHER" if demerger / spin-off / unknown
-
-    detect_bse_to_nse() is no longer called separately — this function
-    handles BSE→NSE detection inline so there are no duplicate events.
+      1. BSE_TO_NSE      — on BSE yesterday + BSE token in ever_seen_bse (not same-day dual IPO)
+      2. NSE_RELISTING   — ever seen on NSE before
+      3. NEW_NSE_LISTING — fresh listing; tag=IPO if in ipo.json, else tag=OTHER
+    detect_bse_to_nse() is no longer called separately.
     """
-    old_bse_by_isin  = {v["isin"]: v for v in (old_bse  or {}).values()}
-    new_bse_by_isin  = {v["isin"]: v for v in (new_bse  or {}).values()}
-    ever_seen_bse    = ever_seen_bse or {}
-    ipo_by_isin      = ipo_by_isin   or {}
+    old_bse_by_isin = {v["isin"]: v for v in (old_bse or {}).values()}
+    new_bse_by_isin = {v["isin"]: v for v in (new_bse or {}).values()}
+    ever_seen_bse   = ever_seen_bse or {}
+    ipo_by_isin     = ipo_by_isin   or {}
     out = []
 
     for isin in sorted(set(new_nse) - set(old_nse)):
-        s = new_nse[isin]
-
-        # ── Priority 1: BSE→NSE migration ──────────────────────────────
+        s       = new_nse[isin]
         bse_old = old_bse_by_isin.get(isin)
         bse_new = new_bse_by_isin.get(isin)
+
+        # Priority 1: BSE→NSE migration
         if (bse_old is not None
                 and bse_new is not None
                 and bse_new["exchange_token"] in ever_seen_bse
@@ -410,32 +404,21 @@ def detect_new_nse(old_nse, new_nse, ever_seen_nse, date,
             })
             continue
 
-        # ── Priority 2: Relisting (was on NSE before) ──────────────────
+        # Priority 2: Relisting
         if isin in ever_seen_nse:
-            ev = {
-                "event":   "NSE_RELISTING",
-                "date":    date,
-                "symbol":  s["symbol"],
-                "name":    s["name"],
-                "isin":    isin,
-                "segment": s["segment"],
-            }
+            ev = {"event": "NSE_RELISTING", "date": date,
+                  "symbol": s["symbol"], "name": s["name"],
+                  "isin": isin, "segment": s["segment"]}
             if bse_new:
                 ev["bse_code"] = bse_new["exchange_token"]
             out.append(ev)
             continue
 
-        # ── Priority 3: Fresh listing — IPO or other ───────────────────
-        tag = "IPO" if isin in ipo_by_isin else "OTHER"
-        ev = {
-            "event":   "NEW_NSE_LISTING",
-            "date":    date,
-            "symbol":  s["symbol"],
-            "name":    s["name"],
-            "isin":    isin,
-            "segment": s["segment"],
-            "tag":     tag,
-        }
+        # Priority 3: Fresh listing
+        ev = {"event": "NEW_NSE_LISTING", "date": date,
+              "symbol": s["symbol"], "name": s["name"],
+              "isin": isin, "segment": s["segment"],
+              "tag": "IPO" if isin in ipo_by_isin else "OTHER"}
         if bse_new:
             ev["bse_code"] = bse_new["exchange_token"]
         out.append(ev)
@@ -690,8 +673,9 @@ async def main():
         # Detect all events
         # --------------------------------------------------
 
-        # Load IPO data once — used by both detect_new_bse and detect_new_nse
+        # Load IPO data once — used by detect_new_bse, detect_new_nse, and safety net #3
         ipo_raw = await r2_download(client, "reports/ipo.json") or []
+        ipo_raw = ipo_raw.get("ipos", ipo_raw) if isinstance(ipo_raw, dict) else ipo_raw
         ipo_by_isin = {x["isin"]: x for x in ipo_raw if x.get("isin")}
 
         all_events = []
@@ -822,6 +806,66 @@ async def main():
             recent_backfilled += 1
         if recent_backfilled:
             print(f"🔁 Backfilled {recent_backfilled} NEW_NSE_LISTING from NSE's recent-listings feed (not caught by snapshot diff)")
+
+        # Safety net #3: IPO data cross-check — catches NEW_BSE_LISTING / NEW_NSE_LISTING
+        # missed by snapshot diff. listing_exchange tells which exchanges to fire events for.
+        already_recorded_isins_all = {
+            e.get("isin") for e in existing_events + all_events if e.get("isin")
+        }
+        bse_snap_by_isin = {v["isin"]: v for v in new_bse.values()}
+        nse_snap_by_isin = new_nse
+
+        ipo_backfilled = 0
+        for ipo in ipo_raw:
+            isin         = ipo.get("isin")
+            listing_date = ipo.get("listing_date")
+            exchanges    = (ipo.get("listing_exchange") or "").upper()
+            if not isin or not listing_date or not exchanges:
+                continue
+            if listing_date != today:
+                continue
+            if isin in already_recorded_isins_all:
+                continue
+
+            on_bse = "BSE" in exchanges
+            on_nse = "NSE" in exchanges
+            bse    = bse_snap_by_isin.get(isin)
+            nse    = nse_snap_by_isin.get(isin)
+
+            if on_bse and bse:
+                all_events.append({
+                    "event":    "NEW_BSE_LISTING",
+                    "date":     today,
+                    "symbol":   bse["trading_symbol"],
+                    "name":     bse["name"],
+                    "isin":     isin,
+                    "bse_code": bse["exchange_token"],
+                    "segment":  bse["segment"],
+                    "tag":      "IPO",
+                    "source":   "ipo_safety_net",
+                })
+                ipo_backfilled += 1
+
+            if on_nse and nse:
+                ev = {
+                    "event":   "NEW_NSE_LISTING",
+                    "date":    today,
+                    "symbol":  nse["symbol"],
+                    "name":    nse["name"],
+                    "isin":    isin,
+                    "segment": nse["segment"],
+                    "tag":     "IPO",
+                    "source":  "ipo_safety_net",
+                }
+                if bse:
+                    ev["bse_code"] = bse["exchange_token"]
+                all_events.append(ev)
+                ipo_backfilled += 1
+
+            already_recorded_isins_all.add(isin)
+
+        if ipo_backfilled:
+            print(f"🔁 Backfilled {ipo_backfilled} IPO listing event(s) from ipo.json (not caught by snapshot diff)")
 
         summary_entry = {
             "date":                  today,
