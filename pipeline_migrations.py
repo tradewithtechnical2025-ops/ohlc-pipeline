@@ -362,7 +362,7 @@ def detect_new_bse(old_bse, new_bse, ever_seen_bse, date, ipo_by_isin=None):
             "segment":  s["segment"],
         }
         if event_type == "NEW_BSE_LISTING":
-            ev["tag"] = "IPO" if s["isin"] in ipo_by_isin else "OTHER"
+            ev["tag"] = ipo_tag(isin) if s["isin"] in ipo_by_isin else "OTHER"
         out.append(ev)
     return out
 
@@ -418,7 +418,7 @@ def detect_new_nse(old_nse, new_nse, ever_seen_nse, date,
         ev = {"event": "NEW_NSE_LISTING", "date": date,
               "symbol": s["symbol"], "name": s["name"],
               "isin": isin, "segment": s["segment"],
-              "tag": "IPO" if isin in ipo_by_isin else "OTHER"}
+              "tag": ipo_tag(isin) if isin in ipo_by_isin else "OTHER"}
         if bse_new:
             ev["bse_code"] = bse_new["exchange_token"]
         out.append(ev)
@@ -677,6 +677,7 @@ async def main():
         ipo_raw = await r2_download(client, "ipo_data.json") or []
         ipo_raw = ipo_raw.get("ipos", ipo_raw) if isinstance(ipo_raw, dict) else ipo_raw
         ipo_by_isin = {x["isin"]: x for x in ipo_raw if x.get("isin")}
+        def ipo_tag(isin): return "IPO_SME" if ipo_by_isin.get(isin, {}).get("issue_type") == "sme" else "IPO_MAINBOARD"
 
         all_events = []
         all_events += detect_new_bse(old_bse, new_bse, ever_seen_bse, today, ipo_by_isin=ipo_by_isin)
@@ -841,7 +842,7 @@ async def main():
                     "isin":     isin,
                     "bse_code": bse["exchange_token"],
                     "segment":  bse["segment"],
-                    "tag":      "IPO",
+                    "tag":      ipo_tag(isin),
                     "source":   "ipo_safety_net",
                 })
                 ipo_backfilled += 1
@@ -854,7 +855,7 @@ async def main():
                     "name":    nse["name"],
                     "isin":    isin,
                     "segment": nse["segment"],
-                    "tag":     "IPO",
+                    "tag":     ipo_tag(isin),
                     "source":  "ipo_safety_net",
                 }
                 if bse:
