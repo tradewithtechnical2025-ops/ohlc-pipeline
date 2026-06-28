@@ -4,6 +4,7 @@ import time
 import requests
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -37,7 +38,8 @@ INSTRUMENTS = [
 # ── Fetch quotes ───────────────────────────────────────────────────────────────
 def fetch_quotes(keys: list[str]) -> dict:
     """Fetch quotes — use urllib to avoid requests re-encoding | and spaces."""
-    key_str = ",".join(keys)
+    # Encode only spaces; leave | ^ , as-is (Upstox requires unencoded)
+    key_str = ",".join(k.replace(" ", "%20") for k in keys)
     url = f"{QUOTE_URL}?instrument_key={key_str}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {UPSTOX_TOKEN}",
