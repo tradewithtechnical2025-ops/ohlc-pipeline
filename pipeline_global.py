@@ -44,6 +44,7 @@ def fetch_quotes(keys: list[str]) -> dict:
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {UPSTOX_TOKEN}",
         "Accept": "application/json",
+        "User-Agent": "python-requests/2.31.0",
     })
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
