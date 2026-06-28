@@ -1279,33 +1279,24 @@ def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,vol
 GAP_KEEP_DAYS_AFTER_FILL = 30   # filled gaps pruned this many days after fill_date
 
 def _scan_new_gap_event(dates, highs, lows, i, min_gap_pct):
-    """Check candle i (vs i-1) for a fresh gap-up or gap-down. Returns event dict or None."""
+    """Check candle i (vs i-1) for a fresh gap-down. Returns event dict or None."""
     prev_low=lows[i-1]; today_high=highs[i]
-    prev_high=highs[i-1]; today_low=lows[i]
     if prev_low is not None and today_high is not None and today_high<prev_low:
         gap_pct=(prev_low-today_high)/prev_low*100
         if gap_pct>=min_gap_pct:
             return {"gap_date":dates[i],"prev_date":dates[i-1],"direction":"down",
                 "gap_pct":round(gap_pct,2),"gap_top":round(prev_low,2),
                 "filled":False,"fill_date":None}
-    if prev_high is not None and today_low is not None and today_low>prev_high:
-        gap_pct=(today_low-prev_high)/prev_high*100
-        if gap_pct>=min_gap_pct:
-            return {"gap_date":dates[i],"prev_date":dates[i-1],"direction":"up",
-                "gap_pct":round(gap_pct,2),"gap_top":round(prev_high,2),
-                "filled":False,"fill_date":None}
     return None
 
 def _check_gap_fills(sym_gaps, dates, closes, from_idx):
-    """Mark fill_date on open gaps whose gap_top gets crossed by a close from from_idx onward."""
+    """Mark fill_date on open gap-downs whose gap_top gets crossed by a close."""
     for g in sym_gaps:
         if g["filled"]: continue
         for j in range(from_idx, len(dates)):
             c=closes[j]
             if c is None: continue
-            if g["direction"]=="down" and c>=g["gap_top"]:
-                g["filled"]=True; g["fill_date"]=dates[j]; break
-            if g["direction"]=="up" and c<=g["gap_top"]:
+            if c>=g["gap_top"]:
                 g["filled"]=True; g["fill_date"]=dates[j]; break
 
 async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days_after_fill=GAP_KEEP_DAYS_AFTER_FILL):
@@ -1360,7 +1351,7 @@ async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days
     return gaps_by_sym
 
 def _build_gap_state(all_data, gaps_by_sym, today, near_pct=5.0):
-    """Per-symbol CURRENT gap state for screener_feed — same shape/keys as before."""
+    """Per-symbol CURRENT gap-down state for screener_feed."""
     gap_state={}
     for sym, sym_gaps in gaps_by_sym.items():
         if sym not in all_data: continue
@@ -1368,25 +1359,28 @@ def _build_gap_state(all_data, gaps_by_sym, today, near_pct=5.0):
         ltp=next((v for v in reversed(closes) if v is not None), None)
         if ltp is None: continue
 
-        just_filled=next((g for g in reversed(sym_gaps) if g["filled"] and g["fill_date"]==today), None)
+        down_gaps=[g for g in sym_gaps if g.get("direction")=="down"]
+        if not down_gaps: continue
+
+        just_filled=next((g for g in reversed(down_gaps) if g["filled"] and g["fill_date"]==today), None)
         if just_filled:
-            gap_state[sym]={"state":"Gap Filled","direction":just_filled["direction"],
+            gap_state[sym]={"state":"Gap Filled","direction":"down",
                 "gap_date":just_filled["gap_date"],"gap_pct":just_filled["gap_pct"],
                 "gap_top":just_filled["gap_top"],"fill_date":just_filled["fill_date"]}
             continue
 
-        open_gap=next((g for g in reversed(sym_gaps) if not g["filled"]), None)
+        open_gap=next((g for g in reversed(down_gaps) if not g["filled"]), None)
         if not open_gap: continue
         level=open_gap["gap_top"]
         if not level: continue
-        dist_pct=(level-ltp)/level*100 if open_gap["direction"]=="down" else (ltp-level)/level*100
+        dist_pct=(level-ltp)/level*100
         if not (0<=dist_pct<=near_pct): continue
 
         recent=[c for c in closes[-6:-1] if c is not None]
         recent_near=bool(recent and len(recent)==5 and all(abs((level-c)/level*100)<=near_pct for c in recent))
 
         gap_state[sym]={"state":"Consolidating near Gap" if recent_near else "Near Gap",
-            "direction":open_gap["direction"],"gap_date":open_gap["gap_date"],
+            "direction":"down","gap_date":open_gap["gap_date"],
             "gap_pct":open_gap["gap_pct"],"gap_top":level,"dist_pct":round(dist_pct,2)}
     return gap_state
 
