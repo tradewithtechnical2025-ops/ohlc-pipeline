@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
 One-time backfill script.
-Adds missing `tag` and `bse_code` fields to existing events.json entries.
-
-Run once:
-    WORKER_URL=... WORKER_TOKEN=... python3 backfill_events.py
+1. Fixes tag: "OTHER" → "IPO" where ISIN matches ipo_data.json
+2. Adds missing NEW_BSE_LISTING for stocks that have bse_code but no BSE event
 """
 
 import asyncio
@@ -48,42 +46,63 @@ async def main():
 
         print("📥 Loading data from R2...")
         events   = await r2_download(client, "reports/events.json")    or []
-        ipo_resp = await r2_download(client, "ipo_data.json")  or {}
+        ipo_resp = await r2_download(client, "ipo_data.json")          or {}
         bse_snap = await r2_download(client, "snapshots/upstox_bse.json") or {}
 
-        # ipo_data.json has structure {"ipos": [...], ...}
         ipo_raw = ipo_resp.get("ipos", ipo_resp) if isinstance(ipo_resp, dict) else ipo_resp
 
         print(f"   events.json     : {len(events)} entries")
         print(f"   ipo_data.json   : {len(ipo_raw)} IPOs")
         print(f"   upstox_bse.json : {len(bse_snap)} tokens")
 
-        # Build lookup maps
         ipo_by_isin = {x["isin"]: x for x in ipo_raw if x.get("isin")}
-        bse_by_isin = {v["isin"]: v["exchange_token"] for v in bse_snap.values() if v.get("isin")}
+        bse_by_isin = {v["isin"]: v for v in bse_snap.values() if v.get("isin")}
 
-        tag_added      = 0
-        bse_code_added = 0
+        tag_fixed       = 0
+        bse_added       = 0
+        existing_isins  = {e.get("isin") for e in events if e.get("event") == "NEW_BSE_LISTING"}
+
+        new_bse_events = []
 
         for ev in events:
             event_type = ev.get("event", "")
             isin       = ev.get("isin")
 
-            # Add tag to NEW_BSE_LISTING / NEW_NSE_LISTING
-            if event_type in ("NEW_BSE_LISTING", "NEW_NSE_LISTING") and "tag" not in ev:
-                ev["tag"] = "IPO" if (isin and isin in ipo_by_isin) else "OTHER"
-                tag_added += 1
+            # Fix tag: OTHER → IPO where ISIN matches ipo_data
+            if event_type in ("NEW_BSE_LISTING", "NEW_NSE_LISTING"):
+                if isin and isin in ipo_by_isin and ev.get("tag") != "IPO":
+                    ev["tag"] = "IPO"
+                    tag_fixed += 1
 
-            # Add bse_code where missing
-            if "bse_code" not in ev and isin and isin in bse_by_isin:
-                ev["bse_code"] = bse_by_isin[isin]
-                bse_code_added += 1
+            # Add missing NEW_BSE_LISTING for NEW_NSE_LISTING with bse_code
+            if event_type == "NEW_NSE_LISTING" and isin and ev.get("bse_code"):
+                if isin not in existing_isins:
+                    bse = bse_by_isin.get(isin)
+                    if bse:
+                        new_bse_events.append({
+                            "event":    "NEW_BSE_LISTING",
+                            "date":     ev["date"],
+                            "symbol":   bse["trading_symbol"],
+                            "name":     bse["name"],
+                            "isin":     isin,
+                            "bse_code": bse["exchange_token"],
+                            "segment":  bse["segment"],
+                            "tag":      "IPO" if isin in ipo_by_isin else "OTHER",
+                            "source":   "backfill",
+                        })
+                        existing_isins.add(isin)
+                        bse_added += 1
 
-        print(f"\n🔧 tag added      : {tag_added}")
-        print(f"🔧 bse_code added : {bse_code_added}")
+        events.extend(new_bse_events)
 
-        if tag_added == 0 and bse_code_added == 0:
-            print("✅ Nothing to update — all entries already have tag + bse_code")
+        print(f"\n🔧 tag fixed (OTHER→IPO) : {tag_fixed}")
+        print(f"🔧 NEW_BSE_LISTING added : {bse_added}")
+        if new_bse_events:
+            for e in new_bse_events:
+                print(f"   + {e['symbol']} ({e['date']}) bse_code={e['bse_code']}")
+
+        if tag_fixed == 0 and bse_added == 0:
+            print("✅ Nothing to update")
             return
 
         await r2_upload(client, "reports/events.json", events)
