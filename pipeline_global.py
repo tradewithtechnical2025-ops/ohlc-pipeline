@@ -62,14 +62,15 @@ def fetch_ltp_v3(instruments):
 
 # ── Upload to R2 ───────────────────────────────────────────────────────────────
 def upload_r2(filename, payload):
+    data = json.dumps(payload, separators=(",", ":")).encode()
     r = requests.post(
-        f"{WORKER_URL}/{filename}",
+        f"{WORKER_URL}?file={filename}",
         headers={"X-Secret-Token": WORKER_TOKEN, "Content-Type": "application/json"},
-        data=json.dumps(payload),
-        timeout=30,
+        data=data,
+        timeout=60,
     )
     r.raise_for_status()
-    print(f"  Uploaded {filename} → {r.status_code}")
+    print(f"  Uploaded {filename} ({len(data)/1024:.1f} KB) → {r.status_code}")
 
 # ── Build result entry ─────────────────────────────────────────────────────────
 def build_entry(instr, raw):
@@ -107,11 +108,8 @@ def main():
     print(f"Fetching {len(INDEX_INSTRUMENTS)} indices (v2 full quotes)...")
     index_raw = fetch_full_quotes(INDEX_INSTRUMENTS)
 
-    print(f"Fetching {len(INDICATOR_INSTRUMENTS)} indicators (v3 ltp)...")
-    indicator_raw = fetch_ltp_v3(INDICATOR_INSTRUMENTS)
-
-    all_raw = {**index_raw, **indicator_raw}
-    all_instruments = INDEX_INSTRUMENTS + INDICATOR_INSTRUMENTS
+    all_raw = index_raw
+    all_instruments = INDEX_INSTRUMENTS
 
     results = [build_entry(i, all_raw) for i in all_instruments]
 
