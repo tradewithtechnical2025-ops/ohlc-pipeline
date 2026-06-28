@@ -13,8 +13,8 @@ HEADERS = {
     "Authorization": f"Bearer {UPSTOX_TOKEN}",
 }
 
-# GLOBAL_INDEX instruments (supported by v2 full quotes)
-INDEX_INSTRUMENTS = [
+# All instruments — spaces encoded as %20, | and ^ kept raw
+INSTRUMENTS = [
     {"key": "GLOBAL_INDEX|SGX%20NIFTY",  "name": "GIFT NIFTY",  "country": "India"},
     {"key": "GLOBAL_INDEX|^GSPC",         "name": "S&P 500",     "country": "America"},
     {"key": "GLOBAL_INDEX|^DJI",          "name": "DOW JONES",   "country": "America"},
@@ -25,39 +25,22 @@ INDEX_INSTRUMENTS = [
     {"key": "GLOBAL_INDEX|^HSI",          "name": "HANG SENG",   "country": "Hong Kong"},
     {"key": "GLOBAL_INDEX|^N225",         "name": "NIKKEI 225",  "country": "Japan"},
     {"key": "NSE_INDEX|India%20VIX",      "name": "India VIX",   "country": "India"},
-]
-
-# GLOBAL_INDICATOR — try LTP V3 separately
-INDICATOR_INSTRUMENTS = [
     {"key": "GLOBAL_INDICATOR|USDINR",    "name": "USD/INR",     "country": ""},
     {"key": "GLOBAL_INDICATOR|BZUSD",     "name": "Brent Oil",   "country": ""},
     {"key": "GLOBAL_INDICATOR|CLUSD",     "name": "WTI Oil",     "country": ""},
 ]
 
-# ── Fetch full quotes (indices) ────────────────────────────────────────────────
-def fetch_full_quotes(instruments):
+# ── Fetch V3 OHLC ─────────────────────────────────────────────────────────────
+def fetch_quotes(instruments):
     results = {}
     for instr in instruments:
-        url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={instr['key']}"
+        url = f"https://api.upstox.com/v3/market-quote/ohlc?instrument_key={instr['key']}&interval=1d"
         r = requests.get(url, headers=HEADERS, timeout=15)
         if r.status_code == 200:
             results.update(r.json().get("data", {}))
             print(f"  OK  {instr['name']}")
         else:
-            print(f"  ERR {instr['name']} → {r.status_code}: {r.text[:100]}")
-    return results
-
-# ── Fetch LTP V3 (indicators) ─────────────────────────────────────────────────
-def fetch_ltp_v3(instruments):
-    results = {}
-    for instr in instruments:
-        url = f"https://api.upstox.com/v3/market-quote/ltp?instrument_key={instr['key']}"
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        if r.status_code == 200:
-            results.update(r.json().get("data", {}))
-            print(f"  OK  {instr['name']}")
-        else:
-            print(f"  ERR {instr['name']} → {r.status_code}: {r.text[:100]}")
+            print(f"  ERR {instr['name']} → {r.status_code}: {r.text[:120]}")
     return results
 
 # ── Upload to R2 ───────────────────────────────────────────────────────────────
@@ -74,46 +57,42 @@ def upload_r2(filename, payload):
 
 # ── Build result entry ─────────────────────────────────────────────────────────
 def build_entry(instr, raw):
-    lookup = instr["key"].replace("%20", " ")
+    lookup    = instr["key"].replace("%20", " ")
     colon_key = lookup.replace("|", ":")
-    quote = raw.get(lookup) or raw.get(colon_key) or {}
+    quote     = raw.get(lookup) or raw.get(colon_key) or {}
 
     if not quote:
         print(f"  MISSING: {instr['name']}")
 
-    ohlc    = quote.get("ohlc", {})
-    ltp     = quote.get("last_price")
-    chg     = quote.get("net_change")
-    # prev close = ltp - net_change (ohlc.close is current day close, not prev)
-    prev    = round(ltp - chg, 4) if ltp is not None and chg is not None else ohlc.get("close")
-    chg_pct = round(chg / prev * 100, 2) if chg is not None and prev and prev != 0 else None
+    live   = quote.get("live_ohlc") or {}
+    prev_o = quote.get("prev_ohlc") or {}
+    ltp    = live.get("close")       # live_ohlc.close = current LTP
+    prev_c = prev_o.get("close")     # prev_ohlc.close = previous day close
+    chg    = round(ltp - prev_c, 4) if ltp is not None and prev_c is not None else None
+    chg_pct = round(chg / prev_c * 100, 2) if chg is not None and prev_c and prev_c != 0 else None
 
     return {
         "key":        lookup,
         "name":       instr["name"],
         "country":    instr["country"],
         "ltp":        ltp,
-        "change":     quote.get("net_change"),
+        "change":     chg,
         "change_pct": chg_pct,
-        "open":       ohlc.get("open"),
-        "high":       ohlc.get("high"),
-        "low":        ohlc.get("low"),
-        "close":      prev,
+        "open":       live.get("open"),
+        "high":       live.get("high"),
+        "low":        live.get("low"),
+        "close":      prev_c,
         "volume":     quote.get("volume"),
-        "ts":         quote.get("last_trade_time"),
+        "ts":         quote.get("ts"),
     }
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
     print("=== pipeline_global.py ===")
+    print(f"Fetching {len(INSTRUMENTS)} instruments (v3 OHLC)...")
 
-    print(f"Fetching {len(INDEX_INSTRUMENTS)} indices (v2 full quotes)...")
-    index_raw = fetch_full_quotes(INDEX_INSTRUMENTS)
-
-    all_raw = index_raw
-    all_instruments = INDEX_INSTRUMENTS
-
-    results = [build_entry(i, all_raw) for i in all_instruments]
+    raw     = fetch_quotes(INSTRUMENTS)
+    results = [build_entry(i, raw) for i in INSTRUMENTS]
 
     output = {
         "updated_at": datetime.now(timezone.utc).isoformat(),
