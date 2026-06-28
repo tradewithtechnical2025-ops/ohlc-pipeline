@@ -339,17 +339,20 @@ def backfill_ever_seen(ever_seen_bse, ever_seen_nse, old_bse, old_nse, existing_
 # DETECT EVENTS
 # =========================================================
 
-def detect_new_bse(old_bse, new_bse, ever_seen_bse, date):
+def detect_new_bse(old_bse, new_bse, ever_seen_bse, date, ipo_by_isin=None):
     """
     NEW_BSE_LISTING   = token never seen before  -> genuine fresh listing
+                        tag="IPO"   if ISIN matches IPO data
+                        tag="OTHER" if demerger / spin-off / unknown
     BSE_RELISTING     = token seen before, missing yesterday, back today
                         -> suspension lifted / re-admitted to trading
     """
+    ipo_by_isin = ipo_by_isin or {}
     out = []
     for token in sorted(set(new_bse) - set(old_bse)):
         s = new_bse[token]
         event_type = "BSE_RELISTING" if token in ever_seen_bse else "NEW_BSE_LISTING"
-        out.append({
+        ev = {
             "event":    event_type,
             "date":     date,
             "symbol":   s["trading_symbol"],
@@ -357,33 +360,86 @@ def detect_new_bse(old_bse, new_bse, ever_seen_bse, date):
             "isin":     s["isin"],
             "bse_code": token,
             "segment":  s["segment"],
-        })
+        }
+        if event_type == "NEW_BSE_LISTING":
+            ev["tag"] = "IPO" if s["isin"] in ipo_by_isin else "OTHER"
+        out.append(ev)
     return out
 
 
-def detect_new_nse(old_nse, new_nse, ever_seen_nse, date, new_bse=None):
+def detect_new_nse(old_nse, new_nse, ever_seen_nse, date,
+                   new_bse=None, old_bse=None, ever_seen_bse=None, ipo_by_isin=None):
     """
-    NEW_NSE_LISTING   = ISIN never seen on NSE before -> genuine fresh listing
-    NSE_RELISTING     = ISIN seen before, missing yesterday, back today
-    Includes bse_code when the same ISIN is also listed on BSE today.
+    For each ISIN newly appearing on NSE today:
+
+      1. BSE_TO_NSE        — was on BSE yesterday (old_bse) AND BSE token
+                             is in ever_seen_bse (not a same-day dual IPO).
+      2. NSE_RELISTING     — ever seen on NSE before (suspension lifted).
+      3. NEW_NSE_LISTING   — genuine fresh listing.
+                             tag="IPO"   if ISIN is in IPO data
+                             tag="OTHER" if demerger / spin-off / unknown
+
+    detect_bse_to_nse() is no longer called separately — this function
+    handles BSE→NSE detection inline so there are no duplicate events.
     """
-    bse_by_isin = {v["isin"]: v for v in (new_bse or {}).values()}
+    old_bse_by_isin  = {v["isin"]: v for v in (old_bse  or {}).values()}
+    new_bse_by_isin  = {v["isin"]: v for v in (new_bse  or {}).values()}
+    ever_seen_bse    = ever_seen_bse or {}
+    ipo_by_isin      = ipo_by_isin   or {}
     out = []
+
     for isin in sorted(set(new_nse) - set(old_nse)):
         s = new_nse[isin]
-        event_type = "NSE_RELISTING" if isin in ever_seen_nse else "NEW_NSE_LISTING"
+
+        # ── Priority 1: BSE→NSE migration ──────────────────────────────
+        bse_old = old_bse_by_isin.get(isin)
+        bse_new = new_bse_by_isin.get(isin)
+        if (bse_old is not None
+                and bse_new is not None
+                and bse_new["exchange_token"] in ever_seen_bse
+                and isin not in ever_seen_nse
+                and s["segment"] == "NSE_EQ"):
+            out.append({
+                "event":       "BSE_TO_NSE",
+                "date":        date,
+                "symbol":      s["symbol"],
+                "name":        s["name"],
+                "isin":        isin,
+                "bse_code":    bse_new["exchange_token"],
+                "bse_segment": bse_old["segment"],
+            })
+            continue
+
+        # ── Priority 2: Relisting (was on NSE before) ──────────────────
+        if isin in ever_seen_nse:
+            ev = {
+                "event":   "NSE_RELISTING",
+                "date":    date,
+                "symbol":  s["symbol"],
+                "name":    s["name"],
+                "isin":    isin,
+                "segment": s["segment"],
+            }
+            if bse_new:
+                ev["bse_code"] = bse_new["exchange_token"]
+            out.append(ev)
+            continue
+
+        # ── Priority 3: Fresh listing — IPO or other ───────────────────
+        tag = "IPO" if isin in ipo_by_isin else "OTHER"
         ev = {
-            "event":   event_type,
+            "event":   "NEW_NSE_LISTING",
             "date":    date,
             "symbol":  s["symbol"],
             "name":    s["name"],
             "isin":    isin,
             "segment": s["segment"],
+            "tag":     tag,
         }
-        bse = bse_by_isin.get(isin)
-        if bse:
-            ev["bse_code"] = bse["exchange_token"]
+        if bse_new:
+            ev["bse_code"] = bse_new["exchange_token"]
         out.append(ev)
+
     return out
 
 
@@ -634,8 +690,12 @@ async def main():
         # Detect all events
         # --------------------------------------------------
 
+        # Load IPO data once — used by both detect_new_bse and detect_new_nse
+        ipo_raw = await r2_download(client, "reports/ipo.json") or []
+        ipo_by_isin = {x["isin"]: x for x in ipo_raw if x.get("isin")}
+
         all_events = []
-        all_events += detect_new_bse(old_bse, new_bse, ever_seen_bse, today)
+        all_events += detect_new_bse(old_bse, new_bse, ever_seen_bse, today, ipo_by_isin=ipo_by_isin)
 
         # Bootstrap guard: if yesterday's snapshot has zero NSE_SME entries,
         # this is the first run since NSE_SME tracking was added — every
@@ -644,7 +704,11 @@ async def main():
         # segment=NSE_SME this one time; they still get registered in
         # ever_seen_nse further below so detection is normal from here on.
         old_nse_has_sme = any(v.get("segment") == "NSE_SME" for v in old_nse.values())
-        nse_new_events = detect_new_nse(old_nse, new_nse, ever_seen_nse, today, new_bse)
+        nse_new_events = detect_new_nse(
+            old_nse, new_nse, ever_seen_nse, today,
+            new_bse=new_bse, old_bse=old_bse,
+            ever_seen_bse=ever_seen_bse, ipo_by_isin=ipo_by_isin,
+        )
         if not old_nse_has_sme:
             suppressed = [e for e in nse_new_events if e.get("segment") == "NSE_SME"]
             nse_new_events = [e for e in nse_new_events if e.get("segment") != "NSE_SME"]
@@ -673,7 +737,7 @@ async def main():
                 print(f"🧹 NSE bond-filter bootstrap: suppressed {suppressed} false DELISTED_NSE (bonds now excluded from tracking, not real delistings)")
         all_events += delisted_nse_events
 
-        all_events += detect_bse_to_nse(old_nse, new_nse, new_bse, ever_seen_nse, today, old_bse, ever_seen_bse)
+        # detect_bse_to_nse() removed — now handled inside detect_new_nse()
         all_events += detect_sme_to_mainboard(old_bse, new_bse, today)
         all_events += detect_nse_sme_to_mainboard(old_nse, new_nse, today)
         all_events += detect_sme_to_nse(old_nse, new_nse, old_bse, ever_seen_nse, today)
