@@ -23,39 +23,58 @@ INSTRUMENTS = [
     {"key": "GLOBAL_INDEX|^FCHI",         "name": "CAC 40",      "country": "France"},
     {"key": "GLOBAL_INDEX|^HSI",          "name": "HANG SENG",   "country": "Hong Kong"},
     {"key": "GLOBAL_INDEX|^N225",         "name": "NIKKEI 225",  "country": "Japan"},
-    {"key": "NSE_INDEX|India%20VIX",      "name": "India VIX",   "country": "India"},
-    {"key": "GLOBAL_INDICATOR|USDINR",    "name": "USD/INR",     "country": ""},
-    {"key": "GLOBAL_INDICATOR|BZUSD",     "name": "Brent Oil",   "country": ""},
-    {"key": "GLOBAL_INDICATOR|CLUSD",     "name": "WTI Oil",     "country": ""},
+    {"key": "NSE_INDEX|India%20VIX",             "name": "India VIX",        "country": "India"},
+    {"key": "GLOBAL_INDICATOR|USDINR",           "name": "USD/INR",          "country": ""},
+    {"key": "GLOBAL_INDICATOR|BZUSD",            "name": "Brent Oil",        "country": ""},
+    {"key": "GLOBAL_INDICATOR|CLUSD",            "name": "WTI Oil",          "country": ""},
+    # Indian Indices
+    {"key": "NSE_INDEX|Nifty%2050",              "name": "NIFTY 50",         "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Bank",            "name": "NIFTY BANK",       "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Fin%20Service",   "name": "NIFTY FIN SVC",    "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20IT",              "name": "NIFTY IT",         "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Midcap%2050",     "name": "NIFTY MIDCAP 50",  "country": "India"},
+    {"key": "NSE_INDEX|NIFTY%20MID%20SELECT",    "name": "NIFTY MID SELECT", "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Auto",            "name": "NIFTY AUTO",       "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20FMCG",           "name": "NIFTY FMCG",       "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Pharma",          "name": "NIFTY PHARMA",     "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Realty",          "name": "NIFTY REALTY",     "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Metal",           "name": "NIFTY METAL",      "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Energy",          "name": "NIFTY ENERGY",     "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Media",           "name": "NIFTY MEDIA",      "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20PSU%20Bank",      "name": "NIFTY PSU BANK",   "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Infra",           "name": "NIFTY INFRA",      "country": "India"},
+    {"key": "NSE_INDEX|Nifty%20Smallcap%2050",   "name": "NIFTY SMLCAP 50",  "country": "India"},
+    {"key": "BSE_INDEX|SENSEX",                  "name": "SENSEX",           "country": "India"},
+    {"key": "BSE_INDEX|BANKEX",                  "name": "BANKEX",           "country": "India"},
 ]
 
-# ── Fetch V3 LTP (ltp + cp + volume) ──────────────────────────────────────────
+# ── Fetch V3 LTP + OHLC in single batch calls ────────────────────────────────
 def fetch_ltp(instruments):
-    # Also fetch OHLC from v3 for open/high/low
-    ltp_data  = {}
+    key_str   = ",".join(i["key"] for i in instruments)
+
+    # V3 LTP batch — ltp, cp (prev close), volume
+    r = requests.get(
+        f"https://api.upstox.com/v3/market-quote/ltp?instrument_key={key_str}",
+        headers=HEADERS, timeout=30,
+    )
+    ltp_data = {}
+    if r.status_code == 200:
+        ltp_data = r.json().get("data", {})
+        print(f"  LTP batch OK — {len(ltp_data)} quotes")
+    else:
+        print(f"  LTP batch ERR → {r.status_code}: {r.text[:200]}")
+
+    # V3 OHLC batch — live_ohlc for open/high/low
+    r2 = requests.get(
+        f"https://api.upstox.com/v3/market-quote/ohlc?instrument_key={key_str}&interval=1d",
+        headers=HEADERS, timeout=30,
+    )
     ohlc_data = {}
-
-    for instr in instruments:
-        key = instr["key"]
-
-        # V3 LTP — ltp, cp (prev close), volume
-        r = requests.get(
-            f"https://api.upstox.com/v3/market-quote/ltp?instrument_key={key}",
-            headers=HEADERS, timeout=15,
-        )
-        if r.status_code == 200:
-            ltp_data.update(r.json().get("data", {}))
-            print(f"  LTP OK  {instr['name']}")
-        else:
-            print(f"  LTP ERR {instr['name']} → {r.status_code}: {r.text[:100]}")
-
-        # V3 OHLC (1d) — open/high/low/live_ohlc
-        r2 = requests.get(
-            f"https://api.upstox.com/v3/market-quote/ohlc?instrument_key={key}&interval=1d",
-            headers=HEADERS, timeout=15,
-        )
-        if r2.status_code == 200:
-            ohlc_data.update(r2.json().get("data", {}))
+    if r2.status_code == 200:
+        ohlc_data = r2.json().get("data", {})
+        print(f"  OHLC batch OK — {len(ohlc_data)} quotes")
+    else:
+        print(f"  OHLC batch ERR → {r2.status_code}: {r2.text[:200]}")
 
     return ltp_data, ohlc_data
 
