@@ -674,7 +674,7 @@ async def main():
         # --------------------------------------------------
 
         # Load IPO data once — used by detect_new_bse, detect_new_nse, and safety net #3
-        ipo_raw = await r2_download(client, "reports/ipo.json") or []
+        ipo_raw = await r2_download(client, "reports/ipo_data.json") or []
         ipo_raw = ipo_raw.get("ipos", ipo_raw) if isinstance(ipo_raw, dict) else ipo_raw
         ipo_by_isin = {x["isin"]: x for x in ipo_raw if x.get("isin")}
 
