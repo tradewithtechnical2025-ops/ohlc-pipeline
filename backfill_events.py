@@ -71,8 +71,9 @@ async def main():
 
             # Fix tag: OTHER → IPO where ISIN matches ipo_data
             if event_type in ("NEW_BSE_LISTING", "NEW_NSE_LISTING"):
-                if isin and isin in ipo_by_isin and ev.get("tag") != "IPO":
-                    ev["tag"] = ipo_tag(isin)
+                correct = ipo_tag(isin)
+                if isin and isin in ipo_by_isin and ev.get("tag") != correct:
+                    ev["tag"] = correct
                     tag_fixed += 1
 
             # Add missing NEW_BSE_LISTING for NEW_NSE_LISTING with bse_code
