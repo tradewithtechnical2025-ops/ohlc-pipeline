@@ -20,7 +20,7 @@ jobs:
 
       - name: Run pipeline
         env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
-          R2_WORKER_URL:       ${{ secrets.R2_WORKER_URL }}
-          R2_SECRET_TOKEN:     ${{ secrets.R2_SECRET_TOKEN }}
+          UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:    ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
         run: python pipeline_global.py
