@@ -1,0 +1,26 @@
+name: Global Markets Pipeline
+
+on:
+  workflow_dispatch:
+  # Schedule via cron-job.org (Asia/Kolkata) — trigger this workflow_dispatch endpoint
+  # Suggested: every 5 min on weekdays during market hours
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run pipeline
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          R2_WORKER_URL:       ${{ secrets.R2_WORKER_URL }}
+          R2_SECRET_TOKEN:     ${{ secrets.R2_SECRET_TOKEN }}
+        run: python pipeline_global.py
