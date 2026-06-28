@@ -47,17 +47,20 @@ async def main():
     async with httpx.AsyncClient() as client:
 
         print("📥 Loading data from R2...")
-        events  = await r2_download(client, "reports/events.json")  or []
-        ipo_raw = await r2_download(client, "reports/ipo.json")      or []
-        bse_snap= await r2_download(client, "snapshots/upstox_bse.json") or {}
+        events   = await r2_download(client, "reports/events.json")    or []
+        ipo_resp = await r2_download(client, "reports/ipo_data.json")  or {}
+        bse_snap = await r2_download(client, "snapshots/upstox_bse.json") or {}
+
+        # ipo_data.json has structure {"ipos": [...], ...}
+        ipo_raw = ipo_resp.get("ipos", ipo_resp) if isinstance(ipo_resp, dict) else ipo_resp
 
         print(f"   events.json     : {len(events)} entries")
-        print(f"   ipo.json        : {len(ipo_raw)} entries")
+        print(f"   ipo_data.json   : {len(ipo_raw)} IPOs")
         print(f"   upstox_bse.json : {len(bse_snap)} tokens")
 
         # Build lookup maps
-        ipo_by_isin    = {x["isin"]: x for x in ipo_raw if x.get("isin")}
-        bse_by_isin    = {v["isin"]: v["exchange_token"] for v in bse_snap.values() if v.get("isin")}
+        ipo_by_isin = {x["isin"]: x for x in ipo_raw if x.get("isin")}
+        bse_by_isin = {v["isin"]: v["exchange_token"] for v in bse_snap.values() if v.get("isin")}
 
         tag_added      = 0
         bse_code_added = 0
@@ -66,13 +69,12 @@ async def main():
             event_type = ev.get("event", "")
             isin       = ev.get("isin")
 
-            # ── Add tag to NEW_BSE_LISTING / NEW_NSE_LISTING ──────────
+            # Add tag to NEW_BSE_LISTING / NEW_NSE_LISTING
             if event_type in ("NEW_BSE_LISTING", "NEW_NSE_LISTING") and "tag" not in ev:
                 ev["tag"] = "IPO" if (isin and isin in ipo_by_isin) else "OTHER"
                 tag_added += 1
 
-            # ── Add bse_code where missing ────────────────────────────
-            # BSE_TO_NSE already has it from pipeline; fill for NEW_NSE_LISTING
+            # Add bse_code where missing
             if "bse_code" not in ev and isin and isin in bse_by_isin:
                 ev["bse_code"] = bse_by_isin[isin]
                 bse_code_added += 1
