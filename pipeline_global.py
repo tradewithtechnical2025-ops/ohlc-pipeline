@@ -35,8 +35,9 @@ INSTRUMENTS = [
 # ── Fetch quotes ───────────────────────────────────────────────────────────────
 def fetch_quotes(keys: list[str]) -> dict:
     """Fetch quotes for a batch of instrument keys (max 500)."""
-    params = {"instrument_key": ",".join(keys)}
-    r = requests.get(QUOTE_URL, headers=HEADERS, params=params, timeout=15)
+    key_str = ",".join(keys)
+    url = f"{QUOTE_URL}?instrument_key={key_str}"
+    r = requests.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
     data = r.json()
     if data.get("status") != "success":
