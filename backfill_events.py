@@ -56,6 +56,7 @@ async def main():
         print(f"   upstox_bse.json : {len(bse_snap)} tokens")
 
         ipo_by_isin = {x["isin"]: x for x in ipo_raw if x.get("isin")}
+        def ipo_tag(isin): return "IPO_SME" if ipo_by_isin.get(isin, {}).get("issue_type") == "sme" else "IPO_MAINBOARD"
         bse_by_isin = {v["isin"]: v for v in bse_snap.values() if v.get("isin")}
 
         tag_fixed       = 0
@@ -71,7 +72,7 @@ async def main():
             # Fix tag: OTHER → IPO where ISIN matches ipo_data
             if event_type in ("NEW_BSE_LISTING", "NEW_NSE_LISTING"):
                 if isin and isin in ipo_by_isin and ev.get("tag") != "IPO":
-                    ev["tag"] = "IPO"
+                    ev["tag"] = ipo_tag(isin)
                     tag_fixed += 1
 
             # Add missing NEW_BSE_LISTING for NEW_NSE_LISTING with bse_code
@@ -87,7 +88,7 @@ async def main():
                             "isin":     isin,
                             "bse_code": bse["exchange_token"],
                             "segment":  bse["segment"],
-                            "tag":      "IPO" if isin in ipo_by_isin else "OTHER",
+                            "tag":      ipo_tag(isin) if isin in ipo_by_isin else "OTHER",
                             "source":   "backfill",
                         })
                         existing_isins.add(isin)
