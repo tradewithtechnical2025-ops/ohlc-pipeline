@@ -48,7 +48,7 @@ async def main():
 
         print("📥 Loading data from R2...")
         events   = await r2_download(client, "reports/events.json")    or []
-        ipo_resp = await r2_download(client, "reports/ipo_data.json")  or {}
+        ipo_resp = await r2_download(client, "ipo_data.json")  or {}
         bse_snap = await r2_download(client, "snapshots/upstox_bse.json") or {}
 
         # ipo_data.json has structure {"ipos": [...], ...}
