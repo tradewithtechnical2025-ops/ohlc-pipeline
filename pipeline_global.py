@@ -5,7 +5,7 @@ import requests
 from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
-UPSTOX_TOKEN   = os.environ["UPSTOX_ACCESS_TOKEN"]
+UPSTOX_TOKEN   = os.environ["UPSTOX_TOKEN"]
 R2_WORKER_URL  = os.environ["R2_WORKER_URL"]          # e.g. https://your-worker.workers.dev
 R2_SECRET      = os.environ["R2_SECRET_TOKEN"]
 
