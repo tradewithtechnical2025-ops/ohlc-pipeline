@@ -1376,7 +1376,7 @@ def _build_gap_state(all_data, gaps_by_sym, today, near_pct=5.0):
     gap_state={}
     for sym, sym_gaps in gaps_by_sym.items():
         if sym not in all_data: continue
-        closes=all_data[sym]["c"]
+        dates=all_data[sym]["d"]; highs=all_data[sym]["h"]; closes=all_data[sym]["c"]
         ltp=next((v for v in reversed(closes) if v is not None), None)
         if ltp is None: continue
 
@@ -1394,11 +1394,25 @@ def _build_gap_state(all_data, gaps_by_sym, today, near_pct=5.0):
         if not open_gap: continue
         level=open_gap["gap_top"]
         if not level: continue
-        dist_pct=(level-ltp)/level*100
+
+        # Recover the gap's bottom edge (the gap-day's high) from OHLC history.
+        # gap_top alone is the FULL-FILL level (far edge) — measuring distance
+        # only to that misses stocks sitting below the whole gap zone but
+        # genuinely close to its near edge (e.g. price approaching from below).
+        gap_bottom=None
+        gd=open_gap.get("gap_date")
+        if gd in dates: gap_bottom=highs[dates.index(gd)]
+
+        def _dist_to_level(price):
+            if gap_bottom is not None and price<gap_bottom:
+                return (gap_bottom-price)/gap_bottom*100   # below the zone -> distance to near edge
+            return (level-price)/level*100                  # inside/near top -> distance to full fill
+
+        dist_pct=_dist_to_level(ltp)
         if not (0<=dist_pct<=near_pct): continue
 
         recent=[c for c in closes[-6:-1] if c is not None]
-        recent_near=bool(recent and len(recent)==5 and all(abs((level-c)/level*100)<=near_pct for c in recent))
+        recent_near=bool(recent and len(recent)==5 and all(0<=_dist_to_level(c)<=near_pct for c in recent))
 
         gap_state[sym]={"state":"Consolidating near Gap" if recent_near else "Near Gap",
             "direction":"down","gap_date":open_gap["gap_date"],
