@@ -130,12 +130,16 @@ async def run():
 
             raw = await fetch_ohlc_batch(client, batch)
 
-            for ikey, ohlc_data in raw.items():
-                sym = ikey_to_sym.get(ikey)
+            for resp_key, ohlc_data in raw.items():
+                # response key is NSE_EQ:SYMBOL but instrument_token is NSE_EQ|ISIN
+                # use instrument_token to reverse-lookup symbol
+                itoken = ohlc_data.get("instrument_token", "")   # NSE_EQ|INE...
+                itoken_colon = itoken.replace("|", ":")           # NSE_EQ:INE...
+                sym = ikey_to_sym.get(itoken_colon)
                 if not sym:
                     continue
-                live = ohlc_data.get("live_ohlc", {})   # v3: today's OHLC
-                prev = ohlc_data.get("prev_ohlc", {})   # v3: previous day OHLC
+                live = ohlc_data.get("live_ohlc") or {}
+                prev = ohlc_data.get("prev_ohlc") or {}
                 result[sym] = {
                     "o"  : live.get("open"),
                     "h"  : live.get("high"),
