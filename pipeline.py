@@ -1140,7 +1140,7 @@ def _build_mswing_json(all_data, mswing_data):
     return rows
 
 
-PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo"]
+PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo","shakeout"]
 HLR_STATE_KEYS={"BO":"hlr_bo","Near HLR":"hlr_near","Consolidating near HLR":"hlr_consol"}
 GAP_STATE_KEYS={"Near Gap":"gap_near","Consolidating near Gap":"gap_consol","Gap Filled":"gap_just_filled"}
 
@@ -1402,7 +1402,7 @@ def _today_gap_events(gaps_by_sym, today):
 # ══════════════════════════════════════════════════════════════
 
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
-    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None):
+    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, shakeout_map=None):
     cls_map={}
     for x in (classification or []):
         sym=x.get("symbol") or x.get("nse_code")
@@ -1575,7 +1575,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             "w_3tc":"Weekly Tight Close" in (pat_map or {}).get(sym,set()),
             "hlr_state":(hlr_map or {}).get(sym,{}).get("state"),"hlr_res":(hlr_map or {}).get(sym,{}).get("resistance"),
             "hlr_dist":(hlr_map or {}).get(sym,{}).get("dist_pct"),"hlr_touches":(hlr_map or {}).get(sym,{}).get("touches"),
-            "pullback":sym in (pb_map or {}),"circuit":sh_info.get("circuit"),"hpbc":sh_info.get("hpbc"),"tl_hl_bo":sh_info.get("tl_hl_bo")}
+            "pullback":sym in (pb_map or {}),"circuit":sh_info.get("circuit"),"hpbc":sh_info.get("hpbc"),"tl_hl_bo":sh_info.get("tl_hl_bo"),
+            "shakeout":sym in (shakeout_map or {}),"shakeout_type":(shakeout_map or {}).get(sym,{}).get("wick_type"),
+            "shakeout_support":(shakeout_map or {}).get(sym,{}).get("support_type")}
         feed.append(row)
     log.info(f"screener_feed: {len(feed)} stocks")
     return feed
@@ -1745,7 +1747,10 @@ async def run_ep_scan() -> None:
             gaps_by_sym=await update_gap_tracker(client,all_data,today)
             gap_state=_build_gap_state(all_data,gaps_by_sym,today)
             gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
-            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state)
+            shakeout_signals=_detect_shakeout(all_data)
+            shakeout_map={sig["symbol"]:sig for sig in shakeout_signals}
+            log.info(f"Shakeout signals: {len(shakeout_signals)}")
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,shakeout_map=shakeout_map)
             ep_pat_map={}
             for sig in signals: ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
             for row in screener_feed:
@@ -1758,7 +1763,7 @@ async def run_ep_scan() -> None:
                     row["eps_ch"]=round((e0-e4)/e4*100,1) if e0 and e4 else None
                 else: row["sales_ch"]=None; row["eps_ch"]=None
                 pats=set()
-                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC")]:
+                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC"),("shakeout","Shakeout")]:
                     if row.get(flag): pats.add(label)
                 if row.get("gap_fill"): pats.add(row["gap_fill"])
                 if row.get("hlr_state"): pats.add(row["hlr_state"])
@@ -2518,6 +2523,152 @@ def _build_cpr_data(all_data, today):
         }
 
     return result
+# ══════════════════════════════════════════════════════════════
+# SHAKEOUT DETECTOR  — Supertrend(10,3) / EMA21 / SMA50 wick-recovery
+# ══════════════════════════════════════════════════════════════
+
+def _calc_atr_series(highs, lows, closes, period):
+    """Wilder-smoothed ATR series — None-safe, carries forward like _calc_ema."""
+    n = len(closes)
+    trs = [None] * n
+    for i in range(1, n):
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        if None in (h, l, pc): continue
+        trs[i] = max(h - l, abs(h - pc), abs(l - pc))
+    atr = [None] * n
+    seed = [v for v in trs[1:period + 1] if v is not None]
+    if len(seed) < period: return atr
+    atr[period] = sum(seed) / period
+    for i in range(period + 1, n):
+        tr = trs[i]
+        if tr is None or atr[i - 1] is None:
+            atr[i] = atr[i - 1]
+        else:
+            atr[i] = (atr[i - 1] * (period - 1) + tr) / period
+    return atr
+
+
+def _calc_supertrend(highs, lows, closes, period=10, mult=3):
+    """
+    Standard Supertrend(period, mult) — returns the active band series
+    (flips between upper/lower band on trend change). None-safe: carries
+    forward the previous band/trend when a candle is missing OHLC.
+    """
+    n = len(closes)
+    atr = _calc_atr_series(highs, lows, closes, period)
+    upper = [None] * n; lower = [None] * n
+    trend = [None] * n; st = [None] * n
+    for i in range(n):
+        h, l, c, a = highs[i], lows[i], closes[i], atr[i]
+        if h is None or l is None or a is None:
+            upper[i] = upper[i - 1] if i > 0 else None
+            lower[i] = lower[i - 1] if i > 0 else None
+            trend[i] = trend[i - 1] if i > 0 else None
+            st[i] = st[i - 1] if i > 0 else None
+            continue
+        mid = (h + l) / 2
+        basic_upper = mid + mult * a
+        basic_lower = mid - mult * a
+        prev_close = closes[i - 1] if i > 0 else None
+        prev_upper = upper[i - 1] if i > 0 else None
+        prev_lower = lower[i - 1] if i > 0 else None
+        if prev_upper is not None and prev_close is not None and prev_close <= prev_upper:
+            upper[i] = min(basic_upper, prev_upper)
+        else:
+            upper[i] = basic_upper
+        if prev_lower is not None and prev_close is not None and prev_close >= prev_lower:
+            lower[i] = max(basic_lower, prev_lower)
+        else:
+            lower[i] = basic_lower
+        prev_trend = trend[i - 1] if i > 0 else None
+        if c is None:
+            trend[i] = prev_trend if prev_trend is not None else 1
+        elif prev_trend == -1:
+            trend[i] = 1 if c > upper[i] else -1
+        elif prev_trend == 1:
+            trend[i] = -1 if c < lower[i] else 1
+        else:
+            trend[i] = 1   # first valid bar — default uptrend seed
+        st[i] = lower[i] if trend[i] == 1 else upper[i]
+    return st
+
+
+def _detect_shakeout(all_data, min_close=20.0, min_turnover_20d=10_00_000,
+                      wick_third=3.0, recovery_ratio=1.03, recovery_mult=4.0,
+                      sma_period=50, ema_period=21, st_period=10, st_mult=3,
+                      mswing_map=None, min_mswing=-0.5):
+    """
+    Shakeout scanner — long lower-wick candle (red, close-near-high OR
+    green, open-near-high) that dipped through Supertrend(10,3) / EMA21 /
+    SMA50 intraday and closed back above it. Mirrors the chartink scan.
+
+    mswing_map: optional {symbol: {"mswing": val}} — pass _calculate_mswing()'s
+    output if you want the "Mswing Homma >= min_mswing" leg applied too.
+    Left off by default — chartink's "Mswing Homma" is likely a different
+    indicator from your own mswing calc, wire it up only if confirmed.
+    """
+    signals = []
+    min_n = max(sma_period, ema_period, st_period) + 5
+    for sym, s in all_data.items():
+        dates, opens, highs, lows, closes, volumes = s["d"], s["o"], s["h"], s["l"], s["c"], s["v"]
+        n = len(dates)
+        if n < min_n: continue
+        o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
+        if None in (o, h, l, c): continue
+        if c < min_close: continue
+
+        avg_vol20 = _calc_sma(volumes, 20)[-1]
+        avg_close20 = _calc_sma(closes, 20)[-1]
+        if avg_vol20 is None or avg_close20 is None: continue
+        if avg_vol20 * avg_close20 < min_turnover_20d: continue
+
+        sma50 = _calc_sma(closes, sma_period)
+        if sma50[-1] is None or h < sma50[-1]: continue
+
+        if mswing_map is not None:
+            ms = mswing_map.get(sym, {}).get("mswing")
+            if ms is None or ms < min_mswing: continue
+
+        rng = h - l
+        if rng <= 0: continue
+
+        shape_a = (h - c) <= rng / wick_third and c <= o and (h - c) <= (c - l)
+        shape_b = (h - o) <= rng / wick_third and c >= o and (h - o) <= (o - l)
+        if not (shape_a or shape_b): continue
+
+        def _recovery_ok(ref):
+            if l is None or l <= 0: return False
+            if ref / l >= recovery_ratio: return True
+            denom = h - ref
+            return denom > 0 and rng / denom >= recovery_mult
+
+        wick_type = None
+        if shape_a and _recovery_ok(c): wick_type = "Bearish (close-near-high)"
+        elif shape_b and _recovery_ok(o): wick_type = "Bullish (open-near-high)"
+        if wick_type is None: continue
+
+        ema21 = _calc_ema(closes, ema_period)
+        st10_3 = _calc_supertrend(highs, lows, closes, st_period, st_mult)
+
+        support_type = support_level = None
+        if st10_3[-1] is not None and c >= st10_3[-1] and l <= st10_3[-1] * 1.01:
+            support_type, support_level = "Supertrend(10,3)", st10_3[-1]
+        elif ema21[-1] is not None and c >= ema21[-1] and l <= ema21[-1]:
+            support_type, support_level = f"EMA{ema_period}", ema21[-1]
+        elif sma50[-1] is not None and c >= sma50[-1] and l <= sma50[-1]:
+            support_type, support_level = f"SMA{sma_period}", sma50[-1]
+        if support_type is None: continue
+
+        signals.append({
+            "symbol": sym, "date": dates[-1],
+            "open": round(o, 2), "high": round(h, 2), "low": round(l, 2), "close": round(c, 2),
+            "wick_type": wick_type, "support_type": support_type,
+            "support_level": round(support_level, 2),
+            "dist_from_support_pct": round((c - support_level) / support_level * 100, 2),
+        })
+    return signals
+
+
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
