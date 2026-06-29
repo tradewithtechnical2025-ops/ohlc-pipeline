@@ -1270,13 +1270,14 @@ def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,vol
 # filled + KEEP_DAYS_AFTER_FILL days old, regardless of what happens to
 # the underlying OHLC history.
 #
-# Handles BOTH directions:
-#   - gap-down: today_high < prev_low   → filled when a later close >= prev_low
-#   - gap-up  : today_low  > prev_high  → filled when a later close <= prev_high
-# (previously only gap-down was tracked at all)
+# Down-gaps only, by design:
+#   gap-down: today_high < prev_low   → filled when a later close >= prev_low
 # ══════════════════════════════════════════════════════════════
 
 GAP_KEEP_DAYS_AFTER_FILL = 30   # filled gaps pruned this many days after fill_date
+GAP_CATCHUP_WINDOW = 7          # re-scan last N candles each run, not just the latest —
+                                 # makes the tracker self-healing if a run is missed/delayed
+                                 # (otherwise that day's gap is permanently lost, never re-checked)
 
 def _scan_new_gap_event(dates, highs, lows, i, min_gap_pct):
     """Check candle i (vs i-1) for a fresh gap-down. Returns event dict or None."""
@@ -1301,11 +1302,12 @@ def _check_gap_fills(sym_gaps, dates, closes, from_idx):
 
 async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days_after_fill=GAP_KEEP_DAYS_AFTER_FILL):
     """
-    Persistent gap-up/down tracker.
+    Persistent gap-down tracker.
     First time a symbol is seen → bootstrap-scans its full available
     window (whatever's in all_data right now) to seed any already-open
-    gaps. After that → O(1) per symbol per day: just checks the latest
-    candle for a brand-new gap, and re-checks open gaps for a fill.
+    gaps. After that → re-checks the last GAP_CATCHUP_WINDOW candles each
+    run (not just the single latest one) for new gaps + fills, so a
+    missed/delayed pipeline run doesn't permanently lose that day's gap.
     Filled gaps get pruned keep_days_after_fill days after fill_date so
     open_gaps.json doesn't grow unbounded.
     Returns gaps_by_sym: {symbol: [event, ...]}
@@ -1329,11 +1331,14 @@ async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days
             _check_gap_fills(sym_gaps,dates,closes,from_idx=0)
         else:
             sym_gaps=gaps_by_sym[sym]
-            today_d=dates[-1]
-            if not any(g["gap_date"]==today_d for g in sym_gaps):
-                ev=_scan_new_gap_event(dates,highs,lows,n-1,min_gap_pct)
-                if ev: sym_gaps.append(ev); new_count+=1
-            _check_gap_fills(sym_gaps,dates,closes,from_idx=n-1)
+            existing_dates={g["gap_date"] for g in sym_gaps}
+            catchup_from=max(1,n-GAP_CATCHUP_WINDOW)
+            for i in range(catchup_from,n):
+                if dates[i] in existing_dates: continue
+                ev=_scan_new_gap_event(dates,highs,lows,i,min_gap_pct)
+                if ev:
+                    sym_gaps.append(ev); existing_dates.add(dates[i]); new_count+=1
+            _check_gap_fills(sym_gaps,dates,closes,from_idx=catchup_from)
 
         filled_today_count+=sum(1 for g in sym_gaps if g["filled"] and g["fill_date"]==dates[-1])
 
