@@ -1272,12 +1272,14 @@ def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,vol
 #
 # Down-gaps only, by design:
 #   gap-down: today_high < prev_low   → filled when a later close >= prev_low
+#
+# Resumes from a per-symbol `last_checked` date every run (not a fixed
+# lookback window) — so an outage of ANY length still gets fully caught
+# up next run, as long as the missed date is still inside the rolling
+# OHLC window.
 # ══════════════════════════════════════════════════════════════
 
 GAP_KEEP_DAYS_AFTER_FILL = 30   # filled gaps pruned this many days after fill_date
-GAP_CATCHUP_WINDOW = 7          # re-scan last N candles each run, not just the latest —
-                                 # makes the tracker self-healing if a run is missed/delayed
-                                 # (otherwise that day's gap is permanently lost, never re-checked)
 
 def _scan_new_gap_event(dates, highs, lows, i, min_gap_pct):
     """Check candle i (vs i-1) for a fresh gap-down. Returns event dict or None."""
@@ -1291,10 +1293,20 @@ def _scan_new_gap_event(dates, highs, lows, i, min_gap_pct):
     return None
 
 def _check_gap_fills(sym_gaps, dates, closes, from_idx):
-    """Mark fill_date on open gap-downs whose gap_top gets crossed by a close."""
+    """
+    Mark fill_date on open gap-downs whose gap_top gets crossed by a close.
+    Bounds each gap's check to start at max(from_idx, the gap's own index) —
+    a close before the gap was created can never "fill" it. Without this,
+    a batch scan (bootstrap or catch-up) that discovers multiple gaps in
+    one pass could wrongly stamp an earlier, pre-gap close as the fill
+    date for a gap created later in that same pass.
+    """
+    date_idx = {d: i for i, d in enumerate(dates)}
     for g in sym_gaps:
         if g["filled"]: continue
-        for j in range(from_idx, len(dates)):
+        gap_idx = date_idx.get(g["gap_date"])
+        start = max(from_idx, gap_idx) if gap_idx is not None else from_idx
+        for j in range(start, len(dates)):
             c=closes[j]
             if c is None: continue
             if c>=g["gap_top"]:
@@ -1303,11 +1315,14 @@ def _check_gap_fills(sym_gaps, dates, closes, from_idx):
 async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days_after_fill=GAP_KEEP_DAYS_AFTER_FILL):
     """
     Persistent gap-down tracker.
-    First time a symbol is seen → bootstrap-scans its full available
-    window (whatever's in all_data right now) to seed any already-open
-    gaps. After that → re-checks the last GAP_CATCHUP_WINDOW candles each
-    run (not just the single latest one) for new gaps + fills, so a
-    missed/delayed pipeline run doesn't permanently lose that day's gap.
+    Tracks a per-symbol `last_checked` date so every run resumes exactly
+    where it left off, scanning forward from last_checked+1 to today —
+    no fixed lookback window, so a missed/delayed pipeline run (of ANY
+    length) can never permanently lose a gap day, as long as that date
+    is still inside the rolling OHLC window (ROLLING_DAYS).
+    First time a symbol is seen (or its last_checked date has rolled out
+    of the OHLC window entirely) → safe full rescan of whatever history
+    is currently available; dedup via gap_date prevents double-entries.
     Filled gaps get pruned keep_days_after_fill days after fill_date so
     open_gaps.json doesn't grow unbounded.
     Returns gaps_by_sym: {symbol: [event, ...]}
@@ -1315,6 +1330,7 @@ async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days
     store=await r2_download(client,"open_gaps.json")
     if not isinstance(store,dict) or "gaps" not in store: store={"gaps":{}}
     gaps_by_sym=store["gaps"]
+    last_checked=store.get("last_checked") or {}
     cutoff=(date.fromisoformat(today)-timedelta(days=keep_days_after_fill)).isoformat()
     new_count=0; filled_today_count=0
 
@@ -1322,23 +1338,21 @@ async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days
         dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; n=len(dates)
         if n<2: continue
 
-        if sym not in gaps_by_sym:
-            # Bootstrap: scan whatever history is currently available once.
-            sym_gaps=[]
-            for i in range(1,n):
-                ev=_scan_new_gap_event(dates,highs,lows,i,min_gap_pct)
-                if ev: sym_gaps.append(ev)
-            _check_gap_fills(sym_gaps,dates,closes,from_idx=0)
+        sym_gaps=gaps_by_sym.get(sym,[])
+        existing_dates={g["gap_date"] for g in sym_gaps}
+        last_dt=last_checked.get(sym)
+
+        if last_dt and last_dt in dates:
+            start_idx=max(1,dates.index(last_dt)+1)   # resume right after last successful check
         else:
-            sym_gaps=gaps_by_sym[sym]
-            existing_dates={g["gap_date"] for g in sym_gaps}
-            catchup_from=max(1,n-GAP_CATCHUP_WINDOW)
-            for i in range(catchup_from,n):
-                if dates[i] in existing_dates: continue
-                ev=_scan_new_gap_event(dates,highs,lows,i,min_gap_pct)
-                if ev:
-                    sym_gaps.append(ev); existing_dates.add(dates[i]); new_count+=1
-            _check_gap_fills(sym_gaps,dates,closes,from_idx=catchup_from)
+            start_idx=1   # never checked, or last_checked fell outside the rolling window — safe full rescan
+
+        for i in range(start_idx,n):
+            if dates[i] in existing_dates: continue
+            ev=_scan_new_gap_event(dates,highs,lows,i,min_gap_pct)
+            if ev:
+                sym_gaps.append(ev); existing_dates.add(dates[i]); new_count+=1
+        _check_gap_fills(sym_gaps,dates,closes,from_idx=start_idx)
 
         filled_today_count+=sum(1 for g in sym_gaps if g["filled"] and g["fill_date"]==dates[-1])
 
@@ -1347,8 +1361,10 @@ async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days
 
         if sym_gaps: gaps_by_sym[sym]=sym_gaps
         elif sym in gaps_by_sym: del gaps_by_sym[sym]
+        last_checked[sym]=dates[-1]
 
     store["updated"]=today
+    store["last_checked"]=last_checked
     await upload_str_with_manifest(client, r2_upload, "open_gaps.json",
                                     json.dumps(store,separators=(",",":")),
                                     schema_v=1, extra_meta={"stock_count": len(gaps_by_sym)})
