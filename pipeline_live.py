@@ -27,7 +27,7 @@ WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
-UPSTOX_OHLC_URL = "https://api.upstox.com/v2/market-quote/ohlc"
+UPSTOX_OHLC_URL = "https://api.upstox.com/v3/market-quote/ohlc"
 BATCH_SIZE = 500
 INTERVAL   = "1d"
 IST        = ZoneInfo("Asia/Kolkata")
@@ -134,14 +134,16 @@ async def run():
                 sym = ikey_to_sym.get(ikey)
                 if not sym:
                     continue
-                ohlc = ohlc_data.get("ohlc", {})
+                live = ohlc_data.get("live_ohlc", {})   # v3: today's OHLC
+                prev = ohlc_data.get("prev_ohlc", {})   # v3: previous day OHLC
                 result[sym] = {
-                    "o" : ohlc.get("open"),
-                    "h" : ohlc.get("high"),
-                    "l" : ohlc.get("low"),
-                    "c" : ohlc_data.get("last_price"),  # live LTP
-                    "pc": ohlc.get("close"),             # prev close
-                    "ts": ohlc_data.get("timestamp", ""),
+                    "o"  : live.get("open"),
+                    "h"  : live.get("high"),
+                    "l"  : live.get("low"),
+                    "c"  : ohlc_data.get("last_price"),  # live LTP
+                    "pc" : prev.get("close"),             # prev day close → for Change%
+                    "vol": live.get("volume"),            # today's volume
+                    "ts" : ohlc_data.get("timestamp", ""),
                 }
 
             if i + BATCH_SIZE < len(ikeys):
