@@ -82,7 +82,11 @@ async def fetch_ohlc_batch(client, ikeys: list[str]) -> dict:
         log.warning(f"  OHLC batch HTTP {r.status_code}")
         return {}
 
-    return r.json().get("data", {})
+    resp = r.json()
+    data = resp.get("data", {})
+    log.info(f"  Raw response keys sample: {list(data.keys())[:3]}")
+    log.info(f"  Sample value: {list(data.values())[:1]}")
+    return data
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
