@@ -1,8 +1,9 @@
 """
 pipeline_live.py
-Fetches live/today's OHLC from Upstox for all stocks in master.json
+Fetches live OHLC from Upstox v3 for all stocks in master.json
+- OHLC endpoint: open, high, low, volume (live_ohlc)
+- LTP endpoint:  last_price + cp (prev close) → Change% ke liye
 Uploads result as live_ohlc.json to R2 via Cloudflare Worker
-Run every 3-5 min during market hours via GitHub Actions
 """
 
 import asyncio
@@ -26,8 +27,9 @@ UPSTOX_TOKEN = os.environ["UPSTOX_TOKEN"]
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 
-WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
-UPSTOX_OHLC_URL = "https://api.upstox.com/v3/market-quote/ohlc"
+WORKER_HEADERS   = {"X-Secret-Token": WORKER_TOKEN}
+UPSTOX_OHLC_URL  = "https://api.upstox.com/v3/market-quote/ohlc"
+UPSTOX_LTP_URL   = "https://api.upstox.com/v3/market-quote/ltp"
 BATCH_SIZE = 500
 INTERVAL   = "1d"
 IST        = ZoneInfo("Asia/Kolkata")
@@ -41,6 +43,8 @@ async def r2_download(client, filename):
         headers=WORKER_HEADERS,
         timeout=120,
     )
+    if r.status_code == 404:
+        return None
     if r.status_code != 200:
         raise RuntimeError(f"Download failed {filename}: HTTP {r.status_code}")
     return r.json()
@@ -59,27 +63,25 @@ async def r2_upload(client, filename, data):
     log.info(f"  ↑ {filename} ({len(payload)/1024:.1f} KB)")
 
 
-# ── Upstox OHLC ───────────────────────────────────────────────────────────────
+# ── Upstox API batch fetch ────────────────────────────────────────────────────
 
-async def fetch_ohlc_batch(client, ikeys: list[str]) -> dict:
-    params  = {"instrument_key": ",".join(ikeys), "interval": INTERVAL}
+async def fetch_batch(client, url, ikeys: list[str], extra_params: dict = {}) -> dict:
+    params  = {"instrument_key": ",".join(ikeys), **extra_params}
     headers = {
         "Authorization": f"Bearer {UPSTOX_TOKEN}",
         "Accept": "application/json",
     }
-    r = await client.get(UPSTOX_OHLC_URL, params=params, headers=headers, timeout=30)
+    r = await client.get(url, params=params, headers=headers, timeout=30)
 
     if r.status_code == 401:
         log.error("❌ UPSTOX_TOKEN invalid")
         raise SystemExit(1)
-
     if r.status_code == 429:
         log.warning("  429 — sleeping 10s")
         await asyncio.sleep(10)
         return {}
-
     if r.status_code != 200:
-        log.warning(f"  OHLC batch HTTP {r.status_code}")
+        log.warning(f"  HTTP {r.status_code} from {url}")
         return {}
 
     return r.json().get("data", {})
@@ -89,77 +91,108 @@ async def fetch_ohlc_batch(client, ikeys: list[str]) -> dict:
 
 async def run():
     now_ist = datetime.now(IST)
+    today   = now_ist.strftime("%Y-%m-%d")
     log.info(f"━━━ Live OHLC Pipeline — {now_ist.strftime('%Y-%m-%d %H:%M:%S IST')} ━━━")
 
     async with httpx.AsyncClient() as client:
 
-        # 1. Load master.json
-        log.info("Downloading master.json…")
-        master = await r2_download(client, "master.json")
-        log.info(f"  {len(master)} stocks")
+        # 1. Load master + ikey_map + old live_ohlc (parallel)
+        log.info("Downloading master.json, ikey_map.json, live_ohlc.json…")
+        master_raw, ikey_map_raw, old_ohlc = await asyncio.gather(
+            r2_download(client, "master.json"),
+            r2_download(client, "ikey_map.json"),
+            r2_download(client, "live_ohlc.json"),
+        )
 
-        # 2. Load ikey_map.json
-        log.info("Downloading ikey_map.json…")
-        ikey_map_raw = await r2_download(client, "ikey_map.json")
-        nse_map = ikey_map_raw.get("nse", {})
-        bse_map = ikey_map_raw.get("bse", {})
+        master  = master_raw or []
+        nse_map = (ikey_map_raw or {}).get("nse", {})
+        bse_map = (ikey_map_raw or {}).get("bse", {})
+        log.info(f"  {len(master)} stocks in master.json")
 
-        # 3. symbol → instrument_key (prefer NSE)
+        # 2. Prev close fallback from old live_ohlc (2-day persistence)
+        old_data   = (old_ohlc or {}).get("data", {})
+        old_date   = (old_ohlc or {}).get("date", "")
+        is_new_day = bool(old_date and old_date != today)
+
+        prev_close_map = {}
+        for sym, d in old_data.items():
+            prev_close_map[sym] = d.get("c") if is_new_day else d.get("pc")
+
+        if is_new_day:
+            log.info(f"  New day (prev={old_date}) → {len(prev_close_map)} prev closes carried")
+        elif old_date:
+            log.info(f"  Same day refresh → {len(prev_close_map)} pc values carried")
+
+        # 3. symbol → instrument_key
         sym_to_ikey = {}
         for stock in master:
-            sym = stock.get("symbol", "")
-            if not sym:
-                continue
+            sym  = stock.get("symbol", "")
             ikey = nse_map.get(sym) or bse_map.get(sym)
-            if ikey:
+            if sym and ikey:
                 sym_to_ikey[sym] = ikey
 
         log.info(f"  Resolved {len(sym_to_ikey)}/{len(master)} symbols")
 
-        # reverse map — Upstox response uses colon (NSE_EQ:SYM) but we send pipe (NSE_EQ|SYM)
+        # ikey (colon format) → symbol reverse map
         ikey_to_sym = {v.replace("|", ":"): k for k, v in sym_to_ikey.items()}
-        ikeys  = list(sym_to_ikey.values())
-        result = {}
+        ikeys = list(sym_to_ikey.values())
 
-        # 4. Batch fetch
+        # 4. Batch fetch OHLC + LTP together per batch
+        result = {}
         total_batches = (len(ikeys) + BATCH_SIZE - 1) // BATCH_SIZE
+
         for i in range(0, len(ikeys), BATCH_SIZE):
-            batch      = ikeys[i : i + BATCH_SIZE]
-            batch_num  = i // BATCH_SIZE + 1
+            batch     = ikeys[i : i + BATCH_SIZE]
+            batch_num = i // BATCH_SIZE + 1
             log.info(f"  Batch {batch_num}/{total_batches} — {len(batch)} stocks…")
 
-            raw = await fetch_ohlc_batch(client, batch)
+            # Fetch OHLC and LTP in parallel for this batch
+            ohlc_raw, ltp_raw = await asyncio.gather(
+                fetch_batch(client, UPSTOX_OHLC_URL, batch, {"interval": INTERVAL}),
+                fetch_batch(client, UPSTOX_LTP_URL,  batch),
+            )
 
-            for resp_key, ohlc_data in raw.items():
-                # response key is NSE_EQ:SYMBOL but instrument_token is NSE_EQ|ISIN
-                # use instrument_token to reverse-lookup symbol
-                itoken = ohlc_data.get("instrument_token", "")   # NSE_EQ|INE...
-                itoken_colon = itoken.replace("|", ":")           # NSE_EQ:INE...
-                sym = ikey_to_sym.get(itoken_colon)
+            # Build ltp lookup: ikey_colon → ltp_data
+            ltp_lookup = {}
+            for resp_key, ltp_data in ltp_raw.items():
+                itoken = ltp_data.get("instrument_token", "").replace("|", ":")
+                ltp_lookup[itoken] = ltp_data
+
+            for resp_key, ohlc_data in ohlc_raw.items():
+                itoken = ohlc_data.get("instrument_token", "").replace("|", ":")
+                sym    = ikey_to_sym.get(itoken)
                 if not sym:
                     continue
+
                 live = ohlc_data.get("live_ohlc") or {}
-                prev = ohlc_data.get("prev_ohlc") or {}
+                ltp_info = ltp_lookup.get(itoken, {})
+
+                # cp from LTP endpoint = previous day close ✅
+                # fallback = our persisted prev_close from yesterday
+                pc = ltp_info.get("cp") or prev_close_map.get(sym)
+
                 result[sym] = {
                     "o"  : live.get("open"),
                     "h"  : live.get("high"),
                     "l"  : live.get("low"),
-                    "c"  : ohlc_data.get("last_price"),  # live LTP
-                    "pc" : prev.get("close"),             # prev day close → for Change%
-                    "vol": live.get("volume"),            # today's volume
+                    "c"  : ltp_info.get("last_price") or ohlc_data.get("last_price"),
+                    "pc" : pc,
+                    "vol": live.get("volume"),
                     "ts" : ohlc_data.get("timestamp", ""),
                 }
 
             if i + BATCH_SIZE < len(ikeys):
                 await asyncio.sleep(1)
 
-        log.info(f"  Fetched OHLC for {len(result)} stocks")
+        pc_filled = sum(1 for d in result.values() if d.get("pc"))
+        log.info(f"  Fetched {len(result)} stocks  (pc available: {pc_filled})")
 
         # 5. Upload
         payload = {
             "updated_at": now_ist.isoformat(),
-            "count": len(result),
-            "data": result,
+            "date"      : today,
+            "count"     : len(result),
+            "data"      : result,
         }
         await r2_upload(client, "live_ohlc.json", payload)
 
