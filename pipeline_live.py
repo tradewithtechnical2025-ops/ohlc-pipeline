@@ -82,11 +82,7 @@ async def fetch_ohlc_batch(client, ikeys: list[str]) -> dict:
         log.warning(f"  OHLC batch HTTP {r.status_code}")
         return {}
 
-    resp = r.json()
-    data = resp.get("data", {})
-    log.info(f"  Raw response keys sample: {list(data.keys())[:3]}")
-    log.info(f"  Sample value: {list(data.values())[:1]}")
-    return data
+    return r.json().get("data", {})
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -120,8 +116,8 @@ async def run():
 
         log.info(f"  Resolved {len(sym_to_ikey)}/{len(master)} symbols")
 
-        # reverse map
-        ikey_to_sym = {v: k for k, v in sym_to_ikey.items()}
+        # reverse map — Upstox response uses colon (NSE_EQ:SYM) but we send pipe (NSE_EQ|SYM)
+        ikey_to_sym = {v.replace("|", ":"): k for k, v in sym_to_ikey.items()}
         ikeys  = list(sym_to_ikey.values())
         result = {}
 
