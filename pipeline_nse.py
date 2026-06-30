@@ -14,6 +14,7 @@ Saves to R2 via Worker (FLAT keys — no slashes, worker slash-rejection safe):
   nse_block.json              → latest block deals
   nse_bulk_history.json       → symbol-wise accumulated bulk history
   nse_block_history.json      → symbol-wise accumulated block history
+  nse_band_changes_history.json → symbol-wise accumulated circuit band-change history
   nse_participant_oi.json     → latest single-day participant OI snapshot
   nse_participant_oi_hist.json → rolling 60-day participant OI history (sorted asc)
   nse_fii_dii.json             → latest FII/DII cash provisional snapshot (Rs Cr)
@@ -537,6 +538,34 @@ def merge_deals_history(hist: dict, deals: list) -> int:
     return added
 
 
+def merge_band_changes_history(hist: dict, changes: dict, effective_date: str) -> int:
+    """
+    hist: {symbol: [ {effective_date, series, from, to, direction}, ... ]}
+          each per-symbol list kept ascending sorted by effective_date.
+    changes: {symbol: {"from":.., "to":.., "series":..}} for this run.
+    effective_date: ISO date string (next_trading_day) the change applies from.
+    Idempotent — skips symbol+effective_date pairs already present.
+    Returns count of new entries added.
+    """
+    added = 0
+    for sym, chg in changes.items():
+        if sym not in hist:
+            hist[sym] = []
+        existing_dates = {e["effective_date"] for e in hist[sym]}
+        if effective_date in existing_dates:
+            continue
+        hist[sym].append({
+            "effective_date": effective_date,
+            "series":         chg.get("series", "EQ"),
+            "from":           chg.get("from"),
+            "to":             chg.get("to"),
+            "direction":      _band_dir(chg),
+        })
+        hist[sym].sort(key=lambda x: x["effective_date"])
+        added += 1
+    return added
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -640,6 +669,7 @@ async def run():
                 changes[sym] = {
                     "from": int(frm) if frm.isdigit() else frm,
                     "to":   int(to)  if to.isdigit()  else to,
+                    "series": series,
                 }
 
         for sym, chg in changes.items():
@@ -703,6 +733,7 @@ async def run():
                 existing_block,
                 bulk_hist,
                 block_hist,
+                band_changes_hist,
                 oi_hist,
                 fii_dii_hist,
             ) = await asyncio.gather(
@@ -711,14 +742,16 @@ async def run():
                 r2_get(client, "nse_block.json"),
                 r2_get(client, "nse_bulk_history.json"),
                 r2_get(client, "nse_block_history.json"),
+                r2_get(client, "nse_band_changes_history.json"),
                 r2_get(client, "nse_participant_oi_hist.json"),
                 r2_get(client, "nse_fii_dii_hist.json"),
             )
 
-            bulk_hist    = bulk_hist    or {}
-            block_hist   = block_hist   or {}
-            oi_hist      = oi_hist      or []
-            fii_dii_hist = fii_dii_hist or []
+            bulk_hist          = bulk_hist          or {}
+            block_hist         = block_hist         or {}
+            band_changes_hist  = band_changes_hist  or {}
+            oi_hist            = oi_hist            or []
+            fii_dii_hist       = fii_dii_hist       or []
 
             upload_tasks = []
 
@@ -770,6 +803,21 @@ async def run():
                 print(f"  Block history: +{b2} new deals")
                 upload_tasks.append(upload_with_manifest(client, r2_put, "nse_block_history.json", block_hist,
                                                            schema_v=1, ensure_ascii=False))
+
+            # ── Band-change history ─────────────────────────────────────────────────
+            if changes:
+                effective_date_str = chg_date.isoformat()
+                b3 = merge_band_changes_history(band_changes_hist, changes, effective_date_str)
+                if b3:
+                    print(f"  Band-change history: +{b3} new entries ({effective_date_str})")
+                    upload_tasks.append(upload_with_manifest(
+                        client, r2_put, "nse_band_changes_history.json", band_changes_hist,
+                        schema_v=1, extra_meta={"symbol_count": len(band_changes_hist)},
+                        ensure_ascii=False))
+                else:
+                    print(f"  ✓ Band-change history: {effective_date_str} already present — unchanged")
+            else:
+                print("  ✓ Band-change history: no changes today — skipping")
 
             # ── Participant OI snapshot + history ─────────────────────────────────
             if oi_snapshot:
