@@ -235,6 +235,45 @@ def _is_week_complete(today_d: str) -> bool:
             return False
     return True
 
+def _is_month_complete(today_d: str) -> bool:
+    """True agar today_d ke baad is calendar month mein koi trading day nahi bacha."""
+    dt_today = date.fromisoformat(today_d)
+    next_month_start = date(dt_today.year + 1, 1, 1) if dt_today.month == 12 else date(dt_today.year, dt_today.month + 1, 1)
+    d = dt_today + timedelta(days=1)
+    while d < next_month_start:
+        if is_trading_day(d.isoformat()): return False
+        d += timedelta(days=1)
+    return True
+
+def _build_tf_series(dates, highs, lows, closes, volumes, tf):
+    """
+    Resamples daily OHLCV into weekly ('W') or monthly ('M') bars, dropping the
+    current in-progress period unless it's already complete (same rule the
+    weekly-pattern scanner already uses, via _is_week_complete).
+    Returns (period_labels, highs, lows, closes, volumes) — all in chronological order.
+    """
+    agg = {}
+    key_fn = (lambda d: date.fromisoformat(d).isocalendar()[:2]) if tf == "W" else (lambda d: d[:7])
+    for d, h, l, c, v in zip(dates, highs, lows, closes, volumes):
+        if h is None or l is None or c is None: continue
+        k = key_fn(d)
+        if k not in agg: agg[k] = {"h": h, "l": l, "c": c, "v": v or 0}
+        else:
+            agg[k]["h"] = max(agg[k]["h"], h); agg[k]["l"] = min(agg[k]["l"], l)
+            agg[k]["c"] = c; agg[k]["v"] += v or 0
+    if not agg or not dates: return [], [], [], [], []
+    today_d = dates[-1]
+    if tf == "W":
+        current_key = date.fromisoformat(today_d).isocalendar()[:2]
+        complete = _is_week_complete(today_d)
+    else:
+        current_key = today_d[:7]
+        complete = _is_month_complete(today_d)
+    keys = sorted(k for k in agg if (k <= current_key if complete else k < current_key))
+    return ([str(k) for k in keys],
+            [agg[k]["h"] for k in keys], [agg[k]["l"] for k in keys],
+            [agg[k]["c"] for k in keys], [agg[k]["v"] for k in keys])
+
 # ══════════════════════════════════════════════════════════════
 # UPSTOX OHLC FETCHERS
 # ══════════════════════════════════════════════════════════════
@@ -1786,6 +1825,10 @@ async def run_ep_scan() -> None:
             shakeout_map={sig["symbol"]:sig for sig in shakeout_signals}
             log.info(f"Shakeout signals: {len(shakeout_signals)}")
             screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,shakeout_map=shakeout_map)
+            mtf_ma_map=_calc_multi_tf_ma(all_data)
+            log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
+            for row in screener_feed:
+                row.update(mtf_ma_map.get(row["symbol"],{}))
             ep_pat_map={}
             for sig in signals: ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
             for row in screener_feed:
@@ -1898,6 +1941,85 @@ def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullbac
             "macd":round(macd_line[i],4),"macd_signal":round(macd_signal[i],4)})
     return signals
 
+def _detect_pullback_tf(all_data, tf="W", ema_periods=(10, 30), length_pull=2,
+                         min_swing_range_pct=10.0, min_pullback_pct=5.0,
+                         ema_proximity_pct=1.5, max_candle_range_pct=10.0):
+    """
+    Same pullback logic as _detect_pullback (swing high -> pullback -> EMA
+    proximity/reversal -> MACD confirmation), run on weekly ('W') or monthly
+    ('M') resampled candles instead of daily.
+
+    ema_periods: the EMA(s) checked for proximity/reversal — e.g. weekly=(10,30),
+    monthly=(21,). Trend confirmation requires price above the LONGEST supplied
+    EMA, with that EMA rising over its last few bars (adapted from the daily
+    version's "EMA21>EMA50, EMA10>EMA50, EMA50 rising" stack — daily has 3 EMAs
+    to chain together, weekly/monthly only have what's supplied here).
+    """
+    signals = []
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        if len(dates) < 60 or not _check_liquidity(volumes, closes, len(dates)): continue
+        td, th, tl, tc, _ = _build_tf_series(dates, highs, lows, closes, volumes, tf)
+        n = len(td)
+        min_bars = max(ema_periods) + 10
+        if n < min_bars: continue
+
+        emas = {p: _calc_ema(tc, p) for p in ema_periods}
+        if any(emas[p][-1] is None for p in ema_periods): continue
+
+        ema12 = _calc_ema(tc, 12); ema26 = _calc_ema(tc, 26)
+        macd_line = [(ema12[i] - ema26[i]) if ema12[i] is not None and ema26[i] is not None else None for i in range(n)]
+        if len([v for v in macd_line if v is not None]) < 9: continue
+        macd_arr = [v if v is not None else 0.0 for v in macd_line]
+        macd_signal = _calc_ema(macd_arr, 9)
+
+        last_swing_high_price = last_swing_high_bar = last_swing_low_price = last_swing_low_bar = None
+        for i in range(length_pull, n - length_pull):
+            if all(th[i] >= th[i - k] for k in range(1, length_pull + 1)) and all(th[i] >= th[i + k] for k in range(1, length_pull + 1)):
+                last_swing_high_price = th[i]; last_swing_high_bar = i
+            if all(tl[i] <= tl[i - k] for k in range(1, length_pull + 1)) and all(tl[i] <= tl[i + k] for k in range(1, length_pull + 1)):
+                last_swing_low_price = tl[i]; last_swing_low_bar = i
+        if last_swing_high_price is None or last_swing_low_price is None: continue
+        i = n - 1
+        if last_swing_high_bar is None or last_swing_low_bar is None: continue
+        if last_swing_high_bar <= last_swing_low_bar: continue
+        if tc[i] is None or th[i] is None or tl[i] is None: continue
+
+        swing_range_pct = (last_swing_high_price - last_swing_low_price) / last_swing_low_price * 100
+        if swing_range_pct < min_swing_range_pct: continue
+        pullback_pct = (last_swing_high_price - tl[i]) / last_swing_high_price * 100
+        if pullback_pct < min_pullback_pct: continue
+
+        near_any = False; reversal_any = False; touched_label = None
+        for p in sorted(ema_periods):
+            e = emas[p][i]
+            near = abs(tl[i] - e) / e * 100 <= ema_proximity_pct or abs(tc[i] - e) / e * 100 <= ema_proximity_pct
+            reversal = tl[i] < e and tc[i] > e
+            if near or reversal:
+                near_any = near_any or near; reversal_any = reversal_any or reversal
+                touched_label = f"EMA{p}"
+        if not (near_any or reversal_any): continue
+
+        longest = max(ema_periods); e_long = emas[longest][i]
+        if not (tc[i] > e_long): continue
+        lb = min(5, i)
+        if any(emas[longest][i - k] is None for k in range(lb + 1)): continue
+        if not all(emas[longest][i - k] >= emas[longest][i - k - 1] for k in range(lb)): continue
+
+        candle_range_pct = (th[i] - tl[i]) / tl[i] * 100 if tl[i] > 0 else 0
+        if candle_range_pct >= max_candle_range_pct: continue
+        if macd_line[i] is None or macd_signal[i] is None: continue
+        if macd_line[i] < macd_signal[i]: continue
+
+        ema_touch = "Reversal" if reversal_any else f"Near {touched_label}"
+        signals.append({"symbol": sym, "tf": tf, "date": td[i], "close": round(tc[i], 2),
+            "swing_high": round(last_swing_high_price, 2), "swing_low": round(last_swing_low_price, 2),
+            "swing_range_pct": round(swing_range_pct, 2), "pullback_pct": round(pullback_pct, 2),
+            **{f"ema{p}": round(emas[p][i], 2) for p in ema_periods},
+            "ema_touch": ema_touch, "candle_range_pct": round(candle_range_pct, 2),
+            "macd": round(macd_line[i], 4), "macd_signal": round(macd_signal[i], 4)})
+    return signals
+
 def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,consol_pct=4.0):
     signals=[]
     for sym,s in all_data.items():
@@ -1944,6 +2066,61 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
                 "vol_spike":round(vol_spike,1) if vol_spike is not None else None})
     return signals
 
+def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, near_pct=5.0, consol_days=2, consol_pct=5.0):
+    """
+    Same swing-cluster resistance-zone logic as _detect_hlr, run on weekly
+    candles. swing_n/consol_days are reduced from the daily defaults since a
+    weekly series only has ~52 bars/year vs ~250 for daily — same idea, scaled
+    down to the timeframe. Volume-spike isn't tracked here (weekly aggregated
+    volume is a less meaningful "spike" signal than daily's).
+    """
+    signals = []
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        if len(dates) < 260 or not _check_liquidity(volumes, closes, len(dates)): continue
+        wd, wh, wl, wc, _ = _build_tf_series(dates, highs, lows, closes, volumes, tf)
+        n = len(wd)
+        if n < swing_n * 2 + consol_days + 2: continue
+
+        swing_highs = []
+        for i in range(swing_n, n - swing_n):
+            if all(wh[i] >= wh[i - k] for k in range(1, swing_n + 1)) and all(wh[i] >= wh[i + k] for k in range(1, swing_n + 1)):
+                sh_price = wh[i]
+                if any(wc[j] > sh_price for j in range(i + 1, n - 1) if wc[j] is not None): continue
+                broke_today = wc[-1] is not None and wc[-1] > sh_price
+                swing_highs.append((sh_price, wd[i], "BO" if broke_today else "valid"))
+        if not swing_highs: continue
+        swing_highs.sort(key=lambda x: x[0], reverse=True); used = [False] * len(swing_highs); levels = []
+        for i, (h, d, tag) in enumerate(swing_highs):
+            if used[i]: continue
+            cluster = [(h, d, tag)]
+            for j in range(i + 1, len(swing_highs)):
+                if not used[j] and abs(swing_highs[j][0] - h) / h * 100 <= cluster_pct:
+                    cluster.append(swing_highs[j]); used[j] = True
+            used[i] = True
+            level = max(c[0] for c in cluster); zone_low = min(c[0] for c in cluster)
+            cluster_tag = "BO" if any(c[2] == "BO" for c in cluster) else "valid"
+            touch_pts = sorted([{"date": c[1], "price": round(c[0], 2)} for c in cluster], key=lambda x: x["date"])
+            levels.append((level, zone_low, len(cluster), len(cluster) >= 2, touch_pts, cluster_tag))
+
+        curr_close = wc[-1]
+        if curr_close is None: continue
+        curr_date = wd[-1]
+        if n >= consol_days:
+            rh = [v for v in wh[-consol_days:] if v is not None]; rl = [v for v in wl[-consol_days:] if v is not None]
+            range_pct = (max(rh) - min(rl)) / curr_close * 100 if rh and rl else 0; is_consol = range_pct < consol_pct
+        else: range_pct = 0; is_consol = False
+
+        for (level, zone_low, touches, is_zone, touch_pts, cluster_tag) in levels:
+            dist_pct = (level - curr_close) / level * 100
+            if cluster_tag == "BO": state = "BO"
+            elif 0 <= dist_pct <= near_pct: state = "Consolidating near HLR" if is_consol else "Near HLR"
+            else: continue
+            signals.append({"symbol": sym, "tf": tf, "state": state, "resistance": round(level, 2), "zone_low": round(zone_low, 2),
+                "is_zone": is_zone, "touches": touches, "touch_points": touch_pts, "dist_pct": round(dist_pct, 2),
+                "last_close": round(curr_close, 2), "last_date": curr_date, "consol_range": round(range_pct, 2)})
+    return signals
+
 async def run_hlr_scan() -> None:
     status = PipelineStatus("run_hlr_scan")
     try:
@@ -1963,6 +2140,14 @@ async def run_hlr_scan() -> None:
             log.info(f"HLR — BO:{bo} Consolidating:{consol} Near:{near} Total:{len(hlr_signals)}")
             pb_signals=_detect_pullback(all_data)
             pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+            w_hlr_signals=_detect_hlr_tf(all_data,tf="W")
+            w_hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
+            log.info(f"Weekly HLR: {len(w_hlr_signals)} signals")
+            w_pb_signals=_detect_pullback_tf(all_data,tf="W",ema_periods=(10,30))
+            w_pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+            m_pb_signals=_detect_pullback_tf(all_data,tf="M",ema_periods=(21,))
+            m_pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+            log.info(f"Weekly Pullback: {len(w_pb_signals)}  Monthly Pullback: {len(m_pb_signals)}")
             # CPR
             cpr_data = _build_cpr_data(all_data, today)
             narrow_cpr = sum(
@@ -1981,6 +2166,18 @@ async def run_hlr_scan() -> None:
                     "updated": today, "count": len(pb_signals),
                     "signals": pb_signals,
                 }), schema_v=1, extra_meta={"count": len(pb_signals)}),
+                upload_str_with_manifest(client, r2_upload, "weekly_hlr_signals.json", json.dumps({
+                    "updated": today, "count": len(w_hlr_signals),
+                    "signals": w_hlr_signals,
+                }), schema_v=1, extra_meta={"count": len(w_hlr_signals)}),
+                upload_str_with_manifest(client, r2_upload, "weekly_pullback_signals.json", json.dumps({
+                    "updated": today, "count": len(w_pb_signals),
+                    "signals": w_pb_signals,
+                }), schema_v=1, extra_meta={"count": len(w_pb_signals)}),
+                upload_str_with_manifest(client, r2_upload, "monthly_pullback_signals.json", json.dumps({
+                    "updated": today, "count": len(m_pb_signals),
+                    "signals": m_pb_signals,
+                }), schema_v=1, extra_meta={"count": len(m_pb_signals)}),
                 upload_str_with_manifest(client, r2_upload, "cpr.json", json.dumps({
                     "updated": today,
                     "count": len(cpr_data),
@@ -2102,6 +2299,62 @@ def _calc_sma(closes, period):
             continue
         sma[i] = sum(window) / period
     return sma
+
+
+# ══════════════════════════════════════════════════════════════
+# MULTI-TIMEFRAME EMA / SMA  —  Daily SMA + Weekly + Monthly EMA/SMA
+# ══════════════════════════════════════════════════════════════
+
+def _calc_multi_tf_ma(all_data, daily_sma_periods=(10, 21, 50, 200),
+                       weekly_periods=(10, 30, 40, 50), monthly_periods=(10, 21)):
+    """
+    Returns {symbol: {field: value, ...}} with:
+      - Daily SMA(daily_sma_periods)  — daily EMA already exists elsewhere in screener_feed
+      - Weekly EMA + SMA(weekly_periods), built off completed weekly candles
+      - Monthly EMA + SMA(monthly_periods), built off completed monthly candles
+    Each period gets 3 fields: <prefix>{ema|sma}{period}, <prefix>above_{ema|sma}{period},
+    <prefix>dist_{ema|sma}{period} (% distance of LTP from that level).
+    None-safe throughout — short-history stocks simply get None for periods they can't support.
+    """
+    result = {}
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        n = len(dates)
+        if n < 30: continue
+        ltp = next((v for v in reversed(closes) if v is not None), None)
+        if ltp is None: continue
+        row = {}
+
+        for p in daily_sma_periods:
+            sma = _calc_sma(closes, p); v = sma[-1] if sma else None
+            row[f"sma{p}"] = round(v, 2) if v is not None else None
+            row[f"above_sma{p}"] = bool(v and ltp > v)
+            row[f"dist_sma{p}"] = round((ltp - v) / v * 100, 2) if v else None
+
+        _, wh, wl, wc, _ = _build_tf_series(dates, highs, lows, closes, volumes, "W")
+        for p in weekly_periods:
+            ema_s = _calc_ema(wc, p); sma_s = _calc_sma(wc, p)
+            ev = ema_s[-1] if ema_s else None; sv = sma_s[-1] if sma_s else None
+            row[f"w_ema{p}"] = round(ev, 2) if ev is not None else None
+            row[f"w_above_ema{p}"] = bool(ev and ltp > ev)
+            row[f"w_dist_ema{p}"] = round((ltp - ev) / ev * 100, 2) if ev else None
+            row[f"w_sma{p}"] = round(sv, 2) if sv is not None else None
+            row[f"w_above_sma{p}"] = bool(sv and ltp > sv)
+            row[f"w_dist_sma{p}"] = round((ltp - sv) / sv * 100, 2) if sv else None
+
+        _, mh, ml, mc, _ = _build_tf_series(dates, highs, lows, closes, volumes, "M")
+        for p in monthly_periods:
+            ema_s = _calc_ema(mc, p); sma_s = _calc_sma(mc, p)
+            ev = ema_s[-1] if ema_s else None; sv = sma_s[-1] if sma_s else None
+            row[f"m_ema{p}"] = round(ev, 2) if ev is not None else None
+            row[f"m_above_ema{p}"] = bool(ev and ltp > ev)
+            row[f"m_dist_ema{p}"] = round((ltp - ev) / ev * 100, 2) if ev else None
+            row[f"m_sma{p}"] = round(sv, 2) if sv is not None else None
+            row[f"m_above_sma{p}"] = bool(sv and ltp > sv)
+            row[f"m_dist_sma{p}"] = round((ltp - sv) / sv * 100, 2) if sv else None
+
+        result[sym] = row
+    return result
 
 
 def _detect_stage2(all_data, sma_fast=50, sma_mid=150, sma_long=200,
