@@ -1506,7 +1506,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         wld52=round((ltp-low52)/low52*100,2) if low52 else None
         new_52wh=bool(high52 and ltp>=high52); new_52wl=bool(low52 and ltp<=low52)
         avg_vol20=sum(v for v in volumes[-21:-1] if v)/20 if n>=21 else None
+        avg_vol50=sum(v for v in volumes[-51:-1] if v)/50 if n>=51 else None
         rvol=round(vol/avg_vol20,2) if avg_vol20 and vol else None
+        rvol50=round(vol/avg_vol50,2) if avg_vol50 and vol else None
         trs=[]
         for i in range(max(1,n-14),n):
             h=highs[i]; l=lows[i]; pc=closes[i-1]
@@ -1630,7 +1632,8 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         row={"symbol":sym,"name":cls_info.get("name",""),"tv_code":sh_info.get("tv_code",f"NSE:{sym},"),
             "sector":cls_info.get("sector_group",""),"industry":cls_info.get("display_industry",""),
             "mcap":cls_info.get("market_cap_cr"),"themes":cls_info.get("themes",[]),
-            "ltp":ltp,"pct_ch":pct_ch,"volume":vol,"rvol":rvol,
+            "ltp":ltp,"pct_ch":pct_ch,"volume":vol,"rvol":rvol,"rvol50":rvol50,
+            "avg_vol20":round(avg_vol20) if avg_vol20 else None,"avg_vol50":round(avg_vol50) if avg_vol50 else None,
             "high52":high52,"low52":low52,"52whd":whd52,"52wld":wld52,"new_52wh":new_52wh,"new_52wl":new_52wl,
             "pct_atr":pct_atr,"pct_bbw":pct_bbw,"ema10":ema10,"ema21":ema21,"ema50":ema50,"ema200":ema200,
             "emad10":emad10,"emad21":emad21,"emad50":emad50,"above_21":above_21,"above_50":above_50,"above_200":above_200,
