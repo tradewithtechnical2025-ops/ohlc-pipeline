@@ -2143,7 +2143,7 @@ async def run_hlr_scan() -> None:
             w_hlr_signals=_detect_hlr_tf(all_data,tf="W")
             w_hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
             log.info(f"Weekly HLR: {len(w_hlr_signals)} signals")
-            w_pb_signals=_detect_pullback_tf(all_data,tf="W",ema_periods=(10,30))
+            w_pb_signals=_detect_pullback_tf(all_data,tf="W",ema_periods=(10,30),min_swing_range_pct=20.0)
             w_pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
             m_pb_signals=_detect_pullback_tf(all_data,tf="M",ema_periods=(21,))
             m_pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
