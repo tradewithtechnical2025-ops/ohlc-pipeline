@@ -26,7 +26,15 @@ Modes:
   python pipeline_fundamentals_prod.py daily          → ONLY stocks with a result
                                                          today (via Finedge
                                                          results-calendar), updates
-                                                         just those per-symbol files
+                                                         just those per-symbol files.
+                                                         Also retries any symbol still
+                                                         pending from a previous day
+                                                         (see fundamentals_pending.json)
+                                                         whose result-day data hasn't
+                                                         landed on Finedge yet — Finedge
+                                                         confirms 12-36h typical
+                                                         turnaround, mostly same-day but
+                                                         not guaranteed same-day.
   python pipeline_fundamentals_prod.py backfill_summary
                                                        → ONE-TIME: builds
                                                          fundamentals_summary.json
@@ -53,6 +61,17 @@ Data-shape decisions (locked in from testing phase):
   - shareholdings/pattern — REMOVED (not needed right now)
   - PL/BS get an alias-resolved "core" object (bank vs non-bank field-naming)
     PLUS full "raw" rows (schemas not yet mapped, e.g. insurance, still captured).
+
+Daily-mode pending-retry (added post Finedge support reply, July 2026):
+  Finedge confirmed there is no per-symbol data-refresh status field on
+  results-calendar, and updates (PL + all derived ratios together) typically
+  land 12-36h after announcement, "mostly same day" but not guaranteed.
+  So run_daily() no longer treats a same-day fetch as final: it snapshots
+  the last-known quarter header for every symbol with a result today, and
+  only marks a symbol "done" once the fetched data's latest quarter header
+  actually changes. Until then the symbol stays in fundamentals_pending.json
+  and gets retried on every subsequent daily run, up to MAX_PENDING_ATTEMPTS
+  trading days, after which it's dropped (self-heals on the next full run).
 """
 
 import asyncio, hashlib, json, logging, os, sys
@@ -81,6 +100,9 @@ BS_PERIODS    = ["annual", "quarterly"]
 CF_PERIODS    = ["annual", "quarterly", "ytd"]
 RATIO_TYPES   = ["pr", "le", "li", "ef"]
 QUARTERLY_CAP = 12
+
+# Daily-mode pending-retry tuning — see module docstring.
+MAX_PENDING_ATTEMPTS = 5  # ~5 trading days of retries before a symbol is dropped
 
 ETF_ENDSWITH = ("ETF", "BEES", "LIQUID", "GILT", "IETF", "MMQS", "TOTAL")
 ETF_CONTAINS = ("NIFTY", "BANKEX", "MSCIN")
@@ -174,6 +196,7 @@ async def r2_upload_symbol(client, sym, obj):
 
 
 SUMMARY_FILE = "fundamentals_summary.json"
+PENDING_FILE = "fundamentals_pending.json"
 
 
 async def r2_download_summary(client):
@@ -186,6 +209,16 @@ async def r2_download_summary(client):
 async def r2_upload_summary(client, stocks):
     payload = json.dumps({"updated": today_ist(), "stocks": stocks}, separators=(",", ":"))
     await r2_upload(client, SUMMARY_FILE, payload)
+
+
+async def r2_download_pending(client):
+    d = await r2_download(client, PENDING_FILE)
+    return d if isinstance(d, dict) else {}
+
+
+async def r2_upload_pending(client, pending):
+    payload = json.dumps(pending, separators=(",", ":"))
+    await r2_upload(client, PENDING_FILE, payload)
 
 
 async def get_nse_universe(client):
@@ -641,35 +674,78 @@ async def run_full(part=0):
 
 
 # ══════════════════════════════════════════════════════════════
-# MODE: daily — only stocks with a result today
+# MODE: daily — only stocks with a result today, plus retries for
+# symbols still pending from previous days (see module docstring:
+# Finedge confirmed there's no per-symbol refresh-status field, and
+# updated data can take 12-36h to land, not always same-day).
 # ══════════════════════════════════════════════════════════════
 
 async def run_daily():
     today = today_ist()
     if not is_trading_day(today):
         log.info(f"⏭  {today} not a trading day"); return
+
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient() as client:
         symbols = await get_nse_universe(client)
-        result_symbols = await get_today_result_symbols(client, sem, symbols)
-        if not result_symbols:
-            log.info("No results today — exiting"); return
-        log.info(f"━━━ Fundamentals Daily  {today}  ({len(result_symbols)} stocks) ━━━")
         summary = await r2_download_summary(client)
-        ok = failed = 0
-        for sym in result_symbols:
+        pending = await r2_download_pending(client)
+
+        # 1. New result-today symbols — snapshot their "before" quarter so we
+        #    can tell once Finedge has actually ingested the fresh quarter.
+        todays_new = await get_today_result_symbols(client, sem, symbols)
+        for sym in todays_new:
+            if sym not in pending:
+                pending[sym] = {
+                    "last_known_quarter": summary.get(sym, {}).get("quarters", [{}])[0].get("header")
+                        if summary.get(sym) else None,
+                    "attempts": 0,
+                    "first_seen": today,
+                }
+
+        # 2. Carry-over: symbols still pending from earlier days get retried too.
+        check_list = list(pending.keys())
+        if not check_list:
+            log.info("No pending result symbols to check — exiting"); return
+
+        log.info(f"━━━ Fundamentals Daily {today} — checking {len(check_list)} symbols "
+                  f"({len(todays_new)} new, {len(check_list) - len(todays_new)} carried over) ━━━")
+
+        updated = still_pending = dropped = failed = 0
+        for sym in check_list:
             try:
                 _, obj, summ = await fetch_one_symbol(client, sem, sym)
-                file_hash = await r2_upload_symbol(client, sym, obj)
-                summ["hash"] = file_hash
-                summary[sym] = summ
-                ok += 1
-                log.info(f"  ✓ {sym}")
+                new_q = (summ.get("quarters") or [{}])[0].get("header")
+                old_q = pending[sym]["last_known_quarter"]
+
+                if new_q and new_q != old_q:
+                    # ✅ Finedge has ingested the new quarter — publish and clear pending.
+                    file_hash = await r2_upload_symbol(client, sym, obj)
+                    summ["hash"] = file_hash
+                    summary[sym] = summ
+                    del pending[sym]
+                    updated += 1
+                    log.info(f"  ✓ {sym} updated ({old_q} → {new_q})")
+                else:
+                    pending[sym]["attempts"] += 1
+                    if pending[sym]["attempts"] >= MAX_PENDING_ATTEMPTS:
+                        log.warning(f"  ⚠ {sym}: {MAX_PENDING_ATTEMPTS} attempts, still no new quarter — dropping "
+                                    f"(will self-heal on next full run)")
+                        del pending[sym]
+                        dropped += 1
+                    else:
+                        still_pending += 1
+                        log.info(f"  ⏳ {sym}: no new quarter yet "
+                                 f"(attempt {pending[sym]['attempts']}/{MAX_PENDING_ATTEMPTS})")
             except Exception as e:
                 failed += 1
                 log.warning(f"  ✗ {sym}: {e}")
+
         await r2_upload_summary(client, summary)
-    log.info(f"━━━ Fundamentals Daily complete — ✓{ok}  ✗{failed} ━━━")
+        await r2_upload_pending(client, pending)
+
+    log.info(f"━━━ Daily complete — updated:{updated}  still_pending:{still_pending}  "
+             f"dropped:{dropped}  failed:{failed} ━━━")
 
 
 # ══════════════════════════════════════════════════════════════
