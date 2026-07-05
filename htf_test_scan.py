@@ -38,7 +38,7 @@ def _htf_swing_low_idx(lows, end_idx, lookback):
     return min(seg, key=lambda x: x[1])[0]
 
 
-def detect_htf(s, min_gain_pct=90.0, pole_min_days=10, pole_max_days=40,
+def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_max_days=40,
                max_pullback_pct=25.0, flag_min_days=10, flag_max_days=40,
                lookback_days=260, success_rr_multiple=2.0):
     dates, highs, lows, closes = s["d"], s["h"], s["l"], s["c"]
@@ -75,6 +75,8 @@ def detect_htf(s, min_gain_pct=90.0, pole_min_days=10, pole_max_days=40,
 
         gain_pct = (pole_high - pole_low) / pole_low * 100.0
         if gain_pct < min_gain_pct:
+            continue
+        if max_gain_pct is not None and gain_pct >= max_gain_pct:
             continue
 
         if any(highs[k] is not None and highs[k] > pole_high for k in range(lo, hi)):
@@ -252,9 +254,9 @@ def upload_to_r2(filename, data_str):
 
 PRESETS = {
     "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0, pole_min_days=10,
-                pole_max_days=40, flag_min_days=10, flag_max_days=40,
+                pole_max_days=40, flag_min_days=21, flag_max_days=35,
                 success_rr_multiple=2.0),
-    "Mini HTF": dict(min_gain_pct=20.0, max_pullback_pct=15.0, pole_min_days=10,
+    "Mini HTF": dict(min_gain_pct=20.0, max_gain_pct=90.0, max_pullback_pct=15.0, pole_min_days=10,
                      pole_max_days=40, flag_min_days=5, flag_max_days=40,
                      success_rr_multiple=2.0),
 }
