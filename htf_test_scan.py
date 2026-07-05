@@ -18,7 +18,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 
 import httpx
 
@@ -351,7 +351,14 @@ def main():
         order = {"success": 0, "breakout": 1, "forming": 2, "pole_just_formed": 3,
                  "breakout_failed": 4, "failed": 5}
         signals.sort(key=lambda x: (order.get(x["status"], 9), -x["pole_gain_pct"]))
-        all_results[label] = signals
+
+        # Flat list, matching your other scan files (hlr_signals.json,
+        # ep_signals.json, pattern_signals.json): {"updated","count","signals"}.
+        all_results[label] = {
+            "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "count": len(signals),
+            "signals": signals,
+        }
 
         success = sum(1 for x in signals if x["status"] == "success")
         breakout = sum(1 for x in signals if x["status"] == "breakout")
@@ -387,6 +394,8 @@ def main():
     if args.r2_key:
         print(f"\nPushing results to R2 as {args.r2_key}...")
         upload_to_r2(args.r2_key, json.dumps(all_results))
+
+
 
 
 if __name__ == "__main__":
