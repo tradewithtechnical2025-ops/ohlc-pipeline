@@ -233,6 +233,23 @@ def download_all_chunks():
     return all_data
 
 
+def upload_to_r2(filename, data_str):
+    """Same convention as pipeline.py's r2_upload(): POST to {WORKER_URL}?file={filename}
+    with the X-Secret-Token header."""
+    if not WORKER_URL or not WORKER_TOKEN:
+        print("ERROR: set WORKER_URL and WORKER_TOKEN env vars first.")
+        sys.exit(1)
+    url = f"{WORKER_URL}?file={filename}"
+    with httpx.Client() as client:
+        r = client.post(url, headers={**WORKER_HEADERS, "Content-Type": "application/json"},
+                         content=data_str.encode(), timeout=90)
+    if r.status_code != 200:
+        print(f"  [warn] R2 upload failed for {filename}: HTTP {r.status_code} {r.text[:200]}")
+        return False
+    print(f"  ↑ {filename} ({len(data_str)/1024:.1f} KB) uploaded to R2")
+    return True
+
+
 PRESETS = {
     "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0, pole_min_days=10,
                 pole_max_days=40, flag_min_days=10, flag_max_days=40,
@@ -245,7 +262,8 @@ PRESETS = {
 
 def main():
     ap = argparse.ArgumentParser(description="Full-universe HTF scan test (no full pipeline run)")
-    ap.add_argument("--save", help="optional path to save results as JSON")
+    ap.add_argument("--save", help="optional path to save results as JSON (local file)")
+    ap.add_argument("--r2-key", help="optional R2 filename to push results to, e.g. htf_test_results.json")
     args = ap.parse_args()
 
     print("Downloading OHLC chunks...")
@@ -301,6 +319,10 @@ def main():
         with open(args.save, "w") as f:
             json.dump(all_results, f, indent=2)
         print(f"Saved to {args.save}")
+
+    if args.r2_key:
+        print(f"\nPushing results to R2 as {args.r2_key}...")
+        upload_to_r2(args.r2_key, json.dumps(all_results))
 
 
 if __name__ == "__main__":
