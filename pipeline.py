@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1476,7 +1477,7 @@ def _today_gap_events(gaps_by_sym, today):
 # ══════════════════════════════════════════════════════════════
 
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
-    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, shakeout_map=None):
+    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, shakeout_map=None, w_pb_map=None):
     cls_map={}
     for x in (classification or []):
         sym=x.get("symbol") or x.get("nse_code")
@@ -1654,7 +1655,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             "hlr_dist":(hlr_map or {}).get(sym,{}).get("dist_pct"),"hlr_touches":(hlr_map or {}).get(sym,{}).get("touches"),
             "pullback":sym in (pb_map or {}),"circuit":sh_info.get("circuit"),"hpbc":sh_info.get("hpbc"),"tl_hl_bo":sh_info.get("tl_hl_bo"),
             "shakeout":sym in (shakeout_map or {}),"shakeout_type":(shakeout_map or {}).get(sym,{}).get("wick_type"),
-            "shakeout_support":(shakeout_map or {}).get(sym,{}).get("support_type")}
+            "shakeout_support":(shakeout_map or {}).get(sym,{}).get("support_type"),
+            "w_pullback":sym in (w_pb_map or {}),"w_pullback_date":(w_pb_map or {}).get(sym,{}).get("signal_date"),
+            "w_pullback_ema":(w_pb_map or {}).get(sym,{}).get("signal_ema")}
         feed.append(row)
     log.info(f"screener_feed: {len(feed)} stocks")
     return feed
@@ -1677,7 +1680,7 @@ async def run_ep_scan() -> None:
             ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
             (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
              idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
-             hlr_raw,pb_raw,pat_raw)=await asyncio.gather(
+             hlr_raw,pb_raw,pat_raw,w_pb_raw)=await asyncio.gather(
                 asyncio.gather(*ohlc_tasks,return_exceptions=True),
                 r2_download(client,"screener.json"),r2_download_fund(client),
                 r2_download(client,"result_calendar.json"),r2_download(client,"classification.json"),
@@ -1686,7 +1689,7 @@ async def run_ep_scan() -> None:
                 r2_download(client,f"index_history/{INDEX_SYMBOLS['smallmid400']}.json"),
                 r2_download(client,"index_daily.json"),r2_download(client,"sheet_data.json"),
                 r2_download(client,"hlr_signals.json"),r2_download(client,"pullback_signals.json"),
-                r2_download(client,"pattern_signals.json"),
+                r2_download(client,"pattern_signals.json"),r2_download(client,"weekly_pullback_signals.json"),
             )
             all_data={}
             for i,res in enumerate(ohlc_results):
@@ -1738,6 +1741,16 @@ async def run_ep_scan() -> None:
                 for sig in (pat_raw.get("signals") or []):
                     sym=sig.get("symbol"); pat=sig.get("pattern")
                     if sym and pat: pat_map.setdefault(sym,set()).add(pat)
+
+            w_pb_map={}
+            if isinstance(w_pb_raw,dict):
+                for sig in (w_pb_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    # keep only the most recent signal per symbol (multiple
+                    # chained legs can exist historically; screener_feed just
+                    # needs "does this stock have a current weekly pullback")
+                    if sym and (sym not in w_pb_map or sig.get("signal_date","") > w_pb_map[sym].get("signal_date","")):
+                        w_pb_map[sym]=sig
 
             # ─── FIX: fresh enrichment helpers ───
             # Classification map — sector ke liye (sheet ki jagah)
@@ -1827,7 +1840,7 @@ async def run_ep_scan() -> None:
             shakeout_signals=_detect_shakeout(all_data)
             shakeout_map={sig["symbol"]:sig for sig in shakeout_signals}
             log.info(f"Shakeout signals: {len(shakeout_signals)}")
-            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,shakeout_map=shakeout_map)
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,shakeout_map=shakeout_map,w_pb_map=w_pb_map)
             mtf_ma_map=_calc_multi_tf_ma(all_data)
             log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
             for row in screener_feed:
@@ -1844,7 +1857,7 @@ async def run_ep_scan() -> None:
                     row["eps_ch"]=round((e0-e4)/e4*100,1) if e0 and e4 else None
                 else: row["sales_ch"]=None; row["eps_ch"]=None
                 pats=set()
-                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC"),("shakeout","Shakeout")]:
+                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC"),("shakeout","Shakeout"),("w_pullback","W-Pullback")]:
                     if row.get(flag): pats.add(label)
                 if row.get("gap_fill"): pats.add(row["gap_fill"])
                 if row.get("hlr_state"): pats.add(row["hlr_state"])
@@ -2023,7 +2036,200 @@ def _detect_pullback_tf(all_data, tf="W", ema_periods=(10, 30), length_pull=2,
             "macd": round(macd_line[i], 4), "macd_signal": round(macd_signal[i], 4)})
     return signals
 
-def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,consol_pct=4.0):
+
+# ══════════════════════════════════════════════════════════════
+# WEEKLY PULLBACK v2 — chain-based pole detection (HTF-style), replaces
+# ONLY the weekly leg of the old _detect_pullback_tf() call in
+# run_hlr_scan(). _detect_pullback_tf() itself is untouched and still
+# powers the MONTHLY pullback scan (tf="M") — see run_hlr_scan() below.
+# _build_tf_series / _calc_ema / _check_liquidity are reused as-is.
+#
+# No entry/SL fields — just the signal itself (pole + pullback + which
+# EMA it touched), for feeding into screener_feed.json as a boolean flag.
+# ══════════════════════════════════════════════════════════════
+
+def _isoweek_to_date(week_str):
+    """Converts _build_tf_series' weekly date-key string (e.g. '(2025, 26)')
+    into the Monday of that ISO week, e.g. '2025-06-23'."""
+    m = re.match(r"\((\d+),\s*(\d+)\)", str(week_str))
+    if not m:
+        return week_str
+    year, week = int(m.group(1)), int(m.group(2))
+    return date.fromisocalendar(year, week, 1).isoformat()
+
+
+def _weekly_pullback_swing_low_candidates(lows, end_idx, lookback, floor=0):
+    """Returns ALL candidate base ('lo') indices within [floor, end_idx],
+    sorted so lower lows (bigger potential gain%) are tried first."""
+    start = max(0, end_idx - lookback, floor)
+    seg_idx = [i for i in range(start, end_idx + 1) if lows[i] is not None]
+    if not seg_idx:
+        return []
+    return sorted(seg_idx, key=lambda i: lows[i])
+
+
+def _try_build_weekly_pullback_v2(lo, hi, wd, wh, wl, wc, emas, n,
+                                   pole_min_weeks, pole_max_weeks, min_gain_pct,
+                                   min_pullback_pct, ema_proximity_pct, max_pullback_weeks,
+                                   pole_ema_tolerance_pct, peak_check_min_pullback_pct):
+    if lo is None or lo >= hi:
+        return None
+
+    pole_high = wh[hi]
+    pole_low = wl[lo]
+    pole_weeks = hi - lo
+    if pole_weeks < pole_min_weeks or pole_weeks > pole_max_weeks:
+        return None
+    if not pole_low or pole_low <= 0:
+        return None
+
+    gain_pct = (pole_high - pole_low) / pole_low * 100.0
+    if gain_pct < min_gain_pct:
+        return None
+
+    if any(wh[k] is not None and wh[k] > pole_high for k in range(lo, hi)):
+        return None
+
+    # Pullback-aware forward check: a later close meaningfully above
+    # pole_high only invalidates this candidate if the rally never genuinely
+    # paused first. If a real pullback already happened before that later
+    # higher close, this candidate IS a legitimate, separate pole-top — the
+    # later high belongs to a NEW leg, picked up by the chain logic below.
+    peak_check_end = min(n, hi + 5)
+    min_low_seen = pole_high
+    for k in range(hi + 1, peak_check_end):
+        if wl[k] is not None:
+            min_low_seen = min(min_low_seen, wl[k])
+        if wc[k] is not None and wc[k] > pole_high * 1.03:
+            pullback_so_far = (pole_high - min_low_seen) / pole_high * 100.0
+            if pullback_so_far < peak_check_min_pullback_pct:
+                return None
+            break
+
+    # Pole-cleanliness: the rally itself (lo -> hi) must stay above its own
+    # EMA10 the whole way (small tolerance for minor undershoots).
+    fast_ema = min(emas.keys())
+    for k in range(lo, hi + 1):
+        e = emas[fast_ema][k]
+        if e is not None and wc[k] is not None and wc[k] < e * (1 - pole_ema_tolerance_pct / 100.0):
+            return None
+
+    walk_end = min(n - 1, hi + max_pullback_weeks)
+    cum_low = pole_high
+    cum_low_idx = hi
+    signal_idx = None
+    signal_ema = None
+    signal_kind = None
+
+    for j in range(hi + 1, walk_end + 1):
+        l, c = wl[j], wc[j]
+        if l is not None and l < cum_low:
+            cum_low = l
+            cum_low_idx = j
+
+        for p in sorted(emas.keys()):
+            e = emas[p][j]
+            if e is None:
+                continue
+            near = (l is not None and abs(l - e) / e * 100 <= ema_proximity_pct) or \
+                   (c is not None and abs(c - e) / e * 100 <= ema_proximity_pct)
+            reversal = l is not None and c is not None and l < e and c > e
+            if near or reversal:
+                signal_idx = j
+                signal_ema = p
+                signal_kind = "Reversal" if reversal else f"Near EMA{p}"
+                break
+        if signal_idx is not None:
+            break
+
+    if signal_idx is None:
+        return None
+
+    pullback_pct = (pole_high - wl[signal_idx]) / pole_high * 100.0
+    if pullback_pct < min_pullback_pct:
+        return None
+
+    return {
+        "pole_low_date": _isoweek_to_date(wd[lo]), "pole_low": round(pole_low, 2),
+        "pole_high_date": _isoweek_to_date(wd[hi]), "pole_high": round(pole_high, 2),
+        "pole_gain_pct": round(gain_pct, 1), "pole_weeks": pole_weeks,
+        "signal_date": _isoweek_to_date(wd[signal_idx]), "signal_ema": f"EMA{signal_ema}",
+        "signal_kind": signal_kind,
+        "pullback_pct": round(pullback_pct, 1),
+        "as_of_date": _isoweek_to_date(wd[-1]), "as_of_close": round(wc[-1], 2) if wc[-1] is not None else None,
+        "_cum_low_idx": cum_low_idx, "_signal_idx": signal_idx,
+    }
+
+
+def _detect_weekly_pullback_v2(all_data, min_gain_pct=30.0, pole_min_weeks=3, pole_max_weeks=26,
+                                ema_periods=(10, 30), ema_proximity_pct=5.0,
+                                max_pullback_weeks=12, min_pullback_pct=5.0,
+                                pole_ema_tolerance_pct=0.0, peak_check_min_pullback_pct=10.0,
+                                lookback_weeks=104):
+    """
+    Chain-based weekly rally + pullback-to-EMA signal detector (HTF-style):
+    pole must be a strictly clean rally (no real EMA10 close-violations
+    during formation), peak-check is pullback-aware, and each pole's own
+    pullback-low chains directly into the next pole's base. No entry/SL —
+    just the signal, for boolean-flagging in screener_feed.json.
+    """
+    all_signals = []
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        if len(dates) < 60 or not _check_liquidity(volumes, closes, len(dates)):
+            continue
+
+        wd, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, "W")
+        n = len(wd)
+        min_bars = max(ema_periods) + pole_min_weeks + 5
+        if n < min_bars:
+            continue
+
+        emas = {p: _calc_ema(wc, p) for p in ema_periods}
+
+        matches = []
+        scan_start = max(0, n - lookback_weeks)
+        chain_lo = None
+        fallback_floor = -1
+
+        for hi in range(scan_start + pole_min_weeks, n):
+            if wh[hi] is None:
+                continue
+
+            candidates = []
+            if chain_lo is not None and hi - chain_lo <= pole_max_weeks:
+                candidates.append(chain_lo)
+            for search_lo in _weekly_pullback_swing_low_candidates(wl, hi, pole_max_weeks, floor=fallback_floor):
+                if search_lo not in candidates:
+                    candidates.append(search_lo)
+
+            match = None
+            for lo in candidates:
+                match = _try_build_weekly_pullback_v2(
+                    lo, hi, wd, wh, wl, wc, emas, n,
+                    pole_min_weeks, pole_max_weeks, min_gain_pct,
+                    min_pullback_pct, ema_proximity_pct, max_pullback_weeks,
+                    pole_ema_tolerance_pct, peak_check_min_pullback_pct)
+                if match is not None:
+                    break
+
+            if match is None:
+                continue
+
+            cum_low_idx = match.pop("_cum_low_idx")
+            signal_idx = match.pop("_signal_idx")
+            matches.append(match)
+            chain_lo = cum_low_idx if cum_low_idx > hi else None
+            fallback_floor = signal_idx + 2
+
+        matches.sort(key=lambda m: m["pole_high_date"], reverse=True)
+        for m in matches:
+            all_signals.append({"symbol": sym, **m})
+
+    return all_signals
+
+
+
     signals=[]
     for sym,s in all_data.items():
         dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
@@ -2146,8 +2352,8 @@ async def run_hlr_scan() -> None:
             w_hlr_signals=_detect_hlr_tf(all_data,tf="W")
             w_hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
             log.info(f"Weekly HLR: {len(w_hlr_signals)} signals")
-            w_pb_signals=_detect_pullback_tf(all_data,tf="W",ema_periods=(10,30),min_swing_range_pct=20.0)
-            w_pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+            w_pb_signals=_detect_weekly_pullback_v2(all_data)
+            w_pb_signals.sort(key=lambda x:x["pole_high_date"],reverse=True)
             m_pb_signals=_detect_pullback_tf(all_data,tf="M",ema_periods=(21,))
             m_pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
             log.info(f"Weekly Pullback: {len(w_pb_signals)}  Monthly Pullback: {len(m_pb_signals)}")
