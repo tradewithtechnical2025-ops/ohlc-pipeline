@@ -40,7 +40,7 @@ def _htf_swing_low_idx(lows, end_idx, lookback):
 
 def detect_htf(s, min_gain_pct=90.0, pole_min_days=10, pole_max_days=40,
                max_pullback_pct=25.0, flag_min_days=10, flag_max_days=40,
-               lookback_days=260):
+               lookback_days=260, success_rr_multiple=2.0):
     dates, highs, lows, closes = s["d"], s["h"], s["l"], s["c"]
     n = len(dates)
     if n < pole_min_days + flag_min_days:
@@ -48,6 +48,7 @@ def detect_htf(s, min_gain_pct=90.0, pole_min_days=10, pole_max_days=40,
 
     matches = []
     scan_start = max(0, n - lookback_days)
+    last_matched_hi = -1   # pole-high index of the most recently recorded match
 
     for hi in range(scan_start + pole_min_days, n):
         pole_high = highs[hi]
@@ -57,6 +58,14 @@ def detect_htf(s, min_gain_pct=90.0, pole_min_days=10, pole_max_days=40,
         lo = _htf_swing_low_idx(lows, hi, pole_max_days)
         if lo is None or lo >= hi:
             continue
+
+        # A genuinely NEW/separate pole must start its base AFTER the previous
+        # matched pole's own high — otherwise its swing-low reaches back into
+        # the earlier rally and this "new" pole is really just re-measuring
+        # (part of) the same underlying move as a second, overlapping pattern.
+        if lo < last_matched_hi:
+            continue
+
         pole_low = lows[lo]
         pole_days = hi - lo
         if pole_days < pole_min_days or pole_days > pole_max_days:
@@ -74,39 +83,112 @@ def detect_htf(s, min_gain_pct=90.0, pole_min_days=10, pole_max_days=40,
         if any(highs[k] is not None and highs[k] > pole_high * 1.03 for k in range(hi + 1, peak_check_end)):
             continue
 
+        # Walk forward day-by-day from the pole high, tracking the flag's
+        # cumulative low/high as consolidation actually unfolds — instead of
+        # freezing the range at one early snapshot (hi+flag_min_days) and
+        # judging today's price against that stale window, which wrongly
+        # flags "failed" when the pattern is still intact over its full span.
         flag_end_max = min(n - 1, hi + flag_max_days)
-        for fe in range(hi + flag_min_days, flag_end_max + 1):
-            flag_lows = [lows[k] for k in range(hi, fe + 1) if lows[k] is not None]
-            flag_highs = [highs[k] for k in range(hi, fe + 1) if highs[k] is not None]
-            if not flag_lows or not flag_highs:
-                continue
-            flag_low = min(flag_lows)
-            flag_high = max(flag_highs)
+        cum_low = pole_high
+        cum_high = pole_high
+        status = "forming"
+        resolved_idx = None   # index where breakout/failure was confirmed
 
-            pullback_pct = (pole_high - flag_low) / pole_high * 100.0
-            if pullback_pct > max_pullback_pct:
+        for j in range(hi + 1, flag_end_max + 1):
+            c, h, l = closes[j], highs[j], lows[j]
+
+            # Breakout check uses the flag high established BEFORE today,
+            # so the breakout candle itself isn't used to validate its own signal.
+            if c is not None and (j - hi) >= flag_min_days and c > cum_high:
+                status = "breakout"
+                resolved_idx = j
                 break
 
-            flag_days = fe - hi
-            last_close = closes[-1]
-            last_low = lows[-1]
-            status = "forming"
-            if last_close is not None and last_close > flag_high:
-                status = "breakout"
-            elif last_low is not None and last_low < flag_low * 0.98:
-                status = "failed"
+            if h is not None:
+                cum_high = max(cum_high, h)
+            if l is not None:
+                cum_low = min(cum_low, l)
 
-            matches.append({
-                "pole_low_date": dates[lo], "pole_low": round(pole_low, 2),
-                "pole_high_date": dates[hi], "pole_high": round(pole_high, 2),
-                "pole_gain_pct": round(gain_pct, 1), "pole_days": pole_days,
-                "flag_end_date": dates[fe], "flag_low": round(flag_low, 2),
-                "flag_high": round(flag_high, 2), "flag_pullback_pct": round(pullback_pct, 1),
-                "flag_days": flag_days, "as_of_date": dates[-1],
-                "as_of_close": round(last_close, 2) if last_close is not None else None,
-                "status": status,
-            })
-            break
+            pullback_pct = (pole_high - cum_low) / pole_high * 100.0
+            if pullback_pct > max_pullback_pct:
+                status = "failed"
+                resolved_idx = j
+                break
+
+        fe = resolved_idx if resolved_idx is not None else flag_end_max
+        pullback_pct = (pole_high - cum_low) / pole_high * 100.0
+        flag_days = fe - hi
+        flag_low_final = cum_low
+        flag_high_final = cum_high
+        last_close = closes[-1]
+
+        # ── Post-breakout tracking ──
+        # Breakout was only "confirmed" as of resolved_idx — that doesn't mean
+        # it held or delivered. Target is dynamic per-stock: risk = distance
+        # from breakout_close down to flag_low (what you'd lose if stopped
+        # out there), target = success_rr_multiple x that risk (2:1 by default).
+        # Resolve by whichever happens FIRST, chronologically:
+        #   - running high reaches the target -> "success"
+        #   - price falls back below flag_low before that -> "breakout_failed"
+        #   - neither has happened yet (as of today) -> stays "breakout"
+        post_info = {}
+        if status == "breakout":
+            bo_idx = resolved_idx
+            breakout_close = closes[bo_idx]
+            post_high = breakout_close
+            post_high_date = dates[bo_idx]
+            success_idx = None
+            broke_back_idx = None
+
+            risk_pct = ((breakout_close - flag_low_final) / breakout_close * 100.0
+                        if breakout_close else None)
+            target_gain_pct = (risk_pct * success_rr_multiple) if risk_pct is not None else None
+
+            for k in range(bo_idx + 1, n):
+                if highs[k] is not None and highs[k] > post_high:
+                    post_high = highs[k]
+                    post_high_date = dates[k]
+
+                if success_idx is None and breakout_close and target_gain_pct is not None:
+                    gain_so_far = (post_high - breakout_close) / breakout_close * 100.0
+                    if gain_so_far >= target_gain_pct:
+                        success_idx = k
+
+                if broke_back_idx is None and lows[k] is not None and lows[k] < flag_low_final:
+                    broke_back_idx = k
+
+            if success_idx is not None and (broke_back_idx is None or success_idx <= broke_back_idx):
+                status = "success"
+            elif broke_back_idx is not None and (success_idx is None or broke_back_idx < success_idx):
+                status = "breakout_failed"
+            # else: stays "breakout" — neither resolved yet as of today
+
+            post_info = {
+                "breakout_date": dates[bo_idx],
+                "breakout_close": round(breakout_close, 2) if breakout_close is not None else None,
+                "risk_pct": round(risk_pct, 1) if risk_pct is not None else None,
+                "target_gain_pct": round(target_gain_pct, 1) if target_gain_pct is not None else None,
+                "post_breakout_high": round(post_high, 2),
+                "post_breakout_high_date": post_high_date,
+                "post_breakout_gain_pct": round((post_high - breakout_close) / breakout_close * 100, 1)
+                    if breakout_close else None,
+                "success_date": dates[success_idx] if status == "success" else None,
+                "broke_flag_low_date": dates[broke_back_idx] if status == "breakout_failed" else None,
+            }
+
+        match = {
+            "pole_low_date": dates[lo], "pole_low": round(pole_low, 2),
+            "pole_high_date": dates[hi], "pole_high": round(pole_high, 2),
+            "pole_gain_pct": round(gain_pct, 1), "pole_days": pole_days,
+            "flag_end_date": dates[fe], "flag_low": round(flag_low_final, 2),
+            "flag_high": round(flag_high_final, 2), "flag_pullback_pct": round(pullback_pct, 1),
+            "flag_days": flag_days, "as_of_date": dates[-1],
+            "as_of_close": round(last_close, 2) if last_close is not None else None,
+            "status": status,
+        }
+        match.update(post_info)
+        matches.append(match)
+        last_matched_hi = hi
 
     matches.sort(key=lambda m: m["pole_high_date"], reverse=True)
     deduped = []
@@ -151,12 +233,18 @@ def download_all_chunks():
     return all_data
 
 
+PRESETS = {
+    "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0, pole_min_days=10,
+                pole_max_days=40, flag_min_days=10, flag_max_days=40,
+                success_rr_multiple=2.0),
+    "Mini HTF": dict(min_gain_pct=20.0, max_pullback_pct=15.0, pole_min_days=10,
+                     pole_max_days=40, flag_min_days=5, flag_max_days=40,
+                     success_rr_multiple=2.0),
+}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Full-universe HTF scan test (no full pipeline run)")
-    ap.add_argument("--min-gain", type=float, default=90.0)
-    ap.add_argument("--max-pullback", type=float, default=25.0)
-    ap.add_argument("--pole-max-days", type=int, default=40)
-    ap.add_argument("--flag-max-days", type=int, default=40)
     ap.add_argument("--save", help="optional path to save results as JSON")
     args = ap.parse_args()
 
@@ -164,43 +252,55 @@ def main():
     all_data = download_all_chunks()
     print(f"\nTotal loaded: {len(all_data)} stocks\n")
 
-    signals = []
+    liquid = {}
     skipped_illiquid = 0
     for sym, s in all_data.items():
         if not _check_liquidity(s.get("v", []), s.get("c", []), len(s.get("d", []))):
             skipped_illiquid += 1
             continue
-        for m in detect_htf(
-            s,
-            min_gain_pct=args.min_gain,
-            max_pullback_pct=args.max_pullback,
-            pole_max_days=args.pole_max_days,
-            flag_max_days=args.flag_max_days,
-        ):
-            signals.append({"symbol": sym, **m})
+        liquid[sym] = s
+    print(f"Skipped (illiquid): {skipped_illiquid}\n")
 
-    order = {"breakout": 0, "forming": 1, "failed": 2}
-    signals.sort(key=lambda x: (order.get(x["status"], 9), -x["pole_gain_pct"]))
+    all_results = {}
+    for label, params in PRESETS.items():
+        signals = []
+        for sym, s in liquid.items():
+            for m in detect_htf(s, **params):
+                signals.append({"symbol": sym, "pattern": label, **m})
 
-    breakout = sum(1 for x in signals if x["status"] == "breakout")
-    forming = sum(1 for x in signals if x["status"] == "forming")
-    failed = sum(1 for x in signals if x["status"] == "failed")
+        order = {"success": 0, "breakout": 1, "forming": 2, "breakout_failed": 3, "failed": 4}
+        signals.sort(key=lambda x: (order.get(x["status"], 9), -x["pole_gain_pct"]))
+        all_results[label] = signals
 
-    print(f"Skipped (illiquid): {skipped_illiquid}")
-    print(f"HTF setups found: {len(signals)}  (Breakout: {breakout}  Forming: {forming}  Failed: {failed})\n")
+        success = sum(1 for x in signals if x["status"] == "success")
+        breakout = sum(1 for x in signals if x["status"] == "breakout")
+        forming = sum(1 for x in signals if x["status"] == "forming")
+        breakout_failed = sum(1 for x in signals if x["status"] == "breakout_failed")
+        failed = sum(1 for x in signals if x["status"] == "failed")
 
-    for x in signals:
-        print(f"  {x['symbol']:<15} {x['status'].upper():<9} "
-              f"pole +{x['pole_gain_pct']}%  flag pullback {x['flag_pullback_pct']}%  "
-              f"pole: {x['pole_low_date']}->{x['pole_high_date']}  flag through {x['flag_end_date']}")
+        print(f"=== {label}  (gain>={params['min_gain_pct']}%  pullback<={params['max_pullback_pct']}%  "
+              f"flag_min_days={params['flag_min_days']}  success={params['success_rr_multiple']}x flag risk) ===")
+        print(f"Found: {len(signals)}  (Success: {success}  Breakout: {breakout}  Forming: {forming}  "
+              f"Breakout-Failed: {breakout_failed}  Failed: {failed})\n")
+        for x in signals:
+            line = (f"  {x['symbol']:<15} {x['status'].upper():<16} "
+                    f"pole +{x['pole_gain_pct']}%  flag pullback {x['flag_pullback_pct']}%  "
+                    f"pole: {x['pole_low_date']}->{x['pole_high_date']}  flag through {x['flag_end_date']}")
+            if x["status"] in ("success", "breakout", "breakout_failed"):
+                line += (f"  | BO on {x['breakout_date']} @ {x['breakout_close']}"
+                         f"  (risk {x['risk_pct']}%  target {x['target_gain_pct']}%)"
+                         f"  ran to {x['post_breakout_high']} (+{x['post_breakout_gain_pct']}%)")
+                if x["status"] == "success":
+                    line += f"  TARGET HIT on {x['success_date']}"
+                if x["status"] == "breakout_failed":
+                    line += f"  BROKE flag_low on {x['broke_flag_low_date']}"
+            print(line)
+        print()
 
     if args.save:
         with open(args.save, "w") as f:
-            json.dump({
-                "count": len(signals), "breakout": breakout, "forming": forming,
-                "failed": failed, "signals": signals,
-            }, f, indent=2)
-        print(f"\nSaved to {args.save}")
+            json.dump(all_results, f, indent=2)
+        print(f"Saved to {args.save}")
 
 
 if __name__ == "__main__":
