@@ -2229,7 +2229,7 @@ def _detect_weekly_pullback_v2(all_data, min_gain_pct=30.0, pole_min_weeks=3, po
     return all_signals
 
 
-
+def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,consol_pct=4.0):
     signals=[]
     for sym,s in all_data.items():
         dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
