@@ -116,6 +116,14 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
     if status == "breakout" and flag_days < flag_min_days:
         return None
 
+    # If the flag ran all the way to flag_max_days without EVER resolving
+    # (no breakout, no failure), this setup is stale/expired — not "still
+    # forming". Reporting it as forming forever (even a year later, once
+    # price has moved on for entirely unrelated reasons) is misleading.
+    # Drop it; a later, genuinely fresh pole picks up from here instead.
+    if status == "forming" and flag_days >= flag_max_days:
+        return None
+
     flag_low_final = cum_low
     flag_high_final = cum_high
     last_close = closes[-1]
