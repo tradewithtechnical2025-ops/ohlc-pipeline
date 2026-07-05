@@ -38,6 +38,19 @@ def _htf_swing_low_idx(lows, end_idx, lookback, floor=0):
     return min(seg, key=lambda x: x[1])[0]
 
 
+def _swing_low_candidates(lows, end_idx, lookback, floor=0):
+    """Returns ALL candidate base indices within [floor, end_idx], sorted so
+    lower lows (bigger potential gain%) are tried first. Trying every point
+    (not just the single absolute minimum) avoids settling for a higher,
+    non-optimal base when a genuinely lower valid one exists in the same
+    window — same fix already applied in weekly_pullback_signal.py."""
+    start = max(0, end_idx - lookback, floor)
+    seg_idx = [i for i in range(start, end_idx + 1) if lows[i] is not None]
+    if not seg_idx:
+        return []
+    return sorted(seg_idx, key=lambda i: lows[i])
+
+
 def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
                           pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
                           max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple):
@@ -231,19 +244,23 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
         candidates = []
         if chain_lo is not None and hi - chain_lo <= pole_max_days:
             candidates.append(chain_lo)
-        search_lo = _htf_swing_low_idx(lows, hi, pole_max_days, floor=fallback_floor)
-        if search_lo is not None and search_lo not in candidates:
-            candidates.append(search_lo)
+        for search_lo in _swing_low_candidates(lows, hi, pole_max_days, floor=fallback_floor):
+            if search_lo not in candidates:
+                candidates.append(search_lo)
 
+        # Try every candidate base, not just the first that works — a lower
+        # low elsewhere in the same valid window measures the rally more
+        # completely (bigger, more accurate gain%). chain_lo still gets a
+        # chance first (preserves intentional staircase continuation), but
+        # if a genuinely lower valid base also exists, prefer it.
         match = None
         used_lo = None
         for lo in candidates:
-            match = _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
-                                          pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
-                                          max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
-            if match is not None:
-                used_lo = lo
-                break
+            m2 = _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
+                                       pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
+                                       max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
+            if m2 is not None and (match is None or lows[lo] < lows[used_lo]):
+                match, used_lo = m2, lo
 
         if match is None:
             hi += 1
