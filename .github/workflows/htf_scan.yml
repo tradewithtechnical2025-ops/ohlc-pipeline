@@ -28,7 +28,7 @@ jobs:
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-        run: python htf_test_scan.py --save htf_results.json
+        run: python htf_test_scan.py --save htf_results.json --r2-key htf_test_results.json
 
       - name: Upload results as workflow artifact
         uses: actions/upload-artifact@v4
