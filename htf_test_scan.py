@@ -222,8 +222,10 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
     chain_lo = None
     fallback_floor = -1
 
-    for hi in range(scan_start + pole_min_days, n):
+    hi = scan_start + pole_min_days
+    while hi < n:
         if highs[hi] is None:
+            hi += 1
             continue
 
         candidates = []
@@ -234,21 +236,42 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
             candidates.append(search_lo)
 
         match = None
+        used_lo = None
         for lo in candidates:
             match = _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
                                           pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
                                           max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
             if match is not None:
+                used_lo = lo
                 break
 
         if match is None:
+            hi += 1
             continue
 
+        # Prefer the highest valid peak reachable from this same lo, not
+        # just the first one encountered chronologically — otherwise a
+        # later, genuinely higher point within the same window gets left
+        # sitting inside the "flag" (inflating flag_high above pole_high)
+        # instead of becoming the pole-high itself.
+        best_hi, best_match = hi, match
+        search_end = min(n - 1, used_lo + pole_max_days)
+        for hi2 in range(hi + 1, search_end + 1):
+            if highs[hi2] is None or highs[hi2] <= highs[best_hi]:
+                continue
+            match2 = _try_build_htf_match(used_lo, hi2, dates, highs, lows, closes, n,
+                                           pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
+                                           max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
+            if match2 is not None:
+                best_hi, best_match = hi2, match2
+
+        match = best_match
         cum_low_idx = match.pop("_cum_low_idx")
         fe = match.pop("_fe")
         matches.append(match)
-        chain_lo = cum_low_idx if cum_low_idx > hi else None
+        chain_lo = cum_low_idx if cum_low_idx > best_hi else None
         fallback_floor = fe + 2
+        hi = best_hi + 1
 
     matches.sort(key=lambda m: m["pole_high_date"], reverse=True)
     deduped = []
@@ -315,7 +338,7 @@ PRESETS = {
                 pole_max_days=40, flag_min_days=15, flag_max_days=25,
                 success_rr_multiple=2.0),
     "Mini HTF": dict(min_gain_pct=20.0, max_gain_pct=90.0, max_pullback_pct=15.0, pole_min_days=10,
-                     pole_max_days=40, flag_min_days=5, flag_max_days=40,
+                     pole_max_days=40, flag_min_days=5, flag_max_days=21,
                      success_rr_multiple=2.0),
 }
 
