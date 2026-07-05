@@ -311,7 +311,7 @@ def upload_to_r2(filename, data_str):
 
 
 PRESETS = {
-    "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0, pole_min_days=10,
+    "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0, pole_min_days=15,
                 pole_max_days=40, flag_min_days=15, flag_max_days=25,
                 success_rr_multiple=2.0),
     "Mini HTF": dict(min_gain_pct=20.0, max_gain_pct=90.0, max_pullback_pct=15.0, pole_min_days=10,
