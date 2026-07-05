@@ -336,6 +336,8 @@ def main():
         signals = []
         for sym, s in liquid.items():
             for m in detect_htf(s, **params):
+                if m["status"] == "failed":
+                    continue   # never confirmed a valid HTF flag — not actionable, skip
                 signals.append({"symbol": sym, "pattern": label, **m})
 
         order = {"success": 0, "breakout": 1, "forming": 2, "pole_just_formed": 3,
@@ -348,12 +350,12 @@ def main():
         forming = sum(1 for x in signals if x["status"] == "forming")
         pole_just_formed = sum(1 for x in signals if x["status"] == "pole_just_formed")
         breakout_failed = sum(1 for x in signals if x["status"] == "breakout_failed")
-        failed = sum(1 for x in signals if x["status"] == "failed")
 
         print(f"=== {label}  (gain>={params['min_gain_pct']}%  pullback<={params['max_pullback_pct']}%  "
               f"flag_min_days={params['flag_min_days']}  success={params['success_rr_multiple']}x flag risk) ===")
         print(f"Found: {len(signals)}  (Success: {success}  Breakout: {breakout}  Forming: {forming}  "
-              f"Pole-Just-Formed: {pole_just_formed}  Breakout-Failed: {breakout_failed}  Failed: {failed})\n")
+              f"Pole-Just-Formed: {pole_just_formed}  Breakout-Failed: {breakout_failed})  "
+              f"[note: 'failed' patterns (never broke out) are excluded entirely]\n")
         for x in signals:
             line = (f"  {x['symbol']:<15} {x['status'].upper():<16} "
                     f"pole +{x['pole_gain_pct']}%  flag pullback {x['flag_pullback_pct']}%  "
