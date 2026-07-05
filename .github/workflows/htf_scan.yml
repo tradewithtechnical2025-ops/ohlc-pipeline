@@ -1,0 +1,38 @@
+name: HTF Scan (standalone)
+
+# Runs htf_test_scan.py directly. Does NOT touch pipeline.py in any way —
+# only needs WORKER_URL + WORKER_TOKEN to read the existing ohlc_*.json
+# chunks from R2.
+
+on:
+  schedule:
+    - cron: "30 10 * * 1-5"   # 4:00 PM IST, after NSE close
+  workflow_dispatch: {}
+
+jobs:
+  htf-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run HTF scan
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python htf_test_scan.py --save htf_results.json
+
+      - name: Upload results as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: htf-results
+          path: htf_results.json
+          retention-days: 30
