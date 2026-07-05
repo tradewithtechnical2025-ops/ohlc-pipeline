@@ -2123,6 +2123,16 @@ def _try_build_weekly_pullback_v2(lo, hi, wd, wh, wl, wc, emas, n,
 
     for j in range(hi + 1, walk_end + 1):
         l, c = wl[j], wc[j]
+
+        # If this week's HIGH already breaks above pole_high, the stock isn't
+        # pulling back anymore — it's making a fresh new high. Such a candle
+        # can't be a valid "pullback signal" week even if its low/close also
+        # happens to sit near an EMA; a wide-range week that dips to the EMA
+        # AND rallies to a new high in the same week is a breakout candle,
+        # not a pullback candle. Stop looking for a signal on this pole.
+        if wh[j] is not None and wh[j] > pole_high * 1.03:
+            break
+
         if l is not None and l < cum_low:
             cum_low = l
             cum_low_idx = j
