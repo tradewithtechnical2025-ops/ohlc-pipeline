@@ -297,10 +297,23 @@ def _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
 def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
                           pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
                           max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
-                          ema21=None):
+                          ema21=None, min_efficiency_ratio=0.5, reject_log=None):
     """Daily-only path (used by Mini HTF): validates the pole itself using
     daily bars, then hands off to _build_flag_and_signal for the rest.
-    Returns None if this (lo, hi) pair doesn't qualify."""
+    Returns None if this (lo, hi) pair doesn't qualify.
+
+    reject_log (optional): if a list is passed in, every rejected candidate
+    gets a dict appended describing why it was rejected (pole_low_date,
+    pole_high_date, reason, and the relevant metric) — this is how you can
+    recover exactly what a stricter setting (e.g. the ER filter) is
+    filtering out, without re-deriving it by hand."""
+    def _reject(reason, **extra):
+        if reject_log is not None:
+            entry = {"pole_low_date": dates[lo], "pole_high_date": dates[hi], "reason": reason}
+            entry.update(extra)
+            reject_log.append(entry)
+        return None
+
     if lo is None or lo >= hi:
         return None
 
@@ -308,25 +321,25 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
     pole_low = lows[lo]
     pole_days = hi - lo
     if pole_days < pole_min_days or pole_days > pole_max_days:
-        return None
+        return _reject("pole_days_out_of_range", pole_days=pole_days)
     if not pole_low or pole_low <= 0:
         return None
 
     gain_pct = (pole_high - pole_low) / pole_low * 100.0
     if gain_pct < min_gain_pct:
-        return None
+        return _reject("gain_below_min", gain_pct=round(gain_pct, 1))
     if max_gain_pct is not None and gain_pct >= max_gain_pct:
-        return None
+        return _reject("gain_above_max", gain_pct=round(gain_pct, 1))
 
     if any(highs[k] is not None and highs[k] > pole_high for k in range(lo, hi)):
-        return None
+        return _reject("intermediate_high_exceeds_pole_high")
     # Forward check uses CLOSES, not highs: a brief intraday wick above the
     # peak shouldn't disqualify it as "the" pole-top — only a sustained
     # CLOSE meaningfully above it means the rally genuinely continued and
     # this candidate wasn't the real peak yet.
     peak_check_end = min(n, hi + 5)
     if any(closes[k] is not None and closes[k] > pole_high * 1.03 for k in range(hi + 1, peak_check_end)):
-        return None
+        return _reject("forward_close_exceeds_pole_high")
 
     # Pole-tightness (Kaufman's Efficiency Ratio): gain% and duration alone
     # let a long, gradual, staircase-style uptrend qualify as a "pole" just
@@ -335,15 +348,16 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
     # TIGHT flag pole should be a compressed, mostly-uninterrupted move: ER
     # = |net move| / (sum of all day-to-day absolute moves) is close to 1
     # for a straight, efficient rally and drops toward 0 for a choppy,
-    # back-and-forth grind. Reject anything below 0.5 as not tight enough
-    # to call a pole, regardless of how the price action resolved later.
+    # back-and-forth grind. Reject anything below min_efficiency_ratio as
+    # not tight enough to call a pole, regardless of how the price action
+    # resolved later.
     pole_closes = [closes[k] for k in range(lo, hi + 1) if closes[k] is not None]
     if len(pole_closes) >= 2:
         net_move = abs(pole_closes[-1] - pole_closes[0])
         total_move = sum(abs(pole_closes[k] - pole_closes[k - 1]) for k in range(1, len(pole_closes)))
         efficiency_ratio = (net_move / total_move) if total_move > 0 else 0
-        if efficiency_ratio < 0.5:
-            return None
+        if efficiency_ratio < min_efficiency_ratio:
+            return _reject("efficiency_ratio_too_low", efficiency_ratio=round(efficiency_ratio, 3))
 
     # Pole-cleanliness: a genuine swing low is often the exact day price is
     # still catching up to its 21 EMA (that's normal at a bottom) — requiring
@@ -361,7 +375,7 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
                 if closes[k] < e:
                     below += 1
         if total > 0 and below / total > 0.20:
-            return None
+            return _reject("pole_ema21_too_dirty", pct_below_ema=round(below / total, 2))
 
     return _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
                                    dates, highs, lows, closes, n,
@@ -466,7 +480,13 @@ def _detect_htf_weekly_pole(s, min_gain_pct, max_gain_pct, pole_min_weeks, pole_
 def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_max_days=40,
                max_pullback_pct=25.0, flag_min_days=10, flag_max_days=40,
                lookback_days=260, success_rr_multiple=2.0,
-               use_weekly_pole=False, pole_min_weeks=3, pole_max_weeks=8):
+               use_weekly_pole=False, pole_min_weeks=3, pole_max_weeks=8,
+               min_efficiency_ratio=0.5, reject_log=None):
+    """reject_log (optional): pass in a list to have every rejected daily-path
+    candidate logged with its rejection reason — use this to see exactly what
+    a given threshold (e.g. min_efficiency_ratio) is filtering out. Only
+    applies to the daily path (Mini HTF); the weekly-pole (HTF) path doesn't
+    log rejections yet."""
     if use_weekly_pole:
         return _detect_htf_weekly_pole(s, min_gain_pct, max_gain_pct, pole_min_weeks, pole_max_weeks,
                                         max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
@@ -520,7 +540,7 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
             m2 = _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
                                        pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
                                        max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
-                                       ema21)
+                                       ema21, min_efficiency_ratio=min_efficiency_ratio, reject_log=reject_log)
             if m2 is not None and (match is None or lows[lo] < lows[used_lo]):
                 match, used_lo = m2, lo
 
@@ -545,7 +565,7 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
                 match2 = _try_build_htf_match(used_lo, hi2, dates, highs, lows, closes, n,
                                                pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
                                                max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
-                                               ema21)
+                                               ema21, min_efficiency_ratio=min_efficiency_ratio, reject_log=reject_log)
                 if match2 is not None:
                     best_hi, best_match = hi2, match2
                     if best_match["status"] not in ("forming", "pole_just_formed"):
