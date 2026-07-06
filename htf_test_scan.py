@@ -28,6 +28,23 @@ WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
 
+def _calc_ema(closes, period):
+    """Same convention as pipeline.py's _calc_ema."""
+    n = len(closes)
+    ema = [None] * n
+    if n < period:
+        return ema
+    k = 2 / (period + 1)
+    seed_vals = [v for v in closes[:period] if v is not None]
+    if not seed_vals:
+        return ema
+    ema[period - 1] = sum(seed_vals) / len(seed_vals)
+    for i in range(period, n):
+        c = closes[i]
+        ema[i] = c * k + ema[i - 1] * (1 - k) if c is not None else ema[i - 1]
+    return ema
+
+
 # ── same _detect_htf logic as the pipeline.py patch ──────────────────────
 
 def _htf_swing_low_idx(lows, end_idx, lookback, floor=0):
@@ -51,39 +68,86 @@ def _swing_low_candidates(lows, end_idx, lookback, floor=0):
     return sorted(seg_idx, key=lambda i: lows[i])
 
 
-def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
-                          pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
-                          max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple):
-    """Validates a single (lo, hi) candidate pole and, if it holds up, builds
-    the full match dict (including flag walk + post-breakout tracking).
-    Returns None if this specific (lo, hi) pair doesn't qualify, so the
-    caller can try a different lo for the same hi."""
-    if lo is None or lo >= hi:
-        return None
+def _build_weekly_map(dates, highs, lows, closes):
+    """Groups daily bars into ISO weeks. Returns weekly OHLC arrays plus,
+    for each week, the DAILY index where that week's high/low actually
+    occurred and the daily index of the week's last trading day — so pole
+    candidates found on smoothed weekly bars can be mapped straight back to
+    exact daily dates/values for the flag+breakout+post-BO tracking."""
+    weeks = {}
+    for i, d in enumerate(dates):
+        h, l, c = highs[i], lows[i], closes[i]
+        if h is None or l is None or c is None:
+            continue
+        k = date.fromisoformat(d).isocalendar()[:2]
+        weeks.setdefault(k, []).append((i, h, l, c))
 
-    pole_high = highs[hi]
-    pole_low = lows[lo]
-    pole_days = hi - lo
-    if pole_days < pole_min_days or pole_days > pole_max_days:
+    keys = sorted(weeks.keys())
+    wd, wh, wl, wc, wh_day, wl_day, week_end_day = [], [], [], [], [], [], []
+    for k in keys:
+        entries = weeks[k]
+        h_idx, _ = max(((i, h) for i, h, l, c in entries), key=lambda x: x[1])
+        l_idx, _ = min(((i, l) for i, h, l, c in entries), key=lambda x: x[1])
+        y, w = k
+        wd.append(date.fromisocalendar(y, w, 1).isoformat())
+        wh.append(highs[h_idx]); wl.append(lows[l_idx]); wc.append(entries[-1][3])
+        wh_day.append(h_idx); wl_day.append(l_idx); week_end_day.append(entries[-1][0])
+
+    # per-daily-index -> week-index lookup, for mapping a daily flag-low back
+    # to "which week does this belong to" (needed for chaining)
+    day_to_week = [0] * len(dates)
+    wk = 0
+    for i in range(len(dates)):
+        while wk < len(week_end_day) - 1 and i > week_end_day[wk]:
+            wk += 1
+        day_to_week[i] = wk
+
+    return wd, wh, wl, wc, wh_day, wl_day, week_end_day, day_to_week
+
+
+def _validate_weekly_pole(lo_w, hi_w, wh, wl, wc, n_weekly,
+                           pole_min_weeks, pole_max_weeks, min_gain_pct, max_gain_pct):
+    """Pole validation (gain%, duration, wick-safe peak-check) on WEEKLY
+    bars — smooths out the daily noise that let clearly choppy, zig-zag
+    stretches qualify as a "pole" just because their net gain cleared the
+    threshold. Returns the gain_pct if valid, else None."""
+    if lo_w is None or lo_w >= hi_w:
+        return None
+    pole_high = wh[hi_w]
+    pole_low = wl[lo_w]
+    weeks = hi_w - lo_w
+    if weeks < pole_min_weeks or weeks > pole_max_weeks:
         return None
     if not pole_low or pole_low <= 0:
         return None
-
     gain_pct = (pole_high - pole_low) / pole_low * 100.0
     if gain_pct < min_gain_pct:
         return None
     if max_gain_pct is not None and gain_pct >= max_gain_pct:
         return None
+    if any(wh[k] is not None and wh[k] > pole_high for k in range(lo_w, hi_w)):
+        return None
+    peak_check_end = min(n_weekly, hi_w + 2)
+    if any(wc[k] is not None and wc[k] > pole_high * 1.03 for k in range(hi_w + 1, peak_check_end)):
+        return None
+    return gain_pct
 
-    if any(highs[k] is not None and highs[k] > pole_high for k in range(lo, hi)):
-        return None
-    # Forward check uses CLOSES, not highs: a brief intraday wick above the
-    # peak shouldn't disqualify it as "the" pole-top — only a sustained
-    # CLOSE meaningfully above it means the rally genuinely continued and
-    # this candidate wasn't the real peak yet.
-    peak_check_end = min(n, hi + 5)
-    if any(closes[k] is not None and closes[k] > pole_high * 1.03 for k in range(hi + 1, peak_check_end)):
-        return None
+
+def _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
+                            dates, highs, lows, closes, n,
+                            max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple):
+    """Everything AFTER the pole itself is validated: the daily flag walk,
+    breakout/failure resolution, and post-breakout success tracking. Shared
+    by both the daily-only path (Mini HTF) and the weekly-pole path (HTF) —
+    pole_low/pole_high/gain_pct/pole_days are passed in already-validated,
+    lo/hi are the DAILY indices of the pole's low/high (for HTF these come
+    from mapping the weekly pole back to its exact daily day)."""
+    # A small pole shouldn't get the same flat pullback allowance as a huge
+    # one — a 21%-gain pole giving back 15% (71% of its own gain) isn't a
+    # "flag", it's most of the move undone. Cap the effective pullback at
+    # whichever is smaller: the preset's own max_pullback_pct, or half of
+    # this pole's own gain.
+    effective_max_pullback_pct = min(max_pullback_pct, gain_pct * 0.5)
 
     # Walk forward day-by-day from the pole high, tracking the flag's
     # cumulative low (for pullback/failure AND as the next pole's future
@@ -114,7 +178,7 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
             cum_low_idx = j
 
         pullback_pct = (pole_high - cum_low) / pole_high * 100.0
-        if pullback_pct > max_pullback_pct:
+        if pullback_pct > effective_max_pullback_pct:
             status = "failed"
             resolved_idx = j
             break
@@ -210,13 +274,161 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
     return match
 
 
+def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
+                          pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
+                          max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                          ema21=None):
+    """Daily-only path (used by Mini HTF): validates the pole itself using
+    daily bars, then hands off to _build_flag_and_signal for the rest.
+    Returns None if this (lo, hi) pair doesn't qualify."""
+    if lo is None or lo >= hi:
+        return None
+
+    pole_high = highs[hi]
+    pole_low = lows[lo]
+    pole_days = hi - lo
+    if pole_days < pole_min_days or pole_days > pole_max_days:
+        return None
+    if not pole_low or pole_low <= 0:
+        return None
+
+    gain_pct = (pole_high - pole_low) / pole_low * 100.0
+    if gain_pct < min_gain_pct:
+        return None
+    if max_gain_pct is not None and gain_pct >= max_gain_pct:
+        return None
+
+    if any(highs[k] is not None and highs[k] > pole_high for k in range(lo, hi)):
+        return None
+    # Forward check uses CLOSES, not highs: a brief intraday wick above the
+    # peak shouldn't disqualify it as "the" pole-top — only a sustained
+    # CLOSE meaningfully above it means the rally genuinely continued and
+    # this candidate wasn't the real peak yet.
+    peak_check_end = min(n, hi + 5)
+    if any(closes[k] is not None and closes[k] > pole_high * 1.03 for k in range(hi + 1, peak_check_end)):
+        return None
+
+    # Pole-cleanliness: if the stock closes below its 21 EMA at any point
+    # while the pole is forming, this isn't a clean, decisive rally — skip it.
+    if ema21 is not None:
+        for k in range(lo, hi + 1):
+            e = ema21[k]
+            if e is not None and closes[k] is not None and closes[k] < e:
+                return None
+
+    return _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
+                                   dates, highs, lows, closes, n,
+                                   max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
+
+
+def _detect_htf_weekly_pole(s, min_gain_pct, max_gain_pct, pole_min_weeks, pole_max_weeks,
+                             max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                             lookback_days):
+    """HTF path: pole is found on WEEKLY bars (smooths out daily noise that
+    let clearly choppy zig-zag stretches qualify just because their net
+    gain cleared the threshold), then mapped to exact daily dates — the
+    flag, breakout, and post-breakout tracking all stay on DAILY bars via
+    the same _build_flag_and_signal used by the daily-only (Mini HTF) path."""
+    dates, highs, lows, closes = s["d"], s["h"], s["l"], s["c"]
+    n = len(dates)
+    if n < 60:
+        return []
+
+    wd, wh, wl, wc, wh_day, wl_day, week_end_day, day_to_week = _build_weekly_map(dates, highs, lows, closes)
+    n_weekly = len(wd)
+    if n_weekly < pole_min_weeks + 2:
+        return []
+
+    matches = []
+    scan_start_w = max(0, n_weekly - (lookback_days // 5 + 10))
+    chain_lo_w = None
+    fallback_floor_w = -1
+
+    hi_w = scan_start_w + pole_min_weeks
+    while hi_w < n_weekly:
+        if wh[hi_w] is None:
+            hi_w += 1
+            continue
+
+        candidates_w = []
+        if chain_lo_w is not None and hi_w - chain_lo_w <= pole_max_weeks:
+            candidates_w.append(chain_lo_w)
+        for search_lo_w in _swing_low_candidates(wl, hi_w, pole_max_weeks, floor=fallback_floor_w):
+            if search_lo_w not in candidates_w:
+                candidates_w.append(search_lo_w)
+
+        best = None  # (lo_w, gain_pct)
+        for lo_w in candidates_w:
+            gp = _validate_weekly_pole(lo_w, hi_w, wh, wl, wc, n_weekly,
+                                        pole_min_weeks, pole_max_weeks, min_gain_pct, max_gain_pct)
+            if gp is not None and (best is None or wl[lo_w] < wl[best[0]]):
+                best = (lo_w, gp)
+
+        if best is None:
+            hi_w += 1
+            continue
+        lo_w, gain_pct = best
+
+        # Prefer the highest valid weekly peak reachable from this lo_w —
+        # same "don't settle for the first candidate" fix as the daily path.
+        best_hi_w, best_gain = hi_w, gain_pct
+        search_end_w = min(n_weekly - 1, lo_w + pole_max_weeks)
+        for hi2_w in range(hi_w + 1, search_end_w + 1):
+            if wh[hi2_w] is None or wh[hi2_w] <= wh[best_hi_w]:
+                continue
+            gp2 = _validate_weekly_pole(lo_w, hi2_w, wh, wl, wc, n_weekly,
+                                         pole_min_weeks, pole_max_weeks, min_gain_pct, max_gain_pct)
+            if gp2 is not None:
+                best_hi_w, best_gain = hi2_w, gp2
+
+        hi_w_final, gain_pct = best_hi_w, best_gain
+
+        # Map the validated weekly pole back to its exact daily low/high day.
+        lo_day = wl_day[lo_w]
+        hi_day = wh_day[hi_w_final]
+        pole_low = lows[lo_day]
+        pole_high = highs[hi_day]
+        pole_days = hi_day - lo_day
+
+        match = _build_flag_and_signal(lo_day, hi_day, pole_low, pole_high, gain_pct, pole_days,
+                                        dates, highs, lows, closes, n,
+                                        max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
+        if match is None:
+            hi_w = hi_w_final + 1
+            continue
+
+        cum_low_idx = match.pop("_cum_low_idx")
+        fe = match.pop("_fe")
+        matches.append(match)
+
+        chain_lo_w = day_to_week[cum_low_idx] if cum_low_idx > hi_day else None
+        fallback_floor_w = day_to_week[min(fe + 2, n - 1)]
+        hi_w = hi_w_final + 1
+
+    matches.sort(key=lambda m: m["pole_high_date"], reverse=True)
+    deduped = []
+    for m in matches:
+        if not any(abs((date.fromisoformat(m["pole_high_date"]) - date.fromisoformat(k["pole_high_date"])).days) <= 10
+                   for k in deduped):
+            deduped.append(m)
+    return deduped
+
+
 def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_max_days=40,
                max_pullback_pct=25.0, flag_min_days=10, flag_max_days=40,
-               lookback_days=260, success_rr_multiple=2.0):
+               lookback_days=260, success_rr_multiple=2.0,
+               use_weekly_pole=False, pole_min_weeks=3, pole_max_weeks=8):
+    if use_weekly_pole:
+        return _detect_htf_weekly_pole(s, min_gain_pct, max_gain_pct, pole_min_weeks, pole_max_weeks,
+                                        max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                                        lookback_days)
+
     dates, highs, lows, closes = s["d"], s["h"], s["l"], s["c"]
     n = len(dates)
     if n < pole_min_days + flag_min_days:
         return []
+
+    ema21 = _calc_ema(closes, 21)
 
     matches = []
     scan_start = max(0, n - lookback_days)
@@ -258,7 +470,8 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
         for lo in candidates:
             m2 = _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
                                        pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
-                                       max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
+                                       max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                                       ema21)
             if m2 is not None and (match is None or lows[lo] < lows[used_lo]):
                 match, used_lo = m2, lo
 
@@ -278,7 +491,8 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
                 continue
             match2 = _try_build_htf_match(used_lo, hi2, dates, highs, lows, closes, n,
                                            pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
-                                           max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
+                                           max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                                           ema21)
             if match2 is not None:
                 best_hi, best_match = hi2, match2
 
@@ -351,9 +565,10 @@ def upload_to_r2(filename, data_str):
 
 
 PRESETS = {
-    "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0, pole_min_days=15,
-                pole_max_days=40, flag_min_days=15, flag_max_days=25,
-                success_rr_multiple=2.0),
+    "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0,
+                flag_min_days=15, flag_max_days=25,
+                success_rr_multiple=2.0,
+                use_weekly_pole=True, pole_min_weeks=3, pole_max_weeks=8),
     "Mini HTF": dict(min_gain_pct=20.0, max_gain_pct=90.0, max_pullback_pct=15.0, pole_min_days=10,
                      pole_max_days=40, flag_min_days=5, flag_max_days=21,
                      success_rr_multiple=2.0),
