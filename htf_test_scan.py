@@ -568,7 +568,7 @@ PRESETS = {
     "HTF": dict(min_gain_pct=90.0, max_pullback_pct=25.0,
                 flag_min_days=15, flag_max_days=25,
                 success_rr_multiple=2.0,
-                use_weekly_pole=True, pole_min_weeks=3, pole_max_weeks=8),
+                use_weekly_pole=True, pole_min_weeks=3, pole_max_weeks=15),
     "Mini HTF": dict(min_gain_pct=20.0, max_gain_pct=90.0, max_pullback_pct=15.0, pole_min_days=10,
                      pole_max_days=40, flag_min_days=5, flag_max_days=21,
                      success_rr_multiple=2.0),
