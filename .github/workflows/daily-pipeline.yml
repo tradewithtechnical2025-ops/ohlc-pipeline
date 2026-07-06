@@ -34,6 +34,10 @@ jobs:
         run: python pipeline.py hlr_scan
       - name: Pattern Scan
         run: python pipeline.py pattern_scan
+      - name: HTF Scan
+        run: python htf_test_scan.py --r2-key htf_test_results.json
+      - name: Shakeout Scan
+        run: python shakeout_scanner.py --r2-key shakeout_signals.json
       - name: Fundamentals
         run: python pipeline_fundamentals_prod.py daily
       - name: EP Scan
