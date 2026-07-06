@@ -5,8 +5,8 @@ name: HTF + Shakeout Scan (standalone)
 # existing ohlc_*.json chunks from R2.
 
 on:
-  schedule:
-    - cron: "30 10 * * 1-5"   # 4:00 PM IST, after NSE close
+  
+   
   workflow_dispatch: {}
 
 jobs:
