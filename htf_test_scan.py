@@ -308,13 +308,23 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
     if any(closes[k] is not None and closes[k] > pole_high * 1.03 for k in range(hi + 1, peak_check_end)):
         return None
 
-    # Pole-cleanliness: if the stock closes below its 21 EMA at any point
-    # while the pole is forming, this isn't a clean, decisive rally — skip it.
+    # Pole-cleanliness: a genuine swing low is often the exact day price is
+    # still catching up to its 21 EMA (that's normal at a bottom) — requiring
+    # EVERY close to be above the EMA throws out the real low and quietly
+    # shifts the pole's start to a later, shallower point instead. Allow up
+    # to 20% of the pole's days to close below EMA21 before rejecting it as
+    # genuinely un-clean/choppy.
     if ema21 is not None:
+        total = 0
+        below = 0
         for k in range(lo, hi + 1):
             e = ema21[k]
-            if e is not None and closes[k] is not None and closes[k] < e:
-                return None
+            if e is not None and closes[k] is not None:
+                total += 1
+                if closes[k] < e:
+                    below += 1
+        if total > 0 and below / total > 0.20:
+            return None
 
     return _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
                                    dates, highs, lows, closes, n,
