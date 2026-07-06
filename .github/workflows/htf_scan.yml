@@ -1,8 +1,8 @@
-name: HTF Scan (standalone)
+name: HTF + Shakeout Scan (standalone)
 
-# Runs htf_test_scan.py directly. Does NOT touch pipeline.py in any way —
-# only needs WORKER_URL + WORKER_TOKEN to read the existing ohlc_*.json
-# chunks from R2.
+# Runs htf_test_scan.py and shakeout_scanner.py directly. Does NOT touch
+# pipeline.py in any way — only needs WORKER_URL + WORKER_TOKEN to read the
+# existing ohlc_*.json chunks from R2.
 
 on:
   schedule:
@@ -30,9 +30,17 @@ jobs:
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: python htf_test_scan.py --save htf_results.json --r2-key htf_test_results.json
 
-      - name: Upload results as workflow artifact
+      - name: Run Shakeout scan
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python shakeout_scanner.py --save shakeout_results.json --r2-key shakeout_signals.json
+
+      - name: Upload results as workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: htf-results
-          path: htf_results.json
+          name: scan-results
+          path: |
+            htf_results.json
+            shakeout_results.json
           retention-days: 30
