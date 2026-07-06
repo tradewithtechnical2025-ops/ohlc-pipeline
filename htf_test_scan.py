@@ -328,6 +328,23 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
     if any(closes[k] is not None and closes[k] > pole_high * 1.03 for k in range(hi + 1, peak_check_end)):
         return None
 
+    # Pole-tightness (Kaufman's Efficiency Ratio): gain% and duration alone
+    # let a long, gradual, staircase-style uptrend qualify as a "pole" just
+    # because it eventually cleared the gain threshold — even a 20-30 day
+    # slow grind with real interim pullbacks along the way. A genuine HIGH
+    # TIGHT flag pole should be a compressed, mostly-uninterrupted move: ER
+    # = |net move| / (sum of all day-to-day absolute moves) is close to 1
+    # for a straight, efficient rally and drops toward 0 for a choppy,
+    # back-and-forth grind. Reject anything below 0.5 as not tight enough
+    # to call a pole, regardless of how the price action resolved later.
+    pole_closes = [closes[k] for k in range(lo, hi + 1) if closes[k] is not None]
+    if len(pole_closes) >= 2:
+        net_move = abs(pole_closes[-1] - pole_closes[0])
+        total_move = sum(abs(pole_closes[k] - pole_closes[k - 1]) for k in range(1, len(pole_closes)))
+        efficiency_ratio = (net_move / total_move) if total_move > 0 else 0
+        if efficiency_ratio < 0.5:
+            return None
+
     # Pole-cleanliness: a genuine swing low is often the exact day price is
     # still catching up to its 21 EMA (that's normal at a bottom) — requiring
     # EVERY close to be above the EMA throws out the real low and quietly
@@ -350,6 +367,7 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
                                    dates, highs, lows, closes, n,
                                    max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
                                    ema21=ema21)
+
 
 
 def _detect_htf_weekly_pole(s, min_gain_pct, max_gain_pct, pole_min_weeks, pole_max_weeks,
