@@ -135,13 +135,21 @@ def _validate_weekly_pole(lo_w, hi_w, wh, wl, wc, n_weekly,
 
 def _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
                             dates, highs, lows, closes, n,
-                            max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple):
+                            max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                            ema21=None):
     """Everything AFTER the pole itself is validated: the daily flag walk,
     breakout/failure resolution, and post-breakout success tracking. Shared
     by both the daily-only path (Mini HTF) and the weekly-pole path (HTF) —
     pole_low/pole_high/gain_pct/pole_days are passed in already-validated,
     lo/hi are the DAILY indices of the pole's low/high (for HTF these come
-    from mapping the weekly pole back to its exact daily day)."""
+    from mapping the weekly pole back to its exact daily day).
+
+    ema21 (optional): if provided, a flag that's still "forming" (never
+    resolved via breakout/failure) but has closed below the 21 EMA on more
+    than 30% of its days so far is downgraded to "failed" — a flag that
+    keeps closing below its short-term average isn't a tight, orderly
+    consolidation anymore, it's early breakdown/distribution, and shouldn't
+    be reported as a live "still forming, watch for breakout" setup."""
     # A small pole shouldn't get the same flat pullback allowance as a huge
     # one — a 21%-gain pole giving back 15% (71% of its own gain) isn't a
     # "flag", it's most of the move undone. Cap the effective pullback at
@@ -162,6 +170,8 @@ def _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
     cum_high = pole_high
     status = "forming"
     resolved_idx = None
+    flag_days_seen = 0
+    flag_days_below_ema = 0
 
     for j in range(hi + 1, flag_end_max + 1):
         c, h, l = closes[j], highs[j], lows[j]
@@ -177,11 +187,21 @@ def _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
             cum_low = l
             cum_low_idx = j
 
+        if ema21 is not None and c is not None and ema21[j] is not None:
+            flag_days_seen += 1
+            if c < ema21[j]:
+                flag_days_below_ema += 1
+
         pullback_pct = (pole_high - cum_low) / pole_high * 100.0
         if pullback_pct > effective_max_pullback_pct:
             status = "failed"
             resolved_idx = j
             break
+
+    if (status == "forming" and ema21 is not None
+            and flag_days_seen >= 5 and flag_days_below_ema / flag_days_seen > 0.30):
+        status = "failed"
+        resolved_idx = None
 
     fe = resolved_idx if resolved_idx is not None else flag_end_max
     pullback_pct = (pole_high - cum_low) / pole_high * 100.0
@@ -328,7 +348,8 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
 
     return _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
                                    dates, highs, lows, closes, n,
-                                   max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple)
+                                   max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                                   ema21=ema21)
 
 
 def _detect_htf_weekly_pole(s, min_gain_pct, max_gain_pct, pole_min_weeks, pole_max_weeks,
@@ -489,22 +510,28 @@ def detect_htf(s, min_gain_pct=90.0, max_gain_pct=None, pole_min_days=10, pole_m
             hi += 1
             continue
 
-        # Prefer the highest valid peak reachable from this same lo, not
-        # just the first one encountered chronologically — otherwise a
-        # later, genuinely higher point within the same window gets left
-        # sitting inside the "flag" (inflating flag_high above pole_high)
-        # instead of becoming the pole-high itself.
+        # Prefer the highest valid peak reachable from this same lo — but
+        # ONLY while the current best match is still "forming"/
+        # "pole_just_formed" (genuinely unresolved, so a later higher high
+        # might really be part of the same unfinished rally). Once a match
+        # has already resolved (success, failed, breakout, breakout_failed),
+        # the flag's outcome is locked in as history; overwriting it with a
+        # "bigger" pole from a later peak would silently discard a real,
+        # already-completed pattern in favor of a different one.
         best_hi, best_match = hi, match
-        search_end = min(n - 1, used_lo + pole_max_days)
-        for hi2 in range(hi + 1, search_end + 1):
-            if highs[hi2] is None or highs[hi2] <= highs[best_hi]:
-                continue
-            match2 = _try_build_htf_match(used_lo, hi2, dates, highs, lows, closes, n,
-                                           pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
-                                           max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
-                                           ema21)
-            if match2 is not None:
-                best_hi, best_match = hi2, match2
+        if best_match["status"] in ("forming", "pole_just_formed"):
+            search_end = min(n - 1, used_lo + pole_max_days)
+            for hi2 in range(hi + 1, search_end + 1):
+                if highs[hi2] is None or highs[hi2] <= highs[best_hi]:
+                    continue
+                match2 = _try_build_htf_match(used_lo, hi2, dates, highs, lows, closes, n,
+                                               pole_min_days, pole_max_days, min_gain_pct, max_gain_pct,
+                                               max_pullback_pct, flag_min_days, flag_max_days, success_rr_multiple,
+                                               ema21)
+                if match2 is not None:
+                    best_hi, best_match = hi2, match2
+                    if best_match["status"] not in ("forming", "pole_just_formed"):
+                        break
 
         match = best_match
         cum_low_idx = match.pop("_cum_low_idx")
