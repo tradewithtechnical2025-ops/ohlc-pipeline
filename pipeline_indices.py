@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import random
 from datetime import datetime, timedelta, date
 
 import httpx
@@ -15,9 +16,11 @@ WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
 # How many index-history requests to run in parallel. Sequential (1) was
-# safe but slow — 119 symbols one at a time, each with its own retry
-# backoff on failure. Raise/lower this if Finedge starts rate-limiting.
-HISTORY_CONCURRENCY = 8
+# safe but slow. 8 was tried and caused Finedge to throw 503s on nearly
+# every request (44% failure rate even with retries) — their server
+# clearly can't handle that concurrency. Keep this low; raise cautiously
+# and only after confirming failure rate stays near zero.
+HISTORY_CONCURRENCY = 3
 
 WORKER_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
@@ -47,9 +50,9 @@ async def fetch_with_retry(client, url, params, *, retries=3, base_delay=2, time
         except (httpx.HTTPStatusError, httpx.TransportError) as e:
             last_exc = e
             if attempt < retries:
-                delay = base_delay * (2 ** (attempt - 1))
+                delay = base_delay * (2 ** (attempt - 1)) + random.uniform(0, base_delay)
                 print(f"  ⚠ {url.split('/')[-1]} attempt {attempt}/{retries} failed "
-                      f"({e.__class__.__name__}: {e}) — retrying in {delay}s...")
+                      f"({e.__class__.__name__}: {e}) — retrying in {delay:.1f}s...")
                 await asyncio.sleep(delay)
             else:
                 print(f"  ✗ {url.split('/')[-1]} — all {retries} attempts failed")
@@ -353,7 +356,7 @@ async def fetch_index_history_one(client, api_symbol):
         "token"       : FINEDGE_TOKEN,
     }
     try:
-        r = await fetch_with_retry(client, url, params, retries=2, base_delay=2)
+        r = await fetch_with_retry(client, url, params, retries=4, base_delay=3)
         return r.json().get("rows") or []
     except Exception:
         return []
