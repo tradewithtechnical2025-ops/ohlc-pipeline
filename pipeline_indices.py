@@ -14,6 +14,11 @@ WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
+# How many index-history requests to run in parallel. Sequential (1) was
+# safe but slow — 119 symbols one at a time, each with its own retry
+# backoff on failure. Raise/lower this if Finedge starts rate-limiting.
+HISTORY_CONCURRENCY = 8
+
 WORKER_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
     "Content-Type": "application/json",
@@ -27,7 +32,7 @@ WORKER_HEADERS = {
 # pipeline run, so every Finedge GET goes through this.
 # ─────────────────────────────────────────────
 
-async def fetch_with_retry(client, url, params, *, retries=3, base_delay=5, timeout=300):
+async def fetch_with_retry(client, url, params, *, retries=3, base_delay=2, timeout=300):
     last_exc = None
     for attempt in range(1, retries + 1):
         try:
@@ -348,7 +353,7 @@ async def fetch_index_history_one(client, api_symbol):
         "token"       : FINEDGE_TOKEN,
     }
     try:
-        r = await fetch_with_retry(client, url, params, retries=3, base_delay=3)
+        r = await fetch_with_retry(client, url, params, retries=2, base_delay=2)
         return r.json().get("rows") or []
     except Exception:
         return []
@@ -368,6 +373,20 @@ def parse_index_history(rows):
         "volume"       : r.get("volume"),
         "turnover"     : r.get("turnover"),
     } for r in rows]
+
+
+async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta):
+    async with sem:
+        rows = await fetch_index_history_one(client, meta["api_symbol"])
+        parsed = parse_index_history(rows)
+        if not parsed:
+            print(f"[{i}/{total}] ✗ {symbol} | no data")
+            return symbol, None, False
+        weekly = compute_weekly_return(parsed)
+        await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
+                                    schema_v=1, extra_meta={"candle_count": len(parsed)})
+        print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles")
+        return symbol, weekly, True
 
 
 def compute_weekly_return(history):
@@ -463,23 +482,23 @@ async def main():
         print("=== INDEX HISTORICAL ===")
         symbols = sorted(master_parsed.items())
         total = len(symbols)
+        sem = asyncio.Semaphore(HISTORY_CONCURRENCY)
+
+        tasks = [
+            fetch_parse_upload_one_history(client, sem, i, total, symbol, meta)
+            for i, (symbol, meta) in enumerate(symbols, 1)
+        ]
+        results = await asyncio.gather(*tasks)
+
         success = failed = 0
         weekly_map = {}
-
-        for i, (symbol, meta) in enumerate(symbols, 1):
-            rows   = await fetch_index_history_one(client, meta["api_symbol"])
-            parsed = parse_index_history(rows)
-            if not parsed:
+        for symbol, weekly, ok in results:
+            if ok:
+                success += 1
+                if weekly:
+                    weekly_map[symbol] = weekly
+            else:
                 failed += 1
-                print(f"[{i}/{total}] ✗ {symbol} | no data")
-                continue
-            weekly = compute_weekly_return(parsed)
-            if weekly:
-                weekly_map[symbol] = weekly
-            await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
-                                        schema_v=1, extra_meta={"candle_count": len(parsed)})
-            success += 1
-            print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles")
 
         if returns_rows is not None:
             returns_parsed = parse_index_returns(returns_rows, valid_symbols, weekly_map)
