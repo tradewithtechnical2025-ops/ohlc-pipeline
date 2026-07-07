@@ -21,6 +21,37 @@ WORKER_HEADERS = {
 
 
 # ─────────────────────────────────────────────
+# Retry helper — Finedge occasionally throws transient
+# 5xx / connection errors (e.g. 503 Service Temporarily
+# Unavailable). A single blip shouldn't abort the whole
+# pipeline run, so every Finedge GET goes through this.
+# ─────────────────────────────────────────────
+
+async def fetch_with_retry(client, url, params, *, retries=3, base_delay=5, timeout=300):
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = await client.get(url, params=params, timeout=timeout)
+            if r.status_code >= 500:
+                raise httpx.HTTPStatusError(
+                    f"Server error '{r.status_code}' for url '{r.request.url}'",
+                    request=r.request, response=r,
+                )
+            r.raise_for_status()
+            return r
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            last_exc = e
+            if attempt < retries:
+                delay = base_delay * (2 ** (attempt - 1))
+                print(f"  ⚠ {url.split('/')[-1]} attempt {attempt}/{retries} failed "
+                      f"({e.__class__.__name__}: {e}) — retrying in {delay}s...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"  ✗ {url.split('/')[-1]} — all {retries} attempts failed")
+    raise last_exc
+
+
+# ─────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────
 
@@ -179,8 +210,7 @@ async def r2_upload(client, filename, data):
 async def fetch_index_master(client):
     url = f"{FINEDGE_BASE}/index/master"
     params = {"token": FINEDGE_TOKEN}
-    r = await client.get(url, params=params, timeout=300)
-    r.raise_for_status()
+    r = await fetch_with_retry(client, url, params)
     return r.json()
 
 
@@ -222,8 +252,7 @@ def parse_index_master(rows):
 async def fetch_index_daily(client):
     url = f"{FINEDGE_BASE}/index/market-price/daily-feed"
     params = {"token": FINEDGE_TOKEN}
-    r = await client.get(url, params=params, timeout=300)
-    r.raise_for_status()
+    r = await fetch_with_retry(client, url, params)
     return r.json()
 
 
@@ -261,8 +290,7 @@ def parse_index_daily(rows, valid_symbols):
 async def fetch_index_returns(client):
     url = f"{FINEDGE_BASE}/index/price-returns"
     params = {"token": FINEDGE_TOKEN}
-    r = await client.get(url, params=params, timeout=300)
-    r.raise_for_status()
+    r = await fetch_with_retry(client, url, params)
     return r.json()
 
 
@@ -320,11 +348,9 @@ async def fetch_index_history_one(client, api_symbol):
         "token"       : FINEDGE_TOKEN,
     }
     try:
-        r = await client.get(url, params=params, timeout=300)
-        if r.status_code != 200:
-            return []
+        r = await fetch_with_retry(client, url, params, retries=3, base_delay=3)
         return r.json().get("rows") or []
-    except:
+    except Exception:
         return []
 
 
@@ -423,8 +449,16 @@ async def main():
         print("✅ index_daily.json uploaded\n")
 
         print("=== INDEX RETURNS ===")
-        returns_rows = await fetch_index_returns(client)
-        print(f"  fetched {len(returns_rows)} raw rows\n")
+        # If this permanently fails after retries, don't crash the whole
+        # run — the historical loop below (119 symbols) is far more
+        # valuable and completely unrelated to this endpoint failing.
+        try:
+            returns_rows = await fetch_index_returns(client)
+            print(f"  fetched {len(returns_rows)} raw rows\n")
+        except Exception as e:
+            print(f"  ✗ index/price-returns permanently failed after retries: {e}")
+            print("  → continuing pipeline without returns data for this run\n")
+            returns_rows = None
 
         print("=== INDEX HISTORICAL ===")
         symbols = sorted(master_parsed.items())
@@ -447,10 +481,13 @@ async def main():
             success += 1
             print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles")
 
-        returns_parsed = parse_index_returns(returns_rows, valid_symbols, weekly_map)
-        await upload_with_manifest(client, r2_upload, "index_returns.json", returns_parsed,
-                                    schema_v=1, extra_meta={"index_count": len(returns_parsed), "weekly_count": len(weekly_map)})
-        print("✅ index_returns.json uploaded\n")
+        if returns_rows is not None:
+            returns_parsed = parse_index_returns(returns_rows, valid_symbols, weekly_map)
+            await upload_with_manifest(client, r2_upload, "index_returns.json", returns_parsed,
+                                        schema_v=1, extra_meta={"index_count": len(returns_parsed), "weekly_count": len(weekly_map)})
+            print("✅ index_returns.json uploaded\n")
+        else:
+            print("⏭️  index_returns.json skipped this run (upstream endpoint failed)\n")
 
         print("\n=================================")
         print(" INDEX PIPELINE COMPLETED")
