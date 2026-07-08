@@ -7,9 +7,11 @@ Fetches from NSE archives:
   - block.csv                       → latest block deals
   - fao_participant_oi_DDMMYYYY.csv → participant-wise F&O OI (FII/DII/Client/Pro)
   - fiidiiTradeReact?csv=true       → FII/DII cash provisional (buy/sell/net in Rs Cr)
+  - sec_bhavdata_full_DDMMYYYY.csv  → delivery qty/% (EQ+BE only)
 
 Saves to R2 via Worker (FLAT keys — no slashes, worker slash-rejection safe):
   nse_bands.json              → EQ+BE symbols with current band + next-day change if any
+                                 (+ deliv_qty/deliv_per merged in when same-day data available)
   nse_bulk.json               → latest bulk deals
   nse_block.json              → latest block deals
   nse_bulk_history.json       → symbol-wise accumulated bulk history
@@ -19,6 +21,8 @@ Saves to R2 via Worker (FLAT keys — no slashes, worker slash-rejection safe):
   nse_participant_oi_hist.json → rolling 60-day participant OI history (sorted asc)
   nse_fii_dii.json             → latest FII/DII cash provisional snapshot (Rs Cr)
   nse_fii_dii_hist.json        → rolling 180-day FII/DII cash history (sorted asc)
+  nse_deliv.json                → latest delivery qty/% snapshot (all EQ+BE symbols)
+  nse_deliv_hist.json           → rolling 30-day delivery qty/% history (sorted asc)
 """
 
 import asyncio
@@ -129,8 +133,9 @@ WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 DL_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 UP_HEADERS = {"X-Secret-Token": WORKER_TOKEN, "Content-Type": "application/json"}
 
-NSE_BASE  = "https://archives.nseindia.com/content/equities"
+NSE_BASE   = "https://archives.nseindia.com/content/equities"
 NSCCL_BASE = "https://archives.nseindia.com/content/nsccl"
+BHAV_BASE  = "https://archives.nseindia.com/products/content"
 NSE_API_BASE = "https://www.nseindia.com/api"
 
 NSE_HEADERS = {
@@ -141,8 +146,9 @@ NSE_HEADERS = {
     "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-OI_HISTORY_DAYS = 60        # rolling window for participant OI
-FII_DII_HISTORY_DAYS = 180  # rolling window for FII/DII cash trend
+OI_HISTORY_DAYS = 60         # rolling window for participant OI
+FII_DII_HISTORY_DAYS = 180   # rolling window for FII/DII cash trend
+DELIV_HISTORY_DAYS = 30      # rolling window for delivery qty/%
 
 # ── NSE Holidays 2026 ─────────────────────────────────────────────────────────
 NSE_HOLIDAYS = {
@@ -292,16 +298,6 @@ def fetch_oi_with_fallback(
 # Participant OI parser
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Column order in the CSV (after stripping whitespace from header):
-#   Client Type,
-#   Future Index Long, Future Index Short,
-#   Future Stock Long, Future Stock Short,
-#   Option Index Call Long, Option Index Put Long,
-#   Option Index Call Short, Option Index Put Short,
-#   Option Stock Call Long, Option Stock Put Long,
-#   Option Stock Call Short, Option Stock Put Short,
-#   Total Long Contracts, Total Short Contracts
-
 _OI_PARTICIPANTS = {"Client", "DII", "FII", "Pro"}
 
 def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
@@ -342,28 +338,22 @@ def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
         total_short    = _int(row, "Total Short Contracts")
 
         participants[ptype] = {
-            # Futures
             "fut_idx_long":   fut_idx_long,
             "fut_idx_short":  fut_idx_short,
             "fut_stk_long":   fut_stk_long,
             "fut_stk_short":  fut_stk_short,
-            # Index options
             "oi_call_long":   oi_call_long,
             "oi_put_long":    oi_put_long,
             "oi_call_short":  oi_call_short,
             "oi_put_short":   oi_put_short,
-            # Stock options
             "os_call_long":   os_call_long,
             "os_put_long":    os_put_long,
             "os_call_short":  os_call_short,
             "os_put_short":   os_put_short,
-            # Totals
             "total_long":     total_long,
             "total_short":    total_short,
             "net":            total_long - total_short,
-            # Derived: futures-only net (cleaner directional signal)
             "fut_net":        (fut_idx_long + fut_stk_long) - (fut_idx_short + fut_stk_short),
-            # Index futures net (most watched)
             "fut_idx_net":    fut_idx_long - fut_idx_short,
         }
 
@@ -371,6 +361,50 @@ def parse_participant_oi(rows: list[dict], as_of: date) -> dict:
         "date":         as_of.isoformat(),
         "participants": participants,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Delivery % (sec_bhavdata_full) parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_bhavdata_deliv(rows: list[dict]) -> dict:
+    """
+    Parses sec_bhavdata_full_DDMMYYYY.csv rows into {symbol: {deliv_qty, deliv_per}}
+    for EQ + BE series only.
+    Header fields come with a leading space (e.g. ' SERIES', ' DELIV_PER') because
+    NSE's CSV uses ", " as the delimiter — strip both keys and values.
+    BE series shows '-' for delivery fields (mandatory delivery, not separately
+    tracked) — treated as None rather than 0.
+    """
+    out = {}
+    for row in rows:
+        r = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+        series = r.get("SERIES", "")
+        if series not in ("EQ", "BE"):
+            continue
+        sym = r.get("SYMBOL", "")
+        if not sym:
+            continue
+
+        qty_raw = r.get("DELIV_QTY", "-")
+        per_raw = r.get("DELIV_PER", "-")
+
+        deliv_qty = None
+        if qty_raw not in ("-", "", None):
+            try:
+                deliv_qty = int(float(qty_raw.replace(",", "")))
+            except ValueError:
+                deliv_qty = None
+
+        deliv_per = None
+        if per_raw not in ("-", "", None):
+            try:
+                deliv_per = float(per_raw)
+            except ValueError:
+                deliv_per = None
+
+        out[sym] = {"deliv_qty": deliv_qty, "deliv_per": deliv_per}
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -498,11 +532,10 @@ def merge_oi_history(hist: list, new_entry: dict, max_days: int = OI_HISTORY_DAY
     Returns updated list with:
       - duplicate dates replaced (idempotent re-runs)
       - oldest entries pruned so only max_days remain
-    Generic — reused for both participant-OI and FII/DII cash history.
+    Generic — reused for participant-OI, FII/DII cash, and delivery % history.
     """
     target_date = new_entry["date"]
 
-    # Replace existing entry for same date, or append
     existing_dates = [e["date"] for e in hist]
     if target_date in existing_dates:
         idx = existing_dates.index(target_date)
@@ -512,10 +545,8 @@ def merge_oi_history(hist: list, new_entry: dict, max_days: int = OI_HISTORY_DAY
         hist.append(new_entry)
         print(f"  history: added new entry for {target_date}")
 
-    # Sort ascending
     hist.sort(key=lambda x: x["date"])
 
-    # Prune to rolling window
     if len(hist) > max_days:
         removed = len(hist) - max_days
         hist = hist[-max_days:]
@@ -591,6 +622,18 @@ async def run():
         sec_rows, sec_date = fetch_with_fallback(
             nse, f"{NSE_BASE}/sec_list_{{}}.csv", today, direction="prev"
         )
+
+        # ── 1b. sec_bhavdata_full — delivery % (same-day companion to sec_list) ──
+        print("\n[1b] sec_bhavdata_full (delivery %)...")
+        try:
+            bhav_rows, bhav_date = fetch_with_fallback(
+                nse, f"{BHAV_BASE}/sec_bhavdata_full_{{}}.csv", today, direction="prev"
+            )
+            deliv_map = parse_bhavdata_deliv(bhav_rows)
+            print(f"  Delivery data: {len(deliv_map)} symbols  ({bhav_date})")
+        except RuntimeError:
+            print("  ⚠ sec_bhavdata_full not available — skipping delivery %")
+            deliv_map, bhav_date = {}, None
 
         # ── 2. eq_band_changes — optional, uploaded ~8 PM IST ────────────────────
         print(f"\n[2] eq_band_changes (next day: {next_day})...")
@@ -678,12 +721,27 @@ async def run():
             else:
                 bands[sym] = {"series": "?", "circuit": chg["from"], "change": chg}
 
+        # ── Merge delivery % into bands — only when bhavdata is for the same
+        #    trading day as sec_list, to avoid mixing stale delivery data with
+        #    a fresh circuit-band snapshot.
+        deliv_merged = False
+        if deliv_map and bhav_date == sec_date:
+            for sym, dv in deliv_map.items():
+                if sym in bands:
+                    bands[sym]["deliv_qty"] = dv["deliv_qty"]
+                    bands[sym]["deliv_per"] = dv["deliv_per"]
+            deliv_merged = True
+        elif deliv_map:
+            print(f"  ⚠ deliv data date ({bhav_date}) != bands date ({sec_date}) — "
+                  f"not merging into bands this run, stored separately below")
+
         bands_out = {
             "date":             sec_date.isoformat(),
             "next_trading_day": chg_date.isoformat(),
             "data":             [{"symbol": s, **v} for s, v in sorted(bands.items())],
         }
-        print(f"\n  Bands: {len(bands)} symbols  |  Changes: {len(changes)}")
+        print(f"\n  Bands: {len(bands)} symbols  |  Changes: {len(changes)}  |  "
+              f"Deliv merged: {deliv_merged}")
 
         # ── Process bulk/block ────────────────────────────────────────────────────
         def clean_deals(rows, has_remarks=False):
@@ -722,6 +780,11 @@ async def run():
         else:
             print("  ⚠ No OI rows — skipping OI upload")
 
+        # ── Process delivery % snapshot ────────────────────────────────────────────
+        deliv_snapshot = None
+        if deliv_map and bhav_date:
+            deliv_snapshot = {"date": bhav_date.isoformat(), "data": deliv_map}
+
         # ── Upload to R2 ──────────────────────────────────────────────────────────
         print("\n[7] Uploading to R2...")
         async with httpx.AsyncClient() as client:
@@ -736,6 +799,7 @@ async def run():
                 band_changes_hist,
                 oi_hist,
                 fii_dii_hist,
+                deliv_hist,
             ) = await asyncio.gather(
                 r2_get(client, "nse_bands.json"),
                 r2_get(client, "nse_bulk.json"),
@@ -745,6 +809,7 @@ async def run():
                 r2_get(client, "nse_band_changes_history.json"),
                 r2_get(client, "nse_participant_oi_hist.json"),
                 r2_get(client, "nse_fii_dii_hist.json"),
+                r2_get(client, "nse_deliv_hist.json"),
             )
 
             bulk_hist          = bulk_hist          or {}
@@ -752,6 +817,7 @@ async def run():
             band_changes_hist  = band_changes_hist  or {}
             oi_hist            = oi_hist            or []
             fii_dii_hist       = fii_dii_hist       or []
+            deliv_hist         = deliv_hist         or []
 
             upload_tasks = []
 
@@ -766,7 +832,6 @@ async def run():
                                                            ensure_ascii=False))
 
             # ── Bulk snapshot + summary + history ─────────────────────────────────
-            # bulk.csv carries date inside each row; use first row's date
             bulk_date_str       = bulk_clean[0]["date"] if bulk_clean else None
             existing_bulk_date  = existing_bulk[0]["date"] if existing_bulk else None
 
@@ -823,11 +888,9 @@ async def run():
             if oi_snapshot:
                 oi_date_str = oi_snapshot["date"]
 
-                # Snapshot always uploaded so frontend shows latest available date
                 upload_tasks.append(upload_with_manifest(client, r2_put, "nse_participant_oi.json", oi_snapshot,
                                                            schema_v=1, ensure_ascii=False))
 
-                # History — only append if genuinely new trading day
                 existing_oi_dates = {e["date"] for e in oi_hist}
                 if oi_date_str in existing_oi_dates:
                     print(f"  ✓ OI history: {oi_date_str} already present — history unchanged")
@@ -846,11 +909,9 @@ async def run():
             if fii_dii_snapshot and fii_dii_snapshot.get("date"):
                 fd_date_str = fii_dii_snapshot["date"]
 
-                # Snapshot always uploaded so frontend shows latest available date
                 upload_tasks.append(upload_with_manifest(client, r2_put, "nse_fii_dii.json", fii_dii_snapshot,
                                                            schema_v=1, ensure_ascii=False))
 
-                # History — only append if genuinely new trading day
                 existing_fd_dates = {e["date"] for e in fii_dii_hist}
                 if fd_date_str in existing_fd_dates:
                     print(f"  ✓ FII/DII history: {fd_date_str} already present — history unchanged")
@@ -864,6 +925,28 @@ async def run():
                                                                ensure_ascii=False))
             else:
                 print("  ⚠ No FII/DII snapshot — skipping FII/DII uploads")
+
+            # ── Delivery % snapshot + rolling 30-day history ────────────────────────
+            if deliv_snapshot and deliv_snapshot.get("date"):
+                dv_date_str = deliv_snapshot["date"]
+
+                upload_tasks.append(upload_with_manifest(client, r2_put, "nse_deliv.json", deliv_snapshot,
+                                                           schema_v=1, extra_meta={"symbol_count": len(deliv_map)},
+                                                           ensure_ascii=False))
+
+                existing_dv_dates = {e["date"] for e in deliv_hist}
+                if dv_date_str in existing_dv_dates:
+                    print(f"  ✓ Deliv history: {dv_date_str} already present — history unchanged")
+                    if deliv_hist:
+                        print(f"    Data available: {len(deliv_hist)} days  "
+                              f"({deliv_hist[0]['date']} → {deliv_hist[-1]['date']})")
+                else:
+                    deliv_hist = merge_oi_history(deliv_hist, deliv_snapshot, max_days=DELIV_HISTORY_DAYS)
+                    upload_tasks.append(upload_with_manifest(client, r2_put, "nse_deliv_hist.json", deliv_hist,
+                                                               schema_v=1, extra_meta={"day_count": len(deliv_hist)},
+                                                               ensure_ascii=False))
+            else:
+                print("  ⚠ No delivery snapshot — skipping delivery uploads")
 
             # ── Fire all pending uploads in parallel ──────────────────────────────
             if upload_tasks:
@@ -892,6 +975,7 @@ async def run():
         status.set("circuit_changes", len(changes))
         status.set("bulk_deals", len(bulk_clean))
         status.set("block_deals", len(block_clean))
+        status.set("deliv_symbols", len(deliv_map))
         status.success()
         print("\n✅ pipeline_nse.py complete")
     except Exception as e:
