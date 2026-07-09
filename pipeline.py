@@ -907,8 +907,7 @@ async def get_result_symbols_finedge(client) -> list[str]:
     sem = asyncio.Semaphore(1)
     d = await _finedge_get(client, sem, "results-calendar", {"from_date":today,"to_date":next7})
     if not d or not isinstance(d, list): log.warning("Finedge results calendar — empty or error"); return []
-    isin_symbols = set(ISIN_MAP.keys())
-    matched = list({item["symbol"] for item in d if item.get("symbol") in isin_symbols and item.get("expected_result_date")==today})
+    matched = list({item["symbol"] for item in d if item.get("expected_result_date")==today})
     log.info(f"Results today ({today}): {len(matched)} stocks")
     return matched
 
