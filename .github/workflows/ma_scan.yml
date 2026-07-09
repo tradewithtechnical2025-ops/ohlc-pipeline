@@ -7,6 +7,9 @@ on:
     - cron: '30 10 * * 1-5'
   workflow_dispatch: {}   # allows manual trigger from GitHub Actions tab
 
+permissions:
+  contents: write   # needed so the job can push results back to the repo
+
 jobs:
   run-ma-expansion-scan:
     runs-on: ubuntu-latest
