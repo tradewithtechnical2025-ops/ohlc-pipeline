@@ -72,9 +72,9 @@ def _linear_slope(values):
     return num / den if den != 0 else None
 
 
-def detect_ma_expansion(s, fast=10, mid=21, slow=50,
-                         contraction_window=10, trigger_window=5,
-                         contraction_thresh_pct=3.0, expansion_thresh_pct=6.0,
+def detect_ma_expansion(s, fast=21, mid=50, slow=150,
+                         contraction_window=20, trigger_window=7,
+                         contraction_thresh_pct=4.0, expansion_thresh_pct=6.0,
                          min_efficiency_ratio=0.5):
     """s: {"d": dates, "c": closes, ...} same shape as htf_test_scan.py's per-symbol dict.
     Returns a match dict if a fresh MA expansion is found, else None."""
@@ -204,11 +204,17 @@ def upload_to_r2(filename, data_str):
 
 def main():
     ap = argparse.ArgumentParser(description="Full-universe MA Expansion scan")
-    ap.add_argument("--fast", type=int, default=21)
-    ap.add_argument("--mid", type=int, default=50)
-    ap.add_argument("--slow", type=int, default=150)
-    ap.add_argument("--contraction-window", type=int, default=20)
-    ap.add_argument("--trigger-window", type=int, default=7,
+    ap.add_argument("--fast", type=int, default=10)
+    ap.add_argument("--mid", type=int, default=21)
+    ap.add_argument("--slow", type=int, default=50)
+    ap.add_argument("--contraction-window", type=int, default=10)
+    ap.add_argument("--contraction-thresh", type=float, default=2.0,
+                     help="max median |spread%%| during contraction window to call it 'coiled'")
+    ap.add_argument("--expansion-thresh", type=float, default=3.0,
+                     help="spread%% threshold used as the expansion trigger level")
+    ap.add_argument("--min-er", type=float, default=0.5,
+                     help="minimum efficiency ratio (0-1) - rejects choppy/noisy expansion")
+    ap.add_argument("--trigger-window", type=int, default=3,
                      help="only report if expansion started within this many recent days")
     ap.add_argument("--save", help="optional path to save results as JSON (local file)")
     ap.add_argument("--r2-key", help="optional R2 filename to push results to, e.g. ma_expansion_results.json")
@@ -231,7 +237,10 @@ def main():
     for sym, s in liquid.items():
         m = detect_ma_expansion(s, fast=args.fast, mid=args.mid, slow=args.slow,
                                  contraction_window=args.contraction_window,
-                                 trigger_window=args.trigger_window)
+                                 trigger_window=args.trigger_window,
+                                 contraction_thresh_pct=args.contraction_thresh,
+                                 expansion_thresh_pct=args.expansion_thresh,
+                                 min_efficiency_ratio=args.min_er)
         if m:
             signals.append({"symbol": sym, **m})
 
