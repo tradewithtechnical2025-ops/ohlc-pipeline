@@ -72,9 +72,9 @@ def _linear_slope(values):
     return num / den if den != 0 else None
 
 
-def detect_ma_expansion(s, fast=21, mid=50, slow=150,
-                         contraction_window=20, trigger_window=7,
-                         contraction_thresh_pct=4.0, expansion_thresh_pct=6.0,
+def detect_ma_expansion(s, fast=10, mid=21, slow=50,
+                         contraction_window=10, trigger_window=5,
+                         contraction_thresh_pct=3.0, expansion_thresh_pct=6.0,
                          min_efficiency_ratio=0.5):
     """s: {"d": dates, "c": closes, ...} same shape as htf_test_scan.py's per-symbol dict.
     Returns a match dict if a fresh MA expansion is found, else None."""
