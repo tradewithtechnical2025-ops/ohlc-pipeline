@@ -126,7 +126,13 @@ def detect_ma_expansion(s, fast=21, mid=50, slow=150,
 
     slope_now = _linear_slope(ema_fast[-5:])
 
-    pole_closes = [c for c in closes[-fast:] if c is not None]
+    # Efficiency Ratio should measure the EXPANSION leg only (the days since
+    # the trigger), not the contraction window - the contraction period is
+    # SUPPOSED to be sideways/choppy (that's what "coiled" means), so mixing
+    # it into the ER window would unfairly drag down a genuinely clean
+    # breakout just because the days before it were flat/noisy.
+    er_lookback = max(days_since_trigger + 1, 3)  # at least 3 pts for a meaningful ER
+    pole_closes = [c for c in closes[-er_lookback:] if c is not None]
     er = None
     if len(pole_closes) >= 2:
         net_move = abs(pole_closes[-1] - pole_closes[0])
@@ -208,9 +214,9 @@ def main():
     ap.add_argument("--mid", type=int, default=21)
     ap.add_argument("--slow", type=int, default=50)
     ap.add_argument("--contraction-window", type=int, default=10)
-    ap.add_argument("--contraction-thresh", type=float, default=2.0,
+    ap.add_argument("--contraction-thresh", type=float, default=1.0,
                      help="max median |spread%%| during contraction window to call it 'coiled'")
-    ap.add_argument("--expansion-thresh", type=float, default=3.0,
+    ap.add_argument("--expansion-thresh", type=float, default=2.0,
                      help="spread%% threshold used as the expansion trigger level")
     ap.add_argument("--min-er", type=float, default=0.5,
                      help="minimum efficiency ratio (0-1) - rejects choppy/noisy expansion")
