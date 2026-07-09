@@ -437,11 +437,15 @@ async def r2_upload_fund(client, data: dict) -> None:
     if r.status_code != 200: raise RuntimeError(f"Upload failed: HTTP {r.status_code}")
     log.info(f"  ↑ fundamentals.json ({len(payload)/1024:.1f} KB)")
 
-async def save_result_calendar(client, symbols, date_str, keep_days=60):
+async def save_result_calendar(client, by_date: dict, keep_days=60):
+    """Merges a {date_str: [symbols]} batch into the persisted result_calendar.json."""
     try: existing = await r2_download(client, "result_calendar.json"); cal = existing if isinstance(existing, dict) else {}
     except: cal = {}
-    cal[date_str] = symbols
-    cutoff = (date.fromisoformat(date_str)-timedelta(days=keep_days)).isoformat()
+    for date_str, syms in by_date.items():
+        merged = set(cal.get(date_str, [])) | set(syms)
+        cal[date_str] = sorted(merged)
+    today = today_ist()
+    cutoff = (date.fromisoformat(today)-timedelta(days=keep_days)).isoformat()
     cal = {d:v for d,v in cal.items() if d >= cutoff}
     await upload_str_with_manifest(client, r2_upload, "result_calendar.json", json.dumps(cal),
                                     schema_v=1, extra_meta={"date_count": len(cal)})
@@ -902,14 +906,25 @@ async def fetch_one_fundamental(client, sem, sym, isin=""):
 # RESULTS CALENDAR + FUND PIPELINE
 # ══════════════════════════════════════════════════════════════
 
-async def get_result_symbols_finedge(client) -> list[str]:
-    today = today_ist(); next7 = (date.fromisoformat(today)+timedelta(days=1)).isoformat()
+async def get_result_calendar_finedge(client, days_ahead=7) -> dict:
+    """Fetches the full upcoming-results window from Finedge, grouped by date.
+    Returns {date_str: [symbols, ...]} — every date in the window, not just today.
+    This gives result_calendar.json a built-in buffer: even if a run is missed
+    or Finedge is briefly down, symbols reporting on nearby dates are already
+    captured from earlier runs."""
+    today = today_ist()
+    to_date = (date.fromisoformat(today) + timedelta(days=days_ahead)).isoformat()
     sem = asyncio.Semaphore(1)
-    d = await _finedge_get(client, sem, "results-calendar", {"from_date":today,"to_date":next7})
-    if not d or not isinstance(d, list): log.warning("Finedge results calendar — empty or error"); return []
-    matched = list({item["symbol"] for item in d if item.get("expected_result_date")==today})
-    log.info(f"Results today ({today}): {len(matched)} stocks")
-    return matched
+    d = await _finedge_get(client, sem, "results-calendar", {"from_date": today, "to_date": to_date})
+    if not d or not isinstance(d, list): log.warning("Finedge results calendar — empty or error"); return {}
+    by_date = {}
+    for item in d:
+        sym = item.get("symbol"); dt = item.get("expected_result_date")
+        if sym and dt: by_date.setdefault(dt, set()).add(sym)
+    by_date = {dt: sorted(syms) for dt, syms in by_date.items()}
+    total = sum(len(v) for v in by_date.values())
+    log.info(f"Finedge calendar: {len(by_date)} dates, {total} entries")
+    return by_date
 
 async def run_fund_daily() -> None:
     status = PipelineStatus("run_fund_daily")
@@ -920,9 +935,10 @@ async def run_fund_daily() -> None:
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-            symbols = await get_result_symbols_finedge(client)
+            by_date = await get_result_calendar_finedge(client)
+            if by_date: await save_result_calendar(client, by_date)
+            symbols = by_date.get(today, [])
             if not symbols: log.info("No results today — exiting"); return
-            await save_result_calendar(client, symbols, today)
             fund_data = await r2_download_fund(client)
             sem = asyncio.Semaphore(FUND_CONCURRENCY)
             results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in symbols if sym in ISIN_MAP])
@@ -1674,8 +1690,8 @@ async def run_ep_scan() -> None:
         async with httpx.AsyncClient() as client:
             global ISIN_MAP,BSE_ISIN_MAP,BSE_META
             ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
-            today_symbols=await get_result_symbols_finedge(client)
-            if today_symbols: await save_result_calendar(client,today_symbols,today)
+            by_date=await get_result_calendar_finedge(client)
+            if by_date: await save_result_calendar(client,by_date)
             ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
             (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
              idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
