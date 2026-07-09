@@ -1,0 +1,41 @@
+name: MA Expansion Scan
+
+on:
+  schedule:
+    # Runs at 4:00 PM IST (10:30 UTC) on weekdays, after market close.
+    # Adjust to match when your OHLC data pipeline finishes updating.
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch: {}   # allows manual trigger from GitHub Actions tab
+
+jobs:
+  run-ma-expansion-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy
+
+      - name: Run MA expansion scanner
+        run: python ma_expansion_scanner.py
+        env:
+          # add any secrets your script needs, e.g. R2/Firebase keys
+          R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+          R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+
+      - name: Commit results (if scanner writes an output file)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add ma_expansion_results.json || true
+          git diff --cached --quiet || git commit -m "Update MA expansion scan results"
+          git push
