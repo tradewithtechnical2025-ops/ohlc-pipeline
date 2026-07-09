@@ -96,10 +96,44 @@ def detect_ma_expansion(
     }
 
 
-# --- usage sketch, matching your existing scanner loop pattern ---
-# results = []
-# for symbol, df in symbol_dfs.items():
-#     out = detect_ma_expansion(df)
-#     if out.get("signal"):
-#         results.append({"symbol": symbol, **out})
-# results_df = pd.DataFrame(results).sort_values("days_since_trigger")
+def run_scan(data_dir: str = "data/ohlc", output_path: str = "ma_expansion_results.json") -> None:
+    """
+    Loops over per-symbol OHLC files, runs detect_ma_expansion, and writes
+    matches to output_path (so the GitHub Actions job has something to commit).
+
+    ASSUMPTION: one CSV per symbol at data_dir/{symbol}.csv with a 'close'
+    column, sorted ascending by date. Change this loader to match however
+    your pipeline actually stores OHLC (R2 chunks / manifest JSON / etc).
+    """
+    import os
+    import json
+
+    results = []
+    if not os.path.isdir(data_dir):
+        print(f"data_dir '{data_dir}' not found - nothing to scan.")
+        with open(output_path, "w") as f:
+            json.dump([], f)
+        return
+
+    for fname in os.listdir(data_dir):
+        if not fname.endswith(".csv"):
+            continue
+        symbol = fname.replace(".csv", "")
+        try:
+            df = pd.read_csv(os.path.join(data_dir, fname))
+            out = detect_ma_expansion(df)
+            if out.get("signal"):
+                results.append({"symbol": symbol, **out})
+        except Exception as e:
+            print(f"skipping {symbol}: {e}")
+
+    results.sort(key=lambda r: r["days_since_trigger"])
+
+    with open(output_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"Scan complete. {len(results)} matches written to {output_path}.")
+
+
+if __name__ == "__main__":
+    run_scan()
