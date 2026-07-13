@@ -1,41 +1,34 @@
 name: HTF + Shakeout Scan (standalone)
-
 # Runs htf_test_scan.py and shakeout_scanner.py directly. Does NOT touch
 # pipeline.py in any way — only needs WORKER_URL + WORKER_TOKEN to read the
 # existing ohlc_*.json chunks from R2.
-
 on:
-  
-   
   workflow_dispatch: {}
-
 jobs:
   htf-scan:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install httpx
-
-      - name: Run HTF scan
+      - name: Run HTF + Tightness scan
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-        run: python htf_test_scan.py --save htf_results.json --r2-key htf_test_results.json
-
+        run: >
+          python htf_test_scan.py
+          --save htf_results.json --r2-key htf_test_results.json
+          --tightness-save tightness_results.json --tightness-r2-key tightness.json
       - name: Run Shakeout scan
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: python shakeout_scanner.py --save shakeout_results.json --r2-key shakeout_signals.json
-
       - name: Upload results as workflow artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -43,4 +36,5 @@ jobs:
           path: |
             htf_results.json
             shakeout_results.json
+            tightness_results.json
           retention-days: 30
