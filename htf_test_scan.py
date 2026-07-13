@@ -105,6 +105,105 @@ def _build_weekly_map(dates, highs, lows, closes):
     return wd, wh, wl, wc, wh_day, wl_day, week_end_day, day_to_week
 
 
+def _calc_atr_weekly(wh, wl, wc, period=14):
+    """Wilder's ATR computed on WEEKLY high/low/close bars (not daily) —
+    matches the weekly-bar convention already used for pole detection above."""
+    n = len(wh)
+    tr = [None] * n
+    for i in range(n):
+        if wh[i] is None or wl[i] is None:
+            continue
+        if i == 0 or wc[i - 1] is None:
+            tr[i] = wh[i] - wl[i]
+        else:
+            tr[i] = max(wh[i] - wl[i], abs(wh[i] - wc[i - 1]), abs(wl[i] - wc[i - 1]))
+
+    atr = [None] * n
+    seed = [v for v in tr[:period] if v is not None]
+    if len(seed) < period:
+        return atr
+    atr[period - 1] = sum(seed) / period
+    for i in range(period, n):
+        atr[i] = atr[i - 1] if tr[i] is None else (atr[i - 1] * (period - 1) + tr[i]) / period
+    return atr
+
+
+def compute_weekly_tightness(s, lookbacks=(2, 3, 4, 6), atr_period=14):
+    """Weekly EMA10 Tightness scanner — how tightly price is coiled near its
+    weekly 10 EMA, measured two ways: raw % range and range relative to
+    weekly ATR (self-adjusts per stock's own volatility regime, so it's
+    comparable across low- and high-priced names).
+
+    Range/ATR figures use only CLOSED weekly bars — the current, still-
+    forming week is excluded so the reading doesn't repaint mid-week and
+    look artificially tight on a Monday. EMA distance uses the latest
+    available close (even if this week hasn't closed yet), since that's a
+    live snapshot of "where is price right now", not a range measurement,
+    so it doesn't have the same repainting problem.
+
+    Returns a dict shaped for tightness.json's per-symbol entry, or None if
+    there isn't enough weekly history yet."""
+    dates, highs, lows, closes = s["d"], s["h"], s["l"], s["c"]
+    if len(dates) < 30:
+        return None
+
+    wd, wh, wl, wc, wh_day, wl_day, week_end_day, day_to_week = _build_weekly_map(dates, highs, lows, closes)
+    n_weekly = len(wd)
+    if n_weekly < max(lookbacks) + atr_period:
+        return None
+
+    ema10_w = _calc_ema(wc, 10)
+    atr_w = _calc_atr_weekly(wh, wl, wc, atr_period)
+
+    # Running week is "closed" once we've reached Friday (or later) in the
+    # data's own trailing date — same idea as checking day-of-week live,
+    # just done against the last date actually present in this OHLC series.
+    last_daily_date = date.fromisoformat(dates[-1])
+    week_closed = last_daily_date.isoweekday() >= 5
+
+    closed_end = n_weekly if week_closed else n_weekly - 1
+    if closed_end < max(lookbacks):
+        return None
+
+    latest_close, latest_ema, latest_atr = wc[-1], ema10_w[-1], atr_w[-1]
+    if latest_close is None or latest_ema is None or not latest_atr:
+        return None
+
+    dist_ema_pct = abs(latest_close - latest_ema) / latest_ema * 100.0
+    dist_ema_atr = abs(latest_close - latest_ema) / latest_atr
+
+    by_lookback = {}
+    for lb in lookbacks:
+        start = closed_end - lb
+        if start < 0:
+            continue
+        ranges_pct, ranges_atr = [], []
+        for h, l, c, a in zip(wh[start:closed_end], wl[start:closed_end],
+                               wc[start:closed_end], atr_w[start:closed_end]):
+            if h is None or l is None or c is None or not c:
+                continue
+            ranges_pct.append((h - l) / c * 100.0)
+            if a:
+                ranges_atr.append((h - l) / a)
+        if not ranges_pct:
+            continue
+        by_lookback[str(lb)] = {
+            "range_pct": round(sum(ranges_pct) / len(ranges_pct), 2),
+            "range_atr": round(sum(ranges_atr) / len(ranges_atr), 2) if ranges_atr else None,
+        }
+
+    if not by_lookback:
+        return None
+
+    return {
+        "dist_ema_pct": round(dist_ema_pct, 2),
+        "dist_ema_atr": round(dist_ema_atr, 2),
+        "week_closed": week_closed,
+        "as_of_date": dates[-1],
+        "by_lookback": by_lookback,
+    }
+
+
 def _validate_weekly_pole(lo_w, hi_w, wh, wl, wc, n_weekly,
                            pole_min_weeks, pole_max_weeks, min_gain_pct, max_gain_pct):
     """Pole validation (gain%, duration, wick-safe peak-check) on WEEKLY
@@ -654,6 +753,8 @@ def main():
     ap = argparse.ArgumentParser(description="Full-universe HTF scan test (no full pipeline run)")
     ap.add_argument("--save", help="optional path to save results as JSON (local file)")
     ap.add_argument("--r2-key", help="optional R2 filename to push results to, e.g. htf_test_results.json")
+    ap.add_argument("--tightness-save", help="optional path to save Weekly EMA10 Tightness results as JSON (local file)")
+    ap.add_argument("--tightness-r2-key", help="optional R2 filename to push tightness results to, e.g. tightness.json")
     args = ap.parse_args()
 
     print("Downloading OHLC chunks...")
@@ -724,6 +825,34 @@ def main():
     if args.r2_key:
         print(f"\nPushing results to R2 as {args.r2_key}...")
         upload_to_r2(args.r2_key, json.dumps(all_results))
+
+    # ── Weekly EMA10 Tightness ────────────────────────────────────────────
+    print("Computing Weekly EMA10 Tightness...")
+    tightness_stocks = {}
+    skipped_tightness = 0
+    for sym, s in liquid.items():
+        t = compute_weekly_tightness(s)
+        if t:
+            tightness_stocks[sym] = t
+        else:
+            skipped_tightness += 1
+
+    tightness_output = {
+        "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "count": len(tightness_stocks),
+        "stocks": tightness_stocks,
+    }
+    print(f"Tightness computed: {len(tightness_stocks)} stocks  "
+          f"(skipped — insufficient history: {skipped_tightness})\n")
+
+    if args.tightness_save:
+        with open(args.tightness_save, "w") as f:
+            json.dump(tightness_output, f, indent=2)
+        print(f"Saved to {args.tightness_save}")
+
+    if args.tightness_r2_key:
+        print(f"\nPushing tightness results to R2 as {args.tightness_r2_key}...")
+        upload_to_r2(args.tightness_r2_key, json.dumps(tightness_output))
 
 
 
