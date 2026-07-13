@@ -155,6 +155,22 @@ def compute_weekly_tightness(s, lookbacks=(2, 3, 4, 6), atr_period=14):
     ema10_w = _calc_ema(wc, 10)
     atr_w = _calc_atr_weekly(wh, wl, wc, atr_period)
 
+    # Guard against unadjusted corporate actions (splits/bonuses): a genuine
+    # split shows up as one week's close jumping by a large multiple/fraction
+    # relative to the prior week — e.g. a 10:1 split makes that week's close
+    # ~1/10th of the previous one. That's not real "range expansion", it's a
+    # data artifact, and would otherwise show up as a wildly wrong tightness
+    # reading (100%+ range). Scan the weeks actually used below and bail out
+    # entirely if any such jump is present — better to skip the stock for now
+    # than report a misleading number.
+    check_start = max(0, n_weekly - max(lookbacks) - 2)
+    for i in range(check_start + 1, n_weekly):
+        prev_c, cur_c = wc[i - 1], wc[i]
+        if prev_c and cur_c and prev_c > 0:
+            ratio = cur_c / prev_c
+            if ratio > 1.6 or ratio < 0.6:
+                return None  # likely unadjusted split/bonus — skip until OHLC is corrected
+
     # Running week is "closed" once we've reached Friday (or later) in the
     # data's own trailing date — same idea as checking day-of-week live,
     # just done against the last date actually present in this OHLC series.
