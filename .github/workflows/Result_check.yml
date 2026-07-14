@@ -1,0 +1,38 @@
+name: Fundamentals Daily (Night Recheck)
+
+# Targets pipeline_fundamentals_prod.py's `daily` mode — this is the
+# standalone production fundamentals pipeline (writes fundamentals_full/{SYM}.json
+# + fundamentals_summary.json), NOT pipeline.py's fund_daily. It already has
+# its own pending-retry logic (fundamentals_pending.json) to handle Finedge's
+# 12-36h data-landing lag, self-healing across runs. Running it again at night
+# just gives same-day stragglers an earlier retry instead of waiting for
+# tomorrow's run.
+
+on:
+  schedule:
+    # 23:30 IST = 18:00 UTC — after Finedge's typical overnight data refresh
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}   # allows manual trigger from Actions tab
+
+jobs:
+  fundamentals-daily-night:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily (night recheck of pending + today's result symbols)
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+        run: python pipeline_fundamentals_prod.py daily
