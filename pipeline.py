@@ -926,7 +926,13 @@ async def get_result_calendar_finedge(client, days_ahead=7) -> dict:
     log.info(f"Finedge calendar: {len(by_date)} dates, {total} entries")
     return by_date
 
-async def run_fund_daily() -> None:
+async def run_fund_daily(lookback_days=2) -> None:
+    """Fetches fundamentals for today's result-day symbols, PLUS a rolling
+    lookback of the last `lookback_days` days. This exists because Finedge's
+    own data only gets updated overnight — a symbol whose result was announced
+    today may still return stale (pre-result) data on today's fetch. Re-checking
+    the last couple of days catches these stragglers automatically once Finedge
+    finally updates, without needing a separate night-run job."""
     status = PipelineStatus("run_fund_daily")
     try:
         today = today_ist()
@@ -937,18 +943,31 @@ async def run_fund_daily() -> None:
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
             by_date = await get_result_calendar_finedge(client)
             if by_date: await save_result_calendar(client, by_date)
-            symbols = by_date.get(today, [])
-            if not symbols: log.info("No results today — exiting"); return
+
+            today_d = date.fromisoformat(today)
+            lookback_dates = [(today_d - timedelta(days=i)).isoformat() for i in range(lookback_days + 1)]
+            symbols = sorted({s for d in lookback_dates for s in by_date.get(d, [])})
+            if not symbols: log.info("No results today/recent — exiting"); return
+            log.info(f"  Checking {len(symbols)} symbols across {lookback_dates}")
+
             fund_data = await r2_download_fund(client)
             sem = asyncio.Semaphore(FUND_CONCURRENCY)
             results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in symbols if sym in ISIN_MAP])
-            ok = 0
+            ok = stale = 0
             for sym, data in results:
-                if data: fund_data[sym]=data; ok+=1; log.info(f"  ✓ {sym}")
-                else: log.warning(f"  ✗ {sym}: no data")
+                if data:
+                    old_q = (fund_data.get(sym, {}).get("pl_quarterly") or [{}])[0].get("period_end")
+                    new_q = (data.get("pl_quarterly") or [{}])[0].get("period_end")
+                    if sym in fund_data and old_q == new_q:
+                        stale += 1; log.info(f"  ⏳ {sym}: still stale (latest quarter unchanged: {old_q})")
+                    else:
+                        ok += 1; log.info(f"  ✓ {sym}: updated ({old_q} → {new_q})")
+                    fund_data[sym] = data
+                else:
+                    log.warning(f"  ✗ {sym}: no data")
             await r2_upload_fund(client, fund_data)
         status.success()
-        log.info("━━━ Fundamentals Daily complete ━━━")
+        log.info(f"━━━ Fundamentals Daily complete — ✓{ok} updated  ⏳{stale} still stale ━━━")
     except Exception as e:
         status.failure(e)
 
