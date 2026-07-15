@@ -107,6 +107,23 @@ Recency-based stype selection (added July 2026, extended same month):
   stock instead of "1 call in the common case where c has data" — full-run
   duration and API usage will go up somewhat; watch RETRY/rate-limit behavior
   on the next full run.
+
+Sector/Industry — canonical taxonomy from classification.json (added July 2026):
+  fundamentals_summary.json's sector/industry/macro_sector come from Finedge's
+  own company-profile fields, which use a different, more fragmented taxonomy
+  (182 distinct "sector" values) than the one used everywhere else on the
+  platform — the RS Dashboard's sector heatmap and industry drilldown, both
+  built from classification.json's sector_group (32 values, e.g. "Banks",
+  "Cement") and display_industry (132 values, e.g. "PSU Banks", "Microfinance").
+  Frontend filters built against Finedge's fields showed confusing, overly
+  granular options that didn't match the rest of the site. Added
+  get_classification_lookup() (a second classification.json read, symbol ->
+  {sector_group, display_industry}) threaded through fetch_one_symbol /
+  _build_summary_entry / _backfill_one, so summary entries now carry both:
+  the original Finedge fields (kept for backward compat) AND sector_group /
+  display_industry, which the frontend should use for Sector/Industry filters
+  going forward. run_backfill_summary is the fast way to retrofit this onto
+  all existing stocks — no Finedge calls, just two R2 reads.
 """
 
 import asyncio, hashlib, json, logging, os, sys
@@ -293,6 +310,35 @@ async def get_nse_universe(client):
     symbols = sorted(set(symbols))
     log.info(f"Universe: {len(symbols)} NSE equity symbols (ETFs excluded)")
     return symbols
+
+
+async def get_classification_lookup(client):
+    """Symbol -> {sector_group, display_industry} lookup from classification.json.
+
+    Added because fundamentals_summary.json's sector/industry/macro_sector
+    come from Finedge's own company-profile fields, which use a DIFFERENT,
+    more fragmented taxonomy (182 distinct "sector" values, mixing grain
+    levels confusingly) than the platform's canonical one already used
+    everywhere else (RS Dashboard sector heatmap, industry drilldown):
+    classification.json's sector_group (32 values, e.g. "Banks", "Cement")
+    and display_industry (132 values, e.g. "PSU Banks", "Microfinance").
+    This keeps the Results Comparison page's Sector/Industry filters
+    consistent with the rest of the site instead of Finedge's raw fields.
+    """
+    classification = await r2_download(client, "classification.json")
+    if not classification or not isinstance(classification, list):
+        log.warning("classification.json missing/invalid — sector_group/display_industry will be blank")
+        return {}
+    out = {}
+    for s in classification:
+        sym = str(s.get("symbol", "")).strip().upper()
+        if not sym:
+            continue
+        out[sym] = {
+            "sector_group": s.get("sector_group"),
+            "display_industry": s.get("display_industry"),
+        }
+    return out
 
 
 # ══════════════════════════════════════════════════════════════
@@ -632,8 +678,9 @@ def _compute_opm(row):
     return None
 
 
-def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
+def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=None):
     profile = profile or {}
+    classification = classification or {}
 
     diluted_shares = None
     for period in ("ttm", "annual", "quarterly"):
@@ -687,6 +734,13 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
         "sector": profile.get("sector"),
         "industry": profile.get("industry"),
         "macro_sector": profile.get("macro_sector"),
+        # Canonical platform taxonomy from classification.json — same fields
+        # used by the RS Dashboard's sector heatmap (sector_group) and
+        # industry drilldown (display_industry). Use these for Sector/
+        # Industry filters instead of the Finedge fields above, which use a
+        # different, more fragmented naming scheme.
+        "sector_group": classification.get("sector_group"),
+        "display_industry": classification.get("display_industry"),
         "diluted_shares": diluted_shares,
         "stype": stype,   # single 'c'/'s' flag — applies to every field below
         "pe": apr0.get("pe"),
@@ -703,7 +757,7 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
 # ASSEMBLE PER-SYMBOL OBJECT
 # ══════════════════════════════════════════════════════════════
 
-async def fetch_one_symbol(client, sem, sym):
+async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
     profile = await _fetch_profile_raw(client, sem, sym)
     company_type = _classify_company(profile)
 
@@ -730,7 +784,8 @@ async def fetch_one_symbol(client, sem, sym):
         "growth_metrics": growth,
         "annual_price_ratios": price_ratios,
     }
-    summary_entry = _build_summary_entry(sym, profile, pl, ratios, price_ratios)
+    classification = (classification_lookup or {}).get(sym)
+    summary_entry = _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification)
     return sym, obj, summary_entry
 
 
@@ -742,6 +797,7 @@ async def run_full(part=0):
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient() as client:
         symbols = await get_nse_universe(client)
+        classification_lookup = await get_classification_lookup(client)
         if part == 0:
             chunk, label = symbols, "Full"
         else:
@@ -761,7 +817,7 @@ async def run_full(part=0):
         ok = failed = 0
         for i, sym in enumerate(chunk, 1):
             try:
-                _, obj, summ = await fetch_one_symbol(client, sem, sym)
+                _, obj, summ = await fetch_one_symbol(client, sem, sym, classification_lookup)
                 file_hash = await r2_upload_symbol(client, sym, obj)
                 summ["hash"] = file_hash
                 summary[sym] = summ
@@ -790,6 +846,7 @@ async def run_daily():
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient() as client:
         symbols = await get_nse_universe(client)
+        classification_lookup = await get_classification_lookup(client)
         summary = await r2_download_summary(client)
         pending = await r2_download_pending(client)
 
@@ -816,7 +873,7 @@ async def run_daily():
         updated = still_pending = dropped = failed = 0
         for sym in check_list:
             try:
-                _, obj, summ = await fetch_one_symbol(client, sem, sym)
+                _, obj, summ = await fetch_one_symbol(client, sem, sym, classification_lookup)
                 new_q = (summ.get("quarters") or [{}])[0].get("header")
                 old_q = pending[sym]["last_known_quarter"]
 
@@ -875,12 +932,13 @@ async def run_local(symbols):
 # already ran with an older pipeline version that didn't write the summary.
 # ══════════════════════════════════════════════════════════════
 
-async def _backfill_one(client, sym):
+async def _backfill_one(client, sym, classification_lookup=None):
     obj = await r2_download(client, f"fundamentals_full/{sym}.json")
     if not obj:
         return sym, None
+    classification = (classification_lookup or {}).get(sym)
     summ = _build_summary_entry(sym, obj.get("profile"), obj.get("pl", {}),
-                                 obj.get("ratios", {}), obj.get("annual_price_ratios", {}))
+                                 obj.get("ratios", {}), obj.get("annual_price_ratios", {}), classification)
     # Re-serialize with the same separators r2_upload_symbol uses, so this
     # backfilled hash is consistent with hashes future live runs will produce.
     # NOTE: since this re-serializes a downloaded-and-reparsed object rather
@@ -896,12 +954,13 @@ async def run_backfill_summary():
     BATCH = 50
     async with httpx.AsyncClient() as client:
         symbols = await get_nse_universe(client)
+        classification_lookup = await get_classification_lookup(client)
         summary = {}
         ok = failed = 0
         failed_syms = []
         for i in range(0, len(symbols), BATCH):
             batch = symbols[i:i + BATCH]
-            results = await asyncio.gather(*[_backfill_one(client, sym) for sym in batch])
+            results = await asyncio.gather(*[_backfill_one(client, sym, classification_lookup) for sym in batch])
             for sym, summ in results:
                 if summ:
                     summary[sym] = summ
@@ -921,7 +980,7 @@ async def run_backfill_summary():
             s_ok = s_fail = 0
             for sym in failed_syms:
                 try:
-                    _, obj, summ = await fetch_one_symbol(client, sem, sym)
+                    _, obj, summ = await fetch_one_symbol(client, sem, sym, classification_lookup)
                     file_hash = await r2_upload_symbol(client, sym, obj)
                     summ["hash"] = file_hash
                     summary[sym] = summ
@@ -943,12 +1002,13 @@ async def run_backfill_summary():
 async def run_sync(symbols):
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient() as client:
+        classification_lookup = await get_classification_lookup(client)
         summary = await r2_download_summary(client)
         ok = failed = 0
         for sym in symbols:
             sym = sym.upper()
             try:
-                _, obj, summ = await fetch_one_symbol(client, sem, sym)
+                _, obj, summ = await fetch_one_symbol(client, sem, sym, classification_lookup)
                 file_hash = await r2_upload_symbol(client, sym, obj)
                 summ["hash"] = file_hash
                 summary[sym] = summ
