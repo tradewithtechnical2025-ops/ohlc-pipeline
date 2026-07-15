@@ -57,7 +57,13 @@ Data-shape decisions (locked in from testing phase):
   - CF  periods : annual (full), quarterly (last 12), ytd (last 12) — SINGLE stype,
     CORE-ONLY (cfo/cfi/cff/net_cash_flow/capex/fcf/dividends_paid/pbt) —
     raw ~100-field granular rows dropped entirely for size.
-  - ratios/growth_metrics/annual_price_ratios — SINGLE stype (c, fallback s)
+  - ratios/annual_price_ratios — BOTH stypes fetched, RECENCY-PICKED (see note
+    below) — was "SINGLE stype (c, fallback s only if c is empty)" until
+    July 2026; changed for the same reason as the PL quarters fix.
+  - growth_metrics — still SINGLE stype (c, fallback s only if c is empty),
+    UNCHANGED. The financial-metrics endpoint returns one metrics object per
+    stype, not a dated rows list, so there's no reliable per-row date field
+    to compare recency against — revisit if Finedge exposes one.
   - shareholdings/pattern — REMOVED (not needed right now)
   - PL/BS get an alias-resolved "core" object (bank vs non-bank field-naming)
     PLUS full "raw" rows (schemas not yet mapped, e.g. insurance, still captured).
@@ -72,6 +78,35 @@ Daily-mode pending-retry (added post Finedge support reply, July 2026):
   actually changes. Until then the symbol stays in fundamentals_pending.json
   and gets retried on every subsequent daily run, up to MAX_PENDING_ATTEMPTS
   trading days, after which it's dropped (self-heals on the next full run).
+
+Recency-based stype selection (added July 2026, extended same month):
+  _build_summary_entry() used to prefer consolidated whenever it had ANY
+  rows at all — for PL quarters, and independently for each ratio field
+  (PE/PB, ROE/ROCE/EBITDA, D/E) — falling back to standalone only if
+  consolidated was completely empty. Many companies stop filing
+  consolidated results after a few years while standalone keeps being
+  reported every quarter, so "any consolidated rows" stayed true (the old
+  rows are still there) and the summary kept surfacing stale consolidated
+  data even though standalone was current.
+
+  Fixed in two steps:
+  1. _fetch_ratios_single / _fetch_annual_price_ratios_single now always
+     fetch both stypes and keep both raw arrays (raw_c/raw_s) alongside the
+     existing raw/stype_used pair, so a consumer can pick per its own needs
+     instead of only seeing whichever one the fetch function guessed was best.
+  2. _build_summary_entry() decides ONE overall stype per stock — from
+     quarterly PL recency (_latest_key, by period_end or year), the
+     highest-frequency signal a company reports on — and applies that same
+     stype to every summary field (quarters, PE/PB, ROE/ROCE/EBITDA, D/E).
+     Earlier each field picked its own most-recent stype independently,
+     which could technically be "more current" per field but showed a
+     confusing mix (e.g. PE from standalone, ROE from consolidated) on the
+     same stock. summary["stype"] now carries this single 'c'/'s' decision.
+
+  Trade-off: ratios/price-ratios now always cost 2x the Finedge calls per
+  stock instead of "1 call in the common case where c has data" — full-run
+  duration and API usage will go up somewhat; watch RETRY/rate-limit behavior
+  on the next full run.
 """
 
 import asyncio, hashlib, json, logging, os, sys
@@ -136,6 +171,30 @@ def _fmt_period_end(period_end):
 
 def today_ist() -> str:
     return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+
+
+def _latest_key(rows):
+    """Recency key for the first (assumed most-recent) row of a Finedge rows
+    list — used to compare consolidated vs standalone data and pick whichever
+    is actually more current, instead of always preferring consolidated
+    whenever it has *any* rows. Tries period_end (YYYYMMDD) first, falls back
+    to year if that's all a row carries. Returns -1 for empty/unusable input."""
+    if not rows:
+        return -1
+    r0 = rows[0]
+    pe = r0.get("period_end")
+    if pe:
+        try:
+            return int(pe)
+        except (TypeError, ValueError):
+            pass
+    yr = r0.get("year")
+    if yr:
+        try:
+            return int(yr) * 10000  # coarse fallback, only used when period_end is absent
+        except (TypeError, ValueError):
+            pass
+    return -1
 
 
 def is_trading_day(d: str) -> bool:
@@ -444,7 +503,10 @@ async def _fetch_basic_financials_dual(client, sem, sym):
 # ══════════════════════════════════════════════════════════════
 # FETCH — SINGLE statement_type, c preferred, fallback to s only
 # if c returns zero rows
-#   used for: BS, CF, ratios, growth_metrics, annual_price_ratios
+#   used for: BS, CF, growth_metrics
+# (ratios and annual_price_ratios moved to a dual-fetch, recency-picked
+#  pattern in July 2026 — see the two functions further below and the
+#  "Recency-based stype selection" note in the module docstring)
 # ══════════════════════════════════════════════════════════════
 
 async def _fetch_financials_single(client, sem, sym, code, periods, build_core_fn=None, keep_raw=True):
@@ -473,18 +535,32 @@ async def _fetch_financials_single(client, sem, sym, code, periods, build_core_f
 async def _fetch_ratios_single(client, sem, sym):
     out = {}
     for rtype in RATIO_TYPES:
-        rows, stype_used = [], None
+        rows_by_stype = {}
         for stype in ("c", "s"):
             d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type": stype, "ratio_type": rtype})
-            r = (d or {}).get("ratios", [])
-            if r:
-                rows, stype_used = r, stype
-                break
-        out[rtype] = {"stype_used": stype_used, "raw": rows}
+            rows_by_stype[stype] = (d or {}).get("ratios", [])
+        c_rows, s_rows = rows_by_stype["c"], rows_by_stype["s"]
+        # Prefer whichever stype's latest row is actually more recent, same
+        # recency-over-existence rule as the PL quarters fix above. Falls
+        # back to whichever one has data if the "winner" turns out empty.
+        stype_used = "s" if _latest_key(s_rows) > _latest_key(c_rows) else "c"
+        rows = rows_by_stype[stype_used]
+        if not rows:
+            rows = c_rows or s_rows
+            stype_used = "c" if c_rows else ("s" if s_rows else None)
+        # raw_c/raw_s kept alongside so _build_summary_entry can pick ONE
+        # stype for the whole company and apply it consistently everywhere
+        # (see "Summary — single consistent stype per stock" in the module
+        # docstring), instead of each ratio type picking independently.
+        out[rtype] = {"stype_used": stype_used, "raw": rows, "raw_c": c_rows, "raw_s": s_rows}
     return out
 
 
 async def _fetch_growth_metrics_single(client, sem, sym):
+    # NOT extended with the recency check above — financial-metrics returns a
+    # single aggregate dict (e.g. multi-year CAGR figures), not a list of
+    # dated rows, so there's no per-row date to compare c vs s recency on.
+    # Left as "prefer c, fallback to s only if c is empty" (original design).
     for stype in ("c", "s"):
         d = await _finedge_get(client, sem, f"financial-metrics/{sym}", {"statement_type": stype, "ratio_type": "gr"})
         fm = (d or {}).get("financial_metrics")
@@ -494,12 +570,17 @@ async def _fetch_growth_metrics_single(client, sem, sym):
 
 
 async def _fetch_annual_price_ratios_single(client, sem, sym):
+    rows_by_stype = {}
     for stype in ("c", "s"):
         d = await _finedge_get(client, sem, f"annual-price-ratios/{sym}", {"statement_type": stype})
-        rows = (d or {}).get("price_ratios", [])
-        if rows:
-            return {"stype_used": stype, "raw": rows}
-    return {"stype_used": None, "raw": []}
+        rows_by_stype[stype] = (d or {}).get("price_ratios", [])
+    c_rows, s_rows = rows_by_stype["c"], rows_by_stype["s"]
+    stype_used = "s" if _latest_key(s_rows) > _latest_key(c_rows) else "c"
+    rows = rows_by_stype[stype_used]
+    if not rows:
+        rows = c_rows or s_rows
+        stype_used = "c" if c_rows else ("s" if s_rows else None)
+    return {"stype_used": stype_used, "raw": rows, "raw_c": c_rows, "raw_s": s_rows}
 
 
 async def _fetch_profile_raw(client, sem, sym):
@@ -564,8 +645,21 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
         if diluted_shares is not None:
             break
 
-    q_core = (pl.get("quarterly", {}).get("c", {}).get("core")
-              or pl.get("quarterly", {}).get("s", {}).get("core") or [])
+    # ── Summary — single consistent stype per stock ──────────────────────
+    # Decide ONE overall c/s choice per stock — from quarterly PL recency,
+    # since that's the highest-frequency signal a company reports on — and
+    # apply it to every field below (quarters, PE/PB, ROE/ROCE/EBITDA, D/E).
+    # Previously each field picked its own most-recent stype independently,
+    # which could show e.g. PE from standalone and ROE from consolidated on
+    # the same stock — technically "most current" per field, but confusing
+    # to read. One flag per stock, used everywhere, is simpler and predictable.
+    c_core = pl.get("quarterly", {}).get("c", {}).get("core") or []
+    s_core = pl.get("quarterly", {}).get("s", {}).get("core") or []
+    stype = "s" if _latest_key(s_core) > _latest_key(c_core) else "c"
+    if stype == "c" and not c_core and s_core:
+        stype = "s"  # c "won" the tie-break but is actually empty — use s
+
+    q_core = s_core if stype == "s" else c_core
     quarters = [{
         "header": _fmt_period_end(row.get("period_end")),
         "sales":    row.get("sales") if row.get("sales") is not None else row.get("interest_earned"),
@@ -576,9 +670,16 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
         "pbt":      row.get("pbt"),
     } for row in q_core[:9]]  # 9 so YoY base (idx+4) exists for any of the 5 displayed quarters
 
-    pr0 = (ratios.get("pr", {}).get("raw") or [{}])[0]
-    le0 = (ratios.get("le", {}).get("raw") or [{}])[0]
-    apr0 = (price_ratios.get("raw") or [{}])[0]
+    # Pull ratios/price-ratios for the SAME chosen stype. Falls back to that
+    # endpoint's own best-available row only if the chosen stype genuinely
+    # has nothing for it (rare) — better to show a number than none, but
+    # this doesn't happen for the vast majority of stocks.
+    pr_rows  = ratios.get("pr", {}).get(f"raw_{stype}") or ratios.get("pr", {}).get("raw") or []
+    le_rows  = ratios.get("le", {}).get(f"raw_{stype}") or ratios.get("le", {}).get("raw") or []
+    apr_rows = price_ratios.get(f"raw_{stype}") or price_ratios.get("raw") or []
+    pr0  = (pr_rows or [{}])[0]
+    le0  = (le_rows or [{}])[0]
+    apr0 = (apr_rows or [{}])[0]
 
     return {
         "symbol": sym,
@@ -587,6 +688,7 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios):
         "industry": profile.get("industry"),
         "macro_sector": profile.get("macro_sector"),
         "diluted_shares": diluted_shares,
+        "stype": stype,   # single 'c'/'s' flag — applies to every field below
         "pe": apr0.get("pe"),
         "pb": apr0.get("pb"),
         "roe": pr0.get("returnOnEquity"),
