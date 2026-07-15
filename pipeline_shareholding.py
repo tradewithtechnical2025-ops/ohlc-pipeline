@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import sys
 from datetime import datetime
 
 import httpx
@@ -267,7 +268,7 @@ async def fetch_one(client, sem, symbol):
 
 
 # ─────────────────────────────────────────────
-# Main
+# Main (full universe run)
 # ─────────────────────────────────────────────
 
 async def main():
@@ -397,5 +398,67 @@ async def main():
         )
 
 
+# ─────────────────────────────────────────────
+# Sync (one or a few specific symbols — no full-universe scan,
+# no master.json download; just fetch + merge these into the
+# existing shareholding.json and re-upload)
+# ─────────────────────────────────────────────
+
+async def run_sync(symbols):
+
+    symbols = [s.upper() for s in symbols]
+
+    async with httpx.AsyncClient() as client:
+
+        try:
+            existing = await r2_download(client, "shareholding.json")
+            if not isinstance(existing, dict):
+                existing = {}
+        except Exception:
+            existing = {}
+            print("No existing shareholding.json found — starting from empty")
+
+        # Start from the full existing file and only touch the requested
+        # symbols — every other symbol's data passes through untouched.
+        output = dict(existing)
+
+        sem = asyncio.Semaphore(CONCURRENCY)
+        tasks = [fetch_one(client, sem, s) for s in symbols]
+        results = await asyncio.gather(*tasks)
+
+        ok = failed = 0
+
+        for sym, data in results:
+
+            if data and data.get("data"):
+                output[sym] = data
+                ok += 1
+                print(f"  ✓ {sym}")
+            elif sym in existing and existing[sym].get("data"):
+                failed += 1
+                print(f"  ✗ {sym} — fetch failed, kept existing entry unchanged")
+            else:
+                failed += 1
+                print(f"  ✗ {sym} — fetch failed, no existing entry either")
+
+        manifest = await upload_with_manifest(
+            client, r2_upload, "shareholding.json", output,
+            schema_v=1, extra_meta={"symbol_count": len(output)}
+        )
+
+        print(
+            f"\n✅ shareholding.json uploaded (hash={manifest['hash']})\n"
+            f"   Synced: {ok}/{len(symbols)}   Failed: {failed}/{len(symbols)}\n"
+            f"   Total symbols in file: {len(output)}"
+        )
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if len(sys.argv) > 1 and sys.argv[1] == "sync":
+        syms = sys.argv[2:]
+        if not syms:
+            print("Usage: python shareholding_pipeline.py sync SYM [SYM2 ...]")
+            sys.exit(1)
+        asyncio.run(run_sync(syms))
+    else:
+        asyncio.run(main())
