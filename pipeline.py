@@ -1769,6 +1769,12 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
 #  to pipeline_fundamentals_prod.py's per-symbol + summary architecture)
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+# run_ep_scan  —  UPDATED to read fundamentals_summary.json
+# (old fundamentals.json is no longer maintained after the migration
+#  to pipeline_fundamentals_prod.py's per-symbol + summary architecture)
+# ══════════════════════════════════════════════════════════════
+
 async def run_ep_scan() -> None:
     status = PipelineStatus("run_ep_scan")
     try:
@@ -1867,18 +1873,23 @@ async def run_ep_scan() -> None:
 
             def _fund_chg(fund):
                 """fundamentals_summary.json se q_name + YoY sales/eps change strings.
-                ← CHANGED: 'pl_quarterly' -> 'quarters' (new summary schema),
-                field names inside each quarter row (header/sales/eps) unchanged."""
+                CHANGED: 'pl_quarterly' -> 'quarters' (new summary schema),
+                field names inside each quarter row (header/sales/eps) unchanged.
+                FIX: divide by abs(prev) not prev -- a negative prior-year base
+                (loss quarter) was flipping the sign of the % change, so a
+                loss->profit turnaround showed as a large NEGATIVE eps_ch instead
+                of positive. abs() keeps the sign meaning "improved/worsened"
+                correct regardless of which side of zero the base sits on."""
                 q=fund.get("quarters",[])
                 q_name=q[0].get("header","") if q else ""
                 sales_ch=eps_ch=""
                 if q and len(q)>=5:
                     s0=q[0].get("sales"); s4=q[4].get("sales")
-                    if s0 and s4:
-                        v=round((s0-s4)/s4*100,1); sales_ch=f"+{v}%" if v>=0 else f"{v}%"
+                    if s0 is not None and s4:
+                        v=round((s0-s4)/abs(s4)*100,1); sales_ch=f"+{v}%" if v>=0 else f"{v}%"
                     e0=q[0].get("eps"); e4=q[4].get("eps")
-                    if e0 and e4:
-                        v=round((e0-e4)/e4*100,1); eps_ch=f"+{v}%" if v>=0 else f"{v}%"
+                    if e0 is not None and e4:
+                        v=round((e0-e4)/abs(e4)*100,1); eps_ch=f"+{v}%" if v>=0 else f"{v}%"
                 return q_name,sales_ch,eps_ch
 
             signals=_detect_ep(all_data)
@@ -1956,12 +1967,14 @@ async def run_ep_scan() -> None:
             for sig in signals: ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
             for row in screener_feed:
                 sym=row["symbol"]; sc=screener.get(sym,{}); fund=fund_lookup.get(sym,{})
-                pl=fund.get("quarters",[]); row["q_name"]=pl[0].get("header","") if pl else ""   # ← CHANGED (was pl_quarterly)
+                pl=fund.get("quarters",[]); row["q_name"]=pl[0].get("header","") if pl else ""   # CHANGED (was pl_quarterly)
                 if pl and len(pl)>=5:
                     s0=pl[0].get("sales"); s4=pl[4].get("sales")
-                    row["sales_ch"]=round((s0-s4)/s4*100,1) if s0 and s4 else None
+                    # FIX: abs(s4)/abs(e4) in denominator -- same sign-flip bug as
+                    # _fund_chg() above, see comment there.
+                    row["sales_ch"]=round((s0-s4)/abs(s4)*100,1) if s0 is not None and s4 else None
                     e0=pl[0].get("eps"); e4=pl[4].get("eps")
-                    row["eps_ch"]=round((e0-e4)/e4*100,1) if e0 and e4 else None
+                    row["eps_ch"]=round((e0-e4)/abs(e4)*100,1) if e0 is not None and e4 else None
                 else: row["sales_ch"]=None; row["eps_ch"]=None
                 pats=set()
                 for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC"),("shakeout","Shakeout"),("w_pullback","W-Pullback")]:
@@ -2006,7 +2019,6 @@ async def run_ep_scan() -> None:
         log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
     except Exception as e:
         status.failure(e)
-
 
 # ══════════════════════════════════════════════════════════════
 # HLR + PULLBACK SCAN
