@@ -324,10 +324,12 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
     filtered_mcap        = 0
     filtered_price       = 0
     filtered_turnover    = 0
+    filtered_stale       = 0
     upstox_named         = 0
     new_listings         = 0
     volume_corrected     = 0   # Finedge volume was lower than Upstox's — corrected
     turnover_rejected_list = []   # debug tracking
+    stale_list           = []   # suspended/merged/delisted debug tracking
 
     for symbol, q in quotes.items():
 
@@ -358,6 +360,24 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
             finedge_vol  = float(q.get("volume")        or 0)
             market_cap   = float(q.get("market_cap")    or 0)
         except Exception:
+            continue
+
+        # ── Suspended / merged / delisted detection ──
+        # Finedge keeps stale quote rows for stocks that have stopped
+        # trading (corporate amalgamation, delisting, scheme of
+        # arrangement, etc.) — open/high/low all come back null and
+        # tradetime freezes at the last actual trading day. These aren't
+        # genuine thin-liquidity rejects, so pull them out separately
+        # instead of letting them clutter the turnover-rejected list.
+        if q.get("open_price") is None and q.get("high_price") is None and q.get("low_price") is None:
+            filtered_stale += 1
+            stale_list.append({
+                "symbol":     symbol,
+                "name":       name,
+                "price":      price,
+                "market_cap": market_cap,
+                "tradetime":  q.get("tradetime"),
+            })
             continue
 
         # ── Finedge volume can be stale/undercounted (not just zero) —
@@ -428,6 +448,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
     print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
     print(f"  ✗ Price Rejected       : {filtered_price}")
     print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
+    print(f"  ✗ Suspended/Stale (merger/delisting etc.) : {filtered_stale}")
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
 
@@ -445,7 +466,22 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
         )
     print("=" * 50)
 
+    # dump suspended/stale stocks for debugging (separate from turnover list)
+    stale_list.sort(key=lambda x: -(x["market_cap"] or 0))
+    with open("suspended_stale_debug.json", "w") as f:
+        json.dump(stale_list, f, indent=2)
+
+    if stale_list:
+        print(f"  🔍 Suspended/Stale sample (top 20 by mcap):")
+        for r in stale_list[:20]:
+            print(
+                f"      {r['symbol']:15s} price={r['price']:>10.2f} "
+                f"mcap={r['market_cap']:>10.0f} tradetime={r['tradetime']}"
+            )
+        print("=" * 50)
+
     return master, turnover_rejected_list
+
 
 
 # =========================================================
