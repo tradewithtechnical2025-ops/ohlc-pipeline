@@ -1247,7 +1247,8 @@ async def backup_pattern_history(client, feed, today, gap_new=None, gap_filled=N
     n_sym=len(all_syms)
     log.info(f"  🗄  pattern_history: {today} → {fname}  ({len(day)} signals, {n_sym} stocks, {len(hist)} dates)")
 
-def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0, volume_lookback=20, max_consolidation=30, max_ep_age_days=30):
+def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0, volume_lookback=20,
+                max_consolidation=30, max_ep_age_days=30, min_days_after_ep=2):
     signals=[]
     for sym,s in all_data.items():
         dates,highs,lows,closes,volumes=s["d"],s["h"],s["l"],s["c"],s["v"]; n=len(dates)
@@ -1274,12 +1275,21 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0, volume_lookback=20
             ep_5d_idx=min(i+5,n-1)
             ep_5d_return=round((closes[ep_5d_idx]-ep_close)/ep_close*100,2) if ep_5d_idx>i else ""
             ep_return=round((closes[last_idx]-ep_close)/ep_close*100,2) if ep_close else 0.0
-            never_broke_high=all(closes[j]<=highs[i] for j in range(i+1,last_idx+1))
+
+            # ── FIX: min 2 trading days EP day ke baad chahiye, warna type abhi decide mat karo ──
+            if consol_count < min_days_after_ep:
+                ep_type = None
+            else:
+                # EP day high/low dono candle ke reference points hain — close EP day
+                # high (highs[i]) se upar nahi gaya to Consolidating, warna Follow-through
+                never_broke_high = all(closes[j] <= highs[i] for j in range(i+1, last_idx+1))
+                ep_type = "Consolidating below EP high" if never_broke_high else "EP Follow-through"
+
             signals.append({"symbol":sym,"ep_date":dates[i],"gap_lower":round(gap_lower,2),"gap_pct":round(gap_pct,2),
                 "vol_spike_x":round(vol_x,1),"ep_candle_high":round(highs[i],2),"ep_candle_low":round(today_low,2),
                 "ep_candle_close":round(ep_close,2),"ep_return":ep_return,"ep_5d_return":ep_5d_return,
                 "last_close":round(closes[last_idx],2),"last_date":dates[last_idx],"consolidation":consol_count,
-                "ep_type":"Consolidating below EP high" if never_broke_high else "EP Follow-through"})
+                "ep_type":ep_type})
     seen={}
     for sig in signals:
         sym=sig["symbol"]
