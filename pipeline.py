@@ -1763,6 +1763,12 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
 # run_ep_scan
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+# run_ep_scan  —  UPDATED to read fundamentals_summary.json
+# (old fundamentals.json is no longer maintained after the migration
+#  to pipeline_fundamentals_prod.py's per-symbol + summary architecture)
+# ══════════════════════════════════════════════════════════════
+
 async def run_ep_scan() -> None:
     status = PipelineStatus("run_ep_scan")
     try:
@@ -1778,7 +1784,8 @@ async def run_ep_scan() -> None:
              idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
              hlr_raw,pb_raw,pat_raw,w_pb_raw)=await asyncio.gather(
                 asyncio.gather(*ohlc_tasks,return_exceptions=True),
-                r2_download(client,"screener.json"),r2_download_fund(client),
+                r2_download(client,"screener.json"),
+                r2_download(client,"fundamentals_summary.json"),   # ← CHANGED (was r2_download_fund(client))
                 r2_download(client,"result_calendar.json"),r2_download(client,"classification.json"),
                 r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty50']}.json"),
                 r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty500']}.json"),
@@ -1810,9 +1817,16 @@ async def run_ep_scan() -> None:
                         v=row.get(col,"")
                         if v and v not in ("",None,0,"No"): combined.add(v if isinstance(v,str) else col)
                     screener[sym]={"sales_ch":sales_ch,"eps_ch":eps_ch,"patterns":"||".join(sorted(combined)),"sector":row.get("SECTOR",""),"rs":row.get("RS Rating",""),"ltp":row.get("LTP","")}
+
+            # ← CHANGED: fundamentals_summary.json shape is {"updated":..., "stocks": {SYM: {...}}}
             fund_lookup={}
-            if isinstance(fund_raw,dict): fund_lookup=fund_raw
-            elif isinstance(fund_raw,list): fund_lookup={d["symbol"]:d for d in fund_raw if d.get("symbol")}
+            if isinstance(fund_raw,dict) and "stocks" in fund_raw:
+                fund_lookup=fund_raw["stocks"]
+            elif isinstance(fund_raw,dict):
+                fund_lookup=fund_raw
+            elif isinstance(fund_raw,list):
+                fund_lookup={d["symbol"]:d for d in fund_raw if d.get("symbol")}
+
             result_calendar=cal_raw if isinstance(cal_raw,dict) else {}
             classification=classification or []
             sheet_data={}
@@ -1842,29 +1856,27 @@ async def run_ep_scan() -> None:
             if isinstance(w_pb_raw,dict):
                 for sig in (w_pb_raw.get("signals") or []):
                     sym=sig.get("symbol")
-                    # keep only the most recent signal per symbol (multiple
-                    # chained legs can exist historically; screener_feed just
-                    # needs "does this stock have a current weekly pullback")
                     if sym and (sym not in w_pb_map or sig.get("signal_date","") > w_pb_map[sym].get("signal_date","")):
                         w_pb_map[sym]=sig
 
             # ─── FIX: fresh enrichment helpers ───
-            # Classification map — sector ke liye (sheet ki jagah)
             cls_map_ep={}
             for x in (classification or []):
                 sym0=x.get("symbol") or x.get("nse_code")
                 if sym0: cls_map_ep[sym0]=x
 
             def _fund_chg(fund):
-                """fundamentals.json se q_name + YoY sales/eps change strings."""
-                pl=fund.get("pl_quarterly",[])
-                q_name=pl[0].get("header","") if pl else ""
+                """fundamentals_summary.json se q_name + YoY sales/eps change strings.
+                ← CHANGED: 'pl_quarterly' -> 'quarters' (new summary schema),
+                field names inside each quarter row (header/sales/eps) unchanged."""
+                q=fund.get("quarters",[])
+                q_name=q[0].get("header","") if q else ""
                 sales_ch=eps_ch=""
-                if pl and len(pl)>=5:
-                    s0=pl[0].get("sales"); s4=pl[4].get("sales")
+                if q and len(q)>=5:
+                    s0=q[0].get("sales"); s4=q[4].get("sales")
                     if s0 and s4:
                         v=round((s0-s4)/s4*100,1); sales_ch=f"+{v}%" if v>=0 else f"{v}%"
-                    e0=pl[0].get("eps"); e4=pl[4].get("eps")
+                    e0=q[0].get("eps"); e4=q[4].get("eps")
                     if e0 and e4:
                         v=round((e0-e4)/e4*100,1); eps_ch=f"+{v}%" if v>=0 else f"{v}%"
                 return q_name,sales_ch,eps_ch
@@ -1902,7 +1914,6 @@ async def run_ep_scan() -> None:
                     })
             rs_data=_calculate_rs(all_data,history_days=90)
             rs_history_list=_build_rs_history_json(all_data,rs_data)
-            # ─── FIX: rs bhi fresh calculated value se (sheet ka stale rs nahi) ───
             for sig in signals:
                 rc=rs_data.get(sig["symbol"],{}).get("rs")
                 sig["rs_calc"]=rc
@@ -1945,7 +1956,7 @@ async def run_ep_scan() -> None:
             for sig in signals: ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
             for row in screener_feed:
                 sym=row["symbol"]; sc=screener.get(sym,{}); fund=fund_lookup.get(sym,{})
-                pl=fund.get("pl_quarterly",[]); row["q_name"]=pl[0].get("header","") if pl else ""
+                pl=fund.get("quarters",[]); row["q_name"]=pl[0].get("header","") if pl else ""   # ← CHANGED (was pl_quarterly)
                 if pl and len(pl)>=5:
                     s0=pl[0].get("sales"); s4=pl[4].get("sales")
                     row["sales_ch"]=round((s0-s4)/s4*100,1) if s0 and s4 else None
@@ -1959,7 +1970,6 @@ async def run_ep_scan() -> None:
                 if row.get("hlr_state"): pats.add(row["hlr_state"])
                 if sym in ep_pat_map: pats|=ep_pat_map[sym]
                 row["patterns"]="||".join(sorted(pats))
-            # ─── FIX: EP/PR signals mein aaj ke fresh patterns (sheet ke purane nahi) ───
             feed_pat={row["symbol"]:row["patterns"] for row in screener_feed}
             for sig in signals:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
