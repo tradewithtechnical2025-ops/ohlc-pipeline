@@ -220,13 +220,14 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
     print(f"  📋 stock_map built : {len(stock_map)} symbols")
     print()
 
-    master            = []
-    filtered_bad      = 0
-    filtered_mcap     = 0
-    filtered_price    = 0
-    filtered_turnover = 0
-    upstox_named      = 0
-    new_listings      = 0
+    master               = []
+    filtered_bad         = 0
+    filtered_mcap        = 0
+    filtered_price       = 0
+    filtered_turnover    = 0
+    upstox_named         = 0
+    new_listings         = 0
+    turnover_rejected_list = []   # ← NEW: debug tracking
 
     for symbol, q in quotes.items():
 
@@ -273,6 +274,14 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
 
         if turnover_cr < MIN_TURNOVER_CR:
             filtered_turnover += 1
+            turnover_rejected_list.append({
+                "symbol":      symbol,
+                "name":        name,
+                "price":       price,
+                "volume":      volume,
+                "market_cap":  market_cap,
+                "turnover_cr": round(turnover_cr, 2),
+            })
             continue
 
         if is_upstox_src:
@@ -284,7 +293,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
             "exchange":         exchange,
             "bse_code":         bse_code,
             "nse_code":         nse_code,
-            "isin":             nse_isin_map.get(symbol, ""),   # ← NEW
+            "isin":             nse_isin_map.get(symbol, ""),
             "consolidated_ind": stock.get("consolidated_ind", False) if stock else False,
             "market_cap_cr":    market_cap if not is_upstox_src else None,
             "price":            price,
@@ -312,6 +321,20 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
     print(f"  ✗ Price Rejected       : {filtered_price}")
     print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
+    print("=" * 50)
+
+    # ── NEW: dump turnover-rejected stocks for debugging ──────────────
+    turnover_rejected_list.sort(key=lambda x: -(x["market_cap"] or 0))
+    with open("turnover_rejected_debug.json", "w") as f:
+        json.dump(turnover_rejected_list, f, indent=2)
+
+    print(f"  🔍 Turnover-rejected sample (top 20 by mcap):")
+    for r in turnover_rejected_list[:20]:
+        print(
+            f"      {r['symbol']:15s} price={r['price']:>10.2f} "
+            f"vol={r['volume']:>12.0f} turnover_cr={r['turnover_cr']:>8.2f} "
+            f"mcap={r['market_cap']:>10.0f}"
+        )
     print("=" * 50)
 
     return master
