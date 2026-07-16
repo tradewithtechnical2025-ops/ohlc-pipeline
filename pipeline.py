@@ -1445,6 +1445,58 @@ async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days
     log.info(f"  gap tracker: {sum(len(v) for v in gaps_by_sym.values())} open/recent gaps across {len(gaps_by_sym)} stocks  (+{new_count} new today, {filled_today_count} filled today)")
     return gaps_by_sym
 
+# ══════════════════════════════════════════════════════════════
+# FOLLOW-THROUGH COUNTER
+# Condition: yesterday's daily % change >= min_pct AND today's daily
+# % change >= min_pct (back-to-back strong up days).
+# Persistent per-day count history stored in R2, independent of the
+# rolling OHLC window — mirrors the open_gaps.json pattern above.
+# ══════════════════════════════════════════════════════════════
+
+def _detect_follow_through(all_data, min_pct=3.0):
+    matches = []
+    for sym, s in all_data.items():
+        closes = s["c"]; dates = s["d"]; n = len(closes)
+        if n < 3: continue
+        c0, c1, c2 = closes[-1], closes[-2], closes[-3]   # today, yesterday, day-before
+        if c0 is None or c1 is None or c2 is None or c1 <= 0 or c2 <= 0: continue
+        today_chg = (c0 - c1) / c1 * 100
+        yday_chg  = (c1 - c2) / c2 * 100
+        if today_chg >= min_pct and yday_chg >= min_pct:
+            matches.append({
+                "symbol": sym,
+                "date": dates[-1],
+                "today_chg_pct": round(today_chg, 2),
+                "yday_chg_pct": round(yday_chg, 2),
+            })
+    return matches
+
+
+async def update_follow_through_history(client, all_data, today, min_pct=3.0, keep_days=730):
+    """
+    Persistent per-day follow-through count history.
+    Stores {date: count} independently of the rolling OHLC window, so
+    old counts survive even after those candles drop out of ohlc_*.json.
+    keep_days caps history length (default ~2 years).
+    """
+    store = await r2_download(client, "follow_through_history.json")
+    if not isinstance(store, dict) or "history" not in store:
+        store = {"history": {}}
+
+    matches = _detect_follow_through(all_data, min_pct=min_pct)
+    store["history"][today] = len(matches)
+
+    cutoff = (date.fromisoformat(today) - timedelta(days=keep_days)).isoformat()
+    store["history"] = {d: c for d, c in store["history"].items() if d >= cutoff}
+    store["updated"] = today
+
+    await upload_str_with_manifest(client, r2_upload, "follow_through_history.json",
+                                    json.dumps(store, separators=(",", ":")),
+                                    schema_v=1, extra_meta={"days": len(store["history"])})
+    log.info(f"  follow-through: {len(matches)} stocks today ({today}), history has {len(store['history'])} days")
+    return matches
+
+
 def _build_gap_state(all_data, gaps_by_sym, today, near_pct=5.0):
     """Per-symbol CURRENT gap-down state for screener_feed."""
     gap_state={}
@@ -2535,6 +2587,9 @@ async def run_pattern_scan(force: bool = False) -> None:
             from collections import Counter; counts=Counter(s["pattern"] for s in signals)
             for pat,cnt in sorted(counts.items()): log.info(f"  {pat}: {cnt}")
             log.info(f"Total: {len(signals)} signals")
+
+            await update_follow_through_history(client, all_data, today)
+
             await upload_str_with_manifest(client, r2_upload, "pattern_signals.json",
                                             json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}),
                                             schema_v=1, extra_meta={"count": len(signals)})
