@@ -75,16 +75,27 @@ def is_bad_symbol(symbol, name):
     return False
 
 
-def debug_trace_upstox(upstox_nse, quotes):
+def debug_trace_upstox(upstox_nse, quotes, data=None):
+    stock_map = {}
+    if data:
+        for stock in data:
+            sym = str(stock.get("symbol", "")).strip().upper()
+            if sym:
+                stock_map[sym] = stock
+
+    STOPWORDS = {"LTD", "LIMITED", "THE", "AND", "CO", "COMPANY", "INDIA", "L"}
+
     for ds in DEBUG_SYMBOLS:
         key = ds.upper().replace(" ", "")
         prefix = key[:5]
+
+        # 1) Original ticker-prefix search (kept for reference)
         matches = [
             x for x in upstox_nse
             if prefix in str(x.get("trading_symbol") or "").upper().replace(" ", "")
             or prefix in str(x.get("name") or "").upper().replace(" ", "")
         ]
-        print(f"  🔍 DEBUG {ds}: {len(matches)} Upstox NSE entries matched")
+        print(f"  🔍 DEBUG {ds}: {len(matches)} Upstox NSE entries matched (ticker-prefix search)")
         for m in matches[:8]:
             print(
                 f"      tsym={m.get('trading_symbol')!r} | seg={m.get('segment')} | "
@@ -92,6 +103,29 @@ def debug_trace_upstox(upstox_nse, quotes):
                 f"ikey={m.get('instrument_key')} | isin={m.get('isin')!r}"
             )
         print(f"      in Finedge quotes : {key in quotes}")
+
+        # 2) Company-name keyword search (more robust when ticker differs)
+        fin_stock = stock_map.get(key, {})
+        fin_name  = str(fin_stock.get("name") or quotes.get(key, {}).get("name") or "").upper()
+        print(f"      Finedge full stock entry : {json.dumps(fin_stock)[:300] if fin_stock else 'N/A'}")
+        print(f"      Finedge quote entry      : {json.dumps(quotes.get(key, {}))[:300]}")
+
+        words = [w for w in fin_name.replace(".", " ").split() if w and w not in STOPWORDS and len(w) > 2]
+        if words:
+            main_word = words[0]
+            name_matches = [
+                x for x in upstox_nse
+                if x.get("segment") == "NSE_EQ"
+                and main_word in str(x.get("name") or "").upper()
+            ]
+            print(f"      Name-keyword search ('{main_word}'): {len(name_matches)} NSE_EQ matches")
+            for m in name_matches[:5]:
+                print(
+                    f"          tsym={m.get('trading_symbol')!r} | name={m.get('name')!r} | "
+                    f"ikey={m.get('instrument_key')} | isin={m.get('isin')!r}"
+                )
+        else:
+            print(f"      Name-keyword search: no usable name found for {key}")
 
 
 # =========================================================
@@ -710,7 +744,7 @@ async def main():
             raise RuntimeError("quote fetch failed")
         print(f"✅ Got {len(quotes)} quotes from API")
 
-        debug_trace_upstox(upstox_nse, quotes)
+        debug_trace_upstox(upstox_nse, quotes, data)
 
         # ── Upstox volume cross-check ──
         # Finedge's volume field can be stale/undercounted for individual
