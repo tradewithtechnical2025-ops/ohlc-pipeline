@@ -38,7 +38,7 @@ MIN_BSE_MCAP_CR = 100
 
 BSE_ONLY_EXCLUSIVE = True
 
-DEBUG_SYMBOLS = ["CMRGREEN"]
+DEBUG_SYMBOLS = ["CMRGREEN", "GSPL", "MANGCHEFER", "CIGNITITEC"]
 
 # ── NEW: anomaly guard ──
 # If today's final stock count drops by more than this % versus the last
@@ -724,14 +724,34 @@ async def main():
             target_ikeys = [nse_ikey_map[sym] for sym in quotes.keys() if sym in nse_ikey_map]
             print(f"  📋 Target instrument keys : {len(target_ikeys)}")
             upstox_ohlc_raw = await fetch_upstox_ohlc(client, target_ikeys)
+            raw_by_sym = {}
             for k, v in upstox_ohlc_raw.items():
                 sym = k.split(":")[-1].strip().upper()
+                raw_by_sym[sym] = v
                 candle = v.get("live_ohlc") or v.get("prev_ohlc") or {}
                 try:
                     upstox_vol_map[sym] = float(candle.get("volume") or 0)
                 except Exception:
                     upstox_vol_map[sym] = 0.0
             print(f"✅ Upstox volume data for {len(upstox_vol_map)} symbols")
+
+            # ── Debug trace for problem symbols ──
+            print()
+            print("  🔍 DEBUG volume trace:")
+            for ds in DEBUG_SYMBOLS:
+                key = ds.upper().replace(" ", "")
+                in_ikey_map = key in nse_ikey_map
+                ikey        = nse_ikey_map.get(key)
+                in_quotes   = key in quotes
+                finedge_q   = quotes.get(key, {})
+                raw_ohlc    = raw_by_sym.get(key)
+                resolved_vol = upstox_vol_map.get(key)
+                print(f"      {key}:")
+                print(f"        in nse_ikey_map     : {in_ikey_map} (ikey={ikey!r})")
+                print(f"        in Finedge quotes   : {in_quotes} (price={finedge_q.get('current_price')!r}, volume={finedge_q.get('volume')!r})")
+                print(f"        Upstox response key found : {raw_ohlc is not None}")
+                print(f"        Upstox raw ohlc     : {json.dumps(raw_ohlc)[:300] if raw_ohlc else None}")
+                print(f"        resolved upstox_vol : {resolved_vol!r}")
         else:
             print("  ⚠️  UPSTOX_ACCESS_TOKEN not set — volume cross-check skipped")
 
