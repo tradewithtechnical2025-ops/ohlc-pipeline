@@ -40,6 +40,14 @@ BSE_ONLY_EXCLUSIVE = True
 
 DEBUG_SYMBOLS = ["CMRGREEN"]
 
+# ── NEW: anomaly guard ──
+# If today's final stock count drops by more than this % versus the last
+# successful upload, treat it as a bad-data day (e.g. provider volume/turnover
+# glitch) and SKIP the upload — keeps the previous good file live in R2
+# instead of overwriting it with a degraded universe.
+MASTER_DROP_ALERT_PCT = 25
+BSE_DROP_ALERT_PCT    = 25
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
@@ -116,7 +124,7 @@ async def finedge_get(client, path):
 
 
 # =========================================================
-# WORKER UPLOAD
+# WORKER UPLOAD / DOWNLOAD
 # =========================================================
 
 async def r2_upload(client, filename, data):
@@ -134,6 +142,61 @@ async def r2_upload(client, filename, data):
     if r.status_code != 200:
         raise RuntimeError(f"{filename} upload failed: {r.status_code}")
     print(f"✅ Uploaded {filename}")
+
+
+async def r2_download(client, filename):
+    """Returns parsed JSON, or None if missing/failed (never raises)."""
+    url = f"{WORKER_URL}/{filename}"
+    try:
+        r = await client.get(
+            url,
+            headers={"X-Secret-Token": WORKER_TOKEN},
+            timeout=90,
+        )
+    except Exception as e:
+        print(f"  ⚠️  Download error {filename}: {e}")
+        return None
+    if r.status_code == 404:
+        print(f"  ℹ️  {filename} not found in R2 (first run?)")
+        return None
+    if r.status_code != 200:
+        print(f"  ⚠️  Download failed {filename}: HTTP {r.status_code}")
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+async def r2_upload_guarded(client, filename, new_data, drop_alert_pct):
+    """
+    Anomaly-guarded upload: compares len(new_data) against the currently
+    live file's length. If the drop exceeds drop_alert_pct, the upload is
+    SKIPPED (previous good file stays live) and a warning is printed.
+    This protects against provider-side data glitches (e.g. missing/zero
+    volume causing mass turnover-filter rejections) silently degrading
+    the live dataset.
+    """
+    previous = await r2_download(client, filename)
+    prev_count = len(previous) if isinstance(previous, list) else None
+    new_count  = len(new_data)
+
+    if prev_count and prev_count > 0:
+        drop_pct = (prev_count - new_count) / prev_count * 100
+        if drop_pct >= drop_alert_pct:
+            print(f"  🚨 ANOMALY GUARD TRIPPED for {filename}")
+            print(f"      previous count : {prev_count}")
+            print(f"      today count    : {new_count}")
+            print(f"      drop           : {drop_pct:.1f}%  (threshold {drop_alert_pct}%)")
+            print(f"      ⛔ Upload SKIPPED — keeping previous {filename} live in R2")
+            return False
+        else:
+            print(f"  ✓ Anomaly check OK for {filename}: {prev_count} → {new_count} ({drop_pct:+.1f}%)")
+    else:
+        print(f"  ℹ️  No previous {filename} to compare against — uploading as-is")
+
+    await r2_upload(client, filename, new_data)
+    return True
 
 
 # =========================================================
@@ -204,12 +267,14 @@ async def fetch_upstox_quotes(client, instrument_keys):
 # BUILD MASTER  (NSE-centric, filtered)
 # =========================================================
 
-async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
+async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_vol_map=None):
 
     print()
     print("=" * 50)
     print("     Building Master Universe")
     print("=" * 50)
+
+    upstox_vol_map = upstox_vol_map or {}
 
     stock_map = {}
     for stock in data:
@@ -227,7 +292,8 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
     filtered_turnover    = 0
     upstox_named         = 0
     new_listings         = 0
-    turnover_rejected_list = []   # ← NEW: debug tracking
+    volume_corrected     = 0   # Finedge volume was lower than Upstox's — corrected
+    turnover_rejected_list = []   # debug tracking
 
     for symbol, q in quotes.items():
 
@@ -254,11 +320,18 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
             continue
 
         try:
-            price      = float(q.get("current_price") or 0)
-            volume     = float(q.get("volume")        or 0)
-            market_cap = float(q.get("market_cap")    or 0)
+            price        = float(q.get("current_price") or 0)
+            finedge_vol  = float(q.get("volume")        or 0)
+            market_cap   = float(q.get("market_cap")    or 0)
         except Exception:
             continue
+
+        # ── Finedge volume can be stale/undercounted (not just zero) —
+        # cross-check against Upstox and trust whichever is higher.
+        upstox_vol = upstox_vol_map.get(symbol, 0.0)
+        volume = max(finedge_vol, upstox_vol)
+        if upstox_vol > finedge_vol:
+            volume_corrected += 1
 
         turnover_cr = (price * volume) / 1e7
 
@@ -316,6 +389,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
     print(f"    — Quote-only         : {quote_only}")
     print(f"    — Upstox-named       : {upstox_named}")
     print(f"    — New listings (Upstox): {new_listings}")
+    print(f"    — Volume corrected (Upstox > Finedge): {volume_corrected}")
     print(f"  ✗ Bad Symbol Filtered  : {filtered_bad}")
     print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
     print(f"  ✗ Price Rejected       : {filtered_price}")
@@ -323,7 +397,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
 
-    # ── NEW: dump turnover-rejected stocks for debugging ──────────────
+    # dump turnover-rejected stocks for debugging
     turnover_rejected_list.sort(key=lambda x: -(x["market_cap"] or 0))
     with open("turnover_rejected_debug.json", "w") as f:
         json.dump(turnover_rejected_list, f, indent=2)
@@ -337,7 +411,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map):
         )
     print("=" * 50)
 
-    return master
+    return master, turnover_rejected_list
 
 
 # =========================================================
@@ -566,7 +640,7 @@ async def inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isi
             "exchange":         "NSE",
             "bse_code":         None,
             "nse_code":         tsym,
-            "isin":             info["isin"],                    # ← NEW
+            "isin":             info["isin"],
             "consolidated_ind": False,
             "market_cap_cr":    0,
             "price":            price,
@@ -608,21 +682,26 @@ async def main():
 
         upstox_nse = await fetch_upstox_master(client, UPSTOX_NSE_URL, "NSE")
 
-        # ── NSE name map + ISIN map (dono ek hi loop mein) ──────────────
+        # ── NSE name map + ISIN map + instrument_key map (ek hi loop mein) ──
         nse_name_map = {}
         nse_isin_map = {}
+        nse_ikey_map = {}
         for x in upstox_nse:
             if x.get("segment") != "NSE_EQ":
                 continue
             tsym = str(x.get("trading_symbol") or "").strip().upper()
             nm   = str(x.get("name") or "").strip()
             isin = str(x.get("isin") or "").strip()
+            ikey = x.get("instrument_key")
             if tsym and nm and tsym not in nse_name_map:
                 nse_name_map[tsym] = nm
             if tsym and isin and tsym not in nse_isin_map:
                 nse_isin_map[tsym] = isin
+            if tsym and ikey and tsym not in nse_ikey_map:
+                nse_ikey_map[tsym] = ikey
         print(f"  📋 NSE name map : {len(nse_name_map)} symbols")
         print(f"  📋 NSE ISIN map : {len(nse_isin_map)} symbols")
+        print(f"  📋 NSE ikey map : {len(nse_ikey_map)} symbols")
 
         print()
         print("📡 Fetching quotes (single call)...")
@@ -633,18 +712,47 @@ async def main():
 
         debug_trace_upstox(upstox_nse, quotes)
 
-        # Pass nse_isin_map to builders
-        master = await build_master(client, data, quotes, nse_name_map, nse_isin_map)
+        # ── Upstox volume cross-check ──
+        # Finedge's volume field can be stale/undercounted for individual
+        # stocks (not just zero — e.g. showing 8438 when actual is 38438).
+        # Fetch Upstox's volume for every symbol we have a quote for, so
+        # build_master can take max(finedge_vol, upstox_vol) per stock.
+        upstox_vol_map = {}
+        if UPSTOX_TOKEN:
+            print()
+            print("📡 Fetching Upstox volumes for cross-check...")
+            target_ikeys = [nse_ikey_map[sym] for sym in quotes.keys() if sym in nse_ikey_map]
+            print(f"  📋 Target instrument keys : {len(target_ikeys)}")
+            upstox_ohlc_raw = await fetch_upstox_ohlc(client, target_ikeys)
+            for k, v in upstox_ohlc_raw.items():
+                sym = k.split(":")[-1].strip().upper()
+                candle = v.get("live_ohlc") or v.get("prev_ohlc") or {}
+                try:
+                    upstox_vol_map[sym] = float(candle.get("volume") or 0)
+                except Exception:
+                    upstox_vol_map[sym] = 0.0
+            print(f"✅ Upstox volume data for {len(upstox_vol_map)} symbols")
+        else:
+            print("  ⚠️  UPSTOX_ACCESS_TOKEN not set — volume cross-check skipped")
+
+        # Pass nse_isin_map + upstox_vol_map to builders
+        master, turnover_rejected_list = await build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_vol_map)
 
         await inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map)
 
-        await r2_upload(client, OUTPUT_FILE, master)
+        master_uploaded = await r2_upload_guarded(client, OUTPUT_FILE, master, MASTER_DROP_ALERT_PCT)
 
         bse = build_bse_master(data, quotes, upstox_map, only_exclusive=BSE_ONLY_EXCLUSIVE)
-        await r2_upload(client, BSE_OUTPUT_FILE, bse)
+        bse_uploaded = await r2_upload_guarded(client, BSE_OUTPUT_FILE, bse, BSE_DROP_ALERT_PCT)
 
         print()
-        print(f"🎉 Done — {OUTPUT_FILE} ({len(master)}) + {BSE_OUTPUT_FILE} ({len(bse)}) uploaded")
+        status_master = "uploaded" if master_uploaded else "SKIPPED (anomaly guard)"
+        status_bse    = "uploaded" if bse_uploaded else "SKIPPED (anomaly guard)"
+        print(f"🎉 Done — {OUTPUT_FILE} ({len(master)}) {status_master} + {BSE_OUTPUT_FILE} ({len(bse)}) {status_bse}")
+
+        if not master_uploaded or not bse_uploaded:
+            print("⚠️  One or more files were NOT uploaded due to anomaly guard — check logs above")
+            raise SystemExit(1)   # non-zero exit → GitHub Actions job shows as failed/flagged
 
 
 if __name__ == "__main__":
