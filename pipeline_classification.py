@@ -881,7 +881,16 @@ async def process_stock(client, stock, semaphore, fundamentals: dict):
         print(f"✗ {symbol} | profile fail")
         return None
 
-    market_cap = float(profile.get("market_cap") or 0)
+    # ── FIX: market cap mismatch ──
+    # company-profile endpoint's market_cap can be stale (fundamentals-type
+    # data, refreshed less often). master.json's market_cap_cr comes from
+    # the live quote endpoint and is fresher — prefer that when present.
+    # Fall back to profile's value only when master doesn't have one yet
+    # (e.g. a stock freshly injected via Upstox with no Finedge quote).
+    master_mcap  = stock.get("market_cap_cr")
+    profile_mcap = float(profile.get("market_cap") or 0)
+    market_cap   = float(master_mcap) if master_mcap else profile_mcap
+
     if market_cap < MIN_MARKET_CAP_CR:
         print(f"✗ {symbol} | market cap < {MIN_MARKET_CAP_CR}cr")
         return None
