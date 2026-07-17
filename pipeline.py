@@ -1988,6 +1988,18 @@ async def run_ep_scan() -> None:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
             for sig in pr_signals:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
+
+            # ── Date confirmation for frontend: authoritative pipeline date,
+            # not the client's local clock. today = today_ist() (IST calendar
+            # date this run actually processed), so even if a run is delayed
+            # or a stale cache is served, the frontend can show the true
+            # as-of date instead of silently implying "today".
+            screener_meta = {
+                "as_of_date": today,
+                "generated_at_ist": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
+                "stock_count": len(screener_feed),
+            }
+
             await asyncio.gather(
                 upload_str_with_manifest(client, r2_upload, "ep_signals.json",
                                           json.dumps({"updated":today,"count":len(signals),"signals":signals}),
@@ -2012,6 +2024,8 @@ async def run_ep_scan() -> None:
                                           schema_v=1),
                 upload_str_with_manifest(client, r2_upload, "screener_feed.json", json.dumps(screener_feed),
                                           schema_v=1, extra_meta={"stock_count": len(screener_feed)}),
+                upload_str_with_manifest(client, r2_upload, "screener_meta.json", json.dumps(screener_meta),
+                                          schema_v=1, extra_meta={}),
                 backup_pattern_history(client,screener_feed,today,gap_new=gap_new,gap_filled=gap_filled),
             )
             log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
