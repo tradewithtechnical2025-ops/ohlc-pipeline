@@ -165,7 +165,7 @@ async def r2_get_existing(client, filename) -> list[dict]:
     """Fetch existing history from R2. Returns [] if file doesn't exist yet."""
     try:
         r = await client.get(
-            f"{WORKER_URL}?file={filename}",
+            f"{WORKER_URL}/{filename}",
             headers={"X-Secret-Token": WORKER_TOKEN},
             timeout=60
         )
