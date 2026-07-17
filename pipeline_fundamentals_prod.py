@@ -124,6 +124,18 @@ Sector/Industry — canonical taxonomy from classification.json (added July 2026
   display_industry, which the frontend should use for Sector/Industry filters
   going forward. run_backfill_summary is the fast way to retrofit this onto
   all existing stocks — no Finedge calls, just two R2 reads.
+
+Daily-mode empty-quarters guard (added July 2026):
+  run_daily() previously did
+    summary.get(sym, {}).get("quarters", [{}])[0].get("header")
+  to snapshot a symbol's last-known quarter before adding it to the pending
+  list. dict.get(key, default) only substitutes the default when the KEY is
+  missing — if summary[sym] exists but its "quarters" list is genuinely
+  empty (e.g. a fresh listing with no quarterly PL data ingested yet), the
+  real (empty) list is returned instead of the default, and [0] on an empty
+  list raises IndexError, crashing the whole daily run. Fixed by resolving
+  the quarters list with `or [{}]` first (which substitutes on ANY falsy
+  value, not just a missing key) before indexing into it.
 """
 
 import asyncio, hashlib, json, logging, os, sys
@@ -855,9 +867,15 @@ async def run_daily():
         todays_new = await get_today_result_symbols(client, sem, symbols)
         for sym in todays_new:
             if sym not in pending:
+                # FIX: `.get("quarters", [{}])` only substitutes the default
+                # when the "quarters" KEY is missing — if summary[sym] exists
+                # but its quarters list is genuinely empty (e.g. a fresh
+                # listing with no PL data yet), the real [] is returned and
+                # [0] on it raises IndexError. `or [{}]` catches that case too.
+                prev = summary.get(sym)
+                last_known = (prev.get("quarters") or [{}])[0].get("header") if prev else None
                 pending[sym] = {
-                    "last_known_quarter": summary.get(sym, {}).get("quarters", [{}])[0].get("header")
-                        if summary.get(sym) else None,
+                    "last_known_quarter": last_known,
                     "attempts": 0,
                     "first_seen": today,
                 }
