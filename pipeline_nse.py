@@ -192,12 +192,39 @@ def fmt(d: date) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_nse_session() -> httpx.Client:
+    """
+    Primes an httpx session with NSE's anti-bot cookies before any archive/API
+    calls. NSE occasionally tightens what it checks here — if this ever stops
+    working, the symptom is specifically fetch_fii_dii() failing (401/403),
+    NOT the archives.nseindia.com static-file fetches (sec_list, bhavdata,
+    bulk/block, fao_participant_oi), which don't enforce session cookies.
+    Retries priming a few times with backoff, and logs (doesn't silently
+    swallow) if it never succeeds — the pipeline still proceeds either way,
+    since most of its data sources don't need cookies at all.
+    """
     client = httpx.Client(headers=NSE_HEADERS, follow_redirects=True, timeout=30)
-    try:
-        client.get("https://www.nseindia.com")
-        time.sleep(1)
-    except Exception:
-        pass
+    for attempt in range(3):
+        try:
+            r1 = client.get("https://www.nseindia.com")
+            time.sleep(1)
+            # Secondary warm-up hit — some NSE anti-bot configs only set the
+            # full cookie set the /api layer checks after a second, more
+            # "specific" page visit, not just the bare homepage.
+            client.get("https://www.nseindia.com/market-data/live-equity-market")
+            time.sleep(1)
+            if r1.status_code == 200 and len(client.cookies) > 0:
+                print(f"  ✓ NSE session primed ({len(client.cookies)} cookies)")
+                return client
+            print(f"  ⚠ NSE cookie priming attempt {attempt+1}/3 looked incomplete "
+                  f"(status={r1.status_code}, cookies={len(client.cookies)}) — retrying")
+        except Exception as e:
+            print(f"  ⚠ NSE cookie priming attempt {attempt+1}/3 failed: {e} — retrying")
+        time.sleep(2 ** attempt)
+    print("  ⚠ NSE cookie priming never fully succeeded after 3 attempts — "
+          "archives.nseindia.com fetches (sec_list/bhavdata/bulk/block/OI) should still "
+          "work since they don't need cookies, but fetch_fii_dii() (www.nseindia.com/api) "
+          "may fail. If NSE has changed their anti-bot cookie requirements, this function "
+          "is the first place to look.")
     return client
 
 
@@ -254,17 +281,33 @@ def fetch_with_fallback(
     direction: str = "prev",
     max_tries: int = 5,
 ) -> tuple[list[dict], date]:
+    """
+    Tries `start`, then walks previous/next trading days on failure — for
+    BOTH a clean 404 AND any other error (network, 502/503/504 after
+    fetch_csv_url's own retries are exhausted). This matters because NSE's
+    archives server sometimes returns 503 instead of 404 for a file that
+    genuinely doesn't exist for that date (e.g. requesting a weekend/holiday
+    date's file) — treating only 404 as "try the next date" would hard-crash
+    on those instead of correctly falling back.
+    """
     cur = start
+    last_err = None
     for i in range(max_tries):
-        url  = tpl.format(fmt(cur))
-        rows = fetch_csv_url(session, url)
+        url = tpl.format(fmt(cur))
+        try:
+            rows = fetch_csv_url(session, url, retries=2)  # fail fast per-URL; this loop handles persistence across dates
+        except Exception as e:
+            last_err = e
+            print(f"  ⚠ error for {cur} ({e}), trying {'previous' if direction=='prev' else 'next'} trading day...")
+            cur = prev_trading_day(cur) if direction == "prev" else next_trading_day(cur)
+            continue
         if rows is not None:
             if i > 0:
                 print(f"  ⚠ Fell back to {cur}")
             return rows, cur
         print(f"  404 for {cur}, trying {'previous' if direction=='prev' else 'next'} trading day...")
         cur = prev_trading_day(cur) if direction == "prev" else next_trading_day(cur)
-    raise RuntimeError(f"Could not fetch after {max_tries} attempts: {tpl}")
+    raise RuntimeError(f"Could not fetch after {max_tries} attempts: {tpl}" + (f" (last error: {last_err})" if last_err else ""))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -333,16 +376,23 @@ def fetch_oi_with_fallback(
     session: httpx.Client, start: date, max_tries: int = 5
 ) -> tuple[list[dict], date]:
     cur = start
+    last_err = None
     for i in range(max_tries):
-        url  = f"{NSCCL_BASE}/fao_participant_oi_{fmt(cur)}.csv"
-        rows = fetch_oi_csv(session, url)
+        url = f"{NSCCL_BASE}/fao_participant_oi_{fmt(cur)}.csv"
+        try:
+            rows = fetch_oi_csv(session, url, retries=2)
+        except Exception as e:
+            last_err = e
+            print(f"  ⚠ error for {cur} ({e}), trying previous trading day...")
+            cur = prev_trading_day(cur)
+            continue
         if rows is not None:
             if i > 0:
                 print(f"  ⚠ Fell back to {cur}")
             return rows, cur
         print(f"  404 for {cur}, trying previous trading day...")
         cur = prev_trading_day(cur)
-    raise RuntimeError(f"Could not fetch fao_participant_oi after {max_tries} attempts")
+    raise RuntimeError(f"Could not fetch fao_participant_oi after {max_tries} attempts" + (f" (last error: {last_err})" if last_err else ""))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -828,8 +878,30 @@ async def run():
             else:
                 print("  ⚠ fii_dii: empty response — skipping")
         except Exception as e:
-            print(f"  ⚠ fii_dii fetch failed: {e} — skipping")
-            fii_dii_snapshot = None
+            print(f"  ⚠ fii_dii fetch failed on first attempt: {e} — this endpoint is the "
+                  f"one most sensitive to NSE anti-bot/cookie changes. Re-priming a brand "
+                  f"new session and retrying once before giving up...")
+            try:
+                nse.close()
+                nse = make_nse_session()
+                fii_dii_rows = fetch_fii_dii(nse)
+                if fii_dii_rows:
+                    fii_dii_snapshot = parse_fii_dii(fii_dii_rows)
+                    if fii_dii_snapshot.get("date") and (fii_dii_snapshot.get("fii") or fii_dii_snapshot.get("dii")):
+                        fii = fii_dii_snapshot.get("fii") or {}
+                        dii = fii_dii_snapshot.get("dii") or {}
+                        print(f"  ✓ Recovered on retry — FII net: {fii.get('net', 0):+,.2f} Cr   "
+                              f"DII net: {dii.get('net', 0):+,.2f} Cr   ({fii_dii_snapshot['date']})")
+                    else:
+                        fii_dii_snapshot = None
+                        print("  ⚠ fii_dii: retry response still unparseable — skipping")
+                else:
+                    print("  ⚠ fii_dii: retry response empty — skipping")
+            except Exception as e2:
+                print(f"  ⚠ fii_dii fetch failed again after fresh session ({e2}) — skipping. "
+                      f"If this persists across multiple runs, NSE has likely changed their "
+                      f"cookie/anti-bot requirements and make_nse_session() needs updating.")
+                fii_dii_snapshot = None
 
         nse.close()
 
