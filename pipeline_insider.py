@@ -18,11 +18,49 @@ RSS_URL = "https://archives.nseindia.com/content/RSS/InsiderTrading.xml"
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/xml, text/xml, */*",
+    "Accept": "application/xml, text/xml, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-insider-trading",
 }
 
 # NSE insider trading XBRL namespace
 NS = "http://www.bseindia.com/xbrl/co/2017-09-15/in-bse-co"
+
+
+async def new_nse_client() -> httpx.AsyncClient:
+    """Create an httpx client primed with NSE session cookies.
+
+    NSE's WAF frequently 503s bare requests to archives.nseindia.com that
+    don't carry a valid session cookie, especially from datacenter IPs
+    (e.g. GitHub Actions runners). Visiting the homepage first sets the
+    cookies subsequent requests need.
+    """
+    client = httpx.AsyncClient(headers=BROWSER_HEADERS, timeout=30, follow_redirects=True)
+    try:
+        await client.get("https://www.nseindia.com", timeout=15)
+    except Exception as e:
+        print(f"⚠ Cookie priming failed ({e}), continuing anyway")
+    return client
+
+
+async def get_with_retry(client: httpx.AsyncClient, url: str, max_retries: int = 4, **kwargs) -> httpx.Response:
+    """GET with retry/backoff on transient 503/429 responses."""
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            resp = await client.get(url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            if e.response.status_code in (503, 429) and attempt < max_retries - 1:
+                wait = 2 ** attempt + 1
+                print(f"{e.response.status_code} on {url}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise last_exc
+
 
 def parse_xml_trade(xml_text: str) -> list[dict]:
     """
@@ -96,8 +134,7 @@ async def fetch_xml(client: httpx.AsyncClient, rss_item: dict) -> list[dict]:
     html_url = rss_item["html_url"]
     published = rss_item["published"]
     try:
-        r = await client.get(xml_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
-        r.raise_for_status()
+        r = await get_with_retry(client, xml_url, timeout=20)
         disclosures = parse_xml_trade(r.text)
         # Attach rss-level fields to each disclosure
         for d in disclosures:
@@ -196,11 +233,11 @@ async def r2_put(client, filename, data):
 
 async def run():
     print("Fetching RSS...")
-    async with httpx.AsyncClient() as fetch_client:
-        rss_resp = await fetch_client.get(
-            RSS_URL, headers=BROWSER_HEADERS, timeout=30, follow_redirects=True
-        )
-        rss_resp.raise_for_status()
+    fetch_client = await new_nse_client()
+    try:
+        rss_resp = await get_with_retry(fetch_client, RSS_URL)
+    finally:
+        await fetch_client.aclose()
     feed = feedparser.parse(rss_resp.content)
     print(f"RSS Items: {len(feed.entries)}")
 
@@ -214,7 +251,8 @@ async def run():
         })
 
     print("Fetching & parsing XMLs...")
-    async with httpx.AsyncClient() as client:
+    client = await new_nse_client()
+    try:
         # Fetch existing history first — skip XMLs already processed
         existing = await r2_get_existing(client, "nse_insider_trading.json")
         known_urls = {d.get("xml_url", "") for d in existing}
@@ -255,6 +293,8 @@ async def run():
         }
 
         await r2_put(client, "nse_insider_trading.json", payload)
+    finally:
+        await client.aclose()
 
     print("✅ Done")
 
