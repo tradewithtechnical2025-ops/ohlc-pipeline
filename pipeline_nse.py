@@ -201,23 +201,50 @@ def make_nse_session() -> httpx.Client:
     return client
 
 
-def fetch_csv_url(session: httpx.Client, url: str) -> list[dict] | None:
-    """Returns rows or None on 404. Raises on other errors."""
-    try:
-        r = session.get(url, timeout=30)
+def fetch_csv_url(session: httpx.Client, url: str, retries: int = 4) -> list[dict] | None:
+    """
+    Returns rows or None on 404. Retries with exponential backoff on
+    502/503/504 and network errors — NSE's archives server is flaky and
+    intermittently returns these for perfectly valid URLs, especially
+    right after market close under load. Raises on other errors, or after
+    exhausting retries.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=30)
+        except httpx.RequestError as e:
+            last_exc = e
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  ⚠ network error on {url.split('/')[-1]} ({e}), retry {attempt+1}/{retries} in {wait}s")
+                time.sleep(wait); continue
+            raise RuntimeError(str(e))
+
         if r.status_code == 404:
             return None
-        r.raise_for_status()
-        text = r.content.decode("utf-8-sig").strip()
-        if "NO RECORDS" in text.splitlines()[:3]:
-            return []
-        rows = list(csv.DictReader(io.StringIO(text)))
-        print(f"  ✓ {url.split('/')[-1]} → {len(rows)} rows")
-        return rows
-    except httpx.HTTPStatusError:
-        raise
-    except Exception as e:
-        raise RuntimeError(str(e))
+        if r.status_code in (502, 503, 504):
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  ⚠ HTTP {r.status_code} on {url.split('/')[-1]}, retry {attempt+1}/{retries} in {wait}s")
+                time.sleep(wait); continue
+            r.raise_for_status()
+
+        try:
+            r.raise_for_status()
+            text = r.content.decode("utf-8-sig").strip()
+            if "NO RECORDS" in text.splitlines()[:3]:
+                return []
+            rows = list(csv.DictReader(io.StringIO(text)))
+            print(f"  ✓ {url.split('/')[-1]} → {len(rows)} rows")
+            return rows
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as e:
+            raise RuntimeError(str(e))
+    if last_exc:
+        raise RuntimeError(str(last_exc))
+    return None
 
 
 def fetch_with_fallback(
@@ -243,17 +270,40 @@ def fetch_with_fallback(
 # ─────────────────────────────────────────────────────────────────────────────
 # Participant OI CSV fetch — handles NSE title row + trailing-space headers
 
-def fetch_oi_csv(session: httpx.Client, url: str) -> list[dict] | None:
+def fetch_oi_csv(session: httpx.Client, url: str, retries: int = 4) -> list[dict] | None:
     """
     NSE fao_participant_oi CSV has a title row as line 0, then the real header,
     then data. Standard fetch_csv_url would use the title as DictReader header.
     This function strips the title row and normalises column header whitespace.
-    Returns rows or None on 404.
+    Returns rows or None on 404. Retries on 502/503/504/network errors — see
+    fetch_csv_url's docstring for why.
     """
-    try:
-        r = session.get(url, timeout=30)
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            r = session.get(url, timeout=30)
+        except httpx.RequestError as e:
+            last_exc = e
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  ⚠ network error on {url.split('/')[-1]} ({e}), retry {attempt+1}/{retries} in {wait}s")
+                time.sleep(wait); continue
+            raise RuntimeError(str(e))
+
         if r.status_code == 404:
             return None
+        if r.status_code in (502, 503, 504):
+            if attempt < retries - 1:
+                wait = 2 ** attempt
+                print(f"  ⚠ HTTP {r.status_code} on {url.split('/')[-1]}, retry {attempt+1}/{retries} in {wait}s")
+                time.sleep(wait); continue
+            r.raise_for_status()
+        break
+    else:
+        if last_exc: raise RuntimeError(str(last_exc))
+        return None
+
+    try:
         r.raise_for_status()
         text = r.content.decode("utf-8-sig").strip()
         lines = text.splitlines()
