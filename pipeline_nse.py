@@ -33,6 +33,7 @@ import os
 import re
 import time
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import httpx
 from r2_manifest import upload_with_manifest
@@ -598,6 +599,102 @@ def merge_band_changes_history(hist: dict, changes: dict, effective_date: str) -
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Delivery % → screener_feed.json self-patch
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# NSE's delivery bhavcopy publishes ~20:10 IST — well after pipeline.py's
+# ep_scan run (~16:20 IST). So screener_feed.json is always built BEFORE
+# today's delivery% is even available. Rather than guessing a fixed-time
+# second cron job, this pipeline (which is the one that actually KNOWS the
+# instant fresh delivery data lands) patches screener_feed.json itself,
+# right after uploading nse_deliv.json/nse_deliv_hist.json above.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_deliv_map(deliv_snapshot: dict, deliv_hist: list, avg_days: int = 20, spike_mult: float = 1.5) -> dict:
+    """
+    Same logic as pipeline.py's _build_deliv_map(), duplicated here since
+    this script runs standalone. today_data = today's deliv_snapshot["data"];
+    avg is computed from the most recent `avg_days` PRIOR entries in
+    deliv_hist (today's own entry excluded), needs >=5 prior days to be
+    meaningful (avoids bogus spikes for freshly-listed stocks).
+    """
+    if not deliv_snapshot or not deliv_snapshot.get("data"):
+        return {}
+    today_date = deliv_snapshot.get("date")
+    today_data = deliv_snapshot.get("data") or {}
+
+    prior = [e for e in (deliv_hist or []) if isinstance(e, dict) and e.get("date") and e.get("date") != today_date]
+    prior.sort(key=lambda e: e["date"])
+    prior = prior[-avg_days:]
+
+    sums, counts = {}, {}
+    for entry in prior:
+        for sym, dv in (entry.get("data") or {}).items():
+            per = (dv or {}).get("deliv_per")
+            if per is None: continue
+            sums[sym] = sums.get(sym, 0.0) + per
+            counts[sym] = counts.get(sym, 0) + 1
+
+    out = {}
+    for sym, dv in today_data.items():
+        today_per = (dv or {}).get("deliv_per")
+        n = counts.get(sym, 0)
+        avg20 = round(sums[sym] / n, 2) if n >= 5 else None
+        spike = bool(today_per is not None and avg20 and avg20 > 0 and today_per >= avg20 * spike_mult)
+        out[sym] = {"deliv_per": today_per, "deliv_avg20": avg20, "deliv_spike": spike}
+    return out
+
+
+def _patch_deliv_into_patterns(patterns_str: str, is_spike: bool) -> str:
+    """Adds/removes only the 'Deliv Spike' token from an existing patterns
+    string — every other token (HVQ, EP, HLR state, etc.) stays untouched."""
+    pats = set(p for p in (patterns_str or "").split("||") if p)
+    if is_spike: pats.add("Deliv Spike")
+    else: pats.discard("Deliv Spike")
+    return "||".join(sorted(pats))
+
+
+async def patch_screener_feed_deliv(client: httpx.AsyncClient, deliv_snapshot: dict, deliv_hist: list) -> None:
+    """
+    Fetches the already-built screener_feed.json (from pipeline.py's earlier
+    ep_scan run) and patches ONLY deliv_per/deliv_avg20/deliv_spike (+ the
+    'Deliv Spike' pattern token) per symbol — no re-run of the heavy RS/
+    mswing/EP/gap pipeline. Also stamps screener_meta.json so the frontend
+    can show when delivery% was last refreshed.
+    """
+    feed = await r2_get(client, "screener_feed.json")
+    if not isinstance(feed, list):
+        print("  ⚠ screener_feed.json missing/invalid — skipping deliv patch")
+        return
+
+    deliv_map = _build_deliv_map(deliv_snapshot, deliv_hist)
+    if not deliv_map:
+        print("  ⚠ no delivery map built — skipping deliv patch")
+        return
+
+    patched = 0
+    for row in feed:
+        dv = deliv_map.get(row.get("symbol"))
+        if not dv: continue
+        row["deliv_per"]   = dv.get("deliv_per")
+        row["deliv_avg20"] = dv.get("deliv_avg20")
+        row["deliv_spike"] = dv.get("deliv_spike", False)
+        row["patterns"]    = _patch_deliv_into_patterns(row.get("patterns", ""), dv.get("deliv_spike", False))
+        patched += 1
+
+    await upload_with_manifest(client, r2_put, "screener_feed.json", feed,
+                                schema_v=1, extra_meta={"stock_count": len(feed), "deliv_patched": patched},
+                                ensure_ascii=False)
+    print(f"  🔗 screener_feed.json patched with delivery % for {patched}/{len(feed)} stocks")
+
+    meta = await r2_get(client, "screener_meta.json")
+    if isinstance(meta, dict):
+        meta["deliv_patched_at_ist"] = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S")
+        meta["deliv_source_date"]    = deliv_snapshot.get("date")
+        await upload_with_manifest(client, r2_put, "screener_meta.json", meta, schema_v=1, extra_meta={}, ensure_ascii=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -927,6 +1024,7 @@ async def run():
                 print("  ⚠ No FII/DII snapshot — skipping FII/DII uploads")
 
             # ── Delivery % snapshot + rolling 30-day history ────────────────────────
+            deliv_history_updated = False
             if deliv_snapshot and deliv_snapshot.get("date"):
                 dv_date_str = deliv_snapshot["date"]
 
@@ -945,6 +1043,7 @@ async def run():
                     upload_tasks.append(upload_with_manifest(client, r2_put, "nse_deliv_hist.json", deliv_hist,
                                                                schema_v=1, extra_meta={"day_count": len(deliv_hist)},
                                                                ensure_ascii=False))
+                    deliv_history_updated = True
             else:
                 print("  ⚠ No delivery snapshot — skipping delivery uploads")
 
@@ -953,6 +1052,17 @@ async def run():
                 await asyncio.gather(*upload_tasks)
             else:
                 print("  ✓ All data already current — nothing to upload")
+
+            # ── Self-patch screener_feed.json with fresh delivery % ────────────────
+            # Only worth doing when there's actually new delivery data for a date
+            # not already reflected (deliv_history_updated), or on a first-ever
+            # run where nse_deliv_hist.json didn't exist before this run.
+            if deliv_snapshot and deliv_snapshot.get("date") and deliv_history_updated:
+                print("\n[8] Patching screener_feed.json with fresh delivery %...")
+                try:
+                    await patch_screener_feed_deliv(client, deliv_snapshot, deliv_hist)
+                except Exception as e:
+                    print(f"  ⚠ screener_feed.json deliv patch failed: {e} — will retry next run")
 
         # ── Circuit change Telegram alert ──────────────────────────────
         if changes:
