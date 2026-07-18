@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 import feedparser
@@ -37,6 +38,7 @@ async def new_nse_client() -> httpx.AsyncClient:
     """
     client = httpx.AsyncClient(headers=BROWSER_HEADERS, timeout=30, follow_redirects=True)
     try:
+        await asyncio.sleep(random.uniform(0, 3))  # jitter: avoid exact-interval request timing
         await client.get("https://www.nseindia.com", timeout=15)
     except Exception as e:
         print(f"⚠ Cookie priming failed ({e}), continuing anyway")
@@ -54,8 +56,9 @@ async def get_with_retry(client: httpx.AsyncClient, url: str, max_retries: int =
         except httpx.HTTPStatusError as e:
             last_exc = e
             if e.response.status_code in (503, 429) and attempt < max_retries - 1:
-                wait = 2 ** attempt + 1
-                print(f"{e.response.status_code} on {url}, retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
+                base_wait = 2 ** attempt + 1
+                wait = base_wait + random.uniform(0, base_wait * 0.5)  # jitter: avoid metronomic retry pattern
+                print(f"{e.response.status_code} on {url}, retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
                 await asyncio.sleep(wait)
                 continue
             raise
