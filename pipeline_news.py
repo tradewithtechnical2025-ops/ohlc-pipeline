@@ -3,6 +3,7 @@ import calendar
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 import feedparser
 import httpx
@@ -98,37 +99,58 @@ def dedup_items(items: list[dict]) -> list[dict]:
     return out
 
 
-async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str) -> tuple[str, list[dict]]:
-    try:
-        r = await client.get(url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
-        r.raise_for_status()
-        feed = feedparser.parse(r.content)
-        items = []
-        for entry in feed.entries:
+async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str, retries: int = 3) -> tuple[str, list[dict]]:
+    last_exc = None
+    v = int(time.time() // 300)  # 5-min cache-buster bucket
+    sep = "&" if "?" in url else "?"
+    cache_busted_url = f"{url}{sep}v={v}"
+    for attempt in range(retries):
+        try:
+            r = await client.get(cache_busted_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
+            r.raise_for_status()
+            feed = feedparser.parse(r.content)
+            items = []
+            for entry in feed.entries:
 
-            # Epoch timestamp for reliable cross-source sorting
-            ts = 0
-            parsed = entry.get("published_parsed") or entry.get("updated_parsed")
-            if parsed:
-                try:
-                    ts = calendar.timegm(parsed)
-                except Exception:
-                    ts = 0
+                # Epoch timestamp for reliable cross-source sorting
+                ts = 0
+                parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+                if parsed:
+                    try:
+                        ts = calendar.timegm(parsed)
+                    except Exception:
+                        ts = 0
 
-            items.append({
-                "source":       label,
-                "source_key":   source_key,
-                "title":        entry.get("title", "").strip(),
-                "link":         entry.get("link", ""),
-                "published":    entry.get("published", ""),
-                "published_ts": ts,
-                "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
-            })
-        print(f"  ✓ {label}: {len(items)} items")
-        return source_key, items
-    except Exception as e:
-        print(f"  ✗ {label}: {e}")
-        return source_key, []
+                items.append({
+                    "source":       label,
+                    "source_key":   source_key,
+                    "title":        entry.get("title", "").strip(),
+                    "link":         entry.get("link", ""),
+                    "published":    entry.get("published", ""),
+                    "published_ts": ts,
+                    "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
+                })
+
+            # NSE occasionally serves a transient empty-but-200 response for
+            # these feeds (confirmed: same feed returned 0 items one run,
+            # 20 the next, with no other change) — retry before accepting
+            # zero as final, since a genuinely empty feed is rare for these.
+            if not items and attempt < retries - 1:
+                print(f"  ⚠ {label}: got 0 items, retry {attempt+1}/{retries} in {2**attempt}s")
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+            print(f"  ✓ {label}: {len(items)} items")
+            return source_key, items
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                print(f"  ⚠ {label}: {type(e).__name__}: {e or '(no message)'}, retry {attempt+1}/{retries} in {2**attempt}s")
+                await asyncio.sleep(2 ** attempt)
+                continue
+
+    print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'}")
+    return source_key, []
 
 
 async def r2_get(client: httpx.AsyncClient, filename: str):
