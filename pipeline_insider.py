@@ -15,7 +15,7 @@ UP_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
     "Content-Type": "application/json"
 }
-RSS_URL = "https://archives.nseindia.com/content/RSS/InsiderTrading.xml"
+RSS_URL = "https://nsearchives.nseindia.com/content/RSS/InsiderTrading.xml"
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -31,7 +31,7 @@ NS = "http://www.bseindia.com/xbrl/co/2017-09-15/in-bse-co"
 async def new_nse_client() -> httpx.AsyncClient:
     """Create an httpx client primed with NSE session cookies.
 
-    NSE's WAF frequently 503s bare requests to archives.nseindia.com that
+    NSE's WAF frequently 503s bare requests to nsearchives.nseindia.com that
     don't carry a valid session cookie, especially from datacenter IPs
     (e.g. GitHub Actions runners). Visiting the homepage first sets the
     cookies subsequent requests need.
