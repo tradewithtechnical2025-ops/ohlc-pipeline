@@ -1,6 +1,8 @@
 name: NSE Pipeline
 on:
   workflow_dispatch:
+env:
+  PYTHONUNBUFFERED: "1"
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -22,7 +24,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python pipeline_nse.py
-
       - name: Telegram fallback on workflow failure
         if: failure()
         env:
