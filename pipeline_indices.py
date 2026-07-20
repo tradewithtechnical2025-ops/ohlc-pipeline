@@ -22,6 +22,14 @@ FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 # and only after confirming failure rate stays near zero.
 HISTORY_CONCURRENCY = 3
 
+# Symbols that need a longer historical lookback than the default 365 days.
+# Add entries here if another symbol ever needs extended history — no
+# other code changes required.
+EXTENDED_HISTORY_DAYS = {
+    "NIFMID400": 365 * 3,
+    "NIFTY50":   365 * 3,
+}
+
 WORKER_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
     "Content-Type": "application/json",
@@ -344,9 +352,13 @@ def parse_index_returns(rows, valid_symbols, weekly_map=None):
 # Historical
 # ─────────────────────────────────────────────
 
-async def fetch_index_history_one(client, api_symbol):
+async def fetch_index_history_one(client, api_symbol, symbol):
+    # Most symbols get the default 365-day window. A small set of symbols
+    # (see EXTENDED_HISTORY_DAYS) need a longer lookback — everything else
+    # is unaffected.
+    lookback_days = EXTENDED_HISTORY_DAYS.get(symbol, 365)
     today     = datetime.now().date()
-    from_date = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+    from_date = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
     url = f"{FINEDGE_BASE}/index/market-price/historical"
     params = {
@@ -380,7 +392,7 @@ def parse_index_history(rows):
 
 async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta):
     async with sem:
-        rows = await fetch_index_history_one(client, meta["api_symbol"])
+        rows = await fetch_index_history_one(client, meta["api_symbol"], symbol)
         parsed = parse_index_history(rows)
         if not parsed:
             print(f"[{i}/{total}] ✗ {symbol} | no data")
@@ -388,7 +400,8 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta):
         weekly = compute_weekly_return(parsed)
         await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
                                     schema_v=1, extra_meta={"candle_count": len(parsed)})
-        print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles")
+        years_note = f" ({EXTENDED_HISTORY_DAYS[symbol] // 365}Y)" if symbol in EXTENDED_HISTORY_DAYS else ""
+        print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles{years_note}")
         return symbol, weekly, True
 
 
