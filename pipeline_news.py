@@ -13,6 +13,9 @@ UP_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
     "Content-Type": "application/json"
 }
+DL_HEADERS = {
+    "X-Secret-Token": WORKER_TOKEN,
+}
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -128,6 +131,18 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
         return source_key, []
 
 
+async def r2_get(client: httpx.AsyncClient, filename: str):
+    try:
+        r = await client.get(f"{WORKER_URL}?file={filename}", headers=DL_HEADERS, timeout=30)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"  ⚠ r2_get({filename}) failed: {e}")
+        return None
+
+
 async def r2_put(client: httpx.AsyncClient, filename: str, data: dict):
     body = json.dumps(data, ensure_ascii=False).encode()
     r = await client.post(
@@ -148,6 +163,259 @@ def make_payload(items: list[dict]) -> dict:
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Financial Results XBRL parsing (in-capmkt / IFIndAs taxonomy)
+#
+# Context IDs (e.g. "OneD", "FourD") are NOT standardized across filers —
+# they're arbitrary labels chosen by whatever software generated the filing.
+# We classify every context by its actual period span instead of trusting
+# the ID: ~80-100 days -> quarter, ~350-380 days -> year, instant -> balance
+# sheet date. Contexts with a dimensional <scenario> (related-party tables,
+# other-expenses breakdowns etc.) are skipped — those aren't primary P&L
+# figures. If a filing lacks annual or YoY-comparison data, we simply don't
+# populate that field rather than guessing.
+# ─────────────────────────────────────────────────────────────────────────
+
+XBRL_LINK_RE = re.compile(r"/corporate/xbrl/.*\.xml$", re.IGNORECASE)
+
+_XBRL_FIELD_MAP = {
+    "RevenueFromOperations":                                              "revenue",
+    "OtherIncome":                                                        "other_income",
+    "Income":                                                             "total_income",
+    "Expenses":                                                           "total_expenses",
+    "ProfitBeforeExceptionalItemsAndTax":                                 "pbt_before_exceptional",
+    "ExceptionalItemsBeforeTax":                                          "exceptional_items",
+    "ProfitBeforeTax":                                                    "pbt",
+    "CurrentTax":                                                         "current_tax",
+    "DeferredTax":                                                        "deferred_tax",
+    "TaxExpense":                                                         "tax_expense",
+    "ProfitLossForPeriod":                                                "pat",
+    "ComprehensiveIncomeForThePeriod":                                    "comprehensive_income",
+    "PaidUpValueOfEquityShareCapital":                                    "paidup_equity_capital",
+    "FaceValueOfEquityShareCapital":                                      "face_value",
+    "BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations":   "eps_basic",
+    "DilutedEarningsLossPerShareFromContinuingAndDiscontinuedOperations": "eps_diluted",
+}
+
+_XBRL_META_TAGS = {
+    "ScripCode":                                          "scrip_code",
+    "Symbol":                                             "symbol",
+    "NameOfTheCompany":                                   "company_name",
+    "DateOfBoardMeetingWhenFinancialResultsWereApproved": "board_meeting_date",
+    "TypeOfReportingPeriod":                               "period_type",
+    "ReportingQuarter":                                    "quarter_label",
+    "WhetherResultsAreAuditedOrUnaudited":                 "audited",
+    "NatureOfReportStandaloneConsolidated":                "standalone_consolidated",
+}
+
+
+def _xbrl_localname(tag: str) -> str:
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _xbrl_parse_date(s):
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%d").date()
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def _xbrl_classify_contexts(root) -> dict:
+    ctx_info = {}
+    for ctx in root.iter():
+        if _xbrl_localname(ctx.tag) != "context":
+            continue
+        cid = ctx.get("id")
+        has_scenario = any(_xbrl_localname(child.tag) == "scenario" for child in ctx)
+
+        period = next((c for c in ctx if _xbrl_localname(c.tag) == "period"), None)
+        if period is None:
+            continue
+
+        instant_el = start_el = end_el = None
+        for p in period:
+            ln = _xbrl_localname(p.tag)
+            if ln == "instant":
+                instant_el = p
+            elif ln == "startDate":
+                start_el = p
+            elif ln == "endDate":
+                end_el = p
+
+        if instant_el is not None:
+            d = _xbrl_parse_date(instant_el.text)
+            ctx_info[cid] = {"type": "instant", "start": None, "end": d,
+                              "days": None, "has_scenario": has_scenario}
+        elif start_el is not None and end_el is not None:
+            s, e = _xbrl_parse_date(start_el.text), _xbrl_parse_date(end_el.text)
+            days = (e - s).days if (s and e) else None
+            ctx_info[cid] = {"type": "duration", "start": s, "end": e,
+                              "days": days, "has_scenario": has_scenario}
+    return ctx_info
+
+
+def _xbrl_bucket(days):
+    if days is None:
+        return None
+    if 75 <= days <= 100:
+        return "quarter"
+    if 175 <= days <= 190:
+        return "half_year"
+    if 350 <= days <= 380:
+        return "year"
+    return None
+
+
+def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
+    """Parses raw XBRL bytes into {meta, quarter, year, yoy_comparison}."""
+    from xml.etree import ElementTree as ET
+
+    root = ET.fromstring(xml_bytes)
+    ctx_info = _xbrl_classify_contexts(root)
+
+    buckets = {"quarter": [], "half_year": [], "year": [], "instant": []}
+    for cid, info in ctx_info.items():
+        if info["has_scenario"]:
+            continue
+        if info["type"] == "instant":
+            buckets["instant"].append(cid)
+        else:
+            b = _xbrl_bucket(info["days"])
+            if b:
+                buckets[b].append(cid)
+
+    for b in ("quarter", "half_year", "year", "instant"):
+        buckets[b].sort(key=lambda cid: ctx_info[cid]["end"], reverse=True)
+
+    facts_by_ctx = {}
+    for el in root.iter():
+        ln = _xbrl_localname(el.tag)
+        cref = el.get("contextRef")
+        if cref is None:
+            continue
+        facts_by_ctx.setdefault(cref, {})[ln] = el.text
+
+    def extract(cid, tag_map):
+        if cid is None or cid not in facts_by_ctx:
+            return {}
+        raw = facts_by_ctx[cid]
+        out = {}
+        for xbrl_tag, field in tag_map.items():
+            if xbrl_tag in raw and raw[xbrl_tag] is not None:
+                val = raw[xbrl_tag]
+                try:
+                    out[field] = float(val)
+                except ValueError:
+                    out[field] = val
+        return out
+
+    meta_cid = buckets["quarter"][0] if buckets["quarter"] else (
+        buckets["year"][0] if buckets["year"] else None)
+    result = {"meta": extract(meta_cid, _XBRL_META_TAGS)}
+
+    if buckets["quarter"]:
+        cur_q = buckets["quarter"][0]
+        result["quarter"] = extract(cur_q, _XBRL_FIELD_MAP)
+        result["quarter"]["period_end"] = ctx_info[cur_q]["end"].isoformat()
+        result["quarter"]["period_start"] = ctx_info[cur_q]["start"].isoformat()
+
+        cur_start = ctx_info[cur_q]["start"]
+        for cid in buckets["quarter"][1:]:
+            other_start = ctx_info[cid]["start"]
+            if other_start and cur_start and abs((cur_start - other_start).days - 365) <= 20:
+                yoy = extract(cid, _XBRL_FIELD_MAP)
+                if yoy:
+                    yoy["period_end"] = ctx_info[cid]["end"].isoformat()
+                    result["yoy_comparison"] = yoy
+                break
+
+    if buckets["year"]:
+        cur_y = buckets["year"][0]
+        result["year"] = extract(cur_y, _XBRL_FIELD_MAP)
+        result["year"]["period_end"] = ctx_info[cur_y]["end"].isoformat()
+        result["year"]["period_start"] = ctx_info[cur_y]["start"].isoformat()
+
+    return result
+
+
+async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3):
+    """Fetch raw XBRL bytes with backoff on 502/503/504/network errors —
+    same flakiness profile as NSE's other archive endpoints."""
+    for attempt in range(retries):
+        try:
+            r = await client.get(url, headers=BROWSER_HEADERS, timeout=30, follow_redirects=True)
+            if r.status_code == 404:
+                return None
+            if r.status_code in (502, 503, 504):
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+            r.raise_for_status()
+            return r.content
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(str(e))
+    return None
+
+
+async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict]) -> dict | None:
+    """
+    For nse_results_feed.json items whose link points to an XBRL file,
+    fetch + parse P&L figures and merge into nse_results_detailed.json.
+    Only processes links not already present (idempotent across runs —
+    avoids re-fetching ~150+ XBRL files every poll).
+    """
+    xbrl_items = [it for it in results_items if XBRL_LINK_RE.search(it.get("link", ""))]
+    if not xbrl_items:
+        print("  ⚠ No XBRL-linked results items — skipping detail parse")
+        return None
+
+    existing = await r2_get(client, "nse_results_detailed.json")
+    existing_items = (existing or {}).get("items", [])
+    existing_links = {it.get("link") for it in existing_items}
+
+    new_items = [it for it in xbrl_items if it["link"] not in existing_links]
+    if not new_items:
+        print("  ✓ nse_results_detailed: no new XBRL filings to parse")
+        return None
+
+    print(f"  Parsing {len(new_items)} new XBRL result filing(s)...")
+    sem = asyncio.Semaphore(5)  # be polite to nsearchives.nseindia.com
+
+    async def process(it):
+        async with sem:
+            try:
+                content = await fetch_xbrl_bytes(client, it["link"])
+                if not content:
+                    return None
+                parsed = parse_financial_results_xbrl(content)
+                if not parsed.get("quarter") and not parsed.get("year"):
+                    return None  # not a financial-results XBRL (or empty) — skip silently
+                parsed["link"] = it["link"]
+                parsed["title"] = it.get("title", "")
+                parsed["published"] = it.get("published", "")
+                parsed["published_ts"] = it.get("published_ts", 0)
+                return parsed
+            except Exception as e:
+                print(f"  ⚠ XBRL parse failed for {it['link'].split('/')[-1]}: {e}")
+                return None
+
+    results = await asyncio.gather(*(process(it) for it in new_items))
+    parsed_new = [r for r in results if r]
+    print(f"  ✓ Parsed {len(parsed_new)}/{len(new_items)} successfully")
+
+    merged = existing_items + parsed_new
+    merged.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+    merged = merged[:1000]  # cap file size — keep most recent 1000 filings
+
+    return make_payload(merged)
+
+
 async def run():
     now = datetime.now(timezone.utc).isoformat()
     print(f"Fetching all feeds... [{now}]")
@@ -159,6 +427,7 @@ async def run():
         result_map = dict(results)
 
         uploads = []
+        results_feed_items = []
 
         for filename, source_keys in OUTPUT_MAP.items():
 
@@ -181,12 +450,21 @@ async def run():
             if dropped_noise or dropped_dup:
                 print(f"  {filename}: -{dropped_noise} noise, -{dropped_dup} dup → {len(items)}")
 
+            if filename == "nse_results_feed.json":
+                results_feed_items = items
+
             uploads.append((filename, make_payload(items)))
 
         # Upload all concurrently
         print("\nUploading to R2...")
         upload_tasks = [r2_put(client, fname, payload) for fname, payload in uploads]
         await asyncio.gather(*upload_tasks)
+
+        # ── Financial results detail (P&L from XBRL) ────────────────────
+        print("\nParsing financial results XBRL...")
+        detailed_payload = await build_results_detailed(client, results_feed_items)
+        if detailed_payload:
+            await r2_put(client, "nse_results_detailed.json", detailed_payload)
 
     print("✅ Done")
 
