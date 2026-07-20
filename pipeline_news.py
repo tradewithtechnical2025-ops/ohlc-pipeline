@@ -25,7 +25,7 @@ BROWSER_HEADERS = {
 # Feed definitions: (source_key, label, rss_url)
 FEEDS = [
     # NSE Official
-    ("nse_results",       "NSE Financial Results",  "https://nsearchives.nseindia.com/content/RSS/Financial_Results.xml"),
+    ("nse_results",       "NSE Financial Results",  "https://nsearchives.nseindia.com/content/RSS/Integrated_Filing_Financials.xml"),
     ("nse_announcements", "NSE Announcements",       "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml"),
     ("nse_board",         "NSE Board Meetings",      "https://nsearchives.nseindia.com/content/RSS/Board_Meetings.xml"),
     ("nse_corp_actions",  "NSE Corporate Actions",   "https://nsearchives.nseindia.com/content/RSS/Corporate_action.xml"),
