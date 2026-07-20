@@ -99,7 +99,7 @@ def dedup_items(items: list[dict]) -> list[dict]:
     return out
 
 
-async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str, retries: int = 3) -> tuple[str, list[dict]]:
+async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str, retries: int = 3) -> tuple[str, list[dict], bool]:
     last_exc = None
     v = int(time.time() // 300)  # 5-min cache-buster bucket
     sep = "&" if "?" in url else "?"
@@ -141,7 +141,7 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                 continue
 
             print(f"  ✓ {label}: {len(items)} items")
-            return source_key, items
+            return source_key, items, True
         except Exception as e:
             last_exc = e
             if attempt < retries - 1:
@@ -150,7 +150,7 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                 continue
 
     print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'}")
-    return source_key, []
+    return source_key, [], False
 
 
 async def r2_get(client: httpx.AsyncClient, filename: str):
@@ -508,12 +508,19 @@ async def run():
         # Fetch all feeds concurrently
         tasks = [fetch_feed(client, sk, label, url) for sk, label, url in FEEDS]
         results = await asyncio.gather(*tasks)
-        result_map = dict(results)
+        result_map  = {sk: items for sk, items, ok in results}
+        success_map = {sk: ok    for sk, items, ok in results}
 
         uploads = []
         results_feed_items = []
 
         for filename, source_keys in OUTPUT_MAP.items():
+
+            failed_sources = [sk for sk in source_keys if not success_map.get(sk, False)]
+            if failed_sources:
+                print(f"  ⚠ {filename}: skipping upload — fetch failed for {failed_sources}, "
+                      f"keeping existing R2 data untouched")
+                continue
 
             items = []
             for sk in source_keys:
