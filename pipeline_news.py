@@ -2,6 +2,7 @@ import asyncio
 import calendar
 import json
 import os
+import re
 from datetime import datetime, timezone
 import feedparser
 import httpx
@@ -46,9 +47,31 @@ NOISE_PATTERNS = [
     "Net Asset Value",
 ]
 
+# |SUBJECT: tag values to drop — routine compliance/regulatory boilerplate,
+# not actionable for trading. Matched case-insensitively against the exact
+# subject text (regex so "Disclosure"/"Intimation" prefix variants both hit).
+NOISE_SUBJECT_PATTERNS = [
+    r"^updates$",
+    r"^general updates$",
+    r"^copy of newspaper publication$",
+    r"^certificate under sebi \(depositories and participants\) regulations, 2018$",
+    r"^quarterly compliance report on corporate governance",
+    r"^structural digital database$",
+    r"^(disclosure|intimation) under regulation (27\(2\)|13\(3\)|7\(1\)|6\(1\)|50\(1\)|51|52\(4\))$",
+    r"^board meeting intimation$",  # future-dated notice only; "Outcome of Board Meeting" kept (actual results)
+]
+_NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
+
+_SUBJECT_TAG_RE = re.compile(r"\|SUBJECT:\s*(.+)$")
+
 def is_noise(item: dict) -> bool:
     summary = item.get("summary", "")
-    return any(p in summary for p in NOISE_PATTERNS)
+    if any(p in summary for p in NOISE_PATTERNS):
+        return True
+    m = _SUBJECT_TAG_RE.search(summary)
+    if m and _NOISE_SUBJECT_RE.match(m.group(1).strip()):
+        return True
+    return False
 
 
 def dedup_items(items: list[dict]) -> list[dict]:
