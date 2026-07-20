@@ -133,7 +133,7 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
 
 async def r2_get(client: httpx.AsyncClient, filename: str):
     try:
-        r = await client.get(f"{WORKER_URL}?file={filename}", headers=DL_HEADERS, timeout=30)
+        r = await client.get(f"{WORKER_URL}/{filename}", headers=DL_HEADERS, timeout=30)
         if r.status_code == 404:
             return None
         r.raise_for_status()
