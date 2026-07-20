@@ -338,6 +338,61 @@ def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
     return result
 
 
+FUNDAMENTALS_FILE = "fundamentals_summary.json"
+
+
+def _quarter_header(iso_date: str):
+    """'2026-06-30' -> 'Jun 2026' (matches fundamentals_summary.json's quarter header format)."""
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d")
+        return d.strftime("%b %Y")
+    except (ValueError, TypeError):
+        return None
+
+
+def _yoy_fundamentals(symbol: str, period_end_iso: str, fundamentals: dict):
+    """
+    Fallback YoY using the fundamentals database when the XBRL filing itself
+    didn't tag a prior-year-same-quarter context (common — many filers only
+    tag the current period).
+
+    CAVEAT: fundamentals_summary.json's `quarters` array is a single series
+    per symbol — we don't know for certain whether Finedge sourced it as
+    standalone or consolidated, and a company can file both. So this is
+    kept separate from the XBRL-derived `yoy_comparison` (which is
+    same-basis-guaranteed) rather than merged into it, and callers should
+    treat it as approximate.
+    """
+    if not fundamentals or not symbol:
+        return None
+    stock = fundamentals.get(symbol.upper())
+    if not stock:
+        return None
+    quarters = stock.get("quarters") or []
+    cur_header = _quarter_header(period_end_iso)
+    if not cur_header:
+        return None
+    try:
+        cur_month, cur_year = cur_header.split()
+        prior_header = f"{cur_month} {int(cur_year) - 1}"
+    except ValueError:
+        return None
+
+    by_header = {q.get("header"): q for q in quarters if q.get("header")}
+    cur_q, prior_q = by_header.get(cur_header), by_header.get(prior_header)
+    if not cur_q or not prior_q:
+        return None
+
+    out = {"basis": "fundamentals_summary (standalone/consolidated not confirmed to match XBRL)",
+           "prior_header": prior_header}
+    for field in ("sales", "pat", "eps"):
+        cur_v, prior_v = cur_q.get(field), prior_q.get(field)
+        if cur_v is not None and prior_v is not None and prior_v != 0:
+            out[f"{field}_prior"] = prior_v
+            out[f"{field}_yoy_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
+    return out if len(out) > 2 else None
+
+
 async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3):
     """Fetch raw XBRL bytes with backoff on 502/503/504/network errors —
     same flakiness profile as NSE's other archive endpoints."""
@@ -363,7 +418,7 @@ async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3
     return None
 
 
-async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict]) -> dict | None:
+async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], fundamentals: dict | None) -> dict | None:
     """
     For nse_results_feed.json items whose link points to an XBRL file,
     fetch + parse P&L figures and merge into nse_results_detailed.json.
@@ -400,6 +455,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 parsed["title"] = it.get("title", "")
                 parsed["published"] = it.get("published", "")
                 parsed["published_ts"] = it.get("published_ts", 0)
+
+                if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
+                    symbol = parsed.get("meta", {}).get("symbol")
+                    yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], fundamentals)
+                    if yoy_fund:
+                        parsed["yoy_fundamentals"] = yoy_fund
+
                 return parsed
             except Exception as e:
                 print(f"  ⚠ XBRL parse failed for {it['link'].split('/')[-1]}: {e}")
@@ -462,7 +524,11 @@ async def run():
 
         # ── Financial results detail (P&L from XBRL) ────────────────────
         print("\nParsing financial results XBRL...")
-        detailed_payload = await build_results_detailed(client, results_feed_items)
+        fundamentals = await r2_get(client, FUNDAMENTALS_FILE)
+        fundamentals_stocks = (fundamentals or {}).get("stocks")
+        if not fundamentals_stocks:
+            print(f"  ⚠ {FUNDAMENTALS_FILE} unavailable — YoY fallback via fundamentals disabled this run")
+        detailed_payload = await build_results_detailed(client, results_feed_items, fundamentals_stocks)
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
 
