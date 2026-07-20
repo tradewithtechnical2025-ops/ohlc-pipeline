@@ -59,6 +59,8 @@ NOISE_SUBJECT_PATTERNS = [
     r"^structural digital database$",
     r"^(disclosure|intimation) under regulation (27\(2\)|13\(3\)|7\(1\)|6\(1\)|50\(1\)|51|52\(4\))$",
     r"^board meeting intimation$",  # future-dated notice only; "Outcome of Board Meeting" kept (actual results)
+    r"^shareholders meeting$",      # AGM/EGM/postal ballot voting outcomes — not trading-actionable
+    r"^allotment of securities$",   # routine NCD/ESOP allotment filings
 ]
 _NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
 
