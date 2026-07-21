@@ -99,57 +99,73 @@ def dedup_items(items: list[dict]) -> list[dict]:
     return out
 
 
-async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str, retries: int = 3) -> tuple[str, list[dict], bool]:
+async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str, retries_per_domain: int = 2) -> tuple[str, list[dict], bool]:
+    # Fallback to the legacy archives.nseindia.com domain if the primary
+    # nsearchives.nseindia.com domain fails all its attempts — GitHub Actions
+    # runner IPs have been seen getting ReadTimeout consistently on the
+    # primary domain while working fine from a regular browser, suggesting
+    # IP-level throttling/WAF specific to that subdomain. Same URL path is
+    # assumed to exist on the legacy domain.
+    urls_to_try = [url]
+    if "nsearchives.nseindia.com" in url:
+        urls_to_try.append(url.replace("nsearchives.nseindia.com", "archives.nseindia.com"))
+
     last_exc = None
     v = int(time.time() // 300)  # 5-min cache-buster bucket
-    sep = "&" if "?" in url else "?"
-    cache_busted_url = f"{url}{sep}v={v}"
-    for attempt in range(retries):
-        try:
-            r = await client.get(cache_busted_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
-            r.raise_for_status()
-            feed = feedparser.parse(r.content)
-            items = []
-            for entry in feed.entries:
 
-                # Epoch timestamp for reliable cross-source sorting
-                ts = 0
-                parsed = entry.get("published_parsed") or entry.get("updated_parsed")
-                if parsed:
-                    try:
-                        ts = calendar.timegm(parsed)
-                    except Exception:
-                        ts = 0
+    for domain_idx, base_url in enumerate(urls_to_try):
+        sep = "&" if "?" in base_url else "?"
+        cache_busted_url = f"{base_url}{sep}v={v}"
+        domain_label = base_url.split("/")[2]
 
-                items.append({
-                    "source":       label,
-                    "source_key":   source_key,
-                    "title":        entry.get("title", "").strip(),
-                    "link":         entry.get("link", ""),
-                    "published":    entry.get("published", ""),
-                    "published_ts": ts,
-                    "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
-                })
+        for attempt in range(retries_per_domain):
+            try:
+                r = await client.get(cache_busted_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
+                r.raise_for_status()
+                feed = feedparser.parse(r.content)
+                items = []
+                for entry in feed.entries:
 
-            # NSE occasionally serves a transient empty-but-200 response for
-            # these feeds (confirmed: same feed returned 0 items one run,
-            # 20 the next, with no other change) — retry before accepting
-            # zero as final, since a genuinely empty feed is rare for these.
-            if not items and attempt < retries - 1:
-                print(f"  ⚠ {label}: got 0 items, retry {attempt+1}/{retries} in {2**attempt}s")
-                await asyncio.sleep(2 ** attempt)
-                continue
+                    # Epoch timestamp for reliable cross-source sorting
+                    ts = 0
+                    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+                    if parsed:
+                        try:
+                            ts = calendar.timegm(parsed)
+                        except Exception:
+                            ts = 0
 
-            print(f"  ✓ {label}: {len(items)} items")
-            return source_key, items, True
-        except Exception as e:
-            last_exc = e
-            if attempt < retries - 1:
-                print(f"  ⚠ {label}: {type(e).__name__}: {e or '(no message)'}, retry {attempt+1}/{retries} in {2**attempt}s")
-                await asyncio.sleep(2 ** attempt)
-                continue
+                    items.append({
+                        "source":       label,
+                        "source_key":   source_key,
+                        "title":        entry.get("title", "").strip(),
+                        "link":         entry.get("link", ""),
+                        "published":    entry.get("published", ""),
+                        "published_ts": ts,
+                        "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
+                    })
 
-    print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'}")
+                # NSE occasionally serves a transient empty-but-200 response
+                # (confirmed: same feed returned 0 items one run, 20 the next,
+                # no other change) — retry before accepting zero as final.
+                if not items and attempt < retries_per_domain - 1:
+                    print(f"  ⚠ {label} ({domain_label}): got 0 items, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                if domain_idx > 0:
+                    print(f"  ⚠ {label}: fell back to {domain_label}")
+                print(f"  ✓ {label}: {len(items)} items")
+                return source_key, items, True
+            except Exception as e:
+                last_exc = e
+                if attempt < retries_per_domain - 1:
+                    print(f"  ⚠ {label} ({domain_label}): {type(e).__name__}: {e or '(no message)'}, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                print(f"  ⚠ {label} ({domain_label}): exhausted retries — {type(e).__name__}: {e or '(no message)'}")
+
+    print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'} (tried {len(urls_to_try)} domain(s))")
     return source_key, [], False
 
 
