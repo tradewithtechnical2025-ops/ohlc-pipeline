@@ -8,6 +8,17 @@ from datetime import datetime, timezone
 import feedparser
 import httpx
 
+# ── Telegram notify ──
+try:
+    from telegram_notify import send_message
+except ImportError:
+    def send_message(text, silent=False, chat_id=""): pass
+
+# Separate channel for financial-results alerts, so they don't mix with
+# pipeline status notifications in the main TELEGRAM_CHAT_ID channel.
+# Boss needs to create this channel and set the secret once.
+TELEGRAM_RESULTS_CHAT_ID = os.environ.get("TELEGRAM_RESULTS_CHAT_ID", "")
+
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 UP_HEADERS = {
@@ -532,6 +543,55 @@ async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3
     return None
 
 
+def _fmt_cr(val):
+    """Formats a raw rupee value as ₹X.XX Cr for Telegram messages."""
+    if val is None:
+        return "—"
+    try:
+        return f"₹{val / 1e7:,.2f} Cr"
+    except (TypeError, ZeroDivisionError):
+        return "—"
+
+
+def _telegram_result_message(parsed: dict) -> str:
+    meta = parsed.get("meta", {})
+    q = parsed.get("quarter", {})
+    company = meta.get("company_name") or parsed.get("title") or "Unknown"
+    nature = meta.get("standalone_consolidated") or ""
+    quarter_label = meta.get("quarter_label") or ""
+    audited = meta.get("audited") or ""
+
+    pat = q.get("pat")
+    pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
+
+    lines = [f"📊 <b>{company}</b>"]
+    tag_bits = [b for b in (nature, quarter_label, audited) if b]
+    if tag_bits:
+        lines.append(" · ".join(tag_bits))
+    lines.append(f"Rev: <b>{_fmt_cr(q.get('revenue'))}</b>")
+    lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
+    if q.get("eps_basic") is not None:
+        lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
+
+    yoy = parsed.get("yoy_comparison")
+    yf = parsed.get("yoy_fundamentals")
+    if yoy and yoy.get("pat") is not None and pat is not None and yoy["pat"] != 0:
+        pct = (pat - yoy["pat"]) / abs(yoy["pat"]) * 100
+        lines.append(f"YoY PAT: {'+' if pct >= 0 else ''}{pct:.1f}%")
+    elif yf and yf.get("pat_yoy_pct") is not None:
+        prefix = "" if yf.get("basis_verified") else "~"
+        lines.append(f"YoY PAT: {prefix}{'+' if yf['pat_yoy_pct'] >= 0 else ''}{yf['pat_yoy_pct']:.1f}%")
+
+    if q.get("yoy_caution"):
+        lines.append("⚠️ Company notes: results may not be YoY comparable")
+
+    link = parsed.get("link")
+    if link:
+        lines.append(f'<a href="{link}">View Filing</a>')
+
+    return "\n".join(lines)
+
+
 async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], fundamentals: dict | None) -> dict | None:
     """
     For nse_results_feed.json items whose link points to an XBRL file,
@@ -585,6 +645,23 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     results = await asyncio.gather(*(process(it) for it in new_items))
     parsed_new = [r for r in results if r]
     print(f"  ✓ Parsed {len(parsed_new)}/{len(new_items)} successfully")
+
+    if parsed_new:
+        print(f"  Sending {len(parsed_new)} Telegram message(s)...")
+        if not TELEGRAM_RESULTS_CHAT_ID:
+            print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
+                  "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
+                  "Set TELEGRAM_RESULTS_CHAT_ID to send these to a separate channel.")
+        # Sequential with a small delay — Telegram's per-chat flood limit is
+        # roughly ~1 msg/sec sustained; sending a batch of ~20 all at once
+        # risks 429s. Individual send failures are swallowed (not fatal to
+        # the pipeline — results are still saved to R2 either way).
+        for parsed in parsed_new:
+            try:
+                send_message(_telegram_result_message(parsed), chat_id=TELEGRAM_RESULTS_CHAT_ID)
+            except Exception as e:
+                print(f"  ⚠ Telegram send failed for {parsed.get('meta', {}).get('symbol')}: {e}")
+            await asyncio.sleep(1)
 
     merged = existing_items + parsed_new
     merged.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
