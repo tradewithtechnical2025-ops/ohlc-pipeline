@@ -1,0 +1,30 @@
+name: Results Backfill (one-time)
+
+# Manual trigger only — this is a one-time script, not meant to run on a
+# schedule. Run it once from the Actions tab (Run workflow), then either
+# disable/delete this workflow file or leave it (harmless if unused since
+# it never triggers itself).
+on:
+  workflow_dispatch:
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install httpx feedparser
+
+      - name: Run pipeline_results_backfill.py
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline_results_backfill.py
