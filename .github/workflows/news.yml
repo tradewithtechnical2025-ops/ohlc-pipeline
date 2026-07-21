@@ -18,7 +18,7 @@ jobs:
           python-version: '3.11'
           cache: pip
       - name: Install dependencies
-        run: pip install httpx feedparser
+        run: pip install httpx feedparser requests
       - name: Run Insider Trading Pipeline
         run: python pipeline_insider.py
         env:
@@ -29,6 +29,9 @@ jobs:
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_RESULTS_CHAT_ID: ${{ secrets.TELEGRAM_RESULTS_CHAT_ID }}
       - name: Run IPO scan
         if: ${{ github.event.inputs.mode == 'full' }}
         env:
