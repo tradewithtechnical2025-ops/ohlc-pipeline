@@ -46,22 +46,42 @@ async def new_nse_client() -> httpx.AsyncClient:
 
 
 async def get_with_retry(client: httpx.AsyncClient, url: str, max_retries: int = 4, **kwargs) -> httpx.Response:
-    """GET with retry/backoff on transient 503/429 responses."""
+    """
+    GET with retry/backoff on transient 503/429/timeout responses, plus
+    automatic fallback to the legacy archives.nseindia.com domain if
+    nsearchives.nseindia.com exhausts its retries — GitHub Actions runner
+    IPs have been seen getting blocked/timed-out consistently on the primary
+    domain while a regular browser works fine, suggesting IP-level
+    throttling/WAF specific to that subdomain. Same URL path is assumed to
+    exist on the legacy domain.
+    """
+    urls_to_try = [url]
+    if "nsearchives.nseindia.com" in url:
+        urls_to_try.append(url.replace("nsearchives.nseindia.com", "archives.nseindia.com"))
+
     last_exc = None
-    for attempt in range(max_retries):
-        try:
-            resp = await client.get(url, **kwargs)
-            resp.raise_for_status()
-            return resp
-        except httpx.HTTPStatusError as e:
-            last_exc = e
-            if e.response.status_code in (503, 429) and attempt < max_retries - 1:
-                base_wait = 2 ** attempt + 1
-                wait = base_wait + random.uniform(0, base_wait * 0.5)  # jitter: avoid metronomic retry pattern
-                print(f"{e.response.status_code} on {url}, retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
-                await asyncio.sleep(wait)
-                continue
-            raise
+    for domain_idx, try_url in enumerate(urls_to_try):
+        domain_label = try_url.split("/")[2]
+        for attempt in range(max_retries):
+            try:
+                resp = await client.get(try_url, **kwargs)
+                resp.raise_for_status()
+                if domain_idx > 0:
+                    print(f"  ⚠ fell back to {domain_label} for {try_url.split('/')[-1]}")
+                return resp
+            except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.TransportError) as e:
+                last_exc = e
+                is_retryable_status = isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (503, 429)
+                is_retryable = is_retryable_status or isinstance(e, (httpx.TimeoutException, httpx.TransportError))
+                if is_retryable and attempt < max_retries - 1:
+                    base_wait = 2 ** attempt + 1
+                    wait = base_wait + random.uniform(0, base_wait * 0.5)  # jitter: avoid metronomic retry pattern
+                    status = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else type(e).__name__
+                    print(f"{status} on {try_url} ({domain_label}), retrying in {wait:.1f}s (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait)
+                    continue
+                break  # exhausted retries on this domain (or non-retryable error) — try next domain if any
+
     raise last_exc
 
 
