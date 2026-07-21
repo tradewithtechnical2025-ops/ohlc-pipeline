@@ -648,29 +648,17 @@ def _fmt_cr(val):
         return "—"
 
 
-def _telegram_result_message(parsed: dict) -> str:
-    meta = parsed.get("meta", {})
+def _telegram_basis_block(parsed: dict) -> list:
+    """Builds the Current Qtr / QoQ / YoY lines for ONE basis (Standalone or
+    Consolidated). No header/company-name lines — those are built once by
+    the caller so two bases for the same company share a single message."""
     q = parsed.get("quarter", {})
-    company = meta.get("company_name") or parsed.get("title") or "Unknown"
-    nature = meta.get("standalone_consolidated") or ""
-    quarter_label = meta.get("quarter_label") or ""
-    audited = meta.get("audited") or ""
-
     revenue = q.get("revenue")
     pat = q.get("pat")
     pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
     cur_header = _quarter_header(q.get("period_end")) or ""
 
-    lines = [f"📊 <b>{company}</b>"]
-    tag_bits = [b for b in (nature, quarter_label, audited) if b]
-    if tag_bits:
-        lines.append(" · ".join(tag_bits))
-    board_date = meta.get("board_meeting_date")
-    if board_date:
-        lines.append(f"Result Date: {board_date}")
-
-    lines.append("")
-    lines.append(f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>")
+    lines = [f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>"]
     lines.append(f"Rev: <b>{_fmt_cr(revenue)}</b>")
     lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
     if q.get("eps_basic") is not None:
@@ -681,28 +669,25 @@ def _telegram_result_message(parsed: dict) -> str:
             return None
         return (cur_v - prior_v) / abs(prior_v) * 100
 
-    def _section(title, prior_header, prior_rev, prior_pat, rev_pct, pat_pct, opm_current_pct=None, opm_pp=None, prefix=""):
+    def _section(title, prior_header, cur_rev, cur_pat, rev_pct, pat_pct, opm_current_pct=None, opm_pp=None, prefix=""):
         sec = ["", f"<b>{title}{' (vs ' + prior_header + ')' if prior_header else ''}</b>"]
-        if prior_rev is not None and rev_pct is not None:
-            sec.append(f"Rev: {_fmt_cr(prior_rev)} → {prefix}{'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%")
-        if prior_pat is not None and pat_pct is not None:
-            sec.append(f"PAT: {_fmt_cr(prior_pat)} → {prefix}{'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%")
+        if cur_rev is not None and rev_pct is not None:
+            sec.append(f"Rev: {_fmt_cr(cur_rev)} ({prefix}{'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%)")
+        if cur_pat is not None and pat_pct is not None:
+            sec.append(f"PAT: {_fmt_cr(cur_pat)} ({prefix}{'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%)")
         if opm_current_pct is not None and opm_pp is not None:
             sec.append(f"OPM: {opm_current_pct}% ({prefix}{'+' if opm_pp >= 0 else ''}{opm_pp:.1f}pp)")
         return sec if len(sec) > 2 else []
 
     cur_opm_pct = round(q["opm"] * 100, 2) if q.get("opm") is not None else None
 
-    # QoQ — always fundamentals-sourced (XBRL never tags the immediately
-    # preceding quarter), so always carries the basis_verified/~ treatment.
     qf = parsed.get("qoq_fundamentals")
     if qf:
         prefix = "" if qf.get("basis_verified") else "~"
-        lines += _section("QoQ", qf.get("prior_header"), qf.get("sales_prior"), qf.get("pat_prior"),
+        lines += _section("QoQ", qf.get("prior_header"), revenue, pat,
                            qf.get("sales_qoq_pct"), qf.get("pat_qoq_pct"),
                            cur_opm_pct, qf.get("opm_qoq_pp"), prefix)
 
-    # YoY — prefer XBRL-native (same-basis-guaranteed) over the fundamentals fallback
     yoy = parsed.get("yoy_comparison")
     yf = parsed.get("yoy_fundamentals")
     if yoy:
@@ -710,10 +695,10 @@ def _telegram_result_message(parsed: dict) -> str:
         pat_pct = _pct(pat, yoy.get("pat"))
         yoy_header = _quarter_header(yoy.get("period_end"))
         opm_pp = round((q["opm"] - yoy["opm"]) * 100, 2) if q.get("opm") is not None and yoy.get("opm") is not None else None
-        lines += _section("YoY", yoy_header, yoy.get("revenue"), yoy.get("pat"), rev_pct, pat_pct, cur_opm_pct, opm_pp)
+        lines += _section("YoY", yoy_header, revenue, pat, rev_pct, pat_pct, cur_opm_pct, opm_pp)
     elif yf:
         prefix = "" if yf.get("basis_verified") else "~"
-        lines += _section("YoY", yf.get("prior_header"), yf.get("sales_prior"), yf.get("pat_prior"),
+        lines += _section("YoY", yf.get("prior_header"), revenue, pat,
                            yf.get("sales_yoy_pct"), yf.get("pat_yoy_pct"),
                            cur_opm_pct, yf.get("opm_yoy_pp"), prefix)
 
@@ -721,7 +706,63 @@ def _telegram_result_message(parsed: dict) -> str:
         lines.append("")
         lines.append("⚠️ Company notes: results may not be YoY comparable")
 
+    return lines
+
+
+def _telegram_result_message(group) -> str:
+    """
+    Builds ONE Telegram message for a company's result. `group` is either a
+    single parsed dict (one basis filed) or a list of 1-2 parsed dicts
+    (Standalone + Consolidated for the same company/quarter) — grouped by
+    _group_parsed_results() before this is called, so the two bases always
+    arrive in the same message instead of as separate messages that other
+    companies' results can get interleaved between.
+    """
+    items = group if isinstance(group, list) else [group]
+    items = sorted(items, key=lambda p: 0 if (p.get("meta", {}).get("standalone_consolidated") == "Consolidated") else 1)
+
+    first_meta = items[0].get("meta", {})
+    company = first_meta.get("company_name") or items[0].get("title") or "Unknown"
+    quarter_label = first_meta.get("quarter_label") or ""
+    audited = first_meta.get("audited") or ""
+    board_date = first_meta.get("board_meeting_date")
+
+    lines = [f"📊 <b>{company}</b>"]
+    tag_bits = [b for b in (quarter_label, audited) if b]
+    if tag_bits:
+        lines.append(" · ".join(tag_bits))
+    if board_date:
+        lines.append(f"Result Date: {board_date}")
+
+    for i, parsed in enumerate(items):
+        nature = parsed.get("meta", {}).get("standalone_consolidated") or ""
+        lines.append("")
+        if nature:
+            lines.append(f"━━ <b>{nature.upper()}</b> ━━")
+        lines += _telegram_basis_block(parsed)
+
     return "\n".join(lines)
+
+
+def _group_parsed_results(parsed_new: list) -> list:
+    """
+    Groups newly-parsed results by company+quarter (scrip_code +
+    board_meeting_date + quarter period_end) so Standalone and Consolidated
+    filings for the same result — which arrive as two separate XBRL files —
+    get sent as ONE Telegram message instead of two, which previously let
+    other companies' messages land in between them.
+    """
+    groups = {}
+    order = []
+    for p in parsed_new:
+        meta = p.get("meta", {})
+        q = p.get("quarter", {})
+        key = (meta.get("scrip_code"), meta.get("board_meeting_date"), q.get("period_end"))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(p)
+    return [groups[k] for k in order]
 
 
 async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], fundamentals: dict | None) -> dict | None:
@@ -786,7 +827,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     print(f"  ✓ Parsed {len(parsed_new)}/{len(new_items)} successfully")
 
     if parsed_new:
-        print(f"  Sending {len(parsed_new)} Telegram message(s)...")
+        groups = _group_parsed_results(parsed_new)
+        print(f"  Sending {len(groups)} Telegram message(s) ({len(parsed_new)} filings grouped)...")
         if not TELEGRAM_RESULTS_CHAT_ID:
             print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
                   "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
@@ -795,11 +837,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         # roughly ~1 msg/sec sustained; sending a batch of ~20 all at once
         # risks 429s. Individual send failures are swallowed (not fatal to
         # the pipeline — results are still saved to R2 either way).
-        for parsed in parsed_new:
+        for group in groups:
             try:
-                send_message(_telegram_result_message(parsed), chat_id=TELEGRAM_RESULTS_CHAT_ID)
+                send_message(_telegram_result_message(group), chat_id=TELEGRAM_RESULTS_CHAT_ID)
             except Exception as e:
-                print(f"  ⚠ Telegram send failed for {parsed.get('meta', {}).get('symbol')}: {e}")
+                sym = group[0].get("meta", {}).get("symbol") if group else "?"
+                print(f"  ⚠ Telegram send failed for {sym}: {e}")
             await asyncio.sleep(1)
 
     merged = existing_items + parsed_new
