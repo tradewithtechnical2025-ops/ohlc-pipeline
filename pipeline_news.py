@@ -479,18 +479,37 @@ def _fundamentals_basis(symbol: str, xbrl_nature: str, fundamentals: dict):
     """Returns (stock_dict, basis_label) if fundamentals_summary.json's stype
     for this symbol matches the XBRL filing's own standalone/consolidated
     nature, else (None, None) — see _compare_to_fundamentals docstring for
-    why we refuse to guess across a basis mismatch."""
+    why we refuse to guess across a basis mismatch.
+
+    Checks the primary stype first, then the dual-tracked alt series
+    (quarters_alt/stype_alt — added July 2026 to pipeline_fundamentals_prod.py)
+    before giving up. The primary pick is a strict-recency tie-break that
+    favours Consolidated on a tie even when Standalone is equally current,
+    so a Standalone XBRL filing would otherwise never match even though the
+    data exists in fundamentals — quarters_alt is where fundamentals stores
+    that "lost" tie-break series.
+    """
     if not fundamentals or not symbol:
         return None, None
     stock = fundamentals.get(symbol.upper())
     if not stock:
         return None, None
-    stype = (stock.get("stype") or "").strip().lower()
-    nature = (xbrl_nature or "").strip().lower()
     basis_map = {"c": "consolidated", "s": "standalone"}
-    if stype not in basis_map or basis_map[stype] != nature:
-        return None, None
-    return stock, basis_map[stype]
+    nature = (xbrl_nature or "").strip().lower()
+
+    stype = (stock.get("stype") or "").strip().lower()
+    if stype in basis_map and basis_map[stype] == nature:
+        return stock, basis_map[stype]
+
+    stype_alt = (stock.get("stype_alt") or "").strip().lower()
+    if stype_alt in basis_map and basis_map[stype_alt] == nature and stock.get("quarters_alt"):
+        # Shim: reuse _compare_to_fundamentals' existing stock["quarters"]
+        # lookup by presenting quarters_alt under that same key.
+        alt_stock = dict(stock)
+        alt_stock["quarters"] = stock["quarters_alt"]
+        return alt_stock, basis_map[stype_alt]
+
+    return None, None
 
 
 def _compare_to_fundamentals(stock: dict, basis: str, xbrl_quarter: dict, prior_header: str, suffix: str):
