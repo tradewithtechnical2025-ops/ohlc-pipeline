@@ -111,14 +111,17 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
         urls_to_try.append(url.replace("nsearchives.nseindia.com", "archives.nseindia.com"))
 
     last_exc = None
+    got_empty_after_all_retries = False
     v = int(time.time() // 300)  # 5-min cache-buster bucket
 
     for domain_idx, base_url in enumerate(urls_to_try):
         sep = "&" if "?" in base_url else "?"
         cache_busted_url = f"{base_url}{sep}v={v}"
         domain_label = base_url.split("/")[2]
+        is_last_domain = domain_idx == len(urls_to_try) - 1
 
         for attempt in range(retries_per_domain):
+            is_last_attempt = is_last_domain and attempt == retries_per_domain - 1
             try:
                 r = await client.get(cache_busted_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
                 r.raise_for_status()
@@ -148,10 +151,17 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                 # NSE occasionally serves a transient empty-but-200 response
                 # (confirmed: same feed returned 0 items one run, 20 the next,
                 # no other change) — retry before accepting zero as final.
-                if not items and attempt < retries_per_domain - 1:
-                    print(f"  ⚠ {label} ({domain_label}): got 0 items, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
-                    await asyncio.sleep(2 ** attempt)
-                    continue
+                if not items:
+                    if not is_last_attempt:
+                        print(f"  ⚠ {label} ({domain_label}): got 0 items, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    # Exhausted every attempt on every domain and still empty.
+                    # For these high-volume feeds a genuine zero is implausible
+                    # — treat as failure (not success) so callers preserve
+                    # existing R2 data rather than overwrite it with [].
+                    got_empty_after_all_retries = True
+                    break
 
                 if domain_idx > 0:
                     print(f"  ⚠ {label}: fell back to {domain_label}")
@@ -159,13 +169,17 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                 return source_key, items, True
             except Exception as e:
                 last_exc = e
-                if attempt < retries_per_domain - 1:
+                if not is_last_attempt:
                     print(f"  ⚠ {label} ({domain_label}): {type(e).__name__}: {e or '(no message)'}, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
                     await asyncio.sleep(2 ** attempt)
                     continue
                 print(f"  ⚠ {label} ({domain_label}): exhausted retries — {type(e).__name__}: {e or '(no message)'}")
 
-    print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'} (tried {len(urls_to_try)} domain(s))")
+    if got_empty_after_all_retries:
+        print(f"  ✗ {label}: got 0 items on every attempt across {len(urls_to_try)} domain(s) — "
+              f"treating as failure (implausible for this feed), keeping existing data")
+    else:
+        print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'} (tried {len(urls_to_try)} domain(s))")
     return source_key, [], False
 
 
