@@ -1,812 +1,858 @@
-// pgNews.js — TradeWithTech Market Feed Page
-// Tabs: Insider Trading, Financial Results, Corp Actions, Market News, Announcements
+import asyncio
+import calendar
+import json
+import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
+import feedparser
+import httpx
 
-const R2_NEWS = 'https://r2-uploader.tradewithtechnical2025.workers.dev';
+# ── Telegram notify ──
+try:
+    from telegram_notify import send_message
+except ImportError:
+    def send_message(text, silent=False, chat_id=""): pass
 
-const NEWS_TABS = [
-  { id: 'insider',       label: 'Insider Trading',    file: 'nse_insider_trading.json',  emoji: '🔍' },
-  { id: 'results',       label: 'Results',             file: 'nse_results_feed.json',     emoji: '📊' },
-  { id: 'corp',          label: 'Corp Actions',        file: 'nse_corp_actions.json',     emoji: '🗓️' },
-  { id: 'news',          label: 'Market News',         file: 'market_news.json',          emoji: '📰' },
-  { id: 'announcements', label: 'Announcements',       file: 'nse_announcements.json',    emoji: '📢' },
-];
+# Separate channel for financial-results alerts, so they don't mix with
+# pipeline status notifications in the main TELEGRAM_CHAT_ID channel.
+# Boss needs to create this channel and set the secret once.
+TELEGRAM_RESULTS_CHAT_ID = os.environ.get("TELEGRAM_RESULTS_CHAT_ID", "")
 
-let _newsActiveTab = 'insider';
-let _newsData = {};
-let _newsSearch = '';
-let _newsFilter = '';
-let _newsInited = false;
-let _resultsDetailMap = null;   // link -> parsed P&L detail from nse_results_detailed.json
-let _resultsDetailLoading = null; // in-flight promise, avoids duplicate fetches
-
-// --- Auto-update & notifications ---
-const NEWS_POLL_MS = 5 * 60 * 1000;   // cache buster bhi 5-min hai, isse kam ka fayda nahi
-let _newsPollTimer = null;
-let _newsSeen = {};                    // tabId -> Set of item hashes (already seen)
-let _newsUnseen = {};                  // tabId -> count of new unseen items
-
-function _newsHash(s) {
-  let h = 5381;
-  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
-  return h.toString(36);
+WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN = os.environ["WORKER_TOKEN"]
+UP_HEADERS = {
+    "X-Secret-Token": WORKER_TOKEN,
+    "Content-Type": "application/json"
+}
+DL_HEADERS = {
+    "X-Secret-Token": WORKER_TOKEN,
 }
 
-function _newsItemKey(id, item) {
-  if (id === 'insider') {
-    return _newsHash([item.symbol, item.insider_name, item.trade_date_from,
-      item.transaction_type, item.qty, item.pre_qty].join('|'));
-  }
-  return _newsHash([item.link, item.title, item.summary].join('|'));
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
-function _newsLoadSeen() {
-  try {
-    const raw = localStorage.getItem('twt_news_seen_v1');
-    if (!raw) return;
-    const obj = JSON.parse(raw);
-    for (const k in obj) _newsSeen[k] = new Set(obj[k]);
-  } catch (e) {}
+# Feed definitions: (source_key, label, rss_url)
+FEEDS = [
+    # NSE Official
+    ("nse_results",       "NSE Financial Results",  "https://nsearchives.nseindia.com/content/RSS/Integrated_Filing_Financials.xml"),
+    ("nse_announcements", "NSE Announcements",       "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml"),
+    ("nse_board",         "NSE Board Meetings",      "https://nsearchives.nseindia.com/content/RSS/Board_Meetings.xml"),
+    ("nse_corp_actions",  "NSE Corporate Actions",   "https://nsearchives.nseindia.com/content/RSS/Corporate_action.xml"),
+    # Market News
+    ("et_markets",   "Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+    ("mint_markets", "LiveMint Markets",        "https://www.livemint.com/rss/markets"),
+]
+
+# source_key(s) -> R2 output file
+# Single key = individual file, list = merged file
+OUTPUT_MAP = {
+    "nse_results_feed.json":   ["nse_results"],
+    "nse_announcements.json":  ["nse_announcements"],
+    "nse_board_meetings.json": ["nse_board"],
+    "nse_corp_actions.json":   ["nse_corp_actions"],
+    "market_news.json":        ["et_markets", "mint_markets"],
 }
 
-function _newsSaveSeen() {
-  try {
-    const obj = {};
-    for (const k in _newsSeen) obj[k] = [..._newsSeen[k]].slice(-600); // cap per tab
-    localStorage.setItem('twt_news_seen_v1', JSON.stringify(obj));
-  } catch (e) {}
-}
 
-function _newsMarkSeen(id) {
-  const items = _newsData[id] || [];
-  if (!_newsSeen[id]) _newsSeen[id] = new Set();
-  items.forEach(it => _newsSeen[id].add(_newsItemKey(id, it)));
-  _newsUnseen[id] = 0;
-  _newsUpdateBadge(id);
-  _newsSaveSeen();
-}
+# Summary patterns to drop (routine regulatory noise, not news)
+NOISE_PATTERNS = [
+    "Net Asset Value",
+]
 
-function _newsCountUnseen(id) {
-  const items = _newsData[id] || [];
-  if (!_newsSeen[id] || _newsSeen[id].size === 0) {
-    // First ever load — sab seen maano, warna purane 600 items pe notification flood
-    return -1;
-  }
-  return items.filter(it => !_newsSeen[id].has(_newsItemKey(id, it))).length;
-}
+# |SUBJECT: tag values to drop — routine compliance/regulatory boilerplate,
+# not actionable for trading. Matched case-insensitively against the exact
+# subject text (regex so "Disclosure"/"Intimation" prefix variants both hit).
+NOISE_SUBJECT_PATTERNS = [
+    r"^updates$",
+    r"^general updates$",
+    r"^copy of newspaper publication$",
+    r"^certificate under sebi \(depositories and participants\) regulations, 2018$",
+    r"^quarterly compliance report on corporate governance",
+    r"^structural digital database$",
+    r"^(disclosure|intimation) under regulation (27\(2\)|13\(3\)|7\(1\)|6\(1\)|50\(1\)|51|52\(4\))$",
+    r"^board meeting intimation$",  # future-dated notice only; "Outcome of Board Meeting" kept (actual results)
+    r"^shareholders meeting$",      # AGM/EGM/postal ballot voting outcomes — not trading-actionable
+    r"^allotment of securities$",   # routine NCD/ESOP allotment filings
+]
+_NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
 
-function _newsUpdateBadge(id) {
-  const el = document.getElementById('newsTabNew-' + id);
-  if (!el) return;
-  const n = _newsUnseen[id] || 0;
-  el.textContent = n > 0 ? '+' + n : '';
-  el.style.display = n > 0 ? 'inline' : 'none';
-}
+_SUBJECT_TAG_RE = re.compile(r"\|SUBJECT:\s*(.+)$")
 
-async function newsInit(tabId) {
-  if (!_newsInited) {
-    _newsInited = true;
-    _newsLoadSeen();
-    _buildNewsUI();
-    _newsStartPolling();
-  }
-  if (tabId) _newsActiveTab = tabId;
-  _setNewsTab(_newsActiveTab);
-  _loadNewsTab(_newsActiveTab);
-}
+def is_noise(item: dict) -> bool:
+    summary = item.get("summary", "")
+    if any(p in summary for p in NOISE_PATTERNS):
+        return True
+    m = _SUBJECT_TAG_RE.search(summary)
+    if m and _NOISE_SUBJECT_RE.match(m.group(1).strip()):
+        return True
+    return False
 
-function _newsStartPolling() {
-  if (_newsPollTimer) return;
-  _newsPollTimer = setInterval(_newsPollAll, NEWS_POLL_MS);
-  setTimeout(_newsPollAll, 30 * 1000);   // first poll jaldi — pichle session ke baad ke items pakde
-}
 
-function _newsNotify(title, body) {
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
-  try {
-    // Desktop browsers
-    const n = new Notification(title, { body: body, tag: 'twt-news' });
-    n.onclick = function () { window.focus(); n.close(); };
-  } catch (e) {
-    // Android Chrome: new Notification() throws — Service Worker route try karo
-    if (navigator.serviceWorker && navigator.serviceWorker.ready) {
-      navigator.serviceWorker.ready.then(reg => {
-        reg.showNotification(title, { body: body, tag: 'twt-news' });
-      }).catch(() => {});
-    }
-  }
-}
+def dedup_items(items: list[dict]) -> list[dict]:
+    """
+    Dedup by link + title + summary, NOT published.
+    NSE re-publishes the same announcement with updated timestamps (NTPC type)
+    — those are duplicates. But NAV updates share one generic link with
+    different summaries — those are distinct and must be kept.
+    Items must be sorted newest-first before calling, so latest published wins.
+    """
+    seen = set()
+    out = []
+    for it in items:
+        key = (it.get("link", ""), it.get("title", ""), it.get("summary", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
 
-async function _newsPollAll() {
-  // Sab tabs silently fetch karo, diff karo, badges/notifications update karo
-  let notifLines = [];
-  for (const tab of NEWS_TABS) {
-    try {
-      const tok = await getR2Token();
-      if (!tok) return;
-      const v = Math.floor(Date.now() / 3e5);
-      const r = await fetch(R2_NEWS + '/' + tab.file + '?v=' + v, {
-        headers: { Authorization: 'Bearer ' + tok }, cache: 'default'
-      });
-      if (!r.ok) continue;
-      const data = await r.json();
-      const fresh = data.items || [];
-      _newsData[tab.id] = fresh;
 
-      // Background poll bypasses _loadNewsTab (which normally awaits this
-      // before rendering), so without this, a newly-arrived result would
-      // render with no P&L data until a full page reload.
-      if (tab.id === 'results') await _loadResultsDetail(true);
+async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str, retries_per_domain: int = 2) -> tuple[str, list[dict], bool]:
+    # Fallback to the legacy archives.nseindia.com domain if the primary
+    # nsearchives.nseindia.com domain fails all its attempts — GitHub Actions
+    # runner IPs have been seen getting ReadTimeout consistently on the
+    # primary domain while working fine from a regular browser, suggesting
+    # IP-level throttling/WAF specific to that subdomain. Same URL path is
+    # assumed to exist on the legacy domain.
+    urls_to_try = [url]
+    if "nsearchives.nseindia.com" in url:
+        urls_to_try.append(url.replace("nsearchives.nseindia.com", "archives.nseindia.com"))
 
-      const cntEl = document.getElementById('newsTabCnt-' + tab.id);
-      if (cntEl) cntEl.textContent = '(' + fresh.length + ')';
+    last_exc = None
+    got_empty_after_all_retries = False
+    v = int(time.time() // 300)  # 5-min cache-buster bucket
 
-      const unseen = _newsCountUnseen(tab.id);
-      if (unseen === -1) {            // first load of this tab's data
-        _newsMarkSeen(tab.id);
-        continue;
-      }
-      _newsUnseen[tab.id] = unseen;
-      _newsUpdateBadge(tab.id);
-      if (unseen > 0) notifLines.push(unseen + ' ' + tab.label);
-    } catch (e) { /* silent */ }
-  }
+    for domain_idx, base_url in enumerate(urls_to_try):
+        sep = "&" if "?" in base_url else "?"
+        cache_busted_url = f"{base_url}{sep}v={v}"
+        domain_label = base_url.split("/")[2]
+        is_last_domain = domain_idx == len(urls_to_try) - 1
 
-  // Active tab pe naya data hai → user scroll mein disturb na ho
-  const feed = document.getElementById('newsFeed');
-  const onNewsPage = feed && feed.offsetParent !== null;
-  if (onNewsPage && (_newsUnseen[_newsActiveTab] || 0) > 0) {
-    if (feed.scrollTop < 50) {
-      _renderNewsFeed(_newsActiveTab);
-      _newsMarkSeen(_newsActiveTab);
-    } else {
-      _newsShowPill(_newsUnseen[_newsActiveTab]);
-    }
-  }
+        for attempt in range(retries_per_domain):
+            is_last_attempt = is_last_domain and attempt == retries_per_domain - 1
+            try:
+                r = await client.get(cache_busted_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
+                r.raise_for_status()
+                feed = feedparser.parse(r.content)
+                items = []
+                for entry in feed.entries:
 
-  // Browser notification — jab tab hidden ho YA user app ke kisi aur page pe ho
-  const feedVisible = feed && feed.offsetParent !== null;
-  console.log('[news poll] unseen:', JSON.stringify(_newsUnseen),
-    'hidden:', document.hidden, 'feedVisible:', feedVisible);
-  if (notifLines.length && (document.hidden || !feedVisible)) {
-    _newsNotify('TradeWithTech — Market Feed', notifLines.join(' · '));
-  }
-}
+                    # Epoch timestamp for reliable cross-source sorting
+                    ts = 0
+                    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+                    if parsed:
+                        try:
+                            ts = calendar.timegm(parsed)
+                        except Exception:
+                            ts = 0
 
-function _newsShowPill(n) {
-  let pill = document.getElementById('newsNewPill');
-  const feed = document.getElementById('newsFeed');
-  if (!feed) return;
-  if (!pill) {
-    pill = document.createElement('div');
-    pill.id = 'newsNewPill';
-    pill.style.cssText = 'position:sticky;top:6px;z-index:5;align-self:center;margin:0 auto;width:fit-content;' +
-      'background:var(--accent);color:#000;font-family:var(--font-data);font-size:.76rem;font-weight:800;' +
-      'padding:5px 14px;border-radius:99px;cursor:pointer;box-shadow:0 2px 10px rgba(0,0,0,.4)';
-    pill.onclick = function () {
-      pill.remove();
-      _renderNewsFeed(_newsActiveTab);
-      _newsMarkSeen(_newsActiveTab);
-      const f = document.getElementById('newsFeed');
-      if (f) f.scrollTop = 0;
-    };
-    feed.prepend(pill);
-  }
-  pill.textContent = '↑ ' + n + ' new';
-}
+                    items.append({
+                        "source":       label,
+                        "source_key":   source_key,
+                        "title":        entry.get("title", "").strip(),
+                        "link":         entry.get("link", ""),
+                        "published":    entry.get("published", ""),
+                        "published_ts": ts,
+                        "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
+                    })
 
-function _newsToggleNotif() {
-  const btn = document.getElementById('newsNotifBtn');
-  if (!('Notification' in window)) {
-    alert('Browser notifications not supported');
-    return;
-  }
-  if (Notification.permission === 'granted') {
-    _newsNotify('TradeWithTech — Test', 'Notifications are working ✓');
-    return;
-  }
-  if (Notification.permission === 'denied') {
-    alert('Notifications are blocked. Enable them in your browser site settings (lock icon in address bar).');
-    return;
-  }
-  Notification.requestPermission().then(p => {
-    if (btn) btn.style.color = p === 'granted' ? 'var(--accent)' : 'var(--muted)';
-    if (p === 'granted') _newsNotify('TradeWithTech — Test', 'Notifications enabled ✓');
-  });
-}
+                # NSE occasionally serves a transient empty-but-200 response
+                # (confirmed: same feed returned 0 items one run, 20 the next,
+                # no other change) — retry before accepting zero as final.
+                if not items:
+                    if not is_last_attempt:
+                        print(f"  ⚠ {label} ({domain_label}): got 0 items, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    # Exhausted every attempt on every domain and still empty.
+                    # For these high-volume feeds a genuine zero is implausible
+                    # — treat as failure (not success) so callers preserve
+                    # existing R2 data rather than overwrite it with [].
+                    got_empty_after_all_retries = True
+                    break
 
-function _buildNewsUI() {
-  const pg = document.getElementById('pgNews');
-  if (!pg) return;
+                if domain_idx > 0:
+                    print(f"  ⚠ {label}: fell back to {domain_label}")
+                print(f"  ✓ {label}: {len(items)} items")
+                return source_key, items, True
+            except Exception as e:
+                last_exc = e
+                if not is_last_attempt:
+                    print(f"  ⚠ {label} ({domain_label}): {type(e).__name__}: {e or '(no message)'}, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                print(f"  ⚠ {label} ({domain_label}): exhausted retries — {type(e).__name__}: {e or '(no message)'}")
 
-  pg.innerHTML = `
-    <div id="newsWrap" style="display:flex;flex-direction:column;height:100%;overflow:hidden;background:var(--bg)">
+    if got_empty_after_all_retries:
+        print(f"  ✗ {label}: got 0 items on every attempt across {len(urls_to_try)} domain(s) — "
+              f"treating as failure (implausible for this feed), keeping existing data")
+    else:
+        print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'} (tried {len(urls_to_try)} domain(s))")
+    return source_key, [], False
 
-      <!-- Header -->
-      <div style="display:flex;align-items:center;gap:10px;padding:10px 14px 0;flex-shrink:0">
-        <span style="font-family:var(--font-data);font-size:.9rem;font-weight:800;color:var(--text);flex:1">Market Feed</span>
-        <span id="newsLiveTag" style="display:flex;align-items:center;gap:5px;font-family:var(--font-data);font-size:.7rem;color:var(--muted)">
-          <span id="newsDot" style="width:6px;height:6px;border-radius:50%;background:var(--green);animation:newsPulse 1.5s infinite"></span>
-          Live
-        </span>
-        <button id="newsNotifBtn" onclick="_newsToggleNotif()" title="Browser notifications"
-          style="background:none;border:1px solid var(--border);border-radius:6px;cursor:pointer;padding:4px 9px;font-family:var(--font-data);font-size:.78rem;color:var(--muted)">
-          🔔
-        </button>
-        <button onclick="_refreshNewsTab()" title="Refresh"
-          style="background:none;border:1px solid var(--border);border-radius:6px;color:var(--muted);cursor:pointer;padding:4px 9px;font-family:var(--font-data);font-size:.78rem">
-          ⟳
-        </button>
-      </div>
 
-      <!-- Tabs -->
-      <div id="newsTabs" style="display:flex;gap:0;padding:8px 14px 0;border-bottom:1px solid var(--border);flex-shrink:0;overflow-x:auto"></div>
+async def r2_get(client: httpx.AsyncClient, filename: str):
+    try:
+        r = await client.get(f"{WORKER_URL}/{filename}", headers=DL_HEADERS, timeout=30)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"  ⚠ r2_get({filename}) failed: {e}")
+        return None
 
-      <!-- Search + Filter -->
-      <div style="display:flex;gap:8px;padding:8px 14px;flex-shrink:0">
-        <input id="newsSearch" type="text" placeholder="Search symbol, company, title…"
-          oninput="_newsSearchChange(this.value)"
-          style="flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:6px 10px;color:var(--text);font-family:var(--font-data);font-size:.82rem;outline:none">
-        <select id="newsFilter" onchange="_newsFilterChange(this.value)"
-          style="background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:6px 8px;color:var(--text);font-family:var(--font-data);font-size:.82rem;outline:none;cursor:pointer">
-          <option value="">All</option>
-        </select>
-      </div>
 
-      <!-- Stats bar -->
-      <div id="newsStats" style="display:flex;gap:12px;padding:0 14px 8px;flex-shrink:0"></div>
+async def r2_put(client: httpx.AsyncClient, filename: str, data: dict):
+    body = json.dumps(data, ensure_ascii=False).encode()
+    r = await client.post(
+        f"{WORKER_URL}?file={filename}",
+        headers=UP_HEADERS,
+        content=body,
+        timeout=120
+    )
+    r.raise_for_status()
+    print(f"✓ Uploaded {filename}")
 
-      <!-- Feed -->
-      <div id="newsFeed" style="flex:1;overflow-y:auto;padding:0 14px 14px"></div>
-    </div>
 
-    <style>
-      @keyframes newsPulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-      .news-card { display:flex;gap:10px;align-items:flex-start;padding:10px 12px;
-        background:var(--surface2);border:1px solid var(--border);border-radius:9px;
-        margin-bottom:6px;cursor:pointer;transition:background .1s }
-      .news-card:hover { background:var(--surface3,var(--surface)) }
-      .news-badge { font-size:.7rem;font-weight:800;padding:2px 7px;border-radius:99px;flex-shrink:0;margin-top:1px;line-height:1.6 }
-      .news-body { flex:1;min-width:0 }
-      .news-title { font-family:var(--font-data);font-size:.9rem;font-weight:600;color:var(--text);
-        white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:2px }
-      .news-sub { font-family:var(--font-data);font-size:.76rem;color:var(--muted);line-height:1.5;
-        display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden }
-      .news-time { font-family:var(--font-data);font-size:.72rem;color:var(--muted);flex-shrink:0;margin-top:2px }
-      .news-empty { display:flex;flex-direction:column;align-items:center;justify-content:center;
-        padding:60px 20px;gap:10px;color:var(--muted);font-family:var(--font-data);font-size:.85rem;text-align:center }
-    </style>
-  `;
-
-  // Build tabs
-  const tabsEl = document.getElementById('newsTabs');
-  tabsEl.innerHTML = NEWS_TABS.map(t => `
-    <div id="newsTab-${t.id}" onclick="_setNewsTab('${t.id}');_loadNewsTab('${t.id}')"
-      style="padding:7px 14px;font-family:var(--font-data);font-size:.82rem;font-weight:600;
-        cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;color:var(--muted);
-        transition:color .15s,border-color .15s">
-      ${t.emoji} ${t.label}
-      <span id="newsTabCnt-${t.id}" style="font-size:.7rem;color:var(--muted);margin-left:3px"></span>
-      <span id="newsTabNew-${t.id}" style="display:none;font-size:.68rem;font-weight:800;color:#000;background:var(--accent);border-radius:99px;padding:1px 6px;margin-left:4px;vertical-align:1px"></span>
-    </div>
-  `).join('');
-
-  // Bell state
-  const nb = document.getElementById('newsNotifBtn');
-  if (nb && 'Notification' in window && Notification.permission === 'granted') {
-    nb.style.color = 'var(--accent)';
-  }
-}
-
-function _setNewsTab(id) {
-  _newsActiveTab = id;
-  _newsSearch = '';
-  _newsFilter = '';
-  const searchEl = document.getElementById('newsSearch');
-  if (searchEl) searchEl.value = '';
-
-  NEWS_TABS.forEach(t => {
-    const el = document.getElementById('newsTab-' + t.id);
-    if (!el) return;
-    const active = t.id === id;
-    el.style.color = active ? 'var(--accent)' : 'var(--muted)';
-    el.style.borderBottomColor = active ? 'var(--accent)' : 'transparent';
-  });
-}
-
-async function _loadResultsDetail(forceRefresh = false) {
-  if (_resultsDetailMap && !forceRefresh) return _resultsDetailMap;
-  if (_resultsDetailLoading && !forceRefresh) return _resultsDetailLoading;
-
-  _resultsDetailLoading = (async () => {
-    try {
-      const tok = await getR2Token();
-      if (!tok) throw new Error('Not authenticated');
-      const v = Math.floor(Date.now() / 3e5);
-      const r = await fetch(R2_NEWS + '/nse_results_detailed.json?v=' + v, {
-        headers: { Authorization: 'Bearer ' + tok }, cache: 'default'
-      });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const data = await r.json();
-      const map = {};
-      (data.items || []).forEach(it => { if (it.link) map[it.link] = it; });
-      _resultsDetailMap = map;
-      return map;
-    } catch (e) {
-      console.warn('[results detail] load failed:', e.message);
-      _resultsDetailMap = {};
-      return _resultsDetailMap;
-    } finally {
-      _resultsDetailLoading = null;
-    }
-  })();
-
-  return _resultsDetailLoading;
-}
-
-async function _loadNewsTab(id, forceRefresh = false) {
-  const tab = NEWS_TABS.find(t => t.id === id);
-  if (!tab) return;
-  const feed = document.getElementById('newsFeed');
-  if (!feed) return;
-
-  if (id === 'results') await _loadResultsDetail(forceRefresh);
-
-  // Use cache if available
-  if (_newsData[id] && !forceRefresh) {
-    _renderNewsFeed(id);
-    _newsMarkSeen(id);
-    return;
-  }
-
-  feed.innerHTML = '<div class="news-empty"><div style="font-size:1.5rem">⏳</div>Loading…</div>';
-
-  try {
-    const tok = await getR2Token();
-    if (!tok) throw new Error('Not authenticated');
-    const v = Math.floor(Date.now() / 3e5);
-    const r = await fetch(R2_NEWS + '/' + tab.file + '?v=' + v, {
-      headers: { Authorization: 'Bearer ' + tok }, cache: 'default'
-    });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const data = await r.json();
-    _newsData[id] = data.items || [];
-
-    // Update tab count badge
-    const cntEl = document.getElementById('newsTabCnt-' + id);
-    if (cntEl) cntEl.textContent = '(' + _newsData[id].length + ')';
-
-    _renderNewsFeed(id);
-    _newsMarkSeen(id);   // user dekh raha hai — sab seen
-  } catch (e) {
-    feed.innerHTML = `<div class="news-empty"><div style="font-size:1.5rem">⚠️</div>${e.message}</div>`;
-  }
-}
-
-function _refreshNewsTab() {
-  delete _newsData[_newsActiveTab];
-  if (_newsActiveTab === 'results') _resultsDetailMap = null;
-  _loadNewsTab(_newsActiveTab, true);
-}
-
-function _newsSearchChange(val) {
-  _newsSearch = val.toLowerCase().trim();
-  _renderNewsFeed(_newsActiveTab);
-}
-
-function _newsFilterChange(val) {
-  _newsFilter = val;
-  _renderNewsFeed(_newsActiveTab);
-}
-
-function _renderNewsFeed(id) {
-  const feed = document.getElementById('newsFeed');
-  const filterEl = document.getElementById('newsFilter');
-  const statsEl = document.getElementById('newsStats');
-  if (!feed) return;
-
-  const items = _newsData[id] || [];
-  if (!items.length) {
-    feed.innerHTML = '<div class="news-empty"><div style="font-size:1.5rem">📭</div>No data yet — run the pipeline first</div>';
-    return;
-  }
-
-  // Build filter options
-  const filterOpts = _getFilterOpts(id, items);
-  if (filterEl) {
-    const cur = filterEl.value;
-    filterEl.innerHTML = '<option value="">All</option>' +
-      filterOpts.map(o => `<option value="${o}">${o}</option>`).join('');
-    if (filterOpts.includes(cur)) filterEl.value = cur;
-  }
-
-  // Apply search + filter
-  let filtered = items.filter(item => {
-    const text = [item.company, item.symbol, item.title, item.insider_name,
-      item.source, item.summary, item.transaction_type].filter(Boolean).join(' ').toLowerCase();
-    if (_newsSearch && !text.includes(_newsSearch)) return false;
-    if (_newsFilter && _getFilterVal(id, item) !== _newsFilter) return false;
-    return true;
-  });
-
-  // Stats bar
-  if (statsEl) statsEl.innerHTML = _buildStats(id, filtered);
-
-  // Render cards
-  if (!filtered.length) {
-    feed.innerHTML = '<div class="news-empty"><div style="font-size:1.5rem">🔍</div>No results</div>';
-    return;
-  }
-
-  let toRender = filtered;
-  if (id === 'results') toRender = _groupResultsItems(filtered);
-
-  feed.innerHTML = toRender.slice(0, 200).map(item => _cardHTML(id, item)).join('');
-}
-
-// Groups Standalone + Consolidated feed entries for the same company/quarter
-// into a single row (item.__mergedItems), so they render as one card with
-// two side-by-side columns instead of two separate rows. Grouping key needs
-// the parsed detail (scrip_code + board_meeting_date + period_end) — items
-// whose XBRL hasn't been parsed yet (no detail match) are left ungrouped
-// rather than guessed at.
-function _groupResultsItems(items) {
-  const groups = new Map();
-  const order = [];
-  items.forEach(it => {
-    const detail = (_resultsDetailMap || {})[it.link];
-    const key = (detail && detail.meta)
-      ? ['g', detail.meta.scrip_code, detail.meta.board_meeting_date, (detail.quarter && detail.quarter.period_end) || ''].join('|')
-      : 'u|' + it.link; // ungrouped — no detail yet, keep as its own row
-    if (!groups.has(key)) {
-      const primary = Object.assign({}, it, { __mergedItems: [it] });
-      groups.set(key, primary);
-      order.push(key);
-    } else {
-      groups.get(key).__mergedItems.push(it);
-    }
-  });
-  return order.map(k => groups.get(k));
-}
-
-function _getFilterOpts(id, items) {
-  if (id === 'insider') return [...new Set(items.map(i => i.transaction_type).filter(Boolean))].sort();
-  if (id === 'corp')    return [...new Set(items.map(i => _corpPurpose(i.summary)).filter(Boolean))].sort();
-  if (id === 'news')    return [...new Set(items.map(i => i.source).filter(Boolean))].sort();
-  return [];
-}
-
-function _getFilterVal(id, item) {
-  if (id === 'insider') return item.transaction_type || '';
-  if (id === 'corp')    return _corpPurpose(item.summary) || '';
-  if (id === 'news')    return item.source || '';
-  return '';
-}
-
-function _corpPurpose(summary) {
-  if (!summary) return '';
-  const s = summary.toUpperCase();
-  if (s.includes('BONUS'))    return 'Bonus';
-  if (s.includes('SPLIT'))    return 'Split';
-  if (s.includes('DIVIDEND')) return 'Dividend';
-  if (s.includes('BUYBACK'))  return 'Buyback';
-  if (s.includes('AGM'))      return 'AGM';
-  return 'Other';
-}
-
-function _buildStats(id, items) {
-  if (id === 'insider') {
-    const buys  = items.filter(i => i.transaction_type === 'Buy').length;
-    const sells = items.filter(i => i.transaction_type === 'Sell').length;
-    const totalVal = items.reduce((a, i) => a + (parseFloat(i.value_inr) || 0), 0);
-    return `
-      <span style="font-family:var(--font-data);font-size:.78rem;color:var(--muted)">
-        <span style="color:var(--green);font-weight:700">${buys} Buy</span> ·
-        <span style="color:var(--red);font-weight:700">${sells} Sell</span> ·
-        Total: <span style="color:var(--text)">${_fmtVal(totalVal)}</span>
-      </span>`;
-  }
-  return `<span style="font-family:var(--font-data);font-size:.78rem;color:var(--muted)">${items.length} items</span>`;
-}
-
-function _cardHTML(id, item) {
-  const time = _fmtTime(item.published || item.date_filing || '');
-
-  if (id === 'insider') {
-    const isBuy  = item.transaction_type === 'Buy';
-    const isSell = item.transaction_type === 'Sell';
-    const badgeBg = isBuy ? 'rgba(0,230,118,.15)' : isSell ? 'rgba(255,61,90,.12)' : 'rgba(200,200,200,.1)';
-    const badgeColor = isBuy ? 'var(--green)' : isSell ? 'var(--red)' : 'var(--muted)';
-    const avgPrice = item.qty && item.value_inr
-      ? (parseFloat(item.value_inr) / parseFloat(item.qty)).toFixed(1) : null;
-
-    return `
-      <div class="news-card" onclick="_newsOpenStock('${item.symbol}', '${item.html_url || item.xml_url || ''}')">
-        <span class="news-badge" style="background:${badgeBg};color:${badgeColor}">
-          ${item.transaction_type || '—'}
-        </span>
-        <div class="news-body">
-          <div class="news-title">
-            <span style="color:var(--accent);font-weight:800">${item.symbol || ''}</span>
-            ${item.symbol ? ' — ' : ''}${item.insider_name || item.company || ''}
-          </div>
-          <div class="news-sub">
-            ${item.insider_category ? `<span style="color:var(--text2)">${item.insider_category}</span> · ` : ''}
-            Qty: <b style="color:var(--text)">${_fmtQty(item.qty)}</b>
-            ${item.value_inr ? ` · Value: <b style="color:var(--text)">${_fmtVal(item.value_inr)}</b>` : ''}
-            ${avgPrice ? ` · ~₹${parseFloat(avgPrice).toLocaleString('en-IN')}` : ''}
-            ${item.mode ? ` · ${item.mode}` : ''}
-          </div>
-        </div>
-        <div class="news-time">${time}</div>
-      </div>`;
-  }
-
-  if (id === 'results') {
-    // Builds the 3 display lines (main/QoQ/YoY) for a single detail object
-    // (one basis — Standalone or Consolidated). Shared by both the
-    // single-column and two-column (merged) layouts below.
-    function _buildResultColumn(detail) {
-      const q = detail && detail.quarter;
-      const nature = detail && detail.meta && detail.meta.standalone_consolidated;
-      let mainLine = '', qoqLine = '', yoyLine = '';
-
-      if (q && (q.revenue != null || q.pat != null)) {
-        const mainParts = [];
-        if (q.revenue != null) mainParts.push(`Rev: <b style="color:var(--text)">${_fmtVal(q.revenue)}</b>`);
-        if (q.pat != null) {
-          const patColor = q.pat >= 0 ? 'var(--green)' : 'var(--red)';
-          mainParts.push(`PAT: <b style="color:${patColor}">${_fmtVal(q.pat)}</b>`);
-        }
-        if (q.eps_basic != null) mainParts.push(`EPS: <b style="color:var(--text)">₹${q.eps_basic}</b>`);
-        mainLine = mainParts.join(' · ');
-
-        function buildCompareLine(label, revPrior, revPct, patPrior, patPct, epsPrior, epsPct, opmCurrentPct, opmPP, verified, tip) {
-          const bits = [];
-          const prefix = verified ? '' : '~';
-          if (revPrior != null && revPct != null) {
-            const color = revPct >= 0 ? 'var(--green)' : 'var(--red)';
-            bits.push(`Rev ${_fmtVal(revPrior)} <b style="color:${color}" title="${tip}">(${prefix}${revPct >= 0 ? '+' : ''}${revPct.toFixed(1)}%)</b>`);
-          }
-          if (patPrior != null && patPct != null) {
-            const color = patPct >= 0 ? 'var(--green)' : 'var(--red)';
-            bits.push(`PAT ${_fmtVal(patPrior)} <b style="color:${color}" title="${tip}">(${prefix}${patPct >= 0 ? '+' : ''}${patPct.toFixed(1)}%)</b>`);
-          }
-          if (epsPrior != null && epsPct != null) {
-            const color = epsPct >= 0 ? 'var(--green)' : 'var(--red)';
-            bits.push(`EPS ₹${epsPrior} <b style="color:${color}" title="${tip}">(${prefix}${epsPct >= 0 ? '+' : ''}${epsPct.toFixed(1)}%)</b>`);
-          }
-          if (opmCurrentPct != null && opmPP != null) {
-            const color = opmPP >= 0 ? 'var(--green)' : 'var(--red)';
-            bits.push(`OPM ${opmCurrentPct.toFixed(1)}% <b style="color:${color}" title="${tip}">(${prefix}${opmPP >= 0 ? '+' : ''}${opmPP.toFixed(1)}pp)</b>`);
-          }
-          return bits.length ? `${label}: ${bits.join(' · ')}` : '';
-        }
-
-        const curOpmPct = q.opm != null ? q.opm * 100 : null;
-
-        const qf = detail.qoq_fundamentals;
-        if (qf) {
-          const verified = !!qf.basis_verified;
-          const tip = verified
-            ? `Verified same-basis comparison (${qf.basis}) vs ${qf.prior_header}`
-            : `Approximate — from fundamentals data, basis may differ`;
-          qoqLine = buildCompareLine('QoQ', qf.sales_prior, qf.sales_qoq_pct, qf.pat_prior, qf.pat_qoq_pct,
-            qf.eps_prior, qf.eps_qoq_pct, curOpmPct, qf.opm_qoq_pp, verified, tip);
-        }
-
-        const yoy = detail.yoy_comparison;
-        const yf = detail.yoy_fundamentals;
-        if (yoy) {
-          function pct(curV, priorV) {
-            if (curV == null || priorV == null || priorV === 0) return null;
-            return ((curV - priorV) / Math.abs(priorV)) * 100;
-          }
-          const opmPP = (q.opm != null && yoy.opm != null) ? (q.opm - yoy.opm) * 100 : null;
-          yoyLine = buildCompareLine('YoY', yoy.revenue, pct(q.revenue, yoy.revenue), yoy.pat, pct(q.pat, yoy.pat),
-            yoy.eps_basic, pct(q.eps_basic, yoy.eps_basic), curOpmPct, opmPP, true, 'Verified same-basis comparison (from XBRL filing)');
-        } else if (yf) {
-          const verified = !!yf.basis_verified;
-          const tip = verified
-            ? `Verified same-basis comparison (${yf.basis}) vs ${yf.prior_header}`
-            : `Approximate — from fundamentals data, basis may differ`;
-          yoyLine = buildCompareLine('YoY', yf.sales_prior, yf.sales_yoy_pct, yf.pat_prior, yf.pat_yoy_pct,
-            yf.eps_prior, yf.eps_yoy_pct, curOpmPct, yf.opm_yoy_pp, verified, tip);
-        }
-      }
-      return { nature, mainLine, qoqLine, yoyLine };
+def make_payload(items: list[dict]) -> dict:
+    return {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(items),
+        "items": items
     }
 
-    // item.__mergedItems is set by _renderNewsFeed when it groups the
-    // Standalone + Consolidated feed entries for the same company/quarter
-    // into one row (see _groupResultsItems). Falls back to just this item
-    // when there's nothing to merge (e.g. only one basis was filed).
-    const mergedLinks = (item.__mergedItems || [item]).map(m => m.link);
-    const details = mergedLinks.map(l => (_resultsDetailMap || {})[l]).filter(Boolean);
-    details.sort((a, b) => {
-      const na = (a.meta && a.meta.standalone_consolidated) || '';
-      return na === 'Consolidated' ? -1 : 1;
-    });
 
-    const anySymbol = details.map(d => d.meta && d.meta.symbol).find(Boolean) || '';
-    const clickTarget = mergedLinks[0];
+# ─────────────────────────────────────────────────────────────────────────
+# Financial Results XBRL parsing (in-capmkt / IFIndAs taxonomy)
+#
+# Context IDs (e.g. "OneD", "FourD") are NOT standardized across filers —
+# they're arbitrary labels chosen by whatever software generated the filing.
+# We classify every context by its actual period span instead of trusting
+# the ID: ~80-100 days -> quarter, ~350-380 days -> year, instant -> balance
+# sheet date. Contexts with a dimensional <scenario> (related-party tables,
+# other-expenses breakdowns etc.) are skipped — those aren't primary P&L
+# figures. If a filing lacks annual or YoY-comparison data, we simply don't
+# populate that field rather than guessing.
+# ─────────────────────────────────────────────────────────────────────────
 
-    if (details.length >= 2) {
-      // Side-by-side two-column layout: one column per basis
-      const cols = details.slice(0, 2).map(_buildResultColumn);
-      const colHtml = cols.map(c => `
-        <div style="flex:1;min-width:0">
-          <div style="font-family:var(--font-data);font-size:.6rem;font-weight:800;color:var(--accent);text-transform:uppercase;letter-spacing:.4px;margin-bottom:2px">${c.nature ? c.nature.toUpperCase() : ''}</div>
-          <div class="news-sub">${c.mainLine || '—'}</div>
-          ${c.qoqLine ? `<div class="news-sub" style="margin-top:2px">${c.qoqLine}</div>` : ''}
-          ${c.yoyLine ? `<div class="news-sub" style="margin-top:2px">${c.yoyLine}</div>` : ''}
-        </div>`).join('<div style="width:1px;background:var(--border);flex-shrink:0"></div>');
+XBRL_LINK_RE = re.compile(r"/corporate/xbrl/.*\.xml$", re.IGNORECASE)
 
-      return `
-        <div class="news-card" onclick="_newsOpenStock('${anySymbol}', '${clickTarget}')">
-          <span class="news-badge" style="background:rgba(0,212,255,.12);color:var(--accent)">RESULT</span>
-          <div class="news-body">
-            <div class="news-title">${item.title || '—'}</div>
-            <div style="display:flex;gap:12px;margin-top:2px">${colHtml}</div>
-          </div>
-          <div class="news-time">${time}</div>
-        </div>`;
-    }
-
-    // Single-basis (or not-yet-parsed) fallback — original single-column look
-    const detail = details[0];
-    const { nature, mainLine, qoqLine, yoyLine } = detail
-      ? _buildResultColumn(detail)
-      : { nature: null, mainLine: item.summary || '', qoqLine: '', yoyLine: '' };
-
-    return `
-      <div class="news-card" onclick="_newsOpenStock('${anySymbol}', '${clickTarget}')">
-        <span class="news-badge" style="background:rgba(0,212,255,.12);color:var(--accent)">${nature ? nature.toUpperCase() : 'RESULT'}</span>
-        <div class="news-body">
-          <div class="news-title">${item.title || '—'}</div>
-          <div class="news-sub">${mainLine}</div>
-          ${qoqLine ? `<div class="news-sub" style="margin-top:2px">${qoqLine}</div>` : ''}
-          ${yoyLine ? `<div class="news-sub" style="margin-top:2px">${yoyLine}</div>` : ''}
-        </div>
-        <div class="news-time">${time}</div>
-      </div>`;
-  }
-
-  if (id === 'corp') {
-    const purpose = _corpPurpose(item.summary);
-    const purposeColor = purpose === 'Dividend' ? 'rgba(0,230,118,.15)' :
-      purpose === 'Bonus' ? 'rgba(255,215,64,.15)' :
-      purpose === 'Buyback' ? 'rgba(167,139,250,.15)' : 'rgba(200,200,200,.1)';
-    const purposeText = purpose === 'Dividend' ? 'var(--green)' :
-      purpose === 'Bonus' ? 'var(--yellow)' :
-      purpose === 'Buyback' ? 'var(--purple)' : 'var(--muted)';
-    return `
-      <div class="news-card" onclick="_newsOpenStock('${(item.title || '').replace(/'/g, "\\'")}', '${item.link}')">
-        <span class="news-badge" style="background:${purposeColor};color:${purposeText}">${purpose}</span>
-        <div class="news-body">
-          <div class="news-title">${item.title || '—'}</div>
-          <div class="news-sub">${(item.summary || '').replace(/\|/g,' · ')}</div>
-        </div>
-        <div class="news-time">${time}</div>
-      </div>`;
-  }
-
-  if (id === 'news') {
-    return `
-      <div class="news-card" onclick="window.open('${item.link}','_blank')">
-        <span class="news-badge" style="background:rgba(167,139,250,.15);color:var(--purple)">NEWS</span>
-        <div class="news-body">
-          <div class="news-title">${item.title || '—'}</div>
-          <div class="news-sub">
-            <span style="color:var(--accent)">${item.source || ''}</span>
-            ${item.summary ? ' · ' + item.summary : ''}
-          </div>
-        </div>
-        <div class="news-time">${time}</div>
-      </div>`;
-  }
-
-  if (id === 'announcements') {
-    return `
-      <div class="news-card" onclick="_newsOpenStock('${(item.title || '').replace(/'/g, "\\'")}', '${item.link}')">
-        <span class="news-badge" style="background:rgba(251,146,60,.12);color:var(--orange)">ANNC</span>
-        <div class="news-body">
-          <div class="news-title">${item.title || '—'}</div>
-          <div class="news-sub">${(item.summary || '')}</div>
-        </div>
-        <div class="news-time">${time}</div>
-      </div>`;
-  }
-
-  return '';
+_XBRL_FIELD_MAP = {
+    "RevenueFromOperations":                                              "revenue",
+    "OtherIncome":                                                        "other_income",
+    "Income":                                                             "total_income",
+    "Expenses":                                                           "total_expenses",
+    "ProfitBeforeExceptionalItemsAndTax":                                 "pbt_before_exceptional",
+    "ExceptionalItemsBeforeTax":                                          "exceptional_items",
+    "ProfitBeforeTax":                                                    "pbt",
+    "CurrentTax":                                                         "current_tax",
+    "DeferredTax":                                                        "deferred_tax",
+    "TaxExpense":                                                         "tax_expense",
+    "ProfitLossForPeriod":                                                "pat",
+    "ComprehensiveIncomeForThePeriod":                                    "comprehensive_income",
+    "PaidUpValueOfEquityShareCapital":                                    "paidup_equity_capital",
+    "FaceValueOfEquityShareCapital":                                      "face_value",
+    "BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations":   "eps_basic",
+    "DilutedEarningsLossPerShareFromContinuingAndDiscontinuedOperations": "eps_diluted",
+    "DisclosureOfNotesOnFinancialResultsExplanatoryTextBlock":            "notes_raw",
 }
 
-let _pgNewsNameMap = null;
+# Phrases NSE filers commonly use to flag that this period isn't a fair
+# YoY comparison (business transfers, discontinued ops, restructuring,
+# scheme of arrangement, etc). Matched case-insensitively against the
+# filing's own notes text — if the company itself says it, we surface it
+# rather than silently showing a misleading % change.
+_NOT_COMPARABLE_RE = re.compile(
+    r"not\s+compar(e|able)|not\s+directly\s+compar|results?\s+(are|is)\s+not\s+compar",
+    re.IGNORECASE,
+)
 
-function _pgNewsNormName(s) {
-  return (s || '').toUpperCase()
-    .replace(/\bLIMITED\b/g, '')
-    .replace(/\bLTD\.?\b/g, '')
-    .replace(/\bCOMPANY\b/g, '')
-    .replace(/\bCO\.?\b/g, '')
-    .replace(/[^A-Z0-9]/g, '')
-    .trim();
+_XBRL_META_TAGS = {
+    "ScripCode":                                          "scrip_code",
+    "Symbol":                                             "symbol",
+    "NameOfTheCompany":                                   "company_name",
+    "DateOfBoardMeetingWhenFinancialResultsWereApproved": "board_meeting_date",
+    "TypeOfReportingPeriod":                               "period_type",
+    "ReportingQuarter":                                    "quarter_label",
+    "WhetherResultsAreAuditedOrUnaudited":                 "audited",
+    "NatureOfReportStandaloneConsolidated":                "standalone_consolidated",
 }
 
-// Builds a company-name -> symbol lookup from fundaMap (already loaded
-// elsewhere on the page for Results Comparison / Peer Comparison), since
-// corp actions / announcements only carry the company name, not the symbol.
-function _pgNewsResolveSymbolByName(name) {
-  if (!name) return null;
-  if (!_pgNewsNameMap) {
-    _pgNewsNameMap = {};
-    const src = (typeof fundaMap !== 'undefined' && fundaMap) ? fundaMap : null;
-    if (src) {
-      Object.keys(src).forEach(sym => {
-        const nm = src[sym] && src[sym].name;
-        if (nm) _pgNewsNameMap[_pgNewsNormName(nm)] = sym;
-      });
-    }
-  }
-  return _pgNewsNameMap[_pgNewsNormName(name)] || null;
-}
 
-// symbolOrName: either an exact NSE symbol (insider trading, results — both
-// carry the real symbol) or a company name (corp actions, announcements —
-// only the title/company name is available). fallbackLink is used only if
-// no symbol can be resolved either way, so the click still goes somewhere.
-function _newsOpenStock(symbolOrName, fallbackLink) {
-  let sym = null;
-  if (symbolOrName) {
-    const upper = symbolOrName.toUpperCase();
-    if (typeof allStocks !== 'undefined' && allStocks.some(s => s.stock === upper)) {
-      sym = upper;
-    } else {
-      sym = _pgNewsResolveSymbolByName(symbolOrName);
-    }
-  }
-  if (sym && typeof ovLoad === 'function') {
-    ovLoad(sym);
-  } else if (fallbackLink) {
-    window.open(fallbackLink, '_blank');
-  }
-}
+def _xbrl_localname(tag: str) -> str:
+    return tag.split("}", 1)[1] if "}" in tag else tag
 
-function _fmtTime(ts) {
-  if (!ts) return '';
-  // Try to extract just time if today
-  const match = ts.match(/(\d{2}:\d{2})/);
-  if (match) return match[1];
-  return ts.slice(0, 10);
-}
 
-function _fmtQty(qty) {
-  if (!qty) return '—';
-  const n = parseFloat(qty);
-  if (isNaN(n)) return qty;
-  if (n >= 1e7) return (n / 1e7).toFixed(2) + ' Cr';
-  if (n >= 1e5) return (n / 1e5).toFixed(2) + ' L';
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-  return n.toLocaleString('en-IN');
-}
+def _xbrl_parse_date(s):
+    try:
+        return datetime.strptime(s.strip(), "%Y-%m-%d").date()
+    except (ValueError, AttributeError, TypeError):
+        return None
 
-function _fmtVal(val) {
-  if (!val) return '—';
-  const n = parseFloat(val);
-  if (isNaN(n)) return '—';
-  if (n >= 1e7) return '₹' + (n / 1e7).toFixed(2) + ' Cr';
-  if (n >= 1e5) return '₹' + (n / 1e5).toFixed(2) + ' L';
-  return '₹' + n.toLocaleString('en-IN');
-}
 
-// Called by notification.js navigate event
-window.addEventListener('notif:navigate', function(e) {
-  const tabMap = {
-    insider: 'insider', results: 'results',
-    corp: 'corp', news: 'news', announcements: 'announcements'
-  };
-  const tab = tabMap[e.detail];
-  if (tab && typeof switchPage === 'function') {
-    switchPage('market');
-    setTimeout(() => newsInit(tab), 100);
-  }
-});
+def _xbrl_classify_contexts(root) -> dict:
+    ctx_info = {}
+    for ctx in root.iter():
+        if _xbrl_localname(ctx.tag) != "context":
+            continue
+        cid = ctx.get("id")
+        has_scenario = any(_xbrl_localname(child.tag) == "scenario" for child in ctx)
+
+        period = next((c for c in ctx if _xbrl_localname(c.tag) == "period"), None)
+        if period is None:
+            continue
+
+        instant_el = start_el = end_el = None
+        for p in period:
+            ln = _xbrl_localname(p.tag)
+            if ln == "instant":
+                instant_el = p
+            elif ln == "startDate":
+                start_el = p
+            elif ln == "endDate":
+                end_el = p
+
+        if instant_el is not None:
+            d = _xbrl_parse_date(instant_el.text)
+            ctx_info[cid] = {"type": "instant", "start": None, "end": d,
+                              "days": None, "has_scenario": has_scenario}
+        elif start_el is not None and end_el is not None:
+            s, e = _xbrl_parse_date(start_el.text), _xbrl_parse_date(end_el.text)
+            days = (e - s).days if (s and e) else None
+            ctx_info[cid] = {"type": "duration", "start": s, "end": e,
+                              "days": days, "has_scenario": has_scenario}
+    return ctx_info
+
+
+def _xbrl_bucket(days):
+    if days is None:
+        return None
+    if 75 <= days <= 100:
+        return "quarter"
+    if 175 <= days <= 190:
+        return "half_year"
+    if 350 <= days <= 380:
+        return "year"
+    return None
+
+
+def _process_notes(period_dict: dict, max_notes_chars: int = 600) -> None:
+    """
+    Mutates period_dict in place: pops the raw notes text, cleans it, checks
+    for a company-stated "not comparable" caveat (common when a business
+    segment was transferred/discontinued — e.g. Paytm's Q1 FY27 standalone
+    revenue after moving its offline merchant business to a subsidiary),
+    and stores a short excerpt + boolean flag plus a truncated general note.
+    Scans the FULL text for the caveat before truncating, so a disclaimer
+    buried deep in a long notes block isn't missed.
+    """
+    raw = period_dict.pop("notes_raw", None)
+    if not raw or not isinstance(raw, str):
+        return
+
+    cleaned = re.sub(r"<br\s*/?>", " ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    m = _NOT_COMPARABLE_RE.search(cleaned)
+    if m:
+        # grab the sentence containing the match for a short, useful excerpt
+        start = cleaned.rfind(".", 0, m.start()) + 1
+        end = cleaned.find(".", m.end())
+        end = end + 1 if end != -1 else min(len(cleaned), m.end() + 200)
+        excerpt = cleaned[start:end].strip()
+        period_dict["yoy_caution"] = True
+        period_dict["yoy_caution_note"] = excerpt[:400]
+
+    if cleaned:
+        period_dict["notes"] = cleaned[:max_notes_chars] + ("…" if len(cleaned) > max_notes_chars else "")
+
+
+def _compute_opm(period_dict: dict) -> None:
+    """
+    Mutates period_dict in place, adding 'opm' as a decimal fraction (e.g.
+    0.241 = 24.1%) using the same formula pipeline_fundamentals_prod.py's
+    _compute_opm() uses for fundamentals_summary.json ((sales-expenses)/
+    sales) — matching methodology is what makes the QoQ/YoY OPM comparison
+    against fundamentals data meaningful rather than comparing two
+    differently-defined margins.
+    """
+    revenue = period_dict.get("revenue")
+    expenses = period_dict.get("total_expenses")
+    if revenue and expenses is not None and revenue != 0:
+        period_dict["opm"] = round((revenue - expenses) / revenue, 4)
+
+
+def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
+    """Parses raw XBRL bytes into {meta, quarter, year, yoy_comparison}."""
+    from xml.etree import ElementTree as ET
+
+    root = ET.fromstring(xml_bytes)
+    ctx_info = _xbrl_classify_contexts(root)
+
+    buckets = {"quarter": [], "half_year": [], "year": [], "instant": []}
+    for cid, info in ctx_info.items():
+        if info["has_scenario"]:
+            continue
+        if info["type"] == "instant":
+            buckets["instant"].append(cid)
+        else:
+            b = _xbrl_bucket(info["days"])
+            if b:
+                buckets[b].append(cid)
+
+    for b in ("quarter", "half_year", "year", "instant"):
+        buckets[b].sort(key=lambda cid: ctx_info[cid]["end"], reverse=True)
+
+    facts_by_ctx = {}
+    for el in root.iter():
+        ln = _xbrl_localname(el.tag)
+        cref = el.get("contextRef")
+        if cref is None:
+            continue
+        facts_by_ctx.setdefault(cref, {})[ln] = el.text
+
+    def extract(cid, tag_map):
+        if cid is None or cid not in facts_by_ctx:
+            return {}
+        raw = facts_by_ctx[cid]
+        out = {}
+        for xbrl_tag, field in tag_map.items():
+            if xbrl_tag in raw and raw[xbrl_tag] is not None:
+                val = raw[xbrl_tag]
+                try:
+                    out[field] = float(val)
+                except ValueError:
+                    out[field] = val
+        return out
+
+    meta_cid = buckets["quarter"][0] if buckets["quarter"] else (
+        buckets["year"][0] if buckets["year"] else None)
+    result = {"meta": extract(meta_cid, _XBRL_META_TAGS)}
+
+    if buckets["quarter"]:
+        cur_q = buckets["quarter"][0]
+        result["quarter"] = extract(cur_q, _XBRL_FIELD_MAP)
+        result["quarter"]["period_end"] = ctx_info[cur_q]["end"].isoformat()
+        result["quarter"]["period_start"] = ctx_info[cur_q]["start"].isoformat()
+        _process_notes(result["quarter"])
+        _compute_opm(result["quarter"])
+
+        cur_start = ctx_info[cur_q]["start"]
+        for cid in buckets["quarter"][1:]:
+            other_start = ctx_info[cid]["start"]
+            if other_start and cur_start and abs((cur_start - other_start).days - 365) <= 20:
+                yoy = extract(cid, _XBRL_FIELD_MAP)
+                if yoy:
+                    yoy["period_end"] = ctx_info[cid]["end"].isoformat()
+                    _compute_opm(yoy)
+                    result["yoy_comparison"] = yoy
+                break
+
+    if buckets["year"]:
+        cur_y = buckets["year"][0]
+        result["year"] = extract(cur_y, _XBRL_FIELD_MAP)
+        result["year"]["period_end"] = ctx_info[cur_y]["end"].isoformat()
+        result["year"]["period_start"] = ctx_info[cur_y]["start"].isoformat()
+        _process_notes(result["year"])
+        _compute_opm(result["year"])
+
+    return result
+
+
+FUNDAMENTALS_FILE = "fundamentals_summary.json"
+
+
+def _quarter_header(iso_date: str):
+    """'2026-06-30' -> 'Jun 2026' (matches fundamentals_summary.json's quarter header format)."""
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d")
+        return d.strftime("%b %Y")
+    except (ValueError, TypeError):
+        return None
+
+
+def _fundamentals_basis(symbol: str, xbrl_nature: str, fundamentals: dict):
+    """Returns (stock_dict, basis_label) if fundamentals_summary.json's stype
+    for this symbol matches the XBRL filing's own standalone/consolidated
+    nature, else (None, None) — see _compare_to_fundamentals docstring for
+    why we refuse to guess across a basis mismatch."""
+    if not fundamentals or not symbol:
+        return None, None
+    stock = fundamentals.get(symbol.upper())
+    if not stock:
+        return None, None
+    stype = (stock.get("stype") or "").strip().lower()
+    nature = (xbrl_nature or "").strip().lower()
+    basis_map = {"c": "consolidated", "s": "standalone"}
+    if stype not in basis_map or basis_map[stype] != nature:
+        return None, None
+    return stock, basis_map[stype]
+
+
+def _compare_to_fundamentals(stock: dict, basis: str, xbrl_quarter: dict, prior_header: str, suffix: str):
+    """
+    Shared comparison logic for both YoY and QoQ: looks up `prior_header`
+    in the stock's fundamentals quarters, and computes % change for
+    Revenue/PAT/EPS against the XBRL-parsed current quarter (xbrl_quarter)
+    — not against fundamentals' own current-quarter figure, which usually
+    isn't there yet (fundamentals lags the live XBRL feed).
+
+    suffix distinguishes the output field names ("yoy" -> sales_yoy_pct,
+    "qoq" -> sales_qoq_pct) so both can coexist in the same result dict.
+    """
+    if not xbrl_quarter or not prior_header:
+        return None
+    quarters = stock.get("quarters") or []
+    by_header = {q.get("header"): q for q in quarters if q.get("header")}
+    prior_q = by_header.get(prior_header)
+    if not prior_q:
+        return None
+
+    out = {"basis": basis, "basis_verified": True, "prior_header": prior_header}
+    field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
+    got_any = False
+    for xbrl_field, fund_field in field_map.items():
+        cur_v = xbrl_quarter.get(xbrl_field)
+        prior_v = prior_q.get(fund_field)
+        if cur_v is not None and prior_v is not None and prior_v != 0:
+            out[f"{fund_field}_prior"] = prior_v
+            out[f"{fund_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
+            got_any = True
+
+    # OPM — percentage-POINT change, not relative % change. A margin is
+    # already a percentage, so "OPM 24.1% (+1.8pp)" is what's meaningful,
+    # not "OPM changed by +8.1%" (relative change of a percentage is
+    # confusing to read). fundamentals' own 'opm' field is a decimal
+    # fraction (e.g. 0.223), same convention as xbrl_quarter['opm'].
+    cur_opm = xbrl_quarter.get("opm")
+    prior_opm = prior_q.get("opm")
+    if cur_opm is not None and prior_opm is not None:
+        out["opm_prior"] = round(prior_opm * 100, 2)
+        out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
+        got_any = True
+
+    return out if got_any else None
+
+
+def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, xbrl_nature: str, fundamentals: dict):
+    """
+    Fallback YoY using the fundamentals database when the XBRL filing itself
+    didn't tag a prior-year-same-quarter context (common — many filers only
+    tag the current period). Only needs fundamentals' PRIOR-year quarter —
+    the current quarter's figures come from the XBRL we already parsed.
+
+    BASIS CHECK: fundamentals_summary.json tags each stock's series with
+    `stype` ("c"=Consolidated, "s"=Standalone). We only compute YoY when
+    this matches the XBRL filing's own NatureOfReportStandaloneConsolidated
+    — Standalone vs Consolidated PAT/Revenue can differ by 15-20%+ for the
+    same company/quarter (seen directly: Paytm standalone PAT ₹185cr vs
+    consolidated ₹220cr, same quarter), so comparing across a basis
+    mismatch would produce a misleading % change. On mismatch or missing
+    stype, we skip rather than guess.
+    """
+    stock, basis = _fundamentals_basis(symbol, xbrl_nature, fundamentals)
+    if not stock:
+        return None
+    cur_header = _quarter_header(period_end_iso)
+    if not cur_header:
+        return None
+    try:
+        cur_month, cur_year = cur_header.split()
+        prior_header = f"{cur_month} {int(cur_year) - 1}"
+    except ValueError:
+        return None
+    return _compare_to_fundamentals(stock, basis, xbrl_quarter, prior_header, "yoy")
+
+
+def _qoq_fundamentals(symbol: str, xbrl_quarter: dict, xbrl_nature: str, fundamentals: dict):
+    """
+    QoQ (immediately-preceding quarter) comparison. XBRL filings essentially
+    never tag the prior quarter as a context (unlike prior-year, which some
+    filers do), so this is fundamentals-only — no XBRL-native equivalent to
+    check first, unlike YoY. Prior quarter is derived from the current
+    quarter's own period_start (one day earlier = prior quarter's end date),
+    which is exact rather than assuming a fixed calendar-quarter cycle.
+    """
+    if not xbrl_quarter:
+        return None
+    stock, basis = _fundamentals_basis(symbol, xbrl_nature, fundamentals)
+    if not stock:
+        return None
+    period_start = xbrl_quarter.get("period_start")
+    if not period_start:
+        return None
+    try:
+        start_date = datetime.strptime(period_start, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    prior_end = start_date - timedelta(days=1)
+    prior_header = prior_end.strftime("%b %Y")
+    return _compare_to_fundamentals(stock, basis, xbrl_quarter, prior_header, "qoq")
+
+
+async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3):
+    """Fetch raw XBRL bytes with backoff on 502/503/504/network errors —
+    same flakiness profile as NSE's other archive endpoints."""
+    for attempt in range(retries):
+        try:
+            r = await client.get(url, headers=BROWSER_HEADERS, timeout=30, follow_redirects=True)
+            if r.status_code == 404:
+                return None
+            if r.status_code in (502, 503, 504):
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                r.raise_for_status()
+            r.raise_for_status()
+            return r.content
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
+                continue
+            raise RuntimeError(str(e))
+    return None
+
+
+def _fmt_cr(val):
+    """Formats a raw rupee value as ₹X.XX Cr for Telegram messages."""
+    if val is None:
+        return "—"
+    try:
+        return f"₹{val / 1e7:,.2f} Cr"
+    except (TypeError, ZeroDivisionError):
+        return "—"
+
+
+def _telegram_result_message(parsed: dict) -> str:
+    meta = parsed.get("meta", {})
+    q = parsed.get("quarter", {})
+    company = meta.get("company_name") or parsed.get("title") or "Unknown"
+    nature = meta.get("standalone_consolidated") or ""
+    quarter_label = meta.get("quarter_label") or ""
+    audited = meta.get("audited") or ""
+
+    revenue = q.get("revenue")
+    pat = q.get("pat")
+    pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
+    cur_header = _quarter_header(q.get("period_end")) or ""
+
+    lines = [f"📊 <b>{company}</b>"]
+    tag_bits = [b for b in (nature, quarter_label, audited) if b]
+    if tag_bits:
+        lines.append(" · ".join(tag_bits))
+    board_date = meta.get("board_meeting_date")
+    if board_date:
+        lines.append(f"Result Date: {board_date}")
+
+    lines.append("")
+    lines.append(f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>")
+    lines.append(f"Rev: <b>{_fmt_cr(revenue)}</b>")
+    lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
+    if q.get("eps_basic") is not None:
+        lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
+
+    def _pct(cur_v, prior_v):
+        if cur_v is None or prior_v is None or prior_v == 0:
+            return None
+        return (cur_v - prior_v) / abs(prior_v) * 100
+
+    def _section(title, prior_header, prior_rev, prior_pat, rev_pct, pat_pct, opm_current_pct=None, opm_pp=None, prefix=""):
+        sec = ["", f"<b>{title}{' (vs ' + prior_header + ')' if prior_header else ''}</b>"]
+        if prior_rev is not None and rev_pct is not None:
+            sec.append(f"Rev: {_fmt_cr(prior_rev)} → {prefix}{'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%")
+        if prior_pat is not None and pat_pct is not None:
+            sec.append(f"PAT: {_fmt_cr(prior_pat)} → {prefix}{'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%")
+        if opm_current_pct is not None and opm_pp is not None:
+            sec.append(f"OPM: {opm_current_pct}% ({prefix}{'+' if opm_pp >= 0 else ''}{opm_pp:.1f}pp)")
+        return sec if len(sec) > 2 else []
+
+    cur_opm_pct = round(q["opm"] * 100, 2) if q.get("opm") is not None else None
+
+    # QoQ — always fundamentals-sourced (XBRL never tags the immediately
+    # preceding quarter), so always carries the basis_verified/~ treatment.
+    qf = parsed.get("qoq_fundamentals")
+    if qf:
+        prefix = "" if qf.get("basis_verified") else "~"
+        lines += _section("QoQ", qf.get("prior_header"), qf.get("sales_prior"), qf.get("pat_prior"),
+                           qf.get("sales_qoq_pct"), qf.get("pat_qoq_pct"),
+                           cur_opm_pct, qf.get("opm_qoq_pp"), prefix)
+
+    # YoY — prefer XBRL-native (same-basis-guaranteed) over the fundamentals fallback
+    yoy = parsed.get("yoy_comparison")
+    yf = parsed.get("yoy_fundamentals")
+    if yoy:
+        rev_pct = _pct(revenue, yoy.get("revenue"))
+        pat_pct = _pct(pat, yoy.get("pat"))
+        yoy_header = _quarter_header(yoy.get("period_end"))
+        opm_pp = round((q["opm"] - yoy["opm"]) * 100, 2) if q.get("opm") is not None and yoy.get("opm") is not None else None
+        lines += _section("YoY", yoy_header, yoy.get("revenue"), yoy.get("pat"), rev_pct, pat_pct, cur_opm_pct, opm_pp)
+    elif yf:
+        prefix = "" if yf.get("basis_verified") else "~"
+        lines += _section("YoY", yf.get("prior_header"), yf.get("sales_prior"), yf.get("pat_prior"),
+                           yf.get("sales_yoy_pct"), yf.get("pat_yoy_pct"),
+                           cur_opm_pct, yf.get("opm_yoy_pp"), prefix)
+
+    if q.get("yoy_caution"):
+        lines.append("")
+        lines.append("⚠️ Company notes: results may not be YoY comparable")
+
+    return "\n".join(lines)
+
+
+async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], fundamentals: dict | None) -> dict | None:
+    """
+    For nse_results_feed.json items whose link points to an XBRL file,
+    fetch + parse P&L figures and merge into nse_results_detailed.json.
+    Only processes links not already present (idempotent across runs —
+    avoids re-fetching ~150+ XBRL files every poll).
+    """
+    xbrl_items = [it for it in results_items if XBRL_LINK_RE.search(it.get("link", ""))]
+    if not xbrl_items:
+        print("  ⚠ No XBRL-linked results items — skipping detail parse")
+        return None
+
+    existing = await r2_get(client, "nse_results_detailed.json")
+    existing_items = (existing or {}).get("items", [])
+    existing_links = {it.get("link") for it in existing_items}
+
+    new_items = [it for it in xbrl_items if it["link"] not in existing_links]
+    if not new_items:
+        print("  ✓ nse_results_detailed: no new XBRL filings to parse")
+        return None
+
+    print(f"  Parsing {len(new_items)} new XBRL result filing(s)...")
+    sem = asyncio.Semaphore(5)  # be polite to nsearchives.nseindia.com
+
+    async def process(it):
+        async with sem:
+            try:
+                content = await fetch_xbrl_bytes(client, it["link"])
+                if not content:
+                    return None
+                parsed = parse_financial_results_xbrl(content)
+                if not parsed.get("quarter") and not parsed.get("year"):
+                    return None  # not a financial-results XBRL (or empty) — skip silently
+                parsed["link"] = it["link"]
+                parsed["title"] = it.get("title", "")
+                parsed["published"] = it.get("published", "")
+                parsed["published_ts"] = it.get("published_ts", 0)
+
+                if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
+                    symbol = parsed.get("meta", {}).get("symbol")
+                    nature = parsed.get("meta", {}).get("standalone_consolidated")
+                    yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], nature, fundamentals)
+                    if yoy_fund:
+                        parsed["yoy_fundamentals"] = yoy_fund
+
+                if parsed.get("quarter"):
+                    symbol = parsed.get("meta", {}).get("symbol")
+                    nature = parsed.get("meta", {}).get("standalone_consolidated")
+                    qoq_fund = _qoq_fundamentals(symbol, parsed["quarter"], nature, fundamentals)
+                    if qoq_fund:
+                        parsed["qoq_fundamentals"] = qoq_fund
+
+                return parsed
+            except Exception as e:
+                print(f"  ⚠ XBRL parse failed for {it['link'].split('/')[-1]}: {e}")
+                return None
+
+    results = await asyncio.gather(*(process(it) for it in new_items))
+    parsed_new = [r for r in results if r]
+    print(f"  ✓ Parsed {len(parsed_new)}/{len(new_items)} successfully")
+
+    if parsed_new:
+        print(f"  Sending {len(parsed_new)} Telegram message(s)...")
+        if not TELEGRAM_RESULTS_CHAT_ID:
+            print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
+                  "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
+                  "Set TELEGRAM_RESULTS_CHAT_ID to send these to a separate channel.")
+        # Sequential with a small delay — Telegram's per-chat flood limit is
+        # roughly ~1 msg/sec sustained; sending a batch of ~20 all at once
+        # risks 429s. Individual send failures are swallowed (not fatal to
+        # the pipeline — results are still saved to R2 either way).
+        for parsed in parsed_new:
+            try:
+                send_message(_telegram_result_message(parsed), chat_id=TELEGRAM_RESULTS_CHAT_ID)
+            except Exception as e:
+                print(f"  ⚠ Telegram send failed for {parsed.get('meta', {}).get('symbol')}: {e}")
+            await asyncio.sleep(1)
+
+    merged = existing_items + parsed_new
+    merged.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+    merged = merged[:1000]  # cap file size — keep most recent 1000 filings
+
+    return make_payload(merged)
+
+
+async def run():
+    now = datetime.now(timezone.utc).isoformat()
+    print(f"Fetching all feeds... [{now}]")
+
+    async with httpx.AsyncClient() as client:
+        # Fetch all feeds concurrently
+        tasks = [fetch_feed(client, sk, label, url) for sk, label, url in FEEDS]
+        results = await asyncio.gather(*tasks)
+        result_map  = {sk: items for sk, items, ok in results}
+        success_map = {sk: ok    for sk, items, ok in results}
+
+        uploads = []
+        results_feed_items = []
+
+        for filename, source_keys in OUTPUT_MAP.items():
+
+            failed_sources = [sk for sk in source_keys if not success_map.get(sk, False)]
+            if failed_sources:
+                print(f"  ⚠ {filename}: skipping upload — fetch failed for {failed_sources}, "
+                      f"keeping existing R2 data untouched")
+                continue
+
+            items = []
+            for sk in source_keys:
+                items.extend(result_map.get(sk, []))
+
+            # Newest first (merged sources ke liye zaroori, aur dedup
+            # latest published wala instance rakhta hai)
+            items.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+
+            before = len(items)
+            items = [it for it in items if not is_noise(it)]
+            dropped_noise = before - len(items)
+
+            before_dedup = len(items)
+            items = dedup_items(items)
+            dropped_dup = before_dedup - len(items)
+
+            if dropped_noise or dropped_dup:
+                print(f"  {filename}: -{dropped_noise} noise, -{dropped_dup} dup → {len(items)}")
+
+            if filename == "nse_results_feed.json":
+                results_feed_items = items
+
+            uploads.append((filename, make_payload(items)))
+
+        # Upload all concurrently
+        print("\nUploading to R2...")
+        upload_tasks = [r2_put(client, fname, payload) for fname, payload in uploads]
+        await asyncio.gather(*upload_tasks)
+
+        # ── Financial results detail (P&L from XBRL) ────────────────────
+        print("\nParsing financial results XBRL...")
+        fundamentals = await r2_get(client, FUNDAMENTALS_FILE)
+        fundamentals_stocks = (fundamentals or {}).get("stocks")
+        if not fundamentals_stocks:
+            print(f"  ⚠ {FUNDAMENTALS_FILE} unavailable — YoY fallback via fundamentals disabled this run")
+        detailed_payload = await build_results_detailed(client, results_feed_items, fundamentals_stocks)
+        if detailed_payload:
+            await r2_put(client, "nse_results_detailed.json", detailed_payload)
+
+    print("✅ Done")
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
