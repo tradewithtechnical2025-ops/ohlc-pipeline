@@ -3,7 +3,7 @@ pipeline_results_backfill.py — ONE-TIME script.
 
 Re-fetches and re-parses every entry already in nse_results_detailed.json
 using the current version of the XBRL parser + YoY-fundamentals logic in
-nse_pipeline.py. Run this once whenever the parser gains new fields (e.g.
+pipeline_news.py. Run this once whenever the parser gains new fields (e.g.
 notes/yoy_caution, basis-verified fundamentals YoY) that older entries were
 processed before, so existing entries pick up the improvements instead of
 waiting for their next filing (which could be months away).
@@ -18,7 +18,7 @@ Usage: python pipeline_results_backfill.py
 import asyncio
 import httpx
 
-from nse_pipeline import (
+from pipeline_news import (
     r2_get,
     r2_put,
     fetch_xbrl_bytes,
