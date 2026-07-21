@@ -247,7 +247,18 @@ _XBRL_FIELD_MAP = {
     "FaceValueOfEquityShareCapital":                                      "face_value",
     "BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations":   "eps_basic",
     "DilutedEarningsLossPerShareFromContinuingAndDiscontinuedOperations": "eps_diluted",
+    "DisclosureOfNotesOnFinancialResultsExplanatoryTextBlock":            "notes_raw",
 }
+
+# Phrases NSE filers commonly use to flag that this period isn't a fair
+# YoY comparison (business transfers, discontinued ops, restructuring,
+# scheme of arrangement, etc). Matched case-insensitively against the
+# filing's own notes text — if the company itself says it, we surface it
+# rather than silently showing a misleading % change.
+_NOT_COMPARABLE_RE = re.compile(
+    r"not\s+compar(e|able)|not\s+directly\s+compar|results?\s+(are|is)\s+not\s+compar",
+    re.IGNORECASE,
+)
 
 _XBRL_META_TAGS = {
     "ScripCode":                                          "scrip_code",
@@ -318,6 +329,37 @@ def _xbrl_bucket(days):
     return None
 
 
+def _process_notes(period_dict: dict, max_notes_chars: int = 600) -> None:
+    """
+    Mutates period_dict in place: pops the raw notes text, cleans it, checks
+    for a company-stated "not comparable" caveat (common when a business
+    segment was transferred/discontinued — e.g. Paytm's Q1 FY27 standalone
+    revenue after moving its offline merchant business to a subsidiary),
+    and stores a short excerpt + boolean flag plus a truncated general note.
+    Scans the FULL text for the caveat before truncating, so a disclaimer
+    buried deep in a long notes block isn't missed.
+    """
+    raw = period_dict.pop("notes_raw", None)
+    if not raw or not isinstance(raw, str):
+        return
+
+    cleaned = re.sub(r"<br\s*/?>", " ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+    m = _NOT_COMPARABLE_RE.search(cleaned)
+    if m:
+        # grab the sentence containing the match for a short, useful excerpt
+        start = cleaned.rfind(".", 0, m.start()) + 1
+        end = cleaned.find(".", m.end())
+        end = end + 1 if end != -1 else min(len(cleaned), m.end() + 200)
+        excerpt = cleaned[start:end].strip()
+        period_dict["yoy_caution"] = True
+        period_dict["yoy_caution_note"] = excerpt[:400]
+
+    if cleaned:
+        period_dict["notes"] = cleaned[:max_notes_chars] + ("…" if len(cleaned) > max_notes_chars else "")
+
+
 def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
     """Parses raw XBRL bytes into {meta, quarter, year, yoy_comparison}."""
     from xml.etree import ElementTree as ET
@@ -370,6 +412,7 @@ def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
         result["quarter"] = extract(cur_q, _XBRL_FIELD_MAP)
         result["quarter"]["period_end"] = ctx_info[cur_q]["end"].isoformat()
         result["quarter"]["period_start"] = ctx_info[cur_q]["start"].isoformat()
+        _process_notes(result["quarter"])
 
         cur_start = ctx_info[cur_q]["start"]
         for cid in buckets["quarter"][1:]:
@@ -386,6 +429,7 @@ def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
         result["year"] = extract(cur_y, _XBRL_FIELD_MAP)
         result["year"]["period_end"] = ctx_info[cur_y]["end"].isoformat()
         result["year"]["period_start"] = ctx_info[cur_y]["start"].isoformat()
+        _process_notes(result["year"])
 
     return result
 
@@ -402,7 +446,7 @@ def _quarter_header(iso_date: str):
         return None
 
 
-def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, fundamentals: dict):
+def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, xbrl_nature: str, fundamentals: dict):
     """
     Fallback YoY using the fundamentals database when the XBRL filing itself
     didn't tag a prior-year-same-quarter context (common — many filers only
@@ -410,23 +454,31 @@ def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, fund
 
     Only the PRIOR-year quarter is needed from fundamentals_summary.json —
     the current quarter's Revenue/PAT/EPS come from the XBRL we already
-    parsed (xbrl_quarter), not from fundamentals. This matters because
-    fundamentals_summary.json lags the live XBRL results feed by up to a
-    quarter (it's updated on its own overnight schedule) — a result filed
-    today often has no entry for its own quarter in fundamentals yet, but
-    the prior-year quarter (needed for comparison) is usually already there.
+    parsed (xbrl_quarter), not from fundamentals (which lags the live XBRL
+    feed by up to a quarter — a result filed today often has no entry for
+    its own quarter yet, but the prior-year quarter usually does).
 
-    CAVEAT: fundamentals_summary.json's `quarters` array is a single series
-    per symbol — we don't know for certain whether Finedge sourced it as
-    standalone or consolidated, and a company can file both. So this stays
-    separate from the XBRL-derived `yoy_comparison` (same-basis-guaranteed)
-    rather than merged into it, and callers should treat it as approximate.
+    BASIS CHECK: fundamentals_summary.json tags each stock's series with
+    `stype` ("c"=Consolidated, "s"=Standalone). We only compute YoY when
+    this matches the XBRL filing's own NatureOfReportStandaloneConsolidated
+    — Standalone vs Consolidated PAT/Revenue can differ by 15-20%+ for the
+    same company/quarter (seen directly: Paytm standalone PAT ₹185cr vs
+    consolidated ₹220cr, same quarter), so comparing across a basis
+    mismatch would produce a misleading % change. On mismatch or missing
+    stype, we skip rather than guess.
     """
     if not fundamentals or not symbol or not xbrl_quarter:
         return None
     stock = fundamentals.get(symbol.upper())
     if not stock:
         return None
+
+    stype = (stock.get("stype") or "").strip().lower()
+    nature = (xbrl_nature or "").strip().lower()
+    basis_map = {"c": "consolidated", "s": "standalone"}
+    if stype not in basis_map or basis_map[stype] != nature:
+        return None  # basis mismatch or unknown — don't guess
+
     quarters = stock.get("quarters") or []
     cur_header = _quarter_header(period_end_iso)
     if not cur_header:
@@ -442,8 +494,7 @@ def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, fund
     if not prior_q:
         return None
 
-    out = {"basis": "fundamentals_summary (standalone/consolidated not confirmed to match XBRL)",
-           "prior_header": prior_header}
+    out = {"basis": basis_map[stype], "basis_verified": True, "prior_header": prior_header}
     field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
     got_any = False
     for xbrl_field, fund_field in field_map.items():
@@ -521,7 +572,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
                 if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
                     symbol = parsed.get("meta", {}).get("symbol")
-                    yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], fundamentals)
+                    nature = parsed.get("meta", {}).get("standalone_consolidated")
+                    yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], nature, fundamentals)
                     if yoy_fund:
                         parsed["yoy_fundamentals"] = yoy_fund
 
