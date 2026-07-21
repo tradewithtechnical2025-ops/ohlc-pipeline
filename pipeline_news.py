@@ -575,19 +575,33 @@ def _telegram_result_message(parsed: dict) -> str:
 
     yoy = parsed.get("yoy_comparison")
     yf = parsed.get("yoy_fundamentals")
-    if yoy and yoy.get("pat") is not None and pat is not None and yoy["pat"] != 0:
-        pct = (pat - yoy["pat"]) / abs(yoy["pat"]) * 100
-        lines.append(f"YoY PAT: {'+' if pct >= 0 else ''}{pct:.1f}%")
-    elif yf and yf.get("pat_yoy_pct") is not None:
+
+    def _pct(cur_v, prior_v):
+        if cur_v is None or prior_v is None or prior_v == 0:
+            return None
+        return (cur_v - prior_v) / abs(prior_v) * 100
+
+    if yoy:
+        # XBRL-native comparison — same-basis-guaranteed, no ~ prefix
+        rev_pct = _pct(q.get("revenue"), yoy.get("revenue"))
+        pat_pct = _pct(pat, yoy.get("pat"))
+        eps_pct = _pct(q.get("eps_basic"), yoy.get("eps_basic"))
+        if rev_pct is not None:
+            lines.append(f"YoY Rev: {'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%")
+        if pat_pct is not None:
+            lines.append(f"YoY PAT: {'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%")
+        if eps_pct is not None:
+            lines.append(f"YoY EPS: {'+' if eps_pct >= 0 else ''}{eps_pct:.1f}%")
+    elif yf:
+        # Fallback source (fundamentals DB) — ~ prefix unless basis_verified
         prefix = "" if yf.get("basis_verified") else "~"
-        lines.append(f"YoY PAT: {prefix}{'+' if yf['pat_yoy_pct'] >= 0 else ''}{yf['pat_yoy_pct']:.1f}%")
+        for label, key in (("YoY Rev", "sales_yoy_pct"), ("YoY PAT", "pat_yoy_pct"), ("YoY EPS", "eps_yoy_pct")):
+            pct = yf.get(key)
+            if pct is not None:
+                lines.append(f"{label}: {prefix}{'+' if pct >= 0 else ''}{pct:.1f}%")
 
     if q.get("yoy_caution"):
         lines.append("⚠️ Company notes: results may not be YoY comparable")
-
-    link = parsed.get("link")
-    if link:
-        lines.append(f'<a href="{link}">View Filing</a>')
 
     return "\n".join(lines)
 
