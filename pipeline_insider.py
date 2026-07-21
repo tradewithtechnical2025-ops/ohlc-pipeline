@@ -254,14 +254,41 @@ async def r2_put(client, filename, data):
     print(f"✓ Uploaded {filename}")
 
 
+async def fetch_rss_with_retry(client: httpx.AsyncClient, url: str, max_retries: int = 4):
+    """
+    Fetches + parses the RSS feed, retrying if NSE serves a genuinely-empty-
+    but-200 response — confirmed to happen transiently (0 items one run,
+    normal count the next, no other change). get_with_retry's own domain
+    fallback only triggers on an HTTP-level failure, not on a 200-with-0-
+    entries response, so this loop explicitly alternates between the
+    primary and legacy domain across attempts to give the empty-response
+    case a real chance at a different domain too.
+    """
+    fallback_url = url.replace("nsearchives.nseindia.com", "archives.nseindia.com") \
+        if "nsearchives.nseindia.com" in url else url
+    urls_to_try = [url, fallback_url, url, fallback_url][:max_retries]
+
+    feed = None
+    for attempt, try_url in enumerate(urls_to_try):
+        resp = await get_with_retry(client, try_url)
+        feed = feedparser.parse(resp.content)
+        if feed.entries:
+            return feed
+        if attempt < len(urls_to_try) - 1:
+            wait = 2 ** attempt + random.uniform(0, 1)
+            print(f"⚠ RSS returned 0 items from {try_url.split('/')[2]}, retrying in {wait:.1f}s (attempt {attempt + 1}/{len(urls_to_try)})")
+            await asyncio.sleep(wait)
+    print("⚠ RSS still 0 items after all retries/domains — proceeding with empty (existing history is preserved either way)")
+    return feed
+
+
 async def run():
     print("Fetching RSS...")
     fetch_client = await new_nse_client()
     try:
-        rss_resp = await get_with_retry(fetch_client, RSS_URL)
+        feed = await fetch_rss_with_retry(fetch_client, RSS_URL)
     finally:
         await fetch_client.aclose()
-    feed = feedparser.parse(rss_resp.content)
     print(f"RSS Items: {len(feed.entries)}")
 
     rss_items = []
