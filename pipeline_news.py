@@ -4,7 +4,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import feedparser
 import httpx
 
@@ -457,17 +457,62 @@ def _quarter_header(iso_date: str):
         return None
 
 
+def _fundamentals_basis(symbol: str, xbrl_nature: str, fundamentals: dict):
+    """Returns (stock_dict, basis_label) if fundamentals_summary.json's stype
+    for this symbol matches the XBRL filing's own standalone/consolidated
+    nature, else (None, None) — see _compare_to_fundamentals docstring for
+    why we refuse to guess across a basis mismatch."""
+    if not fundamentals or not symbol:
+        return None, None
+    stock = fundamentals.get(symbol.upper())
+    if not stock:
+        return None, None
+    stype = (stock.get("stype") or "").strip().lower()
+    nature = (xbrl_nature or "").strip().lower()
+    basis_map = {"c": "consolidated", "s": "standalone"}
+    if stype not in basis_map or basis_map[stype] != nature:
+        return None, None
+    return stock, basis_map[stype]
+
+
+def _compare_to_fundamentals(stock: dict, basis: str, xbrl_quarter: dict, prior_header: str, suffix: str):
+    """
+    Shared comparison logic for both YoY and QoQ: looks up `prior_header`
+    in the stock's fundamentals quarters, and computes % change for
+    Revenue/PAT/EPS against the XBRL-parsed current quarter (xbrl_quarter)
+    — not against fundamentals' own current-quarter figure, which usually
+    isn't there yet (fundamentals lags the live XBRL feed).
+
+    suffix distinguishes the output field names ("yoy" -> sales_yoy_pct,
+    "qoq" -> sales_qoq_pct) so both can coexist in the same result dict.
+    """
+    if not xbrl_quarter or not prior_header:
+        return None
+    quarters = stock.get("quarters") or []
+    by_header = {q.get("header"): q for q in quarters if q.get("header")}
+    prior_q = by_header.get(prior_header)
+    if not prior_q:
+        return None
+
+    out = {"basis": basis, "basis_verified": True, "prior_header": prior_header}
+    field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
+    got_any = False
+    for xbrl_field, fund_field in field_map.items():
+        cur_v = xbrl_quarter.get(xbrl_field)
+        prior_v = prior_q.get(fund_field)
+        if cur_v is not None and prior_v is not None and prior_v != 0:
+            out[f"{fund_field}_prior"] = prior_v
+            out[f"{fund_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
+            got_any = True
+    return out if got_any else None
+
+
 def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, xbrl_nature: str, fundamentals: dict):
     """
     Fallback YoY using the fundamentals database when the XBRL filing itself
     didn't tag a prior-year-same-quarter context (common — many filers only
-    tag the current period).
-
-    Only the PRIOR-year quarter is needed from fundamentals_summary.json —
-    the current quarter's Revenue/PAT/EPS come from the XBRL we already
-    parsed (xbrl_quarter), not from fundamentals (which lags the live XBRL
-    feed by up to a quarter — a result filed today often has no entry for
-    its own quarter yet, but the prior-year quarter usually does).
+    tag the current period). Only needs fundamentals' PRIOR-year quarter —
+    the current quarter's figures come from the XBRL we already parsed.
 
     BASIS CHECK: fundamentals_summary.json tags each stock's series with
     `stype` ("c"=Consolidated, "s"=Standalone). We only compute YoY when
@@ -478,19 +523,9 @@ def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, xbrl
     mismatch would produce a misleading % change. On mismatch or missing
     stype, we skip rather than guess.
     """
-    if not fundamentals or not symbol or not xbrl_quarter:
-        return None
-    stock = fundamentals.get(symbol.upper())
+    stock, basis = _fundamentals_basis(symbol, xbrl_nature, fundamentals)
     if not stock:
         return None
-
-    stype = (stock.get("stype") or "").strip().lower()
-    nature = (xbrl_nature or "").strip().lower()
-    basis_map = {"c": "consolidated", "s": "standalone"}
-    if stype not in basis_map or basis_map[stype] != nature:
-        return None  # basis mismatch or unknown — don't guess
-
-    quarters = stock.get("quarters") or []
     cur_header = _quarter_header(period_end_iso)
     if not cur_header:
         return None
@@ -499,23 +534,33 @@ def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, xbrl
         prior_header = f"{cur_month} {int(cur_year) - 1}"
     except ValueError:
         return None
+    return _compare_to_fundamentals(stock, basis, xbrl_quarter, prior_header, "yoy")
 
-    by_header = {q.get("header"): q for q in quarters if q.get("header")}
-    prior_q = by_header.get(prior_header)
-    if not prior_q:
+
+def _qoq_fundamentals(symbol: str, xbrl_quarter: dict, xbrl_nature: str, fundamentals: dict):
+    """
+    QoQ (immediately-preceding quarter) comparison. XBRL filings essentially
+    never tag the prior quarter as a context (unlike prior-year, which some
+    filers do), so this is fundamentals-only — no XBRL-native equivalent to
+    check first, unlike YoY. Prior quarter is derived from the current
+    quarter's own period_start (one day earlier = prior quarter's end date),
+    which is exact rather than assuming a fixed calendar-quarter cycle.
+    """
+    if not xbrl_quarter:
         return None
-
-    out = {"basis": basis_map[stype], "basis_verified": True, "prior_header": prior_header}
-    field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
-    got_any = False
-    for xbrl_field, fund_field in field_map.items():
-        cur_v = xbrl_quarter.get(xbrl_field)
-        prior_v = prior_q.get(fund_field)
-        if cur_v is not None and prior_v is not None and prior_v != 0:
-            out[f"{fund_field}_prior"] = prior_v
-            out[f"{fund_field}_yoy_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
-            got_any = True
-    return out if got_any else None
+    stock, basis = _fundamentals_basis(symbol, xbrl_nature, fundamentals)
+    if not stock:
+        return None
+    period_start = xbrl_quarter.get("period_start")
+    if not period_start:
+        return None
+    try:
+        start_date = datetime.strptime(period_start, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+    prior_end = start_date - timedelta(days=1)
+    prior_header = prior_end.strftime("%b %Y")
+    return _compare_to_fundamentals(stock, basis, xbrl_quarter, prior_header, "qoq")
 
 
 async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3):
@@ -561,8 +606,10 @@ def _telegram_result_message(parsed: dict) -> str:
     quarter_label = meta.get("quarter_label") or ""
     audited = meta.get("audited") or ""
 
+    revenue = q.get("revenue")
     pat = q.get("pat")
     pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
+    cur_header = _quarter_header(q.get("period_end")) or ""
 
     lines = [f"📊 <b>{company}</b>"]
     tag_bits = [b for b in (nature, quarter_label, audited) if b]
@@ -571,39 +618,50 @@ def _telegram_result_message(parsed: dict) -> str:
     board_date = meta.get("board_meeting_date")
     if board_date:
         lines.append(f"Result Date: {board_date}")
-    lines.append(f"Rev: <b>{_fmt_cr(q.get('revenue'))}</b>")
+
+    lines.append("")
+    lines.append(f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>")
+    lines.append(f"Rev: <b>{_fmt_cr(revenue)}</b>")
     lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
     if q.get("eps_basic") is not None:
         lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
-
-    yoy = parsed.get("yoy_comparison")
-    yf = parsed.get("yoy_fundamentals")
 
     def _pct(cur_v, prior_v):
         if cur_v is None or prior_v is None or prior_v == 0:
             return None
         return (cur_v - prior_v) / abs(prior_v) * 100
 
+    def _section(title, prior_header, prior_rev, prior_pat, rev_pct, pat_pct, prefix=""):
+        sec = ["", f"<b>{title}{' (vs ' + prior_header + ')' if prior_header else ''}</b>"]
+        if prior_rev is not None and rev_pct is not None:
+            sec.append(f"Rev: {_fmt_cr(prior_rev)} → {prefix}{'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%")
+        if prior_pat is not None and pat_pct is not None:
+            sec.append(f"PAT: {_fmt_cr(prior_pat)} → {prefix}{'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%")
+        return sec if len(sec) > 2 else []
+
+    # QoQ — always fundamentals-sourced (XBRL never tags the immediately
+    # preceding quarter), so always carries the basis_verified/~ treatment.
+    qf = parsed.get("qoq_fundamentals")
+    if qf:
+        prefix = "" if qf.get("basis_verified") else "~"
+        lines += _section("QoQ", qf.get("prior_header"), qf.get("sales_prior"), qf.get("pat_prior"),
+                           qf.get("sales_qoq_pct"), qf.get("pat_qoq_pct"), prefix)
+
+    # YoY — prefer XBRL-native (same-basis-guaranteed) over the fundamentals fallback
+    yoy = parsed.get("yoy_comparison")
+    yf = parsed.get("yoy_fundamentals")
     if yoy:
-        # XBRL-native comparison — same-basis-guaranteed, no ~ prefix
-        rev_pct = _pct(q.get("revenue"), yoy.get("revenue"))
+        rev_pct = _pct(revenue, yoy.get("revenue"))
         pat_pct = _pct(pat, yoy.get("pat"))
-        eps_pct = _pct(q.get("eps_basic"), yoy.get("eps_basic"))
-        if rev_pct is not None:
-            lines.append(f"YoY Rev: {'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%")
-        if pat_pct is not None:
-            lines.append(f"YoY PAT: {'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%")
-        if eps_pct is not None:
-            lines.append(f"YoY EPS: {'+' if eps_pct >= 0 else ''}{eps_pct:.1f}%")
+        yoy_header = _quarter_header(yoy.get("period_end"))
+        lines += _section("YoY", yoy_header, yoy.get("revenue"), yoy.get("pat"), rev_pct, pat_pct)
     elif yf:
-        # Fallback source (fundamentals DB) — ~ prefix unless basis_verified
         prefix = "" if yf.get("basis_verified") else "~"
-        for label, key in (("YoY Rev", "sales_yoy_pct"), ("YoY PAT", "pat_yoy_pct"), ("YoY EPS", "eps_yoy_pct")):
-            pct = yf.get(key)
-            if pct is not None:
-                lines.append(f"{label}: {prefix}{'+' if pct >= 0 else ''}{pct:.1f}%")
+        lines += _section("YoY", yf.get("prior_header"), yf.get("sales_prior"), yf.get("pat_prior"),
+                           yf.get("sales_yoy_pct"), yf.get("pat_yoy_pct"), prefix)
 
     if q.get("yoy_caution"):
+        lines.append("")
         lines.append("⚠️ Company notes: results may not be YoY comparable")
 
     return "\n".join(lines)
@@ -653,6 +711,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                     yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], nature, fundamentals)
                     if yoy_fund:
                         parsed["yoy_fundamentals"] = yoy_fund
+
+                if parsed.get("quarter"):
+                    symbol = parsed.get("meta", {}).get("symbol")
+                    nature = parsed.get("meta", {}).get("standalone_consolidated")
+                    qoq_fund = _qoq_fundamentals(symbol, parsed["quarter"], nature, fundamentals)
+                    if qoq_fund:
+                        parsed["qoq_fundamentals"] = qoq_fund
 
                 return parsed
             except Exception as e:
