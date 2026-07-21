@@ -568,6 +568,9 @@ def _telegram_result_message(parsed: dict) -> str:
     tag_bits = [b for b in (nature, quarter_label, audited) if b]
     if tag_bits:
         lines.append(" · ".join(tag_bits))
+    board_date = meta.get("board_meeting_date")
+    if board_date:
+        lines.append(f"Result Date: {board_date}")
     lines.append(f"Rev: <b>{_fmt_cr(q.get('revenue'))}</b>")
     lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
     if q.get("eps_basic") is not None:
