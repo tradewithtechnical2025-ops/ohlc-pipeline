@@ -42,16 +42,25 @@ PIPELINE_EMOJIS = {
 # Low-level send
 # ──────────────────────────────────────────────
 
-def send_message(text: str, silent: bool = False) -> bool:
-    """Send a plain-text Telegram message. Returns True on success."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
+    """
+    Send a plain-text Telegram message. Returns True on success.
+
+    chat_id: optional override — sends to this chat instead of the default
+    TELEGRAM_CHAT_ID (e.g. a separate channel for a specific message type,
+    like financial-results alerts, so they don't mix with pipeline status
+    notifications in the main channel). Falls back to TELEGRAM_CHAT_ID if
+    not given.
+    """
+    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not TELEGRAM_BOT_TOKEN or not target_chat_id:
         print("[telegram_notify] Token or chat_id missing — skipping notification.")
         return False
     try:
         resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={
-                "chat_id":                  TELEGRAM_CHAT_ID,
+                "chat_id":                  target_chat_id,
                 "text":                     text,
                 "parse_mode":               "HTML",
                 "disable_notification":     silent,
