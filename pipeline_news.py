@@ -402,20 +402,27 @@ def _quarter_header(iso_date: str):
         return None
 
 
-def _yoy_fundamentals(symbol: str, period_end_iso: str, fundamentals: dict):
+def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, fundamentals: dict):
     """
     Fallback YoY using the fundamentals database when the XBRL filing itself
     didn't tag a prior-year-same-quarter context (common — many filers only
     tag the current period).
 
+    Only the PRIOR-year quarter is needed from fundamentals_summary.json —
+    the current quarter's Revenue/PAT/EPS come from the XBRL we already
+    parsed (xbrl_quarter), not from fundamentals. This matters because
+    fundamentals_summary.json lags the live XBRL results feed by up to a
+    quarter (it's updated on its own overnight schedule) — a result filed
+    today often has no entry for its own quarter in fundamentals yet, but
+    the prior-year quarter (needed for comparison) is usually already there.
+
     CAVEAT: fundamentals_summary.json's `quarters` array is a single series
     per symbol — we don't know for certain whether Finedge sourced it as
-    standalone or consolidated, and a company can file both. So this is
-    kept separate from the XBRL-derived `yoy_comparison` (which is
-    same-basis-guaranteed) rather than merged into it, and callers should
-    treat it as approximate.
+    standalone or consolidated, and a company can file both. So this stays
+    separate from the XBRL-derived `yoy_comparison` (same-basis-guaranteed)
+    rather than merged into it, and callers should treat it as approximate.
     """
-    if not fundamentals or not symbol:
+    if not fundamentals or not symbol or not xbrl_quarter:
         return None
     stock = fundamentals.get(symbol.upper())
     if not stock:
@@ -431,18 +438,22 @@ def _yoy_fundamentals(symbol: str, period_end_iso: str, fundamentals: dict):
         return None
 
     by_header = {q.get("header"): q for q in quarters if q.get("header")}
-    cur_q, prior_q = by_header.get(cur_header), by_header.get(prior_header)
-    if not cur_q or not prior_q:
+    prior_q = by_header.get(prior_header)
+    if not prior_q:
         return None
 
     out = {"basis": "fundamentals_summary (standalone/consolidated not confirmed to match XBRL)",
            "prior_header": prior_header}
-    for field in ("sales", "pat", "eps"):
-        cur_v, prior_v = cur_q.get(field), prior_q.get(field)
+    field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
+    got_any = False
+    for xbrl_field, fund_field in field_map.items():
+        cur_v = xbrl_quarter.get(xbrl_field)
+        prior_v = prior_q.get(fund_field)
         if cur_v is not None and prior_v is not None and prior_v != 0:
-            out[f"{field}_prior"] = prior_v
-            out[f"{field}_yoy_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
-    return out if len(out) > 2 else None
+            out[f"{fund_field}_prior"] = prior_v
+            out[f"{fund_field}_yoy_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
+            got_any = True
+    return out if got_any else None
 
 
 async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3):
@@ -510,7 +521,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
                 if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
                     symbol = parsed.get("meta", {}).get("symbol")
-                    yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], fundamentals)
+                    yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], fundamentals)
                     if yoy_fund:
                         parsed["yoy_fundamentals"] = yoy_fund
 
