@@ -2,140 +2,8 @@
 """
 Finedge Fundamentals — PRODUCTION pipeline (v3, R2-wired)
 ============================================================
-Standalone pipeline — does NOT touch pipeline.py or fundamentals.json.
-Writes to R2 as PER-SYMBOL files: fundamentals_full/{SYMBOL}.json
-(not one combined blob — keeps per-page load light, see size discussion).
-
-ALSO maintains one lightweight combined file: fundamentals_summary.json
-(all stocks, ~15 fields each + last 5 quarters' PL) — feeds the frontend's
-Results Comparison and Peer Comparison features, which genuinely need
-many stocks at once. Built from data already fetched for the per-symbol
-file — no extra API calls. market_cap is deliberately NOT included here
-(it's price-driven, changes daily for every stock — frontend computes it
-live as diluted_shares × ltp from screener_feed.json).
-
-Stock universe: read from classification.json (already in R2, same source
-pipeline.py uses for sector/industry), filtered to NSE equities, ETFs excluded
-(same ETF filter pattern as run_fund_full in pipeline.py).
-
-Modes:
-  python pipeline_fundamentals_prod.py full          → all NSE stocks
-  python pipeline_fundamentals_prod.py full_1         (1..10)
-                                                       → 1/10th of universe each,
-                                                         for chunked GitHub Actions runs
-  python pipeline_fundamentals_prod.py daily          → ONLY stocks with a result
-                                                         today (via Finedge
-                                                         results-calendar), updates
-                                                         just those per-symbol files.
-                                                         Also retries any symbol still
-                                                         pending from a previous day
-                                                         (see fundamentals_pending.json)
-                                                         whose result-day data hasn't
-                                                         landed on Finedge yet — Finedge
-                                                         confirms 12-36h typical
-                                                         turnaround, mostly same-day but
-                                                         not guaranteed same-day.
-  python pipeline_fundamentals_prod.py backfill_summary
-                                                       → ONE-TIME: builds
-                                                         fundamentals_summary.json
-                                                         from per-symbol files
-                                                         already in R2 — NO Finedge
-                                                         calls, just R2 reads. Use
-                                                         this if full_1..10 already
-                                                         ran before summary support
-                                                         was added.
-  python pipeline_fundamentals_prod.py local SYM SYM  → local-only test (no R2),
-                                                         saves to output/fundamentals_prod.json
-
-Data-shape decisions (locked in from testing phase):
-  - PL  periods : annual (full), quarterly (last 12), ttm (1 row) — BOTH stypes (c+s)
-  - basic_financials — BOTH stypes (c+s)
-    (PL + basic_financials need dual fetch — CET1/NPA-type fields are populated
-     ONLY in standalone, even when consolidated rows exist, so a c→s fallback
-     would never trigger; we need both, always, for these two.)
-  - BS  periods : annual (full), quarterly (last 12) — SINGLE stype (c, fallback s)
-  - CF  periods : annual (full), quarterly (last 12), ytd (last 12) — SINGLE stype,
-    CORE-ONLY (cfo/cfi/cff/net_cash_flow/capex/fcf/dividends_paid/pbt) —
-    raw ~100-field granular rows dropped entirely for size.
-  - ratios/annual_price_ratios — BOTH stypes fetched, RECENCY-PICKED (see note
-    below) — was "SINGLE stype (c, fallback s only if c is empty)" until
-    July 2026; changed for the same reason as the PL quarters fix.
-  - growth_metrics — still SINGLE stype (c, fallback s only if c is empty),
-    UNCHANGED. The financial-metrics endpoint returns one metrics object per
-    stype, not a dated rows list, so there's no reliable per-row date field
-    to compare recency against — revisit if Finedge exposes one.
-  - shareholdings/pattern — REMOVED (not needed right now)
-  - PL/BS get an alias-resolved "core" object (bank vs non-bank field-naming)
-    PLUS full "raw" rows (schemas not yet mapped, e.g. insurance, still captured).
-
-Daily-mode pending-retry (added post Finedge support reply, July 2026):
-  Finedge confirmed there is no per-symbol data-refresh status field on
-  results-calendar, and updates (PL + all derived ratios together) typically
-  land 12-36h after announcement, "mostly same day" but not guaranteed.
-  So run_daily() no longer treats a same-day fetch as final: it snapshots
-  the last-known quarter header for every symbol with a result today, and
-  only marks a symbol "done" once the fetched data's latest quarter header
-  actually changes. Until then the symbol stays in fundamentals_pending.json
-  and gets retried on every subsequent daily run, up to MAX_PENDING_ATTEMPTS
-  trading days, after which it's dropped (self-heals on the next full run).
-
-Recency-based stype selection (added July 2026, extended same month):
-  _build_summary_entry() used to prefer consolidated whenever it had ANY
-  rows at all — for PL quarters, and independently for each ratio field
-  (PE/PB, ROE/ROCE/EBITDA, D/E) — falling back to standalone only if
-  consolidated was completely empty. Many companies stop filing
-  consolidated results after a few years while standalone keeps being
-  reported every quarter, so "any consolidated rows" stayed true (the old
-  rows are still there) and the summary kept surfacing stale consolidated
-  data even though standalone was current.
-
-  Fixed in two steps:
-  1. _fetch_ratios_single / _fetch_annual_price_ratios_single now always
-     fetch both stypes and keep both raw arrays (raw_c/raw_s) alongside the
-     existing raw/stype_used pair, so a consumer can pick per its own needs
-     instead of only seeing whichever one the fetch function guessed was best.
-  2. _build_summary_entry() decides ONE overall stype per stock — from
-     quarterly PL recency (_latest_key, by period_end or year), the
-     highest-frequency signal a company reports on — and applies that same
-     stype to every summary field (quarters, PE/PB, ROE/ROCE/EBITDA, D/E).
-     Earlier each field picked its own most-recent stype independently,
-     which could technically be "more current" per field but showed a
-     confusing mix (e.g. PE from standalone, ROE from consolidated) on the
-     same stock. summary["stype"] now carries this single 'c'/'s' decision.
-
-  Trade-off: ratios/price-ratios now always cost 2x the Finedge calls per
-  stock instead of "1 call in the common case where c has data" — full-run
-  duration and API usage will go up somewhat; watch RETRY/rate-limit behavior
-  on the next full run.
-
-Sector/Industry — canonical taxonomy from classification.json (added July 2026):
-  fundamentals_summary.json's sector/industry/macro_sector come from Finedge's
-  own company-profile fields, which use a different, more fragmented taxonomy
-  (182 distinct "sector" values) than the one used everywhere else on the
-  platform — the RS Dashboard's sector heatmap and industry drilldown, both
-  built from classification.json's sector_group (32 values, e.g. "Banks",
-  "Cement") and display_industry (132 values, e.g. "PSU Banks", "Microfinance").
-  Frontend filters built against Finedge's fields showed confusing, overly
-  granular options that didn't match the rest of the site. Added
-  get_classification_lookup() (a second classification.json read, symbol ->
-  {sector_group, display_industry}) threaded through fetch_one_symbol /
-  _build_summary_entry / _backfill_one, so summary entries now carry both:
-  the original Finedge fields (kept for backward compat) AND sector_group /
-  display_industry, which the frontend should use for Sector/Industry filters
-  going forward. run_backfill_summary is the fast way to retrofit this onto
-  all existing stocks — no Finedge calls, just two R2 reads.
-
-Daily-mode empty-quarters guard (added July 2026):
-  run_daily() previously did
-    summary.get(sym, {}).get("quarters", [{}])[0].get("header")
-  to snapshot a symbol's last-known quarter before adding it to the pending
-  list. dict.get(key, default) only substitutes the default when the KEY is
-  missing — if summary[sym] exists but its "quarters" list is genuinely
-  empty (e.g. a fresh listing with no quarterly PL data ingested yet), the
-  real (empty) list is returned instead of the default, and [0] on an empty
-  list raises IndexError, crashing the whole daily run. Fixed by resolving
-  the quarters list with `or [{}]` first (which substitutes on ANY falsy
-  value, not just a missing key) before indexing into it.
+(See module docstring history in repo — dual-track quarters added July 2026,
+see notes near _build_summary_entry below.)
 """
 
 import asyncio, hashlib, json, logging, os, sys
@@ -165,8 +33,7 @@ CF_PERIODS    = ["annual", "quarterly", "ytd"]
 RATIO_TYPES   = ["pr", "le", "li", "ef"]
 QUARTERLY_CAP = 12
 
-# Daily-mode pending-retry tuning — see module docstring.
-MAX_PENDING_ATTEMPTS = 5  # ~5 trading days of retries before a symbol is dropped
+MAX_PENDING_ATTEMPTS = 5
 
 ETF_ENDSWITH = ("ETF", "BEES", "LIQUID", "GILT", "IETF", "MMQS", "TOTAL")
 ETF_CONTAINS = ("NIFTY", "BANKEX", "MSCIN")
@@ -203,11 +70,6 @@ def today_ist() -> str:
 
 
 def _latest_key(rows):
-    """Recency key for the first (assumed most-recent) row of a Finedge rows
-    list — used to compare consolidated vs standalone data and pick whichever
-    is actually more current, instead of always preferring consolidated
-    whenever it has *any* rows. Tries period_end (YYYYMMDD) first, falls back
-    to year if that's all a row carries. Returns -1 for empty/unusable input."""
     if not rows:
         return -1
     r0 = rows[0]
@@ -220,14 +82,13 @@ def _latest_key(rows):
     yr = r0.get("year")
     if yr:
         try:
-            return int(yr) * 10000  # coarse fallback, only used when period_end is absent
+            return int(yr) * 10000
         except (TypeError, ValueError):
             pass
     return -1
 
 
 def is_trading_day(d: str) -> bool:
-    # weekday check only — holiday file optional, not bundled with this standalone pipeline
     holidays_path = HERE / "nse_holidays.json"
     holidays = set()
     if holidays_path.exists():
@@ -245,9 +106,6 @@ def is_trading_day(d: str) -> bool:
 
 async def r2_download(client, filename):
     from urllib.parse import quote
-    # Worker GET endpoint routes by URL path, NOT by ?file= query param.
-    # quote(filename, safe='/') correctly encodes & → %26 while leaving / intact,
-    # so M&M.json → fundamentals_full/M%26M.json which the Worker decodes correctly.
     url = f"{WORKER_URL}/{quote(filename, safe='/')}"
     r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
     if r.status_code == 404:
@@ -269,11 +127,6 @@ async def r2_upload(client, filename, data):
 
 
 def compute_hash(payload: str) -> str:
-    """Hash of the exact JSON string uploaded for a symbol's per-symbol file.
-    Mirrors r2_upload_symbol's serialization exactly, so the hash stored in
-    fundamentals_summary.json always reflects what's actually on R2 — this is
-    what the frontend will compare against its IndexedDB cache to decide
-    whether to refetch fundamentals_full/{SYMBOL}.json or not."""
     return hashlib.md5(payload.encode()).hexdigest()[:10]
 
 
@@ -325,18 +178,6 @@ async def get_nse_universe(client):
 
 
 async def get_classification_lookup(client):
-    """Symbol -> {sector_group, display_industry} lookup from classification.json.
-
-    Added because fundamentals_summary.json's sector/industry/macro_sector
-    come from Finedge's own company-profile fields, which use a DIFFERENT,
-    more fragmented taxonomy (182 distinct "sector" values, mixing grain
-    levels confusingly) than the platform's canonical one already used
-    everywhere else (RS Dashboard sector heatmap, industry drilldown):
-    classification.json's sector_group (32 values, e.g. "Banks", "Cement")
-    and display_industry (132 values, e.g. "PSU Banks", "Microfinance").
-    This keeps the Results Comparison page's Sector/Industry filters
-    consistent with the rest of the site instead of Finedge's raw fields.
-    """
     classification = await r2_download(client, "classification.json")
     if not classification or not isinstance(classification, list):
         log.warning("classification.json missing/invalid — sector_group/display_industry will be blank")
@@ -398,7 +239,7 @@ async def get_today_result_symbols(client, sem, valid_symbols):
 
 
 # ══════════════════════════════════════════════════════════════
-# COMPANY TYPE DETECTION (from company-profile)
+# COMPANY TYPE DETECTION
 # ══════════════════════════════════════════════════════════════
 
 def _classify_company(profile):
@@ -414,9 +255,6 @@ def _classify_company(profile):
 
 # ══════════════════════════════════════════════════════════════
 # CORE FIELD ALIAS RESOLUTION — PL, BS, CF
-# (handles bank vs non-bank naming differences without branching;
-#  degrades to None gracefully for schemas not yet mapped, e.g.
-#  insurance — raw rows kept alongside for PL/BS so nothing is lost)
 # ══════════════════════════════════════════════════════════════
 
 CORE_PL_ALIASES = {
@@ -528,8 +366,7 @@ def _build_cf_core(row):
 
 
 # ══════════════════════════════════════════════════════════════
-# FETCH — DUAL statement_type (always both c + s)
-#   used for: PL, basic_financials
+# FETCH — DUAL statement_type
 # ══════════════════════════════════════════════════════════════
 
 async def _fetch_financials_dual(client, sem, sym, code, periods, build_core_fn=None):
@@ -559,12 +396,7 @@ async def _fetch_basic_financials_dual(client, sem, sym):
 
 
 # ══════════════════════════════════════════════════════════════
-# FETCH — SINGLE statement_type, c preferred, fallback to s only
-# if c returns zero rows
-#   used for: BS, CF, growth_metrics
-# (ratios and annual_price_ratios moved to a dual-fetch, recency-picked
-#  pattern in July 2026 — see the two functions further below and the
-#  "Recency-based stype selection" note in the module docstring)
+# FETCH — SINGLE statement_type
 # ══════════════════════════════════════════════════════════════
 
 async def _fetch_financials_single(client, sem, sym, code, periods, build_core_fn=None, keep_raw=True):
@@ -598,27 +430,16 @@ async def _fetch_ratios_single(client, sem, sym):
             d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type": stype, "ratio_type": rtype})
             rows_by_stype[stype] = (d or {}).get("ratios", [])
         c_rows, s_rows = rows_by_stype["c"], rows_by_stype["s"]
-        # Prefer whichever stype's latest row is actually more recent, same
-        # recency-over-existence rule as the PL quarters fix above. Falls
-        # back to whichever one has data if the "winner" turns out empty.
         stype_used = "s" if _latest_key(s_rows) > _latest_key(c_rows) else "c"
         rows = rows_by_stype[stype_used]
         if not rows:
             rows = c_rows or s_rows
             stype_used = "c" if c_rows else ("s" if s_rows else None)
-        # raw_c/raw_s kept alongside so _build_summary_entry can pick ONE
-        # stype for the whole company and apply it consistently everywhere
-        # (see "Summary — single consistent stype per stock" in the module
-        # docstring), instead of each ratio type picking independently.
         out[rtype] = {"stype_used": stype_used, "raw": rows, "raw_c": c_rows, "raw_s": s_rows}
     return out
 
 
 async def _fetch_growth_metrics_single(client, sem, sym):
-    # NOT extended with the recency check above — financial-metrics returns a
-    # single aggregate dict (e.g. multi-year CAGR figures), not a list of
-    # dated rows, so there's no per-row date to compare c vs s recency on.
-    # Left as "prefer c, fallback to s only if c is empty" (original design).
     for stype in ("c", "s"):
         d = await _finedge_get(client, sem, f"financial-metrics/{sym}", {"statement_type": stype, "ratio_type": "gr"})
         fm = (d or {}).get("financial_metrics")
@@ -646,40 +467,20 @@ async def _fetch_profile_raw(client, sem, sym):
 
 
 # ══════════════════════════════════════════════════════════════
-# LIGHTWEIGHT SUMMARY ENTRY — built from data already fetched for
-# the per-symbol file, no extra API calls. Feeds fundamentals_summary.json
-# (Results Comparison + Peer Comparison on the frontend).
-#
-# NOTE: market_cap deliberately NOT stored here — it's price-driven and
-# changes every trading day for every stock, while this pipeline only
-# refreshes a stock on result-day or full bulk runs. Frontend computes
-# live market_cap = diluted_shares × ltp (ltp from screener_feed.json,
-# which IS updated daily for all stocks by the OHLC pipeline).
+# LIGHTWEIGHT SUMMARY ENTRY
 # ══════════════════════════════════════════════════════════════
 
 def _compute_opm(row):
-    """OPM from quarterly PL core row.
-    Non-bank: (pbt + dep + fin_costs - other_income) / sales
-    Bank:     NIM = (interest_earned - interest_expended) / interest_earned
-    Returns a decimal fraction (e.g. 0.142 = 14.2%) or None.
-    """
     sales = row.get("sales")
     interest_earned = row.get("interest_earned")
-
-    # Bank path — NIM as OPM proxy
     if not sales and interest_earned:
         ie = row.get("interest_expended") or 0
         return round((interest_earned - ie) / interest_earned, 4) if interest_earned else None
-
     if not sales:
         return None
-
-    # Primary: expenses field available
     exp = row.get("expenses")
     if exp is not None:
         return round((sales - exp) / sales, 4)
-
-    # Fallback: reconstruct operating profit from available fields
     pbt  = row.get("pbt")
     dep  = row.get("depreciation")
     fin  = row.get("finance_costs")
@@ -688,6 +489,21 @@ def _compute_opm(row):
         op = pbt + dep + fin - oth
         return round(op / sales, 4)
     return None
+
+
+def _build_quarters_list(q_core):
+    """Builds the standard 'quarters' array shape from a stype's quarterly
+    PL core rows. Factored out so both the primary and the alt (dual-track)
+    stype can build the same shape without duplicating this logic."""
+    return [{
+        "header": _fmt_period_end(row.get("period_end")),
+        "sales":    row.get("sales") if row.get("sales") is not None else row.get("interest_earned"),
+        "expenses": row.get("expenses"),
+        "opm":      _compute_opm(row),
+        "eps":      row.get("eps"),
+        "pat":      row.get("pat"),
+        "pbt":      row.get("pbt"),
+    } for row in q_core[:9]]
 
 
 def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=None):
@@ -705,34 +521,28 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=
             break
 
     # ── Summary — single consistent stype per stock ──────────────────────
-    # Decide ONE overall c/s choice per stock — from quarterly PL recency,
-    # since that's the highest-frequency signal a company reports on — and
-    # apply it to every field below (quarters, PE/PB, ROE/ROCE/EBITDA, D/E).
-    # Previously each field picked its own most-recent stype independently,
-    # which could show e.g. PE from standalone and ROE from consolidated on
-    # the same stock — technically "most current" per field, but confusing
-    # to read. One flag per stock, used everywhere, is simpler and predictable.
     c_core = pl.get("quarterly", {}).get("c", {}).get("core") or []
     s_core = pl.get("quarterly", {}).get("s", {}).get("core") or []
     stype = "s" if _latest_key(s_core) > _latest_key(c_core) else "c"
     if stype == "c" and not c_core and s_core:
-        stype = "s"  # c "won" the tie-break but is actually empty — use s
+        stype = "s"
 
     q_core = s_core if stype == "s" else c_core
-    quarters = [{
-        "header": _fmt_period_end(row.get("period_end")),
-        "sales":    row.get("sales") if row.get("sales") is not None else row.get("interest_earned"),
-        "expenses": row.get("expenses"),   # needed for OPM in Results Comparison
-        "opm":      _compute_opm(row),     # pre-computed so Results Comparison doesn't need expenses
-        "eps":      row.get("eps"),
-        "pat":      row.get("pat"),
-        "pbt":      row.get("pbt"),
-    } for row in q_core[:9]]  # 9 so YoY base (idx+4) exists for any of the 5 displayed quarters
+    quarters = _build_quarters_list(q_core)
 
-    # Pull ratios/price-ratios for the SAME chosen stype. Falls back to that
-    # endpoint's own best-available row only if the chosen stype genuinely
-    # has nothing for it (rare) — better to show a number than none, but
-    # this doesn't happen for the vast majority of stocks.
+    # ── Dual-track: also keep the OTHER stype's quarters, if it has any
+    # data, as quarters_alt/stype_alt (added July 2026). The single-stype
+    # pick above is a strict-recency tie-break (Consolidated wins on a tie
+    # even when Standalone is equally current) — a consumer that needs to
+    # match a SPECIFIC basis (e.g. pipeline_news.py matching a live XBRL
+    # filing's own Standalone/Consolidated nature) would otherwise never
+    # find that basis's quarters even though the data exists and is
+    # current. Purely additive — existing consumers of quarters/stype see
+    # no change at all.
+    alt_stype = "s" if stype == "c" else "c"
+    alt_core = s_core if alt_stype == "s" else c_core
+    quarters_alt = _build_quarters_list(alt_core) if alt_core else []
+
     pr_rows  = ratios.get("pr", {}).get(f"raw_{stype}") or ratios.get("pr", {}).get("raw") or []
     le_rows  = ratios.get("le", {}).get(f"raw_{stype}") or ratios.get("le", {}).get("raw") or []
     apr_rows = price_ratios.get(f"raw_{stype}") or price_ratios.get("raw") or []
@@ -746,15 +556,10 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=
         "sector": profile.get("sector"),
         "industry": profile.get("industry"),
         "macro_sector": profile.get("macro_sector"),
-        # Canonical platform taxonomy from classification.json — same fields
-        # used by the RS Dashboard's sector heatmap (sector_group) and
-        # industry drilldown (display_industry). Use these for Sector/
-        # Industry filters instead of the Finedge fields above, which use a
-        # different, more fragmented naming scheme.
         "sector_group": classification.get("sector_group"),
         "display_industry": classification.get("display_industry"),
         "diluted_shares": diluted_shares,
-        "stype": stype,   # single 'c'/'s' flag — applies to every field below
+        "stype": stype,
         "pe": apr0.get("pe"),
         "pb": apr0.get("pb"),
         "roe": pr0.get("returnOnEquity"),
@@ -762,6 +567,8 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=
         "ebitda_margin": pr0.get("ebitdaMargin"),
         "de_ratio": le0.get("totalDebtToEquity"),
         "quarters": quarters,
+        "stype_alt": alt_stype if quarters_alt else None,
+        "quarters_alt": quarters_alt,
     }
 
 
@@ -802,7 +609,7 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
 
 
 # ══════════════════════════════════════════════════════════════
-# MODE: full / full_1..10 — bulk universe, per-symbol R2 upload
+# MODE: full / full_1..10
 # ══════════════════════════════════════════════════════════════
 
 async def run_full(part=0):
@@ -818,12 +625,6 @@ async def run_full(part=0):
             chunk, label = symbols[start:end], f"Part {part}/{TOTAL_PARTS}"
         log.info(f"━━━ Fundamentals Full {label}  ({len(chunk)} stocks) ━━━")
 
-        # NOTE: if full_1..full_10 run truly simultaneously (parallel GitHub
-        # Actions), there's a small race window on this shared summary file —
-        # each part downloads-merges-uploads independently. Since parts touch
-        # disjoint symbol sets and we checkpoint every 25 stocks (not just at
-        # the end), the overwrite window is short, but for zero risk run the
-        # parts sequentially rather than all-at-once.
         summary = await r2_download_summary(client)
 
         ok = failed = 0
@@ -844,10 +645,7 @@ async def run_full(part=0):
 
 
 # ══════════════════════════════════════════════════════════════
-# MODE: daily — only stocks with a result today, plus retries for
-# symbols still pending from previous days (see module docstring:
-# Finedge confirmed there's no per-symbol refresh-status field, and
-# updated data can take 12-36h to land, not always same-day).
+# MODE: daily
 # ══════════════════════════════════════════════════════════════
 
 async def run_daily():
@@ -862,16 +660,9 @@ async def run_daily():
         summary = await r2_download_summary(client)
         pending = await r2_download_pending(client)
 
-        # 1. New result-today symbols — snapshot their "before" quarter so we
-        #    can tell once Finedge has actually ingested the fresh quarter.
         todays_new = await get_today_result_symbols(client, sem, symbols)
         for sym in todays_new:
             if sym not in pending:
-                # FIX: `.get("quarters", [{}])` only substitutes the default
-                # when the "quarters" KEY is missing — if summary[sym] exists
-                # but its quarters list is genuinely empty (e.g. a fresh
-                # listing with no PL data yet), the real [] is returned and
-                # [0] on it raises IndexError. `or [{}]` catches that case too.
                 prev = summary.get(sym)
                 last_known = (prev.get("quarters") or [{}])[0].get("header") if prev else None
                 pending[sym] = {
@@ -880,7 +671,6 @@ async def run_daily():
                     "first_seen": today,
                 }
 
-        # 2. Carry-over: symbols still pending from earlier days get retried too.
         check_list = list(pending.keys())
         if not check_list:
             log.info("No pending result symbols to check — exiting"); return
@@ -896,7 +686,6 @@ async def run_daily():
                 old_q = pending[sym]["last_known_quarter"]
 
                 if new_q and new_q != old_q:
-                    # ✅ Finedge has ingested the new quarter — publish and clear pending.
                     file_hash = await r2_upload_symbol(client, sym, obj)
                     summ["hash"] = file_hash
                     summary[sym] = summ
@@ -926,7 +715,7 @@ async def run_daily():
 
 
 # ══════════════════════════════════════════════════════════════
-# MODE: local — no R2, for quick testing
+# MODE: local
 # ══════════════════════════════════════════════════════════════
 
 async def run_local(symbols):
@@ -944,10 +733,7 @@ async def run_local(symbols):
 
 
 # ══════════════════════════════════════════════════════════════
-# MODE: backfill_summary — one-time, builds fundamentals_summary.json
-# from per-symbol files ALREADY in R2 (fundamentals_full/{SYM}.json).
-# No Finedge API calls at all — just R2 reads. Use this once if full_1..10
-# already ran with an older pipeline version that didn't write the summary.
+# MODE: backfill_summary
 # ══════════════════════════════════════════════════════════════
 
 async def _backfill_one(client, sym, classification_lookup=None):
@@ -957,13 +743,6 @@ async def _backfill_one(client, sym, classification_lookup=None):
     classification = (classification_lookup or {}).get(sym)
     summ = _build_summary_entry(sym, obj.get("profile"), obj.get("pl", {}),
                                  obj.get("ratios", {}), obj.get("annual_price_ratios", {}), classification)
-    # Re-serialize with the same separators r2_upload_symbol uses, so this
-    # backfilled hash is consistent with hashes future live runs will produce.
-    # NOTE: since this re-serializes a downloaded-and-reparsed object rather
-    # than the original upload bytes, it's a reliable proxy but not guaranteed
-    # byte-identical to the original upload (e.g. exotic float formatting).
-    # Fine for a one-time backfill — any drift self-corrects on the next
-    # full/daily/sync run, which always hashes the freshly-built object.
     summ["hash"] = compute_hash(json.dumps(obj, separators=(",", ":")))
     return sym, summ
 
@@ -990,8 +769,6 @@ async def run_backfill_summary():
             done = min(i + BATCH, len(symbols))
             log.info(f"  {done}/{len(symbols)}  ✓{ok}  ✗{failed}")
             await r2_upload_summary(client, summary)
-        # Auto-retry ALL symbols not found in R2 — could be new listings,
-        # migrations, or & symbols where path routing failed.
         if failed_syms:
             log.info(f"  Auto-syncing {len(failed_syms)} missing symbols via Finedge...")
             sem = asyncio.Semaphore(CONCURRENCY)
@@ -1013,8 +790,7 @@ async def run_backfill_summary():
 
 
 # ══════════════════════════════════════════════════════════════
-# MODE: sync — retry specific symbols (e.g. ones that failed earlier
-# due to the & URL-encoding bug), without rerunning a whole part.
+# MODE: sync
 # ══════════════════════════════════════════════════════════════
 
 async def run_sync(symbols):
