@@ -894,6 +894,23 @@ async def run():
                 print(f"  {filename}: -{dropped_noise} noise, -{dropped_dup} dup → {len(items)}")
 
             if filename == "nse_results_feed.json":
+                # NSE's RSS feed itself only ever shows its latest ~20 items
+                # (confirmed: consistently exactly 20 across runs) — if we
+                # just re-upload that snapshot each time, results scroll out
+                # of the feed (and off the frontend's Results tab) faster
+                # than they can be viewed, especially during results season
+                # when 100+ companies file in an evening. Accumulate against
+                # the existing R2 file instead, same pattern already used
+                # for nse_results_detailed.json.
+                existing_feed = await r2_get(client, "nse_results_feed.json")
+                existing_feed_items = (existing_feed or {}).get("items", [])
+                merged_feed = dedup_items(items + existing_feed_items)
+                merged_feed.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+                merged_feed = merged_feed[:1000]  # same cap as nse_results_detailed.json
+                added = len(merged_feed) - len(existing_feed_items)
+                print(f"  nse_results_feed.json: {len(existing_feed_items)} existing + "
+                      f"{max(added, 0)} new = {len(merged_feed)} (capped at 1000)")
+                items = merged_feed
                 results_feed_items = items
 
             uploads.append((filename, make_payload(items)))
@@ -918,3 +935,4 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
+    
