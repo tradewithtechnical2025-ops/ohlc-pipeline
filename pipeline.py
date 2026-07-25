@@ -1189,11 +1189,24 @@ def _calculate_mswing(all_data, history_days=90):
         closes=s["c"]; n=len(closes); history=[]
         for day_offset in range(history_days,-1,-1):
             idx=n-1-day_offset
-            if idx<51: history.append(None); continue
-            c_now=closes[idx]; c20=closes[idx-20]; c50=closes[idx-50]
-            if c_now is None or not c20 or not c50: history.append(None); continue
-            try: history.append(round((c_now-c20)/c20*100/20+(c_now-c50)/c50*100/50,4))
-            except ZeroDivisionError: history.append(None)
+            c_now=closes[idx] if idx>=0 else None
+            if c_now is None: history.append(None); continue
+            c5  = closes[idx-5]  if idx>=5  else None
+            c10 = closes[idx-10] if idx>=10 else None
+            c20 = closes[idx-20] if idx>=20 else None
+            c50 = closes[idx-50] if idx>=50 else None
+            try:
+                if c50 and c20:                                   # full history -> 20 & 50
+                    val=(c_now-c20)/c20*100/20+(c_now-c50)/c50*100/50
+                elif c20 and c10:                                 # no 50d    -> 20 & 10
+                    val=(c_now-c10)/c10*100/10+(c_now-c20)/c20*100/20
+                elif c10 and c5:                                  # no 20d    -> 5 & 10
+                    val=(c_now-c5)/c5*100/5+(c_now-c10)/c10*100/10
+                else:
+                    val=None
+            except ZeroDivisionError:
+                val=None
+            history.append(round(val,4) if val is not None else None)
         valid=[v for v in history[-9:] if v is not None]
         result[sym]={"mswing":history[-1] if history else None,"mswing_avg9":round(sum(valid)/len(valid),4) if valid else None,"mswing_history":history}
     return result
