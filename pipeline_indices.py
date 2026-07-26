@@ -396,13 +396,14 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta):
         parsed = parse_index_history(rows)
         if not parsed:
             print(f"[{i}/{total}] ✗ {symbol} | no data")
-            return symbol, None, False
+            return symbol, None, None, False
         weekly = compute_weekly_return(parsed)
+        msw = compute_index_mswing(parsed)
         await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
                                     schema_v=1, extra_meta={"candle_count": len(parsed)})
         years_note = f" ({EXTENDED_HISTORY_DAYS[symbol] // 365}Y)" if symbol in EXTENDED_HISTORY_DAYS else ""
         print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles{years_note}")
-        return symbol, weekly, True
+        return symbol, weekly, msw, True
 
 
 def compute_weekly_return(history):
@@ -448,6 +449,73 @@ def compute_weekly_return(history):
         return None
     pct = round((latest["close"] - base["close"]) / base["close"] * 100, 2)
     return {"v": pct, "d": base["date"]}
+
+
+# ─────────────────────────────────────────────
+# Index MSwing (daily / weekly / previous-week)
+# Same tiered formula as pipeline.py's stock _calculate_mswing:
+#   full history -> 20 & 50 bars, else 20 & 10, else 5 & 10, else None.
+# Weekly uses ISO-week resampled closes (same convention as
+# compute_weekly_return). Previous-week = weekly series minus the
+# current (in-progress) week.
+# ─────────────────────────────────────────────
+
+def _index_weekly_closes(history):
+    rows = sorted(
+        (r for r in history if r.get("date") and r.get("close") is not None),
+        key=lambda r: r["date"]
+    )
+    wk = {}  # (iso_year, iso_week) -> last close of that week
+    for r in rows:
+        try:
+            d = date.fromisoformat(r["date"][:10])
+        except (ValueError, TypeError):
+            continue
+        wk[d.isocalendar()[:2]] = r["close"]
+    return [wk[k] for k in sorted(wk.keys())]
+
+
+def _mswing_latest(closes):
+    """Tiered mswing (20/50 -> 20/10 -> 5/10) on a chronological close list; latest value or None."""
+    n = len(closes)
+    if n < 11:
+        return None
+    idx = n - 1
+    c_now = closes[idx]
+    if c_now is None:
+        return None
+
+    def _c(k):
+        j = idx - k
+        v = closes[j] if j >= 0 else None
+        return v if v else None
+
+    c5, c10, c20, c50 = _c(5), _c(10), _c(20), _c(50)
+    try:
+        if c50 and c20:
+            return round((c_now - c20) / c20 * 100 / 20 + (c_now - c50) / c50 * 100 / 50, 4)
+        if c20 and c10:
+            return round((c_now - c10) / c10 * 100 / 10 + (c_now - c20) / c20 * 100 / 20, 4)
+        if c10 and c5:
+            return round((c_now - c5) / c5 * 100 / 5 + (c_now - c10) / c10 * 100 / 10, 4)
+    except ZeroDivisionError:
+        return None
+    return None
+
+
+def compute_index_mswing(history):
+    """{'d': daily, 'w': weekly, 'wprev': previous-week} tiered mswing from an index's daily history."""
+    rows = sorted(
+        (r for r in history if r.get("date") and r.get("close") is not None),
+        key=lambda r: r["date"]
+    )
+    daily_closes = [r["close"] for r in rows]
+    weekly_closes = _index_weekly_closes(history)
+    return {
+        "d"    : _mswing_latest(daily_closes),
+        "w"    : _mswing_latest(weekly_closes),
+        "wprev": _mswing_latest(weekly_closes[:-1]) if len(weekly_closes) >= 2 else None,
+    }
 
 
 # ─────────────────────────────────────────────
@@ -508,13 +576,23 @@ async def main():
 
         success = failed = 0
         weekly_map = {}
-        for symbol, weekly, ok in results:
+        mswing_map = {}
+        for symbol, weekly, msw, ok in results:
             if ok:
                 success += 1
                 if weekly:
                     weekly_map[symbol] = weekly
+                if msw:
+                    mswing_map[symbol] = msw
             else:
                 failed += 1
+
+        # index_mswing.json — { symbol: {d, w, wprev} }. Independent of the
+        # returns endpoint (only needs the history already fetched above),
+        # so it's emitted even if index/price-returns failed this run.
+        await upload_with_manifest(client, r2_upload, "index_mswing.json", mswing_map,
+                                    schema_v=1, extra_meta={"index_count": len(mswing_map)})
+        print(f"✅ index_mswing.json uploaded ({len(mswing_map)} indices)\n")
 
         if returns_rows is not None:
             returns_parsed = parse_index_returns(returns_rows, valid_symbols, weekly_map)
