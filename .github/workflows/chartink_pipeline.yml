@@ -1,9 +1,7 @@
 name: Chartink Scanner Pipeline
 
 on:
-  schedule:
-    # Runs every 3 minutes between 09:00–15:35 IST (03:30–10:05 UTC), Mon–Fri.
-    - cron: '*/3 3-10 * * 1-5'
+  
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
 jobs:
