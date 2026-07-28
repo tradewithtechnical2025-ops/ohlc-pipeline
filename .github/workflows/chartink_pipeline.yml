@@ -3,8 +3,6 @@ name: Chartink Scanner Pipeline
 on:
   schedule:
     # Runs every 3 minutes between 09:00–15:35 IST (03:30–10:05 UTC), Mon–Fri.
-    # Adjust to match how often you actually want this to run — every-3-min
-    # is aggressive; consider 5/15 min if Chartink starts rate-limiting you.
     - cron: '*/3 3-10 * * 1-5'
   workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
 
@@ -25,10 +23,41 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pandas requests beautifulsoup4 lxml gspread oauth2client pytz
+          pip install -r requirements.txt
 
+      # Using a heredoc with a quoted delimiter preserves the secret exactly as
+      # stored — no shell expansion, no backslash mangling. Plain `echo "$SECRET"`
+      # can corrupt JSON containing \n escapes inside the private_key field.
       - name: Write Google service account credentials
-        run: echo "${{ secrets.GOOGLE_CREDENTIALS_JSON }}" > credentials.json
+        env:
+          CREDS: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: |
+          cat > credentials.json << 'CREDS_EOF'
+          ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          CREDS_EOF
+
+      # Safe diagnostics: reports only structure/validity, never any values.
+      - name: Validate credentials file (no values printed)
+        run: |
+          python - << 'PYEOF'
+          import json, sys
+          raw = open('credentials.json', 'rb').read()
+          print(f"File size: {len(raw)} bytes")
+          print(f"Starts with '{{': {raw.lstrip()[:1] == b'{'}")
+          print(f"Ends with '}}': {raw.rstrip()[-1:] == b'}'}")
+          # Detect curly/smart quotes, the usual copy-paste culprit
+          for name, seq in [("left smart quote", b'\xe2\x80\x9c'),
+                            ("right smart quote", b'\xe2\x80\x9d')]:
+              if seq in raw:
+                  print(f"WARNING: found {name} — secret was corrupted on paste")
+          try:
+              data = json.loads(raw)
+              print("JSON is VALID")
+              print("Keys present:", sorted(data.keys()))
+          except Exception as e:
+              print("JSON is INVALID:", e)
+              sys.exit(1)
+          PYEOF
 
       - name: Run Chartink scanner pipeline
         run: python chartink_pipeline.py
