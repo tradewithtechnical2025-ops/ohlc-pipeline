@@ -1,1 +1,8 @@
 httpx>=0.27
+pandas
+requests
+beautifulsoup4
+lxml
+gspread
+oauth2client
+pytz
