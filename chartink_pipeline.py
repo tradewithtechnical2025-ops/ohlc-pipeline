@@ -537,23 +537,19 @@ def run_custom_list_scanner():
 
                 }, inplace=True)
 
-                # 🔥 SAFE DATA CLEANING (FINAL FIX)
+                # 🔥 SAFE DATA CLEANING — pandas 2.x/3.x compatible
                 for col in df.columns:
                     try:
-                        df[col] = pd.to_numeric(df[col])
+                        s = pd.to_numeric(df[col])
+                    except (ValueError, TypeError):
+                        continue  # non-numeric column, chhod do
+                    s = s.replace([np.inf, -np.inf], np.nan)
+                    s = s.mask(s.abs() > 1e10)   # abnormal values -> NaN
+                    df[col] = s
 
-                        # Remove inf values
-                        df[col].replace([np.inf, -np.inf], np.nan, inplace=True)
-
-                        # Remove abnormal large values
-                        df[col] = df[col].apply(
-                            lambda x: "" if pd.notnull(x) and x > 1e10 else x
-                        )
-
-                    except:
-                        continue
-
-                df.fillna("", inplace=True)
+                # NaN ko blank karo — object dtype pe pehle switch karke, taaki
+                # float column mein "" daalne wala dtype error na aaye
+                df = df.astype(object).where(df.notna(), "")
 
                 # Reorder columns
                 cols = ["Stock"] + [c for c in df.columns if c != "Stock"]
