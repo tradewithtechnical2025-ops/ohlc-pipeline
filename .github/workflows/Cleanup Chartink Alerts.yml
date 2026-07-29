@@ -1,0 +1,31 @@
+name: Cleanup Chartink Alerts
+
+# Safety net only. The Worker already trims chartink_alerts.json on every
+# incoming webhook, so in normal operation this finds nothing to do. It exists
+# to catch the case where the Worker's trim silently stops running (bad deploy,
+# changed payload shape) and the file starts growing again unnoticed.
+#
+# Weekly rather than daily for that reason — a daily run would just be noise.
+on:
+  schedule:
+    - cron: '30 12 * * 0'   # Sundays 18:00 IST (12:30 UTC)
+  workflow_dispatch: {}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Trim chartink_alerts.json
+        env:
+          R2_TOKEN: ${{ secrets.R2_TOKEN }}
+        run: python cleanup_chartink_alerts.py
