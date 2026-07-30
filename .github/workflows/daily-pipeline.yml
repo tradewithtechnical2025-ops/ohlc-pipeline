@@ -24,26 +24,87 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install httpx requests
+
       - name: Classification
-        run: python pipeline_classification.py classification
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline_classification.py classification
+
       - name: Daily OHLC
-        run: python pipeline.py daily
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py daily
+
       - name: Today OHLC
-        run: python pipeline.py today
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py today
+
       - name: HLR Scan
-        run: python pipeline.py hlr_scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py hlr_scan
+
       - name: Pattern Scan
-        run: python pipeline.py pattern_scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py pattern_scan
+
       - name: HTF Scan
-        run: python htf_test_scan.py --r2-key htf_test_results.json
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python htf_test_scan.py --r2-key htf_test_results.json
+
       - name: Shakeout Scan
-        run: python shakeout_scanner.py --r2-key shakeout_signals.json
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python shakeout_scanner.py --r2-key shakeout_signals.json
+
       - name: Fundamentals
-        run: python pipeline_fundamentals_prod.py daily
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline_fundamentals_prod.py daily
+
       - name: EP Scan
-        run: python pipeline.py ep_scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py ep_scan
+
       - name: Indices Pipeline
-        run: python pipeline_indices.py
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline_indices.py
+
       - name: Telegram fallback on workflow failure
         if: failure()
         run: |
