@@ -102,6 +102,8 @@ counts_backtest_scanners = {
     "Stage2": "( {cash} (  daily close >  daily sma(  daily close , 50 ) and  daily close >  daily sma(  daily close , 150 ) and  daily close >  daily sma(  daily close , 200 ) and  daily sma(  daily close , 50 ) >  daily sma(  daily close , 150 ) and  daily sma(  daily close , 50 ) >  daily sma(  daily close , 200 ) and  daily sma(  daily close , 150 ) >  daily sma(  daily close , 200 ) and  daily count( 20, 1 where  daily sma(  daily close , 200 ) >  1 day ago sma(  daily close , 200 ) ) >=  20 and  daily close >  daily max( 252 ,  daily high ) *  0.75 ) )",
     "Above40SMA": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and  daily close >  daily sma(  daily close , 40 ) ) )",
     "5DayCh": "( {166311} not(  1 > 0 ) ) and( {1468504} not( 1 > 0 ) ) and( {cash} ( ( {cash} (  daily close >=  0 and  market cap >=  1 and(  daily close -  5 days ago close ) /  5 days ago close *  100 >  20 ) ) ) )",
+    "Advances": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and(  daily close -  1 day ago close ) /  1 day ago close *  100 >  0 ) )",
+    "Declines": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and(  daily close -  1 day ago close ) /  1 day ago close *  100 <  0 ) )",
 }
 
 # Weekly-periodicity scanner(s) — kept separate from daily counts so dates don't mismatch
