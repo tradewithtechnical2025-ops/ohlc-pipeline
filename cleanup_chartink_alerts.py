@@ -21,7 +21,7 @@ WORKER_URL   = "https://r2-uploader.tradewithtechnical2025.workers.dev"
 WORKER_TOKEN = os.environ.get("R2_TOKEN", "TWT2025xSecure")
 
 FILE      = "chartink_alerts.json"
-KEEP_DAYS        = 2   # drop entries older than this entirely
+KEEP_DAYS        = 1   # drop entries older than this entirely
 KEEP_DETAIL_DAYS = 1   # older than this: keep count/time, strip heavy arrays
 IST       = timezone(timedelta(hours=5, minutes=30))
 
