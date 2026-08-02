@@ -491,6 +491,30 @@ def _compute_opm(row):
     return None
 
 
+def _compute_ebitda_abs(row):
+    """Mirrors _compute_opm()'s branches exactly, but returns the absolute
+    EBITDA-ish figure (the numerator) instead of dividing by sales to get
+    a margin. Banks/NBFCs (no `sales`, only `interest_earned`) are handled
+    the same way _compute_opm() handles them."""
+    sales = row.get("sales")
+    interest_earned = row.get("interest_earned")
+    if not sales and interest_earned:
+        ie = row.get("interest_expended") or 0
+        return interest_earned - ie
+    if not sales:
+        return None
+    exp = row.get("expenses")
+    if exp is not None:
+        return sales - exp
+    pbt = row.get("pbt")
+    dep = row.get("depreciation")
+    fin = row.get("finance_costs")
+    oth = row.get("other_income") or 0
+    if pbt is not None and dep is not None and fin is not None:
+        return pbt + dep + fin - oth
+    return None
+
+
 def _build_quarters_list(q_core):
     """Builds the standard 'quarters' array shape from a stype's quarterly
     PL core rows. Factored out so both the primary and the alt (dual-track)
@@ -500,15 +524,17 @@ def _build_quarters_list(q_core):
         "sales":    row.get("sales") if row.get("sales") is not None else row.get("interest_earned"),
         "expenses": row.get("expenses"),
         "opm":      _compute_opm(row),
+        "ebitda":   _compute_ebitda_abs(row),
         "eps":      row.get("eps"),
         "pat":      row.get("pat"),
         "pbt":      row.get("pbt"),
     } for row in q_core[:9]]
 
 
-def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=None):
+def _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf=None, classification=None):
     profile = profile or {}
     classification = classification or {}
+    cf = cf or {}
 
     diluted_shares = None
     for period in ("ttm", "annual", "quarterly"):
@@ -550,6 +576,22 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=
     le0  = (le_rows or [{}])[0]
     apr0 = (apr_rows or [{}])[0]
 
+    # ── FCF ────────────────────────────────────────────────────────────
+    # _fetch_financials_single (unlike the PL fetch) already auto-picks a
+    # single stype for cash flow — cf["quarterly"] is {"stype_used":...,
+    # "core":[...]}, not split by stype the way pl["quarterly"] is. Take
+    # whatever its most recent quarterly row's fcf is. fcf itself is
+    # computed upstream in _build_cf_core() as cfo + capex.
+    cf_core = (cf.get("quarterly", {}) or {}).get("core") or []
+    fcf_latest = cf_core[0].get("fcf") if cf_core else None
+
+    ebitda_latest = quarters[0].get("ebitda") if quarters else None
+    fcf_to_ebitda = (
+        round(fcf_latest / ebitda_latest, 4)
+        if fcf_latest is not None and ebitda_latest not in (None, 0)
+        else None
+    )
+
     return {
         "symbol": sym,
         "name": profile.get("name"),
@@ -566,6 +608,8 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification=
         "roce": pr0.get("returnOnCapital"),
         "ebitda_margin": pr0.get("ebitdaMargin"),
         "de_ratio": le0.get("totalDebtToEquity"),
+        "fcf": fcf_latest,
+        "fcf_to_ebitda": fcf_to_ebitda,
         "quarters": quarters,
         "stype_alt": alt_stype if quarters_alt else None,
         "quarters_alt": quarters_alt,
@@ -604,7 +648,7 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
         "annual_price_ratios": price_ratios,
     }
     classification = (classification_lookup or {}).get(sym)
-    summary_entry = _build_summary_entry(sym, profile, pl, ratios, price_ratios, classification)
+    summary_entry = _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf, classification)
     return sym, obj, summary_entry
 
 
@@ -742,7 +786,8 @@ async def _backfill_one(client, sym, classification_lookup=None):
         return sym, None
     classification = (classification_lookup or {}).get(sym)
     summ = _build_summary_entry(sym, obj.get("profile"), obj.get("pl", {}),
-                                 obj.get("ratios", {}), obj.get("annual_price_ratios", {}), classification)
+                                 obj.get("ratios", {}), obj.get("annual_price_ratios", {}),
+                                 obj.get("cf", {}), classification)
     summ["hash"] = compute_hash(json.dumps(obj, separators=(",", ":")))
     return sym, summ
 
