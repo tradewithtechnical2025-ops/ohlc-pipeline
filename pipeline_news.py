@@ -625,17 +625,31 @@ def _qoq_fundamentals(symbol: str, xbrl_quarter: dict, xbrl_nature: str, fundame
     return _compare_to_fundamentals(stock, basis, xbrl_quarter, prior_header, "qoq")
 
 
-async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3):
-    """Fetch raw XBRL bytes with backoff on 502/503/504/network errors —
-    same flakiness profile as NSE's other archive endpoints."""
+XBRL_HEADERS = {
+    **BROWSER_HEADERS,
+    "Accept": "application/xml, text/xml, */*",
+    "Referer": "https://www.nseindia.com/",
+}
+
+
+async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
+    """Fetch raw XBRL bytes with backoff on 403/502/503/504/network errors.
+
+    403s on this host tend to be a CDN-edge-cached negative response tied to
+    the exact URL (the file itself is fine — a request from a different
+    edge/POP returns 200), not a real per-IP block. So after the first 403
+    we retry with a cache-busting query param so the CDN can't serve the
+    same cached 403 again — it's forced to treat it as a fresh URL."""
+    sep = "&" if "?" in url else "?"
     for attempt in range(retries):
+        fetch_url = url if attempt == 0 else f"{url}{sep}_cb={int(time.time() * 1000)}{attempt}"
         try:
-            r = await client.get(url, headers=BROWSER_HEADERS, timeout=30, follow_redirects=True)
+            r = await client.get(fetch_url, headers=XBRL_HEADERS, timeout=30, follow_redirects=True)
             if r.status_code == 404:
                 return None
-            if r.status_code in (502, 503, 504):
+            if r.status_code in (403, 429, 502, 503, 504):
                 if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(2 ** attempt + 1)
                     continue
                 r.raise_for_status()
             r.raise_for_status()
@@ -644,7 +658,7 @@ async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 3
             raise
         except Exception as e:
             if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2 ** attempt + 1)
                 continue
             raise RuntimeError(str(e))
     return None
@@ -793,13 +807,27 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     existing_items = (existing or {}).get("items", [])
     existing_links = {it.get("link") for it in existing_items}
 
+    def _result_key(it):
+        """Business key for a result: same company + same quarter + same
+        standalone/consolidated nature = the same underlying result, even if
+        NSE re-files it under a brand-new XBRL link (corrections, resubmissions,
+        or just a re-publish — same root cause as the NTPC-type re-publishing
+        the general feed dedup already works around)."""
+        meta = it.get("meta", {}) or {}
+        quarter = it.get("quarter", {}) or {}
+        return (meta.get("symbol"), quarter.get("period_end"), meta.get("standalone_consolidated"))
+
+    # index existing items by business key so a re-filed result updates the
+    # existing record in place instead of appending a lookalike duplicate
+    existing_by_key = {_result_key(it): idx for idx, it in enumerate(existing_items) if _result_key(it)[0]}
+
     new_items = [it for it in xbrl_items if it["link"] not in existing_links]
     if not new_items:
         print("  ✓ nse_results_detailed: no new XBRL filings to parse")
         return None
 
     print(f"  Parsing {len(new_items)} new XBRL result filing(s)...")
-    sem = asyncio.Semaphore(5)  # be polite to nsearchives.nseindia.com
+    sem = asyncio.Semaphore(3)  # be polite to nsearchives.nseindia.com
 
     async def process(it):
         async with sem:
@@ -835,8 +863,23 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 return None
 
     results = await asyncio.gather(*(process(it) for it in new_items))
-    parsed_new = [r for r in results if r]
-    print(f"  ✓ Parsed {len(parsed_new)}/{len(new_items)} successfully")
+    parsed_all = [r for r in results if r]
+    print(f"  ✓ Parsed {len(parsed_all)}/{len(new_items)} successfully")
+
+    # Split out re-filed results (same symbol+quarter+nature already notified
+    # under a different link) — refresh their data but don't spam Telegram again.
+    parsed_new = []
+    refiled = []
+    for r in parsed_all:
+        key = _result_key(r)
+        if key[0] and key in existing_by_key:
+            refiled.append(r)
+        else:
+            parsed_new.append(r)
+    if refiled:
+        print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — updating record, skipping Telegram")
+        for r in refiled:
+            existing_items[existing_by_key[_result_key(r)]] = r
 
     if parsed_new:
         groups = _group_parsed_results(parsed_new)
