@@ -1448,13 +1448,31 @@ async def run():
         upload_tasks = [r2_put(client, fname, payload) for fname, payload in uploads]
         await asyncio.gather(*upload_tasks)
 
+        # nse_board_meetings.json is just a rolling ~300-item snapshot of the
+        # RSS feed (not accumulated, unlike nse_results_feed.json) — a PDF
+        # "Outcome of Board Meeting" filed early in the day can scroll out
+        # of that window by evening once enough other announcements (KMP
+        # changes, press releases, etc.) push it out, well before it's ever
+        # been detail-parsed. Keep a small dedicated accumulator so PDF
+        # fast-path candidates aren't lost to feed churn, same fix already
+        # applied to nse_results_feed.json for the same underlying reason.
+        pdf_candidates_now = [it for it in board_meeting_items if _is_board_outcome_pdf(it)]
+        existing_pdf_feed = await r2_get(client, "nse_results_pdf_feed.json")
+        existing_pdf_items = (existing_pdf_feed or {}).get("items", [])
+        merged_pdf_feed = dedup_items(pdf_candidates_now + existing_pdf_items)
+        merged_pdf_feed.sort(key=_effective_ts, reverse=True)
+        merged_pdf_feed = merged_pdf_feed[:500]
+        print(f"  nse_results_pdf_feed.json: {len(existing_pdf_items)} existing + "
+              f"{max(len(merged_pdf_feed) - len(existing_pdf_items), 0)} new = {len(merged_pdf_feed)} (capped at 500)")
+        await r2_put(client, "nse_results_pdf_feed.json", make_payload(merged_pdf_feed))
+
         # ── Financial results detail (P&L from XBRL) ────────────────────
         print("\nParsing financial results XBRL...")
         fundamentals = await r2_get(client, FUNDAMENTALS_FILE)
         fundamentals_stocks = (fundamentals or {}).get("stocks")
         if not fundamentals_stocks:
             print(f"  ⚠ {FUNDAMENTALS_FILE} unavailable — YoY fallback via fundamentals disabled this run")
-        detailed_payload = await build_results_detailed(client, results_feed_items, board_meeting_items, fundamentals_stocks)
+        detailed_payload = await build_results_detailed(client, results_feed_items, merged_pdf_feed, fundamentals_stocks)
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
 
