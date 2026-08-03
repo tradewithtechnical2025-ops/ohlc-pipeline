@@ -274,10 +274,18 @@ XBRL_LINK_RE = re.compile(r"/corporate/xbrl/.*\.xml$", re.IGNORECASE)
 # been observed to come through as 0 for this feed) for deciding which of
 # two filings for the same symbol+quarter+nature is the newer one.
 _XBRL_FILENAME_TS_RE = re.compile(r"_(\d{14})_WEB\.xml$", re.IGNORECASE)
+# Generic fallback: NSE embeds a DDMMYYYYHHMMSS submission timestamp in
+# virtually every corporate filing filename regardless of file type
+# (XBRL .xml, PDF outcome letters, etc) — e.g. "KAYA_03082026160711_..." or
+# "BLUEJET_03082026124851_FinalUpload.pdf". Used when the file isn't XBRL.
+_GENERIC_FILENAME_TS_RE = re.compile(r"_(\d{14})_")
 
 
 def _filing_ts(link: str) -> str:
     m = _XBRL_FILENAME_TS_RE.search(link or "")
+    if m:
+        return m.group(1)
+    m = _GENERIC_FILENAME_TS_RE.search(link or "")
     return m.group(1) if m else ""
 
 _XBRL_FIELD_MAP = {
@@ -503,6 +511,215 @@ def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
 
 
 FUNDAMENTALS_FILE = "fundamentals_summary.json"
+
+# ── PDF fast-path parsing (Outcome of Board Meeting) ────────────────────
+# NSE's XBRL filing for a result often lands noticeably later than the
+# "Outcome of Board Meeting" PDF for the same result (the PDF is filed the
+# moment the board approves it; XBRL is a separate, slower submission).
+# This is a best-effort text/regex parser — PDFs aren't a standardized
+# machine-readable format the way XBRL is, so it targets only the core
+# line items needed for the Telegram alert. When the XBRL filing for the
+# same symbol+quarter+nature shows up later, build_results_detailed's
+# "refiled" handling silently supersedes this record with the authoritative
+# XBRL data — so an imperfect PDF parse just gets corrected, it never
+# blocks or duplicates the real notification.
+
+_PDF_SUBJECT_RE = re.compile(r"outcome of board meeting", re.IGNORECASE)
+_PDF_STATEMENT_HEADING_RE = re.compile(
+    r"Statement of (Standalone|Consolidated)[^\n]{0,80}?Financial Results", re.IGNORECASE
+)
+_PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
+_PDF_FORMULA_REF_RE = re.compile(r"\(\s*\d+\s*[+\-]\s*\d+\s*\)")
+_PDF_NUM_TOKEN_RE = r"\(?-?[\d,]+\.?\d*\)?|-|—"
+
+
+def _is_board_outcome_pdf(it: dict) -> bool:
+    link = it.get("link", "")
+    if not link.lower().endswith(".pdf"):
+        return False
+    m = _SUBJECT_TAG_RE.search(it.get("summary", ""))
+    return bool(m and _PDF_SUBJECT_RE.search(m.group(1)))
+
+
+def _pdf_parse_num(tok: str):
+    tok = tok.strip()
+    if tok in ("-", "—", ""):
+        return 0.0
+    neg = tok.startswith("(") and tok.endswith(")")
+    tok = tok.strip("()").replace(",", "").strip()
+    if not tok:
+        return None
+    try:
+        v = float(tok)
+        return -v if neg else v
+    except ValueError:
+        return None
+
+
+def _pdf_number_after(section: str, label_pattern: str):
+    """Finds the label, then reads the FIRST numeric token on the same line
+    (i.e. the current-quarter column) — skipping over formula-reference
+    parentheticals like "(3 - 4)" that follow some row labels in NSE's
+    standard result format, which would otherwise get misread as data."""
+    m = re.search(label_pattern, section, re.IGNORECASE)
+    if not m:
+        return None
+    nl = section.find("\n", m.end())
+    tail = section[m.end(): nl if nl != -1 else m.end() + 300]
+    tail = _PDF_FORMULA_REF_RE.sub(" ", tail)
+    for tok in re.findall(_PDF_NUM_TOKEN_RE, tail):
+        v = _pdf_parse_num(tok)
+        if v is not None:
+            return v
+    return None
+
+
+def _pdf_quarter_label(period_end_iso: str):
+    try:
+        d = datetime.strptime(period_end_iso, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return None
+    if d.month in (4, 5, 6):
+        q, fy_end = 1, d.year + 1
+    elif d.month in (7, 8, 9):
+        q, fy_end = 2, d.year + 1
+    elif d.month in (10, 11, 12):
+        q, fy_end = 3, d.year + 1
+    else:
+        q, fy_end = 4, d.year
+    return f"Q{q} FY{str(fy_end)[-2:]}"
+
+
+def parse_financial_results_pdf(content: bytes, link: str):
+    """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
+    {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
+    flow through the same grouping/dedup/Telegram code. Prefers the
+    Consolidated results table over Standalone when a PDF contains both.
+    Returns None if this isn't a financial-results outcome (e.g. a PDF only
+    about KMP appointments) or the core numbers can't be found."""
+    from pypdf import PdfReader
+    import io as _io
+
+    try:
+        reader = PdfReader(_io.BytesIO(content))
+        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+    except Exception:
+        return None
+    if not text.strip():
+        return None
+
+    headings = list(_PDF_STATEMENT_HEADING_RE.finditer(text))
+    if not headings:
+        return None  # no results table in this PDF (pure governance/KMP outcome)
+
+    chosen = next((h for h in headings if h.group(1).lower() == "consolidated"), headings[0])
+    nature = "Consolidated" if chosen.group(1).lower() == "consolidated" else "Standalone"
+    start = chosen.end()
+    later = [h.start() for h in headings if h.start() > start]
+    section = text[start: min(later) if later else len(text)]
+
+    revenue        = _pdf_number_after(section, r"Revenue from operations")
+    other_income   = _pdf_number_after(section, r"Other income")
+    total_income   = _pdf_number_after(section, r"Total income")
+    total_expenses = _pdf_number_after(section, r"Total expenses")
+    pbt            = _pdf_number_after(section, r"\)\s*before tax")
+    tax_expense    = _pdf_number_after(section, r"Total tax expense")
+    pat            = _pdf_number_after(section, r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period")
+    comprehensive  = _pdf_number_after(section, r"Total comprehensive.*?for the period")
+    eps_basic      = _pdf_number_after(section, r"\(a\)\s*Basic")
+    eps_diluted    = _pdf_number_after(section, r"\(b\)\s*Diluted")
+
+    if revenue is None and pat is None:
+        return None  # couldn't find the table's actual numbers — don't fabricate a record
+
+    m_qend = re.search(r"quarter ended\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.IGNORECASE)
+    period_end = None
+    if m_qend:
+        try:
+            period_end = datetime.strptime(m_qend.group(1).strip(), "%d %B %Y").strftime("%Y-%m-%d")
+        except ValueError:
+            period_end = None
+    if not period_end:
+        return None  # can't build a reliable dedup key without the quarter
+
+    fname = link.rsplit("/", 1)[-1]
+    m_fn = _PDF_FILENAME_TS_RE.match(fname)
+    if not m_fn:
+        return None
+    board_meeting_date = f"{m_fn.group(4)}-{m_fn.group(3)}-{m_fn.group(2)}"
+
+    # The filename prefix is often an internal/uploader ID, NOT the real NSE
+    # trading symbol (e.g. "GLAXO1924_...", "NOCIL1961_...", "ESCORTS2_...",
+    # "TATACHEMYS_..." for GLAXO/NOCIL/ESCORTS/TATACHEM respectively) — using
+    # it as the dedup key's symbol would silently break the match against
+    # the later XBRL's authoritative symbol, causing a duplicate Telegram
+    # send instead of a quiet update. Pull the real symbol from the PDF's
+    # own "NSE Symbol: XXXX" line (present in every NSE outcome letter);
+    # fall back to the filename prefix only if that's not found.
+    m_sym = re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&]+)", text, re.IGNORECASE)
+    symbol = m_sym.group(1).upper() if m_sym else m_fn.group(1)
+
+    m_aud = re.search(r"\((Unaudited|Audited)\)", section, re.IGNORECASE)
+    audited = m_aud.group(1).capitalize() if m_aud else None
+
+    first_line = text.strip().split("\n", 1)[0].strip()
+    company_name = first_line if first_line and len(first_line) < 80 else symbol
+
+    quarter = {
+        "revenue": revenue,
+        "other_income": other_income,
+        "total_income": total_income,
+        "total_expenses": total_expenses,
+        "pbt": pbt,
+        "tax_expense": tax_expense,
+        "pat": pat,
+        "comprehensive_income": comprehensive,
+        "eps_basic": eps_basic,
+        "eps_diluted": eps_diluted,
+        "period_end": period_end,
+    }
+    _compute_opm(quarter)
+
+    return {
+        "meta": {
+            "symbol": symbol,
+            "company_name": company_name,
+            "board_meeting_date": board_meeting_date,
+            "standalone_consolidated": nature,
+            "audited": audited,
+            "quarter_label": _pdf_quarter_label(period_end),
+            "scrip_code": None,
+            "source": "pdf",
+        },
+        "quarter": quarter,
+    }
+
+
+async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
+    """Same retry/backoff/cache-bust profile as fetch_xbrl_bytes — NSE's
+    archive host shows the same flakiness for PDFs as for XBRL."""
+    sep = "&" if "?" in url else "?"
+    for attempt in range(retries):
+        fetch_url = url if attempt == 0 else f"{url}{sep}_cb={int(time.time() * 1000)}{attempt}"
+        try:
+            r = await client.get(fetch_url, headers=BROWSER_HEADERS, timeout=30, follow_redirects=True)
+            if r.status_code == 404:
+                return None
+            if r.status_code in (403, 429, 502, 503, 504):
+                if attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt + 1)
+                    continue
+                r.raise_for_status()
+            r.raise_for_status()
+            return r.content
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as e:
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt + 1)
+                continue
+            raise RuntimeError(str(e))
+    return None
 
 
 def _quarter_header(iso_date: str):
@@ -810,7 +1027,7 @@ def _group_parsed_results(parsed_new: list) -> list:
     for p in parsed_new:
         meta = p.get("meta", {})
         q = p.get("quarter", {})
-        key = (meta.get("scrip_code"), meta.get("board_meeting_date"), q.get("period_end"))
+        key = (meta.get("scrip_code") or meta.get("symbol"), meta.get("board_meeting_date"), q.get("period_end"))
         if key not in groups:
             groups[key] = []
             order.append(key)
@@ -818,16 +1035,25 @@ def _group_parsed_results(parsed_new: list) -> list:
     return [groups[k] for k in order]
 
 
-async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], fundamentals: dict | None) -> dict | None:
+async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict], fundamentals: dict | None) -> dict | None:
     """
-    For nse_results_feed.json items whose link points to an XBRL file,
-    fetch + parse P&L figures and merge into nse_results_detailed.json.
+    Builds/updates nse_results_detailed.json from two sources:
+      - XBRL filings (results_items, nse_results_feed.json) — authoritative,
+        full-detail, but often published well after the board meeting.
+      - "Outcome of Board Meeting" PDFs (board_items, nse_board_meetings.json)
+        — a fast-path: usually available immediately, core numbers only,
+        best-effort regex parse (see parse_financial_results_pdf).
+    Both feed the same symbol+quarter+nature dedup key, so if a PDF result
+    was already notified, the later XBRL for the same result just updates
+    the record silently (see the "refiled" handling below) instead of
+    sending a second Telegram message.
     Only processes links not already present (idempotent across runs —
-    avoids re-fetching ~150+ XBRL files every poll).
+    avoids re-fetching ~150+ files every poll).
     """
     xbrl_items = [it for it in results_items if XBRL_LINK_RE.search(it.get("link", ""))]
-    if not xbrl_items:
-        print("  ⚠ No XBRL-linked results items — skipping detail parse")
+    pdf_items = [it for it in board_items if _is_board_outcome_pdf(it)]
+    if not xbrl_items and not pdf_items:
+        print("  ⚠ No XBRL or board-outcome-PDF results items — skipping detail parse")
         return None
 
     existing = await r2_get(client, "nse_results_detailed.json")
@@ -839,24 +1065,41 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         standalone/consolidated nature = the same underlying result, even if
         NSE re-files it under a brand-new XBRL link (corrections, resubmissions,
         or just a re-publish — same root cause as the NTPC-type re-publishing
-        the general feed dedup already works around)."""
+        the general feed dedup already works around), or if it was first seen
+        as a fast-path PDF and is now confirmed by the authoritative XBRL."""
         meta = it.get("meta", {}) or {}
         quarter = it.get("quarter", {}) or {}
         return (meta.get("symbol"), quarter.get("period_end"), meta.get("standalone_consolidated"))
 
-    # index existing items by business key so a re-filed result updates the
-    # existing record in place instead of appending a lookalike duplicate
+    # index existing items by business key so a re-filed result (or a later
+    # XBRL confirming an earlier fast-path PDF) updates the existing record
+    # in place instead of appending a lookalike duplicate
     existing_by_key = {_result_key(it): idx for idx, it in enumerate(existing_items) if _result_key(it)[0]}
 
-    new_items = [it for it in xbrl_items if it["link"] not in existing_links]
-    if not new_items:
-        print("  ✓ nse_results_detailed: no new XBRL filings to parse")
+    new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
+    new_pdf = [it for it in pdf_items if it["link"] not in existing_links]
+    if not new_xbrl and not new_pdf:
+        print("  ✓ nse_results_detailed: no new filings to parse")
         return None
 
-    print(f"  Parsing {len(new_items)} new XBRL result filing(s)...")
+    print(f"  Parsing {len(new_xbrl)} new XBRL + {len(new_pdf)} new PDF result filing(s)...")
     sem = asyncio.Semaphore(3)  # be polite to nsearchives.nseindia.com
 
-    async def process(it):
+    def _attach_fundamentals(parsed):
+        if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
+            symbol = parsed.get("meta", {}).get("symbol")
+            nature = parsed.get("meta", {}).get("standalone_consolidated")
+            yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], nature, fundamentals)
+            if yoy_fund:
+                parsed["yoy_fundamentals"] = yoy_fund
+        if parsed.get("quarter"):
+            symbol = parsed.get("meta", {}).get("symbol")
+            nature = parsed.get("meta", {}).get("standalone_consolidated")
+            qoq_fund = _qoq_fundamentals(symbol, parsed["quarter"], nature, fundamentals)
+            if qoq_fund:
+                parsed["qoq_fundamentals"] = qoq_fund
+
+    async def process_xbrl(it):
         async with sem:
             try:
                 content = await fetch_xbrl_bytes(client, it["link"])
@@ -869,29 +1112,37 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 parsed["title"] = it.get("title", "")
                 parsed["published"] = it.get("published", "")
                 parsed["published_ts"] = it.get("published_ts", 0)
-
-                if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
-                    symbol = parsed.get("meta", {}).get("symbol")
-                    nature = parsed.get("meta", {}).get("standalone_consolidated")
-                    yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], nature, fundamentals)
-                    if yoy_fund:
-                        parsed["yoy_fundamentals"] = yoy_fund
-
-                if parsed.get("quarter"):
-                    symbol = parsed.get("meta", {}).get("symbol")
-                    nature = parsed.get("meta", {}).get("standalone_consolidated")
-                    qoq_fund = _qoq_fundamentals(symbol, parsed["quarter"], nature, fundamentals)
-                    if qoq_fund:
-                        parsed["qoq_fundamentals"] = qoq_fund
-
+                _attach_fundamentals(parsed)
                 return parsed
             except Exception as e:
                 print(f"  ⚠ XBRL parse failed for {it['link'].split('/')[-1]}: {e}")
                 return None
 
-    results = await asyncio.gather(*(process(it) for it in new_items))
-    parsed_all = [r for r in results if r]
-    print(f"  ✓ Parsed {len(parsed_all)}/{len(new_items)} successfully")
+    async def process_pdf(it):
+        async with sem:
+            try:
+                content = await fetch_pdf_bytes(client, it["link"])
+                if not content:
+                    return None
+                parsed = parse_financial_results_pdf(content, it["link"])
+                if not parsed:
+                    return None  # not a results PDF, or couldn't extract the table
+                parsed["link"] = it["link"]
+                parsed["title"] = it.get("title", "")
+                parsed["published"] = it.get("published", "")
+                parsed["published_ts"] = it.get("published_ts", 0)
+                _attach_fundamentals(parsed)
+                return parsed
+            except Exception as e:
+                print(f"  ⚠ PDF parse failed for {it['link'].split('/')[-1]}: {e}")
+                return None
+
+    xbrl_results, pdf_results = await asyncio.gather(
+        asyncio.gather(*(process_xbrl(it) for it in new_xbrl)),
+        asyncio.gather(*(process_pdf(it) for it in new_pdf)),
+    )
+    parsed_all = [r for r in xbrl_results if r] + [r for r in pdf_results if r]
+    print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf)} successfully")
 
     # Intra-batch dedup: NSE sometimes files the same symbol+quarter+nature
     # twice within minutes (correction/resubmission) — both can land as
@@ -986,6 +1237,7 @@ async def run():
 
         uploads = []
         results_feed_items = []
+        board_meeting_items = []
 
         for filename, source_keys in OUTPUT_MAP.items():
 
@@ -1034,6 +1286,9 @@ async def run():
                 items = merged_feed
                 results_feed_items = items
 
+            if filename == "nse_board_meetings.json":
+                board_meeting_items = items
+
             uploads.append((filename, make_payload(items)))
 
         # Upload all concurrently
@@ -1047,7 +1302,7 @@ async def run():
         fundamentals_stocks = (fundamentals or {}).get("stocks")
         if not fundamentals_stocks:
             print(f"  ⚠ {FUNDAMENTALS_FILE} unavailable — YoY fallback via fundamentals disabled this run")
-        detailed_payload = await build_results_detailed(client, results_feed_items, fundamentals_stocks)
+        detailed_payload = await build_results_detailed(client, results_feed_items, board_meeting_items, fundamentals_stocks)
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
 
