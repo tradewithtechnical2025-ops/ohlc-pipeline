@@ -143,6 +143,7 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                 r.raise_for_status()
                 feed = feedparser.parse(r.content)
                 items = []
+                IST = timezone(timedelta(hours=5, minutes=30))
                 for entry in feed.entries:
 
                     # Epoch timestamp for reliable cross-source sorting
@@ -151,6 +152,20 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                     if parsed:
                         try:
                             ts = calendar.timegm(parsed)
+                        except Exception:
+                            ts = 0
+                    if not ts:
+                        # NSE's own feeds (results, board meetings, corp actions)
+                        # use a non-standard "DD-Mon-YYYY HH:MM:SS" IST string
+                        # with no weekday/timezone, which feedparser's RFC822/
+                        # ISO parsers silently fail on (published_parsed stays
+                        # None) — parse it manually instead of falling back to 0,
+                        # which broke newest-first sort/1000-cap truncation and
+                        # made every item look equally "new".
+                        raw = entry.get("published", "") or entry.get("updated", "")
+                        try:
+                            dt = datetime.strptime(raw.strip(), "%d-%b-%Y %H:%M:%S").replace(tzinfo=IST)
+                            ts = int(dt.astimezone(timezone.utc).timestamp())
                         except Exception:
                             ts = 0
 
@@ -252,6 +267,18 @@ def make_payload(items: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────
 
 XBRL_LINK_RE = re.compile(r"/corporate/xbrl/.*\.xml$", re.IGNORECASE)
+
+# XBRL filenames embed a DDMMYYYYHHMMSS submission timestamp, e.g.
+# INTEGRATED_FILING_INDAS_1699505_22072026062423_WEB.xml -> 22072026062423.
+# This is far more reliable than the RSS entry's published_ts (which has
+# been observed to come through as 0 for this feed) for deciding which of
+# two filings for the same symbol+quarter+nature is the newer one.
+_XBRL_FILENAME_TS_RE = re.compile(r"_(\d{14})_WEB\.xml$", re.IGNORECASE)
+
+
+def _filing_ts(link: str) -> str:
+    m = _XBRL_FILENAME_TS_RE.search(link or "")
+    return m.group(1) if m else ""
 
 _XBRL_FIELD_MAP = {
     "RevenueFromOperations":                                              "revenue",
@@ -865,6 +892,28 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     results = await asyncio.gather(*(process(it) for it in new_items))
     parsed_all = [r for r in results if r]
     print(f"  ✓ Parsed {len(parsed_all)}/{len(new_items)} successfully")
+
+    # Intra-batch dedup: NSE sometimes files the same symbol+quarter+nature
+    # twice within minutes (correction/resubmission) — both can land as
+    # "new" in the SAME run, so the cross-run existing_by_key check below
+    # (built before this run started) can't catch them against each other.
+    # Keep only the latest per key, using the XBRL filename's embedded
+    # submission timestamp (published_ts has been observed as unreliable/0
+    # for this feed).
+    latest_by_key = {}
+    unkeyed = []
+    for r in parsed_all:
+        key = _result_key(r)
+        if not key[0]:
+            unkeyed.append(r)
+            continue
+        prior = latest_by_key.get(key)
+        if prior is None or _filing_ts(r.get("link", "")) >= _filing_ts(prior.get("link", "")):
+            latest_by_key[key] = r
+    superseded_count = len(parsed_all) - len(latest_by_key) - len(unkeyed)
+    parsed_all = list(latest_by_key.values()) + unkeyed
+    if superseded_count > 0:
+        print(f"  ↺ {superseded_count} superseded within this batch (same-run resubmission) — kept latest only")
 
     # Split out re-filed results (same symbol+quarter+nature already notified
     # under a different link) — refresh their data but don't spam Telegram again.
