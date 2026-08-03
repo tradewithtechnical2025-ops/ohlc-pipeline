@@ -27,6 +27,7 @@ UP_HEADERS = {
 }
 DL_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
+    "Cache-Control": "no-cache",
 }
 
 BROWSER_HEADERS = {
@@ -76,6 +77,10 @@ NOISE_SUBJECT_PATTERNS = [
     r"^board meeting intimation$",  # future-dated notice only; "Outcome of Board Meeting" kept (actual results)
     r"^shareholders meeting$",      # AGM/EGM/postal ballot voting outcomes — not trading-actionable
     r"^allotment of securities$",   # routine NCD/ESOP allotment filings
+    r"^change in directors?/kmp/smp/auditor/rta$",  # routine KMP/auditor/RTA administrative changes
+    r"^change in director\(s\)$",                   # routine board-composition filings (not MD/CEO-level)
+    r"^appointment$",                                # generic appointment notices (KMP/company secretary level)
+    r"^cessation$",                                  # generic cessation notices (KMP/director resignations)
 ]
 _NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
 
@@ -195,8 +200,15 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
 
 
 async def r2_get(client: httpx.AsyncClient, filename: str):
+    # Cache-bust every call. Without this, the Worker/Cloudflare edge can
+    # serve a stale cached response for this exact URL — which silently
+    # breaks the new-vs-already-processed dedup in build_results_detailed()
+    # (a stale/empty read makes every filing look "new" again on the very
+    # next run, even minutes after the previous run's upload succeeded).
     try:
-        r = await client.get(f"{WORKER_URL}/{filename}", headers=DL_HEADERS, timeout=30)
+        v = int(time.time())
+        sep = "&" if "?" in filename else "?"
+        r = await client.get(f"{WORKER_URL}/{filename}{sep}v={v}", headers=DL_HEADERS, timeout=30)
         if r.status_code == 404:
             return None
         r.raise_for_status()
@@ -833,17 +845,34 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
                   "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
                   "Set TELEGRAM_RESULTS_CHAT_ID to send these to a separate channel.")
-        # Sequential with a small delay — Telegram's per-chat flood limit is
-        # roughly ~1 msg/sec sustained; sending a batch of ~20 all at once
-        # risks 429s. Individual send failures are swallowed (not fatal to
-        # the pipeline — results are still saved to R2 either way).
+        # Sequential with a delay between sends — Telegram's per-chat flood
+        # limit is roughly ~1 msg/sec sustained, but real-world timing
+        # jitter means even a strict 1s gap can trigger 429s during a
+        # heavy burst (e.g. 60+ companies reporting the same evening).
+        # On a 429, back off and retry a few times rather than dropping the
+        # message — a dropped send here is a PERMANENTLY missed
+        # notification, since the filing is still recorded as "already
+        # processed" in nse_results_detailed.json regardless of whether
+        # the Telegram send succeeded.
+        SEND_RETRIES = 4
         for group in groups:
-            try:
-                send_message(_telegram_result_message(group), chat_id=TELEGRAM_RESULTS_CHAT_ID)
-            except Exception as e:
-                sym = group[0].get("meta", {}).get("symbol") if group else "?"
-                print(f"  ⚠ Telegram send failed for {sym}: {e}")
-            await asyncio.sleep(1)
+            sym = group[0].get("meta", {}).get("symbol") if group else "?"
+            msg = _telegram_result_message(group)
+            for attempt in range(SEND_RETRIES):
+                try:
+                    send_message(msg, chat_id=TELEGRAM_RESULTS_CHAT_ID)
+                    break
+                except Exception as e:
+                    is_last = attempt == SEND_RETRIES - 1
+                    is_rate_limit = "429" in str(e)
+                    if is_last:
+                        print(f"  ⚠ Telegram send failed for {sym} after {SEND_RETRIES} attempts: {e}")
+                        break
+                    wait = (10 if is_rate_limit else 3) * (attempt + 1)
+                    print(f"  ⚠ Telegram send for {sym} failed ({e}), retrying in {wait}s "
+                          f"(attempt {attempt+1}/{SEND_RETRIES})...")
+                    await asyncio.sleep(wait)
+            await asyncio.sleep(2)
 
     merged = existing_items + parsed_new
     merged.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
@@ -935,4 +964,3 @@ async def run():
 
 if __name__ == "__main__":
     asyncio.run(run())
-    
