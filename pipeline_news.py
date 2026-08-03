@@ -1078,12 +1078,35 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
     new_pdf = [it for it in pdf_items if it["link"] not in existing_links]
+
+    # Give-up tracking: NSE's WAF blocks some specific filing URLs
+    # persistently for GitHub Actions' IP/pattern (confirmed: the same file
+    # is fetchable from elsewhere, so this isn't a transient/cache issue —
+    # it just never succeeds from this runner). Without this, an
+    # unfetchable filing gets retried every single run forever since a
+    # failure never lands it in existing_links. GIVE_UP_ATTEMPTS caps that:
+    # after ~7.5h of retrying (15 runs x 30min), stop hammering it and flag
+    # it for manual attention instead.
+    GIVE_UP_ATTEMPTS = 15
+    failures_payload = await r2_get(client, "nse_xbrl_failures.json")
+    failures = (failures_payload or {}).get("links", {})
+    given_up_links = {link for link, e in failures.items() if e.get("attempts", 0) >= GIVE_UP_ATTEMPTS}
+    if given_up_links:
+        before_xbrl, before_pdf = len(new_xbrl), len(new_pdf)
+        new_xbrl = [it for it in new_xbrl if it["link"] not in given_up_links]
+        new_pdf = [it for it in new_pdf if it["link"] not in given_up_links]
+        skipped = (before_xbrl - len(new_xbrl)) + (before_pdf - len(new_pdf))
+        if skipped:
+            print(f"  ⏭ Skipping {skipped} filing(s) given up after {GIVE_UP_ATTEMPTS}+ failed "
+                  f"attempts (see nse_xbrl_failures.json)")
+
     if not new_xbrl and not new_pdf:
         print("  ✓ nse_results_detailed: no new filings to parse")
         return None
 
     print(f"  Parsing {len(new_xbrl)} new XBRL + {len(new_pdf)} new PDF result filing(s)...")
     sem = asyncio.Semaphore(3)  # be polite to nsearchives.nseindia.com
+    failed_links = []
 
     def _attach_fundamentals(parsed):
         if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
@@ -1116,6 +1139,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 return parsed
             except Exception as e:
                 print(f"  ⚠ XBRL parse failed for {it['link'].split('/')[-1]}: {e}")
+                failed_links.append(it["link"])
                 return None
 
     async def process_pdf(it):
@@ -1123,10 +1147,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             try:
                 content = await fetch_pdf_bytes(client, it["link"])
                 if not content:
+                    failed_links.append(it["link"])
                     return None
                 parsed = parse_financial_results_pdf(content, it["link"])
                 if not parsed:
-                    return None  # not a results PDF, or couldn't extract the table
+                    failed_links.append(it["link"])  # not a results PDF — no point refetching forever
+                    return None
                 parsed["link"] = it["link"]
                 parsed["title"] = it.get("title", "")
                 parsed["published"] = it.get("published", "")
@@ -1135,6 +1161,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 return parsed
             except Exception as e:
                 print(f"  ⚠ PDF parse failed for {it['link'].split('/')[-1]}: {e}")
+                failed_links.append(it["link"])
                 return None
 
     xbrl_results, pdf_results = await asyncio.gather(
@@ -1143,6 +1170,20 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     )
     parsed_all = [r for r in xbrl_results if r] + [r for r in pdf_results if r]
     print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf)} successfully")
+
+    if failed_links:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for link in failed_links:
+            entry = failures.get(link, {"first_failed": now_iso, "attempts": 0})
+            entry["attempts"] += 1
+            entry["last_failed"] = now_iso
+            failures[link] = entry
+        newly_given_up = [link for link in failed_links
+                          if failures[link]["attempts"] == GIVE_UP_ATTEMPTS]
+        if newly_given_up:
+            print(f"  ⚠ {len(newly_given_up)} filing(s) just crossed {GIVE_UP_ATTEMPTS} failed "
+                  f"attempts — giving up on them going forward (nse_xbrl_failures.json)")
+        await r2_put(client, "nse_xbrl_failures.json", {"updated_at": now_iso, "links": failures})
 
     # Intra-batch dedup: NSE sometimes files the same symbol+quarter+nature
     # twice within minutes (correction/resubmission) — both can land as
