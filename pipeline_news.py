@@ -288,6 +288,32 @@ def _filing_ts(link: str) -> str:
     m = _GENERIC_FILENAME_TS_RE.search(link or "")
     return m.group(1) if m else ""
 
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _effective_ts(it: dict) -> int:
+    """Sort key for merging/capping nse_results_detailed.json. Prefers the
+    RSS published_ts, but falls back to the filename-embedded submission
+    timestamp when published_ts is 0 — which every record parsed before the
+    published_ts date-parsing fix has. Without this fallback, a large batch
+    of same-valued (0) timestamps makes the merge sort a no-op, so newly
+    parsed+notified items can get silently dropped by the 1000-item cap
+    truncation before ever being persisted (they were already sent to
+    Telegram, but never actually saved) — causing the exact same filings to
+    look "new" again on the next run and get re-notified forever."""
+    ts = it.get("published_ts", 0)
+    if ts:
+        return ts
+    fts = _filing_ts(it.get("link", ""))
+    if fts:
+        try:
+            dt = datetime.strptime(fts, "%d%m%Y%H%M%S").replace(tzinfo=_IST)
+            return int(dt.astimezone(timezone.utc).timestamp())
+        except ValueError:
+            pass
+    return 0
+
 _XBRL_FIELD_MAP = {
     "RevenueFromOperations":                                              "revenue",
     "OtherIncome":                                                        "other_income",
@@ -556,22 +582,73 @@ def _pdf_parse_num(tok: str):
         return None
 
 
-def _pdf_number_after(section: str, label_pattern: str):
-    """Finds the label, then reads the FIRST numeric token on the same line
-    (i.e. the current-quarter column) — skipping over formula-reference
-    parentheticals like "(3 - 4)" that follow some row labels in NSE's
-    standard result format, which would otherwise get misread as data."""
+def _pdf_numbers_after(section: str, label_pattern: str, max_cols: int = 4):
+    """Finds the label, then reads up to max_cols numeric tokens on the same
+    line — the standard NSE quarterly-result row layout is
+    [current quarter, immediately-preceding quarter, same quarter last year,
+    full year], all on one line. Returns a list padded with None to
+    max_cols. Skips formula-reference parentheticals like "(3 - 4)"."""
     m = re.search(label_pattern, section, re.IGNORECASE)
     if not m:
-        return None
+        return [None] * max_cols
     nl = section.find("\n", m.end())
-    tail = section[m.end(): nl if nl != -1 else m.end() + 300]
+    tail = section[m.end(): nl if nl != -1 else m.end() + 400]
     tail = _PDF_FORMULA_REF_RE.sub(" ", tail)
-    for tok in re.findall(_PDF_NUM_TOKEN_RE, tail):
-        v = _pdf_parse_num(tok)
-        if v is not None:
-            return v
-    return None
+    vals = [_pdf_parse_num(t) for t in re.findall(_PDF_NUM_TOKEN_RE, tail)]
+    vals = vals[:max_cols]
+    return vals + [None] * (max_cols - len(vals))
+
+
+def _pdf_number_after(section: str, label_pattern: str):
+    """Current-quarter (first column) convenience wrapper around
+    _pdf_numbers_after."""
+    return _pdf_numbers_after(section, label_pattern, max_cols=1)[0]
+
+
+def _pdf_header_dates(section: str):
+    """Extracts the column header dates from the results table's
+    'Particulars <date1> <date2> ...' row, e.g. ['30 June 2026',
+    '31 March 2026', '30 June 2025', '31 March 2026']. Returns ISO dates,
+    padded with None to 4 columns."""
+    m = re.search(r"Particulars\s+((?:\d{1,2}\s+[A-Za-z]+\s+\d{4}\s*){2,4})", section)
+    if not m:
+        return [None] * 4
+    raw_dates = re.findall(r"\d{1,2}\s+[A-Za-z]+\s+\d{4}", m.group(1))
+    iso_dates = []
+    for d in raw_dates[:4]:
+        try:
+            iso_dates.append(datetime.strptime(d.strip(), "%d %B %Y").strftime("%Y-%m-%d"))
+        except ValueError:
+            iso_dates.append(None)
+    return iso_dates + [None] * (4 - len(iso_dates))
+
+
+def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
+    """Builds a comparison dict in the same shape _compare_to_fundamentals()
+    produces (sales_prior/sales_{suffix}_pct, pat_..., eps_..., opm_...),
+    but computed directly from the PDF's own comparative column instead of
+    a separate fundamentals lookup — this is the filing's own reported
+    comparative figure, which is more precise than a database join.
+    basis="reported" flags this as sourced from the filing itself."""
+    if not prior_header or not any(v is not None for v in prior.values()):
+        return None
+    out = {"basis": "reported", "basis_verified": True, "prior_header": prior_header}
+    field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
+    got_any = False
+    for cur_field, out_field in field_map.items():
+        cur_v, prior_v = cur.get(cur_field), prior.get(cur_field)
+        if cur_v is not None and prior_v is not None and prior_v != 0:
+            out[f"{out_field}_prior"] = prior_v
+            out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
+            got_any = True
+    prior_rev, prior_exp = prior.get("revenue"), prior.get("total_expenses")
+    prior_opm = (prior_rev - prior_exp) / prior_rev if (prior_rev and prior_exp is not None and prior_rev != 0) else None
+    cur_opm = cur.get("opm")
+    if cur_opm is not None and prior_opm is not None:
+        out["opm_prior"] = round(prior_opm * 100, 2)
+        out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
+        got_any = True
+    return out if got_any else None
 
 
 def _pdf_quarter_label(period_end_iso: str):
@@ -618,16 +695,20 @@ def parse_financial_results_pdf(content: bytes, link: str):
     later = [h.start() for h in headings if h.start() > start]
     section = text[start: min(later) if later else len(text)]
 
-    revenue        = _pdf_number_after(section, r"Revenue from operations")
-    other_income   = _pdf_number_after(section, r"Other income")
-    total_income   = _pdf_number_after(section, r"Total income")
-    total_expenses = _pdf_number_after(section, r"Total expenses")
-    pbt            = _pdf_number_after(section, r"\)\s*before tax")
-    tax_expense    = _pdf_number_after(section, r"Total tax expense")
-    pat            = _pdf_number_after(section, r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period")
-    comprehensive  = _pdf_number_after(section, r"Total comprehensive.*?for the period")
-    eps_basic      = _pdf_number_after(section, r"\(a\)\s*Basic")
-    eps_diluted    = _pdf_number_after(section, r"\(b\)\s*Diluted")
+    revenue_c        = _pdf_numbers_after(section, r"Revenue from operations")
+    other_income_c   = _pdf_numbers_after(section, r"Other income")
+    total_income_c   = _pdf_numbers_after(section, r"Total income")
+    total_expenses_c = _pdf_numbers_after(section, r"Total expenses")
+    pbt_c            = _pdf_numbers_after(section, r"\)\s*before tax")
+    tax_expense_c    = _pdf_numbers_after(section, r"Total tax expense")
+    pat_c            = _pdf_numbers_after(section, r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period")
+    comprehensive_c  = _pdf_numbers_after(section, r"Total comprehensive.*?for the period")
+    eps_basic_c      = _pdf_numbers_after(section, r"\(a\)\s*Basic")
+    eps_diluted_c    = _pdf_numbers_after(section, r"\(b\)\s*Diluted")
+
+    revenue, other_income, total_income, total_expenses = revenue_c[0], other_income_c[0], total_income_c[0], total_expenses_c[0]
+    pbt, tax_expense, pat, comprehensive = pbt_c[0], tax_expense_c[0], pat_c[0], comprehensive_c[0]
+    eps_basic, eps_diluted = eps_basic_c[0], eps_diluted_c[0]
 
     if revenue is None and pat is None:
         return None  # couldn't find the table's actual numbers — don't fabricate a record
@@ -680,7 +761,7 @@ def parse_financial_results_pdf(content: bytes, link: str):
     }
     _compute_opm(quarter)
 
-    return {
+    result = {
         "meta": {
             "symbol": symbol,
             "company_name": company_name,
@@ -693,6 +774,29 @@ def parse_financial_results_pdf(content: bytes, link: str):
         },
         "quarter": quarter,
     }
+
+    # QoQ (col 1) and YoY (col 2) comparisons, straight from the PDF's own
+    # comparative columns — same standard 4-column layout as SEBI Reg. 33
+    # quarterly disclosures: [current, immediately-preceding qtr,
+    # same qtr last year, full year]. More precise than the fundamentals-
+    # database fallback since it's the filing's own reported figures.
+    header_dates = _pdf_header_dates(section)
+    qoq_prior = {
+        "revenue": revenue_c[1], "pat": pat_c[1], "eps_basic": eps_basic_c[1], "total_expenses": total_expenses_c[1],
+    }
+    yoy_prior = {
+        "revenue": revenue_c[2], "pat": pat_c[2], "eps_basic": eps_basic_c[2], "total_expenses": total_expenses_c[2],
+    }
+    qoq_header = _quarter_header(header_dates[1]) if header_dates[1] else None
+    yoy_header = _quarter_header(header_dates[2]) if header_dates[2] else None
+    qoq_fund = _pdf_comparison(quarter, qoq_prior, qoq_header, "qoq")
+    yoy_fund = _pdf_comparison(quarter, yoy_prior, yoy_header, "yoy")
+    if qoq_fund:
+        result["qoq_fundamentals"] = qoq_fund
+    if yoy_fund:
+        result["yoy_fundamentals"] = yoy_fund
+
+    return result
 
 
 async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
@@ -1076,6 +1180,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # in place instead of appending a lookalike duplicate
     existing_by_key = {_result_key(it): idx for idx, it in enumerate(existing_items) if _result_key(it)[0]}
 
+    # ⚠️ TEMPORARY: XBRL processing disabled to isolate-test the PDF fast-path.
+    # Set back to False (or remove this block) once PDF testing is done.
+    DISABLE_XBRL_FOR_TESTING = True
+    if DISABLE_XBRL_FOR_TESTING:
+        print("  ⚠ XBRL processing disabled for testing — PDF-only this run")
+        xbrl_items = []
+
     new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
     new_pdf = [it for it in pdf_items if it["link"] not in existing_links]
 
@@ -1109,13 +1220,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     failed_links = []
 
     def _attach_fundamentals(parsed):
-        if "yoy_comparison" not in parsed and parsed.get("quarter", {}).get("period_end"):
+        if "yoy_comparison" not in parsed and "yoy_fundamentals" not in parsed and parsed.get("quarter", {}).get("period_end"):
             symbol = parsed.get("meta", {}).get("symbol")
             nature = parsed.get("meta", {}).get("standalone_consolidated")
             yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], nature, fundamentals)
             if yoy_fund:
                 parsed["yoy_fundamentals"] = yoy_fund
-        if parsed.get("quarter"):
+        if "qoq_fundamentals" not in parsed and parsed.get("quarter"):
             symbol = parsed.get("meta", {}).get("symbol")
             nature = parsed.get("meta", {}).get("standalone_consolidated")
             qoq_fund = _qoq_fundamentals(symbol, parsed["quarter"], nature, fundamentals)
@@ -1259,7 +1370,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             await asyncio.sleep(2)
 
     merged = existing_items + parsed_new
-    merged.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+    merged.sort(key=_effective_ts, reverse=True)
     merged = merged[:1000]  # cap file size — keep most recent 1000 filings
 
     return make_payload(merged)
@@ -1319,7 +1430,7 @@ async def run():
                 existing_feed = await r2_get(client, "nse_results_feed.json")
                 existing_feed_items = (existing_feed or {}).get("items", [])
                 merged_feed = dedup_items(items + existing_feed_items)
-                merged_feed.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+                merged_feed.sort(key=_effective_ts, reverse=True)
                 merged_feed = merged_feed[:1000]  # same cap as nse_results_detailed.json
                 added = len(merged_feed) - len(existing_feed_items)
                 print(f"  nse_results_feed.json: {len(existing_feed_items)} existing + "
