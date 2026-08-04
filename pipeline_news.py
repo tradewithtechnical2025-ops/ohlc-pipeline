@@ -19,6 +19,13 @@ except ImportError:
 # Boss needs to create this channel and set the secret once.
 TELEGRAM_RESULTS_CHAT_ID = os.environ.get("TELEGRAM_RESULTS_CHAT_ID", "")
 
+# Used for AI-assisted PDF financial-results extraction (fallback/primary
+# when regex label-matching fails or produces implausible values — see
+# _ai_extract_financials). Pipeline runs regex-only (degraded but
+# functional) when this isn't set.
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AI_PDF_MODEL = "claude-sonnet-5"
+
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 UP_HEADERS = {
@@ -752,37 +759,83 @@ def _pdf_quarter_label(period_end_iso: str):
     return f"Q{q} FY{str(fy_end)[-2:]}"
 
 
-def parse_financial_results_pdf(content: bytes, link: str):
-    """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
-    {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
-    flow through the same grouping/dedup/Telegram code. Prefers the
-    Consolidated results table over Standalone when a PDF contains both.
-    Returns None if this isn't a financial-results outcome (e.g. a PDF only
-    about KMP appointments) or the core numbers can't be found."""
-    # pdfplumber's layout=True mode reconstructs text using each word's
-    # actual (x,y) position on the page, rather than following the PDF
-    # content stream's draw order. This matters a lot for these tables:
-    # pypdf's extract_text() was confirmed (via a live UNO MINDA filing) to
-    # dump the entire "Particulars" label column first, then the entire
-    # numbers column separately hundreds of lines later — completely
-    # breaking the same-line label→number matching every regex below
-    # depends on. layout=True keeps each row's label and its numbers
-    # together as they actually appear.
-    import pdfplumber
-    import io as _io
+_AI_EXTRACT_SYSTEM_PROMPT = """You extract structured financial data from the text of an NSE-listed Indian company's quarterly results outcome PDF (already OCR'd/extracted to plain text — it may include a cover letter, an auditor's review report, notes, and segment/subsidiary disclosures in addition to the actual results table, or it may not be a results table at all).
 
-    fname_dbg = link.rsplit("/", 1)[-1]
+Your job:
+1. Determine if this document contains an actual quarterly financial results TABLE (the "Statement of Standalone/Consolidated Financial Results" with line items like Revenue, Expenses, Profit, EPS). If it's only a cover letter, merger intimation, KMP change notice, AGM notice, or similar with no such table, set is_results_table to false and leave other fields null.
+2. If both Standalone and Consolidated tables are present, use the CONSOLIDATED table. Otherwise use whichever is present.
+3. Extract values ONLY from the MAIN results table's own rows — never from a subsidiary/joint-venture footnote, a segment-wise breakdown table, or the auditor's report's boilerplate sentences, even if they mention similar words ("total income", "net profit") with numbers nearby. The main table is the one with the full standard line-item structure (Revenue, Expenses, Profit before tax, Tax expense, Profit for the period, EPS).
+4. Use the CURRENT quarter column only (the most recent quarter, i.e. the first/leftmost data column — NOT a prior-year or prior-quarter comparative column).
+5. Report the unit the table itself states (look for "₹ in Crore", "Rs in Crores", "₹ in Million", "₹ in Lakh", or similar near the table header) — if genuinely no unit statement exists anywhere, use "Crore" as the default (NSE's most common convention).
+6. Ignore any numbers inside formula references like "(3+4)" or "[3-4]" next to line-item labels — those are row-number citations, not data.
+7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, PAT, and EPS if visible as separate columns in the same main table, plus each comparison column's period-end date.
+8. Extract the quarter-end date (the date this result is FOR, e.g. "quarter ended June 30, 2026" -> "2026-06-30").
 
+Return ONLY valid JSON (no markdown fences, no other text) matching exactly this schema:
+{
+  "is_results_table": true or false,
+  "nature": "Standalone" or "Consolidated" or null,
+  "unit": "Crore" or "Million" or "Lakh" or null,
+  "period_end": "YYYY-MM-DD" or null,
+  "current": {
+    "revenue": number or null,
+    "other_income": number or null,
+    "total_income": number or null,
+    "total_expenses": number or null,
+    "pbt": number or null,
+    "tax_expense": number or null,
+    "pat": number or null,
+    "comprehensive_income": number or null,
+    "eps_basic": number or null,
+    "eps_diluted": number or null
+  },
+  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null},
+  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null}
+}
+
+All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS."""
+
+
+async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str):
+    """Calls Claude Sonnet to extract structured financial data directly from
+    the raw extracted PDF text. Returns the parsed JSON dict, or None if the
+    API isn't configured, the call fails, or the response doesn't parse as
+    valid JSON. Caller is responsible for unit-scaling and sanity checks."""
+    if not ANTHROPIC_API_KEY:
+        return None
     try:
-        with pdfplumber.open(_io.BytesIO(content)) as pdf:
-            text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": AI_PDF_MODEL,
+                "max_tokens": 700,
+                "system": _AI_EXTRACT_SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": text[:14000]}],
+            },
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        blocks = data.get("content", [])
+        raw_text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
+        parsed = json.loads(cleaned)
+        return parsed
     except Exception as e:
-        print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
-        return None
-    if not text.strip():
-        print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
+        print(f"    · [{fname_dbg}] AI extraction failed: {type(e).__name__}: {e}")
         return None
 
+
+def _parse_pdf_regex(text: str, link: str, fname_dbg: str):
+    """Regex/label-matching fallback parser — used when AI extraction is
+    unavailable (no ANTHROPIC_API_KEY) or fails. Takes already-extracted
+    text (see parse_financial_results_pdf, which does the pdfplumber
+    extraction once and tries AI first)."""
     headings = _pdf_find_heading_candidates(text)
     if not headings:
         snippets = []
@@ -1001,6 +1054,7 @@ def parse_financial_results_pdf(content: bytes, link: str):
             "quarter_label": _pdf_quarter_label(period_end),
             "scrip_code": None,
             "source": "pdf",
+            "extraction_method": "regex",
         },
         "quarter": quarter,
     }
@@ -1027,6 +1081,166 @@ def parse_financial_results_pdf(content: bytes, link: str):
         result["yoy_fundamentals"] = yoy_fund
 
     return result
+
+
+def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str):
+    """Converts the AI extraction's JSON into the same {meta, quarter,
+    qoq_fundamentals, yoy_fundamentals} shape _parse_pdf_regex produces.
+    Applies unit scaling and the same total_income sanity check used on
+    the regex path. Returns None if the AI result fails basic validation
+    (missing revenue+PAT, bad date, unmatched filename) — caller falls
+    back to the regex parser in that case."""
+    cur = ai.get("current") or {}
+    nature = ai.get("nature") or "Standalone"
+    unit_word = (ai.get("unit") or "Crore").lower()
+    if unit_word.startswith("million"):
+        unit_multiplier = 1e6
+    elif unit_word.startswith("lakh"):
+        unit_multiplier = 1e5
+    else:
+        unit_multiplier = 1e7  # Crore, NSE's default convention
+
+    def scale(v):
+        return v * unit_multiplier if isinstance(v, (int, float)) else None
+
+    revenue = scale(cur.get("revenue"))
+    other_income = scale(cur.get("other_income"))
+    total_income = scale(cur.get("total_income"))
+    total_expenses = scale(cur.get("total_expenses"))
+    pbt = scale(cur.get("pbt"))
+    tax_expense = scale(cur.get("tax_expense"))
+    pat = scale(cur.get("pat"))
+    comprehensive = scale(cur.get("comprehensive_income"))
+    eps_basic = cur.get("eps_basic")      # per-share rupee amount — never scaled
+    eps_diluted = cur.get("eps_diluted")
+
+    if revenue is None and pat is None:
+        print(f"    · [{fname_dbg}] AI returned is_results_table=true but no revenue/PAT — treating as invalid")
+        return None
+
+    # Same reconciliation sanity check as the regex path: Total Income must
+    # equal Revenue + Other Income by definition. Even AI extraction can
+    # occasionally pick up a stray number, so this stays as defense-in-depth.
+    if revenue is not None and other_income is not None and total_income is not None:
+        expected = revenue + other_income
+        if abs(expected - total_income) > max(1e7, 0.02 * abs(expected)):
+            print(f"    · [{fname_dbg}] AI total_income sanity check failed: ₹{total_income/1e7:.2f} Cr, "
+                  f"but revenue+other_income = ₹{expected/1e7:.2f} Cr — using computed value")
+            total_income = round(expected, 2)
+
+    period_end = ai.get("period_end")
+    if not period_end:
+        print(f"    · [{fname_dbg}] AI result missing period_end — can't build dedup key")
+        return None
+    try:
+        datetime.strptime(period_end, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        print(f"    · [{fname_dbg}] AI returned invalid period_end format: {period_end!r}")
+        return None
+
+    fname = link.rsplit("/", 1)[-1]
+    m_fn = _PDF_FILENAME_TS_RE.match(fname)
+    if not m_fn:
+        print(f"    · [{fname_dbg}] AI result parsed but filename doesn't match expected timestamp pattern")
+        return None
+    board_meeting_date = f"{m_fn.group(4)}-{m_fn.group(3)}-{m_fn.group(2)}"
+
+    m_sym = re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&]+)", text, re.IGNORECASE)
+    symbol = m_sym.group(1).upper() if m_sym else m_fn.group(1)
+
+    m_aud = re.search(r"\((Unaudited|Audited)\)", text, re.IGNORECASE)
+    audited = m_aud.group(1).capitalize() if m_aud else None
+
+    first_line = text.strip().split("\n", 1)[0].strip()
+    company_name = first_line if first_line and len(first_line) < 80 else symbol
+
+    quarter = {
+        "revenue": revenue, "other_income": other_income, "total_income": total_income,
+        "total_expenses": total_expenses, "pbt": pbt, "tax_expense": tax_expense, "pat": pat,
+        "comprehensive_income": comprehensive, "eps_basic": eps_basic, "eps_diluted": eps_diluted,
+        "period_end": period_end,
+    }
+    _compute_opm(quarter)
+
+    result = {
+        "meta": {
+            "symbol": symbol,
+            "company_name": company_name,
+            "board_meeting_date": board_meeting_date,
+            "standalone_consolidated": nature,
+            "audited": audited,
+            "quarter_label": _pdf_quarter_label(period_end),
+            "scrip_code": None,
+            "source": "pdf",
+            "extraction_method": "ai",
+        },
+        "quarter": quarter,
+    }
+
+    qoq = ai.get("qoq_prior") or {}
+    yoy = ai.get("yoy_prior") or {}
+    qoq_prior = {
+        "revenue": scale(qoq.get("revenue")), "pat": scale(qoq.get("pat")),
+        "eps_basic": qoq.get("eps_basic"), "total_expenses": scale(qoq.get("total_expenses")),
+    }
+    yoy_prior = {
+        "revenue": scale(yoy.get("revenue")), "pat": scale(yoy.get("pat")),
+        "eps_basic": yoy.get("eps_basic"), "total_expenses": scale(yoy.get("total_expenses")),
+    }
+    qoq_header = _quarter_header(qoq.get("period_end")) if qoq.get("period_end") else None
+    yoy_header = _quarter_header(yoy.get("period_end")) if yoy.get("period_end") else None
+    qoq_fund = _pdf_comparison(quarter, qoq_prior, qoq_header, "qoq")
+    yoy_fund = _pdf_comparison(quarter, yoy_prior, yoy_header, "yoy")
+    if qoq_fund:
+        result["qoq_fundamentals"] = qoq_fund
+    if yoy_fund:
+        result["yoy_fundamentals"] = yoy_fund
+
+    return result
+
+
+async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str):
+    """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
+    {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
+    flow through the same grouping/dedup/Telegram code.
+
+    Tries AI extraction first (see _ai_extract_financials) when
+    ANTHROPIC_API_KEY is configured — this reads the document the way a
+    human would, sidestepping the regex pitfalls that repeatedly produced
+    silently-wrong numbers across many real filings: wrong-row picks from
+    subsidiary/JV footnotes, formula-ref bracket vs parenthesis confusion,
+    unit ambiguity (Crore/Million/Lakh), wrong-quarter-column selection,
+    and one-off label wording per filer. Falls back to the regex parser
+    (_parse_pdf_regex) when AI is unavailable, fails, or its result fails
+    validation — so the pipeline still functions (in a more limited way)
+    without an API key configured.
+    """
+    import pdfplumber
+    import io as _io
+
+    fname_dbg = link.rsplit("/", 1)[-1]
+
+    try:
+        with pdfplumber.open(_io.BytesIO(content)) as pdf:
+            text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
+    except Exception as e:
+        print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
+        return None
+    if not text.strip():
+        print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
+        return None
+
+    ai = await _ai_extract_financials(client, text, fname_dbg)
+    if ai and ai.get("is_results_table"):
+        result = _build_result_from_ai(ai, text, link, fname_dbg)
+        if result:
+            return result
+        print(f"    · [{fname_dbg}] AI result failed validation — falling back to regex parser")
+    elif ai is not None and not ai.get("is_results_table"):
+        print(f"    · [{fname_dbg}] AI says this isn't a results table — trying regex parser too "
+              f"(defense in depth, in case AI is wrong)")
+
+    return _parse_pdf_regex(text, link, fname_dbg)
 
 
 async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
@@ -1417,23 +1631,42 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print("  ⚠ XBRL processing disabled for testing — PDF-only this run")
         xbrl_items = []
 
-    # Existing PDF-sourced records missing PAT/PBT are treated as
-    # reprocess-eligible even though their link is already present — this
-    # lets a label-regex improvement (like the PBT/PAT/EPS wording fix)
-    # go back and correct an already-saved incomplete record (confirmed
-    # case: GODREJPROP saved with pat/pbt/eps all null from an earlier,
-    # narrower regex) instead of that bad data sitting on R2 forever.
-    # Only applies to source=="pdf" — XBRL-sourced records are considered
-    # authoritative and aren't churned by this.
-    incomplete_pdf_links = {
-        it.get("link") for it in existing_items
-        if (it.get("meta", {}) or {}).get("source") == "pdf"
-        and it.get("quarter", {}).get("pat") is None
-        and it.get("quarter", {}).get("pbt") is None
-    }
+    # Existing PDF-sourced records are treated as reprocess-eligible (even
+    # though their link is already present) when they show signs of being
+    # stale/wrong rather than genuinely complete — this lets extraction
+    # improvements (new label regex, the AI extractor, unit-scaling fixes)
+    # go back and correct records already sitting on R2 with bad data.
+    # Confirmed real cases that motivated each check below:
+    #   - GODREJPROP/DDEL/MSWIL: pat/pbt were null (missing entirely)
+    #   - GODREJPROP/DDEL/UNOMINDA: pat/pbt were non-null but UNSCALED
+    #     (e.g. revenue=506.17 instead of ~5,061,700,000) — a null-only
+    #     check would never catch these, since they "look" complete
+    #   - UNOMINDA: eps_basic=511.0 (should be ~5.11) — a decimal/scale bug
+    #     unrelated to the Crore-vs-rupee issue but equally implausible
+    # Only applies to source=="pdf" — XBRL-sourced records are authoritative.
+    def _looks_stale_or_wrong(it):
+        meta = it.get("meta", {}) or {}
+        if meta.get("source") != "pdf":
+            return False
+        q = it.get("quarter", {}) or {}
+        pat, pbt = q.get("pat"), q.get("pbt")
+        if pat is None and pbt is None:
+            return True
+        revenue = q.get("revenue")
+        if revenue is not None and 0 < abs(revenue) < 1e6:
+            return True  # implausibly small for raw rupees — almost certainly unscaled Crore/Million data
+        for eps_field in ("eps_basic", "eps_diluted"):
+            eps_v = q.get(eps_field)
+            if eps_v is not None and abs(eps_v) > 1000:
+                return True  # no real NSE-listed company's quarterly EPS is in the thousands
+        if "extraction_method" not in meta:
+            return True  # pre-dates this tracking — provenance/quality unknown, worth a fresh attempt
+        return False
+
+    incomplete_pdf_links = {it.get("link") for it in existing_items if _looks_stale_or_wrong(it)}
     if incomplete_pdf_links:
-        print(f"  ↻ {len(incomplete_pdf_links)} existing PDF-sourced record(s) missing PAT/PBT — "
-              f"will retry parsing them with current label regexes")
+        print(f"  ↻ {len(incomplete_pdf_links)} existing PDF-sourced record(s) look stale/incomplete/implausible — "
+              f"will retry parsing them")
 
     new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
     new_pdf = [it for it in pdf_items if it["link"] not in existing_links or it["link"] in incomplete_pdf_links]
@@ -1510,7 +1743,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                     print(f"  ⚠ PDF fetch returned empty for {fname}")
                     failed_links.append(it["link"])
                     return None
-                parsed = parse_financial_results_pdf(content, it["link"])
+                parsed = await parse_financial_results_pdf(client, content, it["link"])
                 if not parsed:
                     print(f"  ⚠ PDF parse returned None for {fname} "
                           f"(no results table / no statement heading / missing quarter-end match — "
