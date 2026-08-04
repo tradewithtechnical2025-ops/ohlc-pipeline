@@ -104,6 +104,10 @@ counts_backtest_scanners = {
     "5DayCh": "( {166311} not(  1 > 0 ) ) and( {1468504} not( 1 > 0 ) ) and( {cash} ( ( {cash} (  daily close >=  0 and  market cap >=  1 and(  daily close -  5 days ago close ) /  5 days ago close *  100 >  20 ) ) ) )",
     "Advances": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and(  daily close -  1 day ago close ) /  1 day ago close *  100 >  0 ) )",
     "Declines": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and(  daily close -  1 day ago close ) /  1 day ago close *  100 <  0 ) )",
+    "1MH": "( {cash} (  daily high =  daily max( 20 ,  daily high ) and  daily close >  1 and  market cap >  10 ) )",
+    "1ML": "( {cash} (  daily low =  daily min( 20 ,  daily low ) and  daily close >  1 and  market cap >  10 ) )",
+    "3MH": "( {cash} (  daily high =  daily max( 50 ,  daily high ) and  daily close >  1 and  market cap >  10 ) )",
+    "3ML": "( {cash} (  daily low =  daily min( 50 ,  daily low ) and  daily close >  1 and  market cap >  10 ) )",
 }
 
 # Weekly-periodicity scanner(s) — kept separate from daily counts so dates don't mismatch
