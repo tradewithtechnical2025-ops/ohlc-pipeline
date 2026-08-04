@@ -588,6 +588,24 @@ _PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_",
 _PDF_FORMULA_REF_RE = re.compile(r"\(\s*\d+\s*[+\-]\s*\d+\s*\)")
 _PDF_NUM_TOKEN_RE = r"\(?-?[\d,]+\.?\d*\)?|-|—"
 
+# Date token matching BOTH orderings NSE filers use: "30 June 2026" (day
+# first) and "June 30, 2026" (month first, with optional comma) — confirmed
+# both appear across different filers' PDFs in practice.
+_PDF_DATE_TOKEN_RE = r"(?:\d{1,2}\s+[A-Za-z]+,?\s+\d{4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})"
+
+
+def _pdf_parse_flex_date(s: str):
+    """Parses a date string in either 'DD Month YYYY'/'DD Month, YYYY' or
+    'Month DD, YYYY'/'Month DD YYYY' form. Returns a datetime or None."""
+    s = s.strip().rstrip(",")
+    s = re.sub(r"\s+", " ", s)
+    for fmt in ("%d %B %Y", "%d %B, %Y", "%B %d, %Y", "%B %d %Y", "%d %b %Y", "%b %d, %Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
 
 def _pdf_find_heading_candidates(text: str):
     """Returns [(start, end, nature)] for every non-boilerplate heading-like
@@ -655,6 +673,18 @@ def _pdf_numbers_after(section: str, label_pattern: str, max_cols: int = 4):
     return vals + [None] * (max_cols - len(vals))
 
 
+def _pdf_numbers_after_any(section: str, label_patterns: list, max_cols: int = 4):
+    """Tries each label pattern in order (different filers phrase the same
+    line item differently — e.g. 'Profit before tax' vs '...tax (3+4)' vs
+    'Profit/(Loss) before tax') and returns the first one whose column 0 is
+    non-None. Falls back to an all-None result if none match."""
+    for pat in label_patterns:
+        vals = _pdf_numbers_after(section, pat, max_cols)
+        if vals[0] is not None:
+            return vals
+    return [None] * max_cols
+
+
 def _pdf_number_after(section: str, label_pattern: str):
     """Current-quarter (first column) convenience wrapper around
     _pdf_numbers_after."""
@@ -664,18 +694,17 @@ def _pdf_number_after(section: str, label_pattern: str):
 def _pdf_header_dates(section: str):
     """Extracts the column header dates from the results table's
     'Particulars <date1> <date2> ...' row, e.g. ['30 June 2026',
-    '31 March 2026', '30 June 2025', '31 March 2026']. Returns ISO dates,
-    padded with None to 4 columns."""
-    m = re.search(r"Particulars\s+((?:\d{1,2}\s+[A-Za-z]+\s+\d{4}\s*){2,4})", section)
+    '31 March 2026', '30 June 2025', '31 March 2026'] or the month-first
+    equivalent ('June 30, 2026', ...). Returns ISO dates, padded with None
+    to 4 columns."""
+    m = re.search(r"Particulars\s+((?:" + _PDF_DATE_TOKEN_RE + r"\s*){2,4})", section)
     if not m:
         return [None] * 4
-    raw_dates = re.findall(r"\d{1,2}\s+[A-Za-z]+\s+\d{4}", m.group(1))
+    raw_dates = re.findall(_PDF_DATE_TOKEN_RE, m.group(1))
     iso_dates = []
     for d in raw_dates[:4]:
-        try:
-            iso_dates.append(datetime.strptime(d.strip(), "%d %B %Y").strftime("%Y-%m-%d"))
-        except ValueError:
-            iso_dates.append(None)
+        parsed = _pdf_parse_flex_date(d)
+        iso_dates.append(parsed.strftime("%Y-%m-%d") if parsed else None)
     return iso_dates + [None] * (4 - len(iso_dates))
 
 
@@ -786,12 +815,31 @@ def parse_financial_results_pdf(content: bytes, link: str):
         other_income_c   = _pdf_numbers_after(section, r"Other income")
         total_income_c   = _pdf_numbers_after(section, r"Total income")
         total_expenses_c = _pdf_numbers_after(section, r"Total expenses")
-        pbt_c            = _pdf_numbers_after(section, r"\)\s*before tax")
-        tax_expense_c    = _pdf_numbers_after(section, r"Total tax expense")
-        pat_c            = _pdf_numbers_after(section, r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period")
+        pbt_c            = _pdf_numbers_after_any(section, [
+            r"\)\s*before tax",                                          # "...tax (3+4)" style (numbered formula ref)
+            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*before\s+tax",             # "Profit before tax" / "Profit/(Loss) before tax"
+            r"Profit before exceptional items and tax",
+        ])
+        tax_expense_c    = _pdf_numbers_after_any(section, [
+            r"Total tax expense",
+            r"Tax expense\b",                                            # e.g. "Tax expense charge" (no numbers on this
+        ])                                                                # row for some filers — falls through to None, fine
+        pat_c            = _pdf_numbers_after_any(section, [
+            r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period",
+            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*after tax.*?for the period",   # Godrej: "Profit after tax for the period / year"
+            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*for the period.*?year",        # generic "Profit for the period/year"
+        ])
         comprehensive_c  = _pdf_numbers_after(section, r"Total comprehensive.*?for the period")
-        eps_basic_c      = _pdf_numbers_after(section, r"\(a\)\s*Basic")
-        eps_diluted_c    = _pdf_numbers_after(section, r"\(b\)\s*Diluted")
+        eps_basic_c      = _pdf_numbers_after_any(section, [
+            r"\(a\)\s*Basic",
+            r"Basic\s+EPS",                                              # Godrej: "Basic EPS (* not annualized)"
+            r"Basic\s+earning[s]?\s+per\s+share",
+        ])
+        eps_diluted_c    = _pdf_numbers_after_any(section, [
+            r"\(b\)\s*Diluted",
+            r"Diluted\s+EPS",
+            r"Diluted\s+earning[s]?\s+per\s+share",
+        ])
 
         if revenue_c[0] is not None or pat_c[0] is not None:
             chosen_section = section
@@ -799,7 +847,14 @@ def parse_financial_results_pdf(content: bytes, link: str):
             chosen_numbers = (revenue_c, other_income_c, total_income_c, total_expenses_c,
                                pbt_c, tax_expense_c, pat_c, comprehensive_c, eps_basic_c, eps_diluted_c)
             break
-        tried_snippets.append(f"[{nature} @ {start}] {section[:200].replace(chr(10), '⏎')}")
+        rev_line = ""
+        m_rev = re.search(r"Revenue from operations[^\n]{0,150}", section, re.IGNORECASE)
+        if m_rev:
+            rev_line = m_rev.group(0).replace("\n", "⏎")
+        tried_snippets.append(
+            f"[{nature} @ {start}] revenue-line: {rev_line or '(not found in this section)'} "
+            f"| section-start: {section[:250].replace(chr(10), '⏎')}"
+        )
 
     if chosen_section is None:
         joined = " || ".join(tried_snippets[:3])
@@ -817,6 +872,22 @@ def parse_financial_results_pdf(content: bytes, link: str):
     pbt, tax_expense, pat, comprehensive = pbt_c[0], tax_expense_c[0], pat_c[0], comprehensive_c[0]
     eps_basic, eps_diluted = eps_basic_c[0], eps_diluted_c[0]
 
+    # Sanity check: Total Income is arithmetically Revenue + Other Income by
+    # definition in every NSE results table. If our extracted total_income
+    # doesn't reconcile, the label regex almost certainly grabbed a number
+    # from the wrong row (e.g. a "Total Income" mention inside a notes/
+    # segment sub-table further down the same section) rather than the
+    # main table's own row — recompute from the two components instead of
+    # publishing a number we know is wrong.
+    if revenue is not None and other_income is not None and total_income is not None:
+        expected = revenue + other_income
+        if abs(expected - total_income) > max(1.0, 0.02 * abs(expected)):
+            print(f"    · [{fname_dbg}] total_income sanity check failed: extracted {total_income}, "
+                  f"but revenue({revenue}) + other_income({other_income}) = {round(expected, 2)} "
+                  f"— label regex likely matched a stray 'Total Income' mention elsewhere "
+                  f"(notes/segment sub-table); using the computed value instead")
+            total_income = round(expected, 2)
+
     if revenue is None and pat is None:
         section_snippet = section[:900].replace("\n", "⏎")
         print(f"    · [{fname_dbg}] found a results heading but couldn't extract Revenue or PAT numbers "
@@ -824,13 +895,11 @@ def parse_financial_results_pdf(content: bytes, link: str):
               f" | section text: ...{section_snippet}...")
         return None  # couldn't find the table's actual numbers — don't fabricate a record
 
-    m_qend = re.search(r"quarter ended\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.IGNORECASE)
+    m_qend = re.search(r"quarter ended\s+(" + _PDF_DATE_TOKEN_RE + r")", text, re.IGNORECASE)
     period_end = None
     if m_qend:
-        try:
-            period_end = datetime.strptime(m_qend.group(1).strip(), "%d %B %Y").strftime("%Y-%m-%d")
-        except ValueError:
-            period_end = None
+        d = _pdf_parse_flex_date(m_qend.group(1))
+        period_end = d.strftime("%Y-%m-%d") if d else None
     if not period_end:
         print(f"    · [{fname_dbg}] Revenue/PAT found but no 'quarter ended <date>' phrase matched "
               f"— can't build the dedup key without it")
@@ -1302,8 +1371,26 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print("  ⚠ XBRL processing disabled for testing — PDF-only this run")
         xbrl_items = []
 
+    # Existing PDF-sourced records missing PAT/PBT are treated as
+    # reprocess-eligible even though their link is already present — this
+    # lets a label-regex improvement (like the PBT/PAT/EPS wording fix)
+    # go back and correct an already-saved incomplete record (confirmed
+    # case: GODREJPROP saved with pat/pbt/eps all null from an earlier,
+    # narrower regex) instead of that bad data sitting on R2 forever.
+    # Only applies to source=="pdf" — XBRL-sourced records are considered
+    # authoritative and aren't churned by this.
+    incomplete_pdf_links = {
+        it.get("link") for it in existing_items
+        if (it.get("meta", {}) or {}).get("source") == "pdf"
+        and it.get("quarter", {}).get("pat") is None
+        and it.get("quarter", {}).get("pbt") is None
+    }
+    if incomplete_pdf_links:
+        print(f"  ↻ {len(incomplete_pdf_links)} existing PDF-sourced record(s) missing PAT/PBT — "
+              f"will retry parsing them with current label regexes")
+
     new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
-    new_pdf = [it for it in pdf_items if it["link"] not in existing_links]
+    new_pdf = [it for it in pdf_items if it["link"] not in existing_links or it["link"] in incomplete_pdf_links]
 
     # Give-up tracking: NSE's WAF blocks some specific filing URLs
     # persistently for GitHub Actions' IP/pattern (confirmed: the same file
