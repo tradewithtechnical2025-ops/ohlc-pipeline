@@ -74,16 +74,16 @@ NOISE_SUBJECT_PATTERNS = [
     r"^quarterly compliance report on corporate governance",
     r"^structural digital database$",
     r"^(disclosure|intimation) under regulation (27\(2\)|13\(3\)|7\(1\)|6\(1\)|50\(1\)|51|52\(4\))$",
-    r"^board meeting intimation$",
-    r"^(notice of )?shareholders? meetings?(-xbrl)?$",   # broadened to catch the XBRL variant
-    r"^allotment of securities$",
-    r"^change in directors?/kmp/smp/auditor/rta$",
-    r"^change in director\(s\)$",
-    r"^appointment$",
-    r"^cessation$",
-    r"^options to purchase securities$",
-    r"^analysts?/institutional investor meet/con\. call updates$",   # new
-    r"^analyst/investor meet para a-xbrl$",                          # new
+    r"^board meeting intimation$",  # future-dated notice only; "Outcome of Board Meeting" kept (actual results)
+    r"^(notice of )?shareholders? meetings?(-xbrl)?$",  # AGM/EGM/postal ballot voting outcomes — not trading-actionable (covers both the plain-feed and XBRL-tagged variants)
+    r"^allotment of securities$",   # routine NCD/ESOP allotment filings
+    r"^change in directors?/kmp/smp/auditor/rta$",  # routine KMP/auditor/RTA administrative changes
+    r"^change in director\(s\)$",                   # routine board-composition filings (not MD/CEO-level)
+    r"^appointment$",                                # generic appointment notices (KMP/company secretary level)
+    r"^cessation$",                                  # generic cessation notices (KMP/director resignations)
+    r"^options to purchase securities$",             # ESOP/stock benefit grants — compliance filing, not trading-actionable
+    r"^analysts?/institutional investor meet/con\. call updates$",  # analyst meet schedule/outcome/transcript — routine, very high frequency
+    r"^analyst/investor meet para a-xbrl$",                          # XBRL-tagged variant of the same analyst-meet noise
 ]
 _NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
 
@@ -1459,7 +1459,24 @@ async def run():
         # been detail-parsed. Keep a small dedicated accumulator so PDF
         # fast-path candidates aren't lost to feed churn, same fix already
         # applied to nse_results_feed.json for the same underlying reason.
-        pdf_candidates_now = [it for it in board_meeting_items if _is_board_outcome_pdf(it)]
+        # NSE doesn't consistently route "Outcome of Board Meeting" PDFs
+        # through Board_Meetings.xml — some land only in
+        # Online_announcements.xml instead (confirmed: e.g. UNO Minda's
+        # outcome PDF appeared only in nse_announcements this run, with
+        # board_meeting_items empty of it). Use the RAW pre-noise-filtered
+        # fetch of both feeds so a future noise-pattern tweak can't
+        # accidentally hide a real results PDF from this detector.
+        pdf_source_items = result_map.get("nse_board", []) + result_map.get("nse_announcements", [])
+        seen_pdf_links = set()
+        pdf_candidates_now = []
+        for it in pdf_source_items:
+            if not _is_board_outcome_pdf(it):
+                continue
+            link = it.get("link", "")
+            if link in seen_pdf_links:
+                continue
+            seen_pdf_links.add(link)
+            pdf_candidates_now.append(it)
         existing_pdf_feed = await r2_get(client, "nse_results_pdf_feed.json")
         existing_pdf_items = (existing_pdf_feed or {}).get("items", [])
         merged_pdf_feed = dedup_items(pdf_candidates_now + existing_pdf_items)
