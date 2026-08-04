@@ -585,7 +585,7 @@ _PDF_HEADING_PATTERNS = [
 # Checked against the ~40 chars immediately before the match.
 _PDF_BOILERPLATE_PRECEDE_RE = re.compile(r"(accompanying|reviewed)[\s\S]{0,15}$", re.IGNORECASE)
 _PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
-_PDF_FORMULA_REF_RE = re.compile(r"\(\s*\d+\s*[+\-]\s*\d+\s*\)")
+_PDF_FORMULA_REF_RE = re.compile(r"[\(\[]\s*\d+\s*[+\-]\s*\d+\s*[\)\]]")
 _PDF_NUM_TOKEN_RE = r"\(?-?[\d,]+\.?\d*\)?|-|—"
 
 # Date token matching BOTH orderings NSE filers use: "30 June 2026" (day
@@ -811,15 +811,25 @@ def parse_financial_results_pdf(content: bytes, link: str):
         later = [c[0] for c in headings if c[0] > start]
         section = text[end: min(later) if later else len(text)]
 
-        revenue_c        = _pdf_numbers_after(section, r"Revenue from operations")
+        revenue_c        = _pdf_numbers_after_any(section, [
+            r"Total Revenue from operations",   # some filers split Sales + Other operating income
+            r"Revenue from operations",         # under a bare header line — try the summed row first
+        ])
         other_income_c   = _pdf_numbers_after(section, r"Other income")
         total_income_c   = _pdf_numbers_after(section, r"Total income")
         total_expenses_c = _pdf_numbers_after(section, r"Total expenses")
         pbt_c            = _pdf_numbers_after_any(section, [
             r"\)\s*before tax",                                          # "...tax (3+4)" style (numbered formula ref)
-            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*before\s+tax",             # "Profit before tax" / "Profit/(Loss) before tax"
+            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*before\s+tax(?!\s+and\s+exceptional)",
+            # ^ exact "Profit before tax" row — NOT the "before tax and
+            # exceptional items" subtotal row that often appears just above
+            # it (MSWIL: row 4 "before tax and exceptional items" vs row 6
+            # "before tax" — same value only when exceptional items = 0,
+            # so this must be excluded explicitly rather than relying on
+            # match order)
             r"Profit before exceptional items and tax",
-        ])
+            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*before\s+tax",             # last resort: allow the "and exceptional" row
+        ])                                                                # too, for filers with no separate plain PBT row
         tax_expense_c    = _pdf_numbers_after_any(section, [
             r"Total tax expense",
             r"Tax expense\b",                                            # e.g. "Tax expense charge" (no numbers on this
@@ -828,17 +838,20 @@ def parse_financial_results_pdf(content: bytes, link: str):
             r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period",
             r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*after tax.*?for the period",   # Godrej: "Profit after tax for the period / year"
             r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*for the period.*?year",        # generic "Profit for the period/year"
+            r"Net (?:profit|loss|\(loss\)|profit/\(loss\))\b",               # Zyduswell: bare "Net Profit [5-6]", no "for the period"
         ])
         comprehensive_c  = _pdf_numbers_after(section, r"Total comprehensive.*?for the period")
         eps_basic_c      = _pdf_numbers_after_any(section, [
             r"\(a\)\s*Basic",
             r"Basic\s+EPS",                                              # Godrej: "Basic EPS (* not annualized)"
             r"Basic\s+earning[s]?\s+per\s+share",
-        ])
-        eps_diluted_c    = _pdf_numbers_after_any(section, [
+            r"Basic\s*\[?₹?\]?\s*(?=[\d(])",                             # Zyduswell: bare "Basic [₹]" row — lookahead
+        ])                                                                # requires a digit/paren right after, so it
+        eps_diluted_c    = _pdf_numbers_after_any(section, [              # doesn't match "Basic" in unrelated prose
             r"\(b\)\s*Diluted",
             r"Diluted\s+EPS",
             r"Diluted\s+earning[s]?\s+per\s+share",
+            r"Diluted\s*\[?₹?\]?\s*(?=[\d(])",
         ])
 
         if revenue_c[0] is not None or pat_c[0] is not None:
@@ -868,6 +881,39 @@ def parse_financial_results_pdf(content: bytes, link: str):
     (revenue_c, other_income_c, total_income_c, total_expenses_c,
      pbt_c, tax_expense_c, pat_c, comprehensive_c, eps_basic_c, eps_diluted_c) = chosen_numbers
 
+    # NSE's PDF tables report every rupee-value line item in whatever unit
+    # the table's own header states — most filers use "(₹ in Crore)" but
+    # some (confirmed: Zyduswell) use "(₹ in Million)", and a few smaller
+    # companies use Lakh. Every downstream consumer (this file's own
+    # _fmt_cr() for Telegram, the frontend's _fmtVal() in pgNews.js, and
+    # the XBRL parser's own field convention) expects RAW RUPEES and does
+    # its own /1e7 to display Crores — so we must scale up by the ACTUAL
+    # unit multiplier here, not a hardcoded Crore assumption (which would
+    # silently make Million-denominated filers' numbers 10x too large).
+    unit_m = re.search(r"[₹Rs\.]*\s*in\s*(Crores?|Millions?|Lakh[s]?)", text, re.IGNORECASE)
+    unit_word = unit_m.group(1).lower() if unit_m else None
+    if unit_word and unit_word.startswith("million"):
+        unit_multiplier, unit_label = 1e6, "Million"
+    elif unit_word and unit_word.startswith("lakh"):
+        unit_multiplier, unit_label = 1e5, "Lakh"
+    else:
+        unit_multiplier, unit_label = 1e7, "Crore"  # NSE default when no header found — most common
+    if not unit_m:
+        print(f"    · [{fname_dbg}] no '(₹ in Crore/Million/Lakh)' unit header found — "
+              f"defaulting to Crore (₹×1e7); verify this filing's actual unit if numbers look off")
+
+    def _scale_to_rupees(col):
+        return [v * unit_multiplier if v is not None else None for v in col]
+
+    revenue_c, other_income_c, total_income_c, total_expenses_c = (
+        _scale_to_rupees(revenue_c), _scale_to_rupees(other_income_c),
+        _scale_to_rupees(total_income_c), _scale_to_rupees(total_expenses_c),
+    )
+    pbt_c, tax_expense_c, pat_c, comprehensive_c = (
+        _scale_to_rupees(pbt_c), _scale_to_rupees(tax_expense_c),
+        _scale_to_rupees(pat_c), _scale_to_rupees(comprehensive_c),
+    )
+
     revenue, other_income, total_income, total_expenses = revenue_c[0], other_income_c[0], total_income_c[0], total_expenses_c[0]
     pbt, tax_expense, pat, comprehensive = pbt_c[0], tax_expense_c[0], pat_c[0], comprehensive_c[0]
     eps_basic, eps_diluted = eps_basic_c[0], eps_diluted_c[0]
@@ -881,11 +927,11 @@ def parse_financial_results_pdf(content: bytes, link: str):
     # publishing a number we know is wrong.
     if revenue is not None and other_income is not None and total_income is not None:
         expected = revenue + other_income
-        if abs(expected - total_income) > max(1.0, 0.02 * abs(expected)):
-            print(f"    · [{fname_dbg}] total_income sanity check failed: extracted {total_income}, "
-                  f"but revenue({revenue}) + other_income({other_income}) = {round(expected, 2)} "
-                  f"— label regex likely matched a stray 'Total Income' mention elsewhere "
-                  f"(notes/segment sub-table); using the computed value instead")
+        if abs(expected - total_income) > max(1e7, 0.02 * abs(expected)):
+            print(f"    · [{fname_dbg}] total_income sanity check failed: extracted ₹{total_income/1e7:.2f} Cr, "
+                  f"but revenue(₹{revenue/1e7:.2f} Cr) + other_income(₹{other_income/1e7:.2f} Cr) = "
+                  f"₹{expected/1e7:.2f} Cr — label regex likely matched a stray 'Total Income' mention "
+                  f"elsewhere (notes/segment sub-table); using the computed value instead")
             total_income = round(expected, 2)
 
     if revenue is None and pat is None:
