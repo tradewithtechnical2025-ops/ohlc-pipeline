@@ -48,6 +48,11 @@ DEBUG_SYMBOLS = ["CMRGREEN", "GSPL", "MANGCHEFER", "CIGNITITEC"]
 MASTER_DROP_ALERT_PCT = 25
 BSE_DROP_ALERT_PCT    = 25
 
+# HTTP status codes worth retrying — transient gateway/server errors, not
+# permanent client errors (400/401/403/404 etc, which won't fix themselves
+# on retry).
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
@@ -132,28 +137,55 @@ def debug_trace_upstox(upstox_nse, quotes, data=None):
 # FINEDGE GET
 # =========================================================
 
-async def finedge_get(client, path):
+async def finedge_get(client, path, retries=None):
+    """
+    GET a Finedge API path with retry + exponential backoff.
+
+    Retries on:
+      - network-level exceptions (timeouts, connection errors)
+      - HTTP 429 (rate limit — fixed 15s wait, as before)
+      - HTTP 500/502/503/504 (transient gateway/server errors)
+
+    Does NOT retry on other non-200s (e.g. 400/401/403/404) since those
+    are permanent — retrying won't help and just wastes the retry budget.
+    """
     url    = f"{FINEDGE_BASE}/{path}"
     params = {"token": FINEDGE_TOKEN}
-    for attempt in range(RETRY):
+    attempts = retries if retries is not None else RETRY
+
+    for attempt in range(attempts):
         await asyncio.sleep(RATE_DELAY)
         try:
             r = await client.get(url, params=params, timeout=60)
         except Exception as e:
-            print(f"  ⚠️  Network Error: {e}")
-            await asyncio.sleep(2 ** attempt)
+            wait = 2 ** attempt
+            print(f"  ⚠️  Network Error (attempt {attempt + 1}/{attempts}): {e} — retrying in {wait}s...")
+            await asyncio.sleep(wait)
             continue
+
         if r.status_code == 429:
-            print("  ⏳ 429 Rate Limit — waiting 15s...")
+            print(f"  ⏳ 429 Rate Limit (attempt {attempt + 1}/{attempts}) — waiting 15s...")
             await asyncio.sleep(15)
             continue
+
+        if r.status_code in RETRYABLE_STATUS_CODES:
+            wait = min(2 ** attempt * 3, 30)  # 3s, 6s, 12s, 24s, capped at 30s
+            print(f"  ⚠️  HTTP {r.status_code} (transient, attempt {attempt + 1}/{attempts}) "
+                  f"for path: {path[:80]} — retrying in {wait}s...")
+            await asyncio.sleep(wait)
+            continue
+
         if r.status_code != 200:
             print(f"  ❌ HTTP {r.status_code} for path: {path[:80]}")
             return None
+
         try:
             return r.json()
         except Exception:
+            print(f"  ❌ Invalid JSON response for path: {path[:80]}")
             return None
+
+    print(f"  ❌ Exhausted {attempts} retries for path: {path[:80]}")
     return None
 
 
@@ -246,22 +278,38 @@ async def fetch_symbols(client):
     return data
 
 
-async def fetch_upstox_master(client, url, label):
+async def fetch_upstox_master(client, url, label, retries=3):
     print(f"📡 Fetching Upstox {label} master...")
-    r = await client.get(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-            "Referer": "https://upstox.com/"
-        },
-        follow_redirects=True,
-        timeout=120
-    )
-    r.raise_for_status()
-    data = json.loads(gzip.decompress(r.content))
-    print(f"✅ Loaded {len(data)} {label} instruments")
-    return data
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = await client.get(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "*/*",
+                    "Referer": "https://upstox.com/"
+                },
+                follow_redirects=True,
+                timeout=120
+            )
+            if r.status_code in RETRYABLE_STATUS_CODES:
+                wait = min(2 ** attempt * 3, 30)
+                print(f"  ⚠️  HTTP {r.status_code} fetching Upstox {label} master "
+                      f"(attempt {attempt + 1}/{retries}) — retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            r.raise_for_status()
+            data = json.loads(gzip.decompress(r.content))
+            print(f"✅ Loaded {len(data)} {label} instruments")
+            return data
+        except Exception as e:
+            last_err = e
+            wait = min(2 ** attempt * 3, 30)
+            print(f"  ⚠️  Error fetching Upstox {label} master "
+                  f"(attempt {attempt + 1}/{retries}): {e} — retrying in {wait}s...")
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"Upstox {label} master fetch failed after {retries} attempts: {last_err}")
 
 
 # =========================================================
@@ -272,27 +320,36 @@ async def fetch_upstox_quotes(client, instrument_keys):
     out = {}
     for i in range(0, len(instrument_keys), 500):
         batch = instrument_keys[i:i + 500]
-        try:
-            r = await client.get(
-                "https://api.upstox.com/v2/market-quote/quotes",
-                params={"instrument_key": ",".join(batch)},
-                headers={
-                    "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
-                    "Accept": "application/json",
-                },
-                timeout=60,
-            )
-        except Exception as e:
-            print(f"  ⚠️  Upstox quote network error: {e}")
-            continue
-        if r.status_code != 200:
-            print(f"  ❌ Upstox quotes HTTP {r.status_code}: {r.text[:120]}")
-            continue
-        payload = r.json().get("data", {}) or {}
-        for k, v in payload.items():
-            sym = str(v.get("symbol") or k.split(":")[-1]).strip().upper()
-            if sym:
-                out[sym] = v
+        for attempt in range(RETRY):
+            try:
+                r = await client.get(
+                    "https://api.upstox.com/v2/market-quote/quotes",
+                    params={"instrument_key": ",".join(batch)},
+                    headers={
+                        "Authorization": f"Bearer {UPSTOX_ACCESS_TOKEN}",
+                        "Accept": "application/json",
+                    },
+                    timeout=60,
+                )
+            except Exception as e:
+                wait = 2 ** attempt
+                print(f"  ⚠️  Upstox quote network error (attempt {attempt + 1}/{RETRY}): {e} — retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code in RETRYABLE_STATUS_CODES:
+                wait = min(2 ** attempt * 3, 30)
+                print(f"  ⚠️  Upstox quotes HTTP {r.status_code} (attempt {attempt + 1}/{RETRY}) — retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code != 200:
+                print(f"  ❌ Upstox quotes HTTP {r.status_code}: {r.text[:120]}")
+                break
+            payload = r.json().get("data", {}) or {}
+            for k, v in payload.items():
+                sym = str(v.get("symbol") or k.split(":")[-1]).strip().upper()
+                if sym:
+                    out[sym] = v
+            break
         await asyncio.sleep(0.3)
     return out
 
@@ -569,19 +626,27 @@ async def fetch_upstox_ohlc(client, instrument_keys):
     out = {}
     for i in range(0, len(instrument_keys), 500):
         batch = instrument_keys[i:i + 500]
-        r = await client.get(
-            UPSTOX_OHLC_URL,
-            params={"instrument_key": ",".join(batch), "interval": "1d"},
-            headers={
-                "Authorization": f"Bearer {UPSTOX_TOKEN}",
-                "Accept": "application/json",
-            },
-            timeout=60,
-        )
-        if r.status_code != 200:
-            print(f"  ⚠️  Upstox OHLC HTTP {r.status_code} (batch {i // 500 + 1})")
-            continue
-        out.update(r.json().get("data") or {})
+        for attempt in range(RETRY):
+            r = await client.get(
+                UPSTOX_OHLC_URL,
+                params={"instrument_key": ",".join(batch), "interval": "1d"},
+                headers={
+                    "Authorization": f"Bearer {UPSTOX_TOKEN}",
+                    "Accept": "application/json",
+                },
+                timeout=60,
+            )
+            if r.status_code in RETRYABLE_STATUS_CODES:
+                wait = min(2 ** attempt * 3, 30)
+                print(f"  ⚠️  Upstox OHLC HTTP {r.status_code} (batch {i // 500 + 1}, "
+                      f"attempt {attempt + 1}/{RETRY}) — retrying in {wait}s...")
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code != 200:
+                print(f"  ⚠️  Upstox OHLC HTTP {r.status_code} (batch {i // 500 + 1})")
+                break
+            out.update(r.json().get("data") or {})
+            break
     return out
 
 
@@ -775,7 +840,9 @@ async def main():
 
         print()
         print("📡 Fetching quotes (single call)...")
-        quotes = await finedge_get(client, "quote?symbol=RELIANCE")
+        # This single call is a hard dependency for the whole pipeline, so
+        # give it more retry headroom than the default RETRY=3.
+        quotes = await finedge_get(client, "quote?symbol=RELIANCE", retries=6)
         if not quotes:
             raise RuntimeError("quote fetch failed")
         print(f"✅ Got {len(quotes)} quotes from API")
