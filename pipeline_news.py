@@ -680,16 +680,23 @@ def parse_financial_results_pdf(content: bytes, link: str):
     from pypdf import PdfReader
     import io as _io
 
+    fname_dbg = link.rsplit("/", 1)[-1]
+
     try:
         reader = PdfReader(_io.BytesIO(content))
         text = "\n".join((p.extract_text() or "") for p in reader.pages)
-    except Exception:
+    except Exception as e:
+        print(f"    · [{fname_dbg}] PdfReader/extract_text raised: {type(e).__name__}: {e}")
         return None
     if not text.strip():
+        print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
         return None
 
     headings = list(_PDF_STATEMENT_HEADING_RE.finditer(text))
     if not headings:
+        print(f"    · [{fname_dbg}] no 'Statement of Standalone/Consolidated ... Financial Results' "
+              f"heading found — not a results table (governance/KMP-only outcome PDF), "
+              f"or heading wording differs from expected pattern")
         return None  # no results table in this PDF (pure governance/KMP outcome)
 
     chosen = next((h for h in headings if h.group(1).lower() == "consolidated"), headings[0])
@@ -714,6 +721,8 @@ def parse_financial_results_pdf(content: bytes, link: str):
     eps_basic, eps_diluted = eps_basic_c[0], eps_diluted_c[0]
 
     if revenue is None and pat is None:
+        print(f"    · [{fname_dbg}] found a results heading but couldn't extract Revenue or PAT numbers "
+              f"— label regex likely didn't match this PDF's exact wording/layout")
         return None  # couldn't find the table's actual numbers — don't fabricate a record
 
     m_qend = re.search(r"quarter ended\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.IGNORECASE)
@@ -724,11 +733,15 @@ def parse_financial_results_pdf(content: bytes, link: str):
         except ValueError:
             period_end = None
     if not period_end:
+        print(f"    · [{fname_dbg}] Revenue/PAT found but no 'quarter ended <date>' phrase matched "
+              f"— can't build the dedup key without it")
         return None  # can't build a reliable dedup key without the quarter
 
     fname = link.rsplit("/", 1)[-1]
     m_fn = _PDF_FILENAME_TS_RE.match(fname)
     if not m_fn:
+        print(f"    · [{fname_dbg}] all numbers found but filename doesn't match the expected "
+              f"'PREFIX_DDMMYYYYHHMMSS_...' timestamp pattern — can't derive board_meeting_date")
         return None
     board_meeting_date = f"{m_fn.group(4)}-{m_fn.group(3)}-{m_fn.group(2)}"
 
@@ -1258,13 +1271,18 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     async def process_pdf(it):
         async with sem:
+            fname = it["link"].split("/")[-1]
             try:
                 content = await fetch_pdf_bytes(client, it["link"])
                 if not content:
+                    print(f"  ⚠ PDF fetch returned empty for {fname}")
                     failed_links.append(it["link"])
                     return None
                 parsed = parse_financial_results_pdf(content, it["link"])
                 if not parsed:
+                    print(f"  ⚠ PDF parse returned None for {fname} "
+                          f"(no results table / no statement heading / missing quarter-end match — "
+                          f"see parse_financial_results_pdf's early-return points)")
                     failed_links.append(it["link"])  # not a results PDF — no point refetching forever
                     return None
                 parsed["link"] = it["link"]
