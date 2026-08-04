@@ -74,13 +74,16 @@ NOISE_SUBJECT_PATTERNS = [
     r"^quarterly compliance report on corporate governance",
     r"^structural digital database$",
     r"^(disclosure|intimation) under regulation (27\(2\)|13\(3\)|7\(1\)|6\(1\)|50\(1\)|51|52\(4\))$",
-    r"^board meeting intimation$",  # future-dated notice only; "Outcome of Board Meeting" kept (actual results)
-    r"^shareholders meeting$",      # AGM/EGM/postal ballot voting outcomes — not trading-actionable
-    r"^allotment of securities$",   # routine NCD/ESOP allotment filings
-    r"^change in directors?/kmp/smp/auditor/rta$",  # routine KMP/auditor/RTA administrative changes
-    r"^change in director\(s\)$",                   # routine board-composition filings (not MD/CEO-level)
-    r"^appointment$",                                # generic appointment notices (KMP/company secretary level)
-    r"^cessation$",                                  # generic cessation notices (KMP/director resignations)
+    r"^board meeting intimation$",
+    r"^(notice of )?shareholders? meetings?(-xbrl)?$",   # broadened to catch the XBRL variant
+    r"^allotment of securities$",
+    r"^change in directors?/kmp/smp/auditor/rta$",
+    r"^change in director\(s\)$",
+    r"^appointment$",
+    r"^cessation$",
+    r"^options to purchase securities$",
+    r"^analysts?/institutional investor meet/con\. call updates$",   # new
+    r"^analyst/investor meet para a-xbrl$",                          # new
 ]
 _NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
 
