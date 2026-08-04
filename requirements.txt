@@ -6,3 +6,4 @@ lxml
 gspread
 oauth2client
 pytz
+pdfplumber
