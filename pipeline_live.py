@@ -3,14 +3,9 @@ pipeline_live.py
 Fetches live OHLC from Upstox v3 for all stocks in master.json
 - OHLC endpoint: open, high, low, volume (live_ohlc)
 - LTP endpoint:  last_price + cp (prev close) → Change% ke liye
-- Pre-open window (8:58–9:14 AM IST): captures indicative LTP vs prev close
+- Pre-open window (9:00–9:08 AM IST): captures indicative LTP vs prev close
   as a frozen "preopen_gap" % for gap-up/gap-down screening.
-Uploads result as live_ohlc.json to R2 via Cloudflare Worker.
-
-Pre-open gap snapshot is ALSO persisted separately as preopen_gaps.json —
-this makes it immune to any partial/transient failure in the main
-live_ohlc.json fetch/upload cycle (e.g. one Upstox batch failing mid-day
-no longer wipes the whole day's gap data for the rest of the session).
+Uploads result as live_ohlc.json to R2 via Cloudflare Worker
 """
 
 import asyncio
@@ -40,8 +35,6 @@ UPSTOX_LTP_URL   = "https://api.upstox.com/v3/market-quote/ltp"
 BATCH_SIZE = 500
 INTERVAL   = "1d"
 IST        = ZoneInfo("Asia/Kolkata")
-
-PREOPEN_FILE = "preopen_gaps.json"   # separate, resilient store for pre-open snapshot
 
 # Pre-open call auction window (IST), expressed as minutes-since-midnight.
 # NSE pre-open mechanics: 09:00-09:08 order entry, 09:08-09:12 order
@@ -138,13 +131,12 @@ async def run():
 
     async with httpx.AsyncClient() as client:
 
-        # 1. Load master + ikey_map + old live_ohlc + old preopen snapshot (parallel)
-        log.info("Downloading master.json, ikey_map.json, live_ohlc.json, preopen_gaps.json…")
-        master_raw, ikey_map_raw, old_ohlc, old_preopen = await asyncio.gather(
+        # 1. Load master + ikey_map + old live_ohlc (parallel)
+        log.info("Downloading master.json, ikey_map.json, live_ohlc.json…")
+        master_raw, ikey_map_raw, old_ohlc = await asyncio.gather(
             r2_download(client, "master.json"),
             r2_download(client, "ikey_map.json"),
             r2_download(client, "live_ohlc.json"),
-            r2_download(client, PREOPEN_FILE),
         )
 
         master  = master_raw or []
@@ -158,33 +150,22 @@ async def run():
         is_new_day = bool(old_date and old_date != today)
 
         prev_close_map = {}
+        preopen_map    = {}  # sym → {"preopen_price":.., "preopen_gap":..} frozen snapshot
         for sym, d in old_data.items():
             prev_close_map[sym] = d.get("c") if is_new_day else d.get("pc")
+            # Pre-open snapshot only carries forward within the SAME trading day.
+            # On a new day it resets (no stale gap % from yesterday's pre-open).
+            if not is_new_day and d.get("preopen_gap") is not None:
+                preopen_map[sym] = {
+                    "preopen_price": d.get("preopen_price"),
+                    "preopen_gap"  : d.get("preopen_gap"),
+                }
 
         if is_new_day:
             log.info(f"  New day (prev={old_date}) → {len(prev_close_map)} prev closes carried")
         elif old_date:
-            log.info(f"  Same day refresh → {len(prev_close_map)} pc values carried")
-
-        # 2b. Pre-open snapshot — sourced from its OWN file, independent of
-        #     whatever happened to live_ohlc.json in any given run. This is
-        #     the fix: a partial/failed live_ohlc fetch no longer wipes the
-        #     whole day's frozen gap data.
-        old_preopen_data = (old_preopen or {}).get("data", {})
-        old_preopen_date = (old_preopen or {}).get("date", "")
-        preopen_is_new_day = bool(old_preopen_date and old_preopen_date != today)
-
-        # preopen_map is the running truth: starts as a copy of whatever we
-        # already had for today, and only gets overwritten per-symbol below
-        # when this run actually captures/confirms a value. Symbols not
-        # touched this run (e.g. dropped from a failed Upstox batch) simply
-        # keep their previously known snapshot.
-        preopen_map = {} if preopen_is_new_day else dict(old_preopen_data)
-
-        if preopen_is_new_day:
-            log.info(f"  New day → pre-open snapshot reset (prev={old_preopen_date})")
-        elif old_preopen_date:
-            log.info(f"  Pre-open snapshot loaded → {len(preopen_map)} gaps carried from store")
+            log.info(f"  Same day refresh → {len(prev_close_map)} pc values carried, "
+                      f"{len(preopen_map)} pre-open gaps carried")
 
         # 3. symbol → instrument_key
         sym_to_ikey = {}
@@ -254,17 +235,10 @@ async def run():
                     preopen_price = ltp_price
                     preopen_gap   = round((preopen_price - pc) / pc * 100, 2)
                     preopen_captured += 1
-                    preopen_map[sym] = {
-                        "preopen_price": preopen_price,
-                        "preopen_gap"  : preopen_gap,
-                    }
                 else:
                     prev = preopen_map.get(sym, {})
                     preopen_price = prev.get("preopen_price")
                     preopen_gap   = prev.get("preopen_gap")
-                    # NOTE: we deliberately do NOT delete/overwrite preopen_map[sym]
-                    # here even if prev is empty — there's nothing to carry, and
-                    # leaving it absent is correct (no stale/fabricated value).
 
                 result[sym] = {
                     "o"  : live.get("open"),
@@ -288,7 +262,7 @@ async def run():
         if in_preopen:
             log.info(f"  🔔 Captured pre-open gap for {preopen_captured} stocks this run")
 
-        # 5. Upload live_ohlc.json
+        # 5. Upload
         payload = {
             "updated_at": now_ist.isoformat(),
             "date"      : today,
@@ -297,19 +271,7 @@ async def run():
         }
         await r2_upload(client, "live_ohlc.json", payload)
 
-        # 5b. Upload preopen_gaps.json — the resilient, independent store.
-        # Written every run (cheap, small file) so it self-heals: even if a
-        # batch dropped some symbols from `result` this run, their entries
-        # in preopen_map (carried from the previous store load) are untouched
-        # and get re-persisted here regardless.
-        preopen_payload = {
-            "updated_at": now_ist.isoformat(),
-            "date"      : today,
-            "data"      : preopen_map,
-        }
-        await r2_upload(client, PREOPEN_FILE, preopen_payload)
-
-    log.info("✅ live_ohlc.json + preopen_gaps.json uploaded")
+    log.info("✅ live_ohlc.json uploaded")
     log.info("━━━ Done ━━━")
 
 
