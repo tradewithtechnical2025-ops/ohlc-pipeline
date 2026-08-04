@@ -704,15 +704,15 @@ def parse_financial_results_pdf(content: bytes, link: str):
         headings = list(_PDF_STATEMENT_HEADING_FALLBACK_RE.finditer(text))
         used_fallback = True
     if not headings:
-        snippet = ""
-        m_fr = re.search(r"financial results", text, re.IGNORECASE)
-        if m_fr:
+        snippets = []
+        for m_fr in list(re.finditer(r"financial results", text, re.IGNORECASE))[:3]:
             start = max(0, m_fr.start() - 60)
-            snippet = text[start:m_fr.end() + 20].replace("\n", "⏎")
+            snippets.append(text[start:m_fr.end() + 20].replace("\n", "⏎"))
+        snippet_text = " || ".join(snippets)
         print(f"    · [{fname_dbg}] no 'Standalone/Consolidated ... Financial Results' "
               f"heading found (tried both primary and fallback patterns) — not a results table "
               f"(governance/KMP-only outcome PDF), or heading wording differs further from expected"
-              + (f" | nearby text: ...{snippet}..." if snippet else " | 'financial results' not found in text at all"))
+              + (f" | occurrences: ...{snippet_text}..." if snippet_text else " | 'financial results' not found in text at all"))
         return None  # no results table in this PDF (pure governance/KMP outcome)
     if used_fallback:
         print(f"    · [{fname_dbg}] matched via fallback heading pattern (primary 'Statement of ...' pattern missed it)")
@@ -739,8 +739,10 @@ def parse_financial_results_pdf(content: bytes, link: str):
     eps_basic, eps_diluted = eps_basic_c[0], eps_diluted_c[0]
 
     if revenue is None and pat is None:
+        section_snippet = section[:900].replace("\n", "⏎")
         print(f"    · [{fname_dbg}] found a results heading but couldn't extract Revenue or PAT numbers "
-              f"— label regex likely didn't match this PDF's exact wording/layout")
+              f"— label regex likely didn't match this PDF's exact wording/layout"
+              f" | section text: ...{section_snippet}...")
         return None  # couldn't find the table's actual numbers — don't fabricate a record
 
     m_qend = re.search(r"quarter ended\s+(\d{1,2}\s+[A-Za-z]+\s+\d{4})", text, re.IGNORECASE)
