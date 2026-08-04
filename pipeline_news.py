@@ -554,18 +554,65 @@ FUNDAMENTALS_FILE = "fundamentals_summary.json"
 # blocks or duplicates the real notification.
 
 _PDF_SUBJECT_RE = re.compile(r"outcome of board meeting", re.IGNORECASE)
-_PDF_STATEMENT_HEADING_RE = re.compile(
-    r"Statement of (Standalone|Consolidated)[\s\S]{0,80}?Financial Results", re.IGNORECASE
-)
-# Fallback for filings that don't use the "Statement of ..." prefix at all —
-# e.g. just "STANDALONE UNAUDITED FINANCIAL RESULTS FOR THE QUARTER ENDED...".
-# Tried only if the primary pattern above finds nothing.
-_PDF_STATEMENT_HEADING_FALLBACK_RE = re.compile(
-    r"(Standalone|Consolidated)[\s\S]{0,40}?Financial Results", re.IGNORECASE
-)
+# Candidate heading patterns, tried in this priority order:
+#   1. "Statement of Standalone/Consolidated ... Financial Results" (most specific)
+#   2. "Standalone/Consolidated ... Financial Results" without the "Statement of" prefix
+#   3. Bare "(Un)Audited Financial Results for the Quarter/Year" with NO
+#      Standalone/Consolidated qualifier at all — some single-entity filers
+#      (no subsidiaries) omit it entirely (confirmed: MSWIL's actual table
+#      heading was "UNAUDITED FINANCIAL RESULTS FOR THE QUARTER ENDED..."
+#      with no qualifier word anywhere nearby). Defaults to "Standalone".
+# All three commonly ALSO match inside the auditor's review-report cover
+# letter ("...reviewed the accompanying Statement of Standalone unaudited
+# financial results...") which precedes the real table in these PDFs —
+# that boilerplate sentence is excluded via _PDF_BOILERPLATE_PRECEDE_RE
+# rather than by pattern alone, since the wording is otherwise identical.
+_PDF_HEADING_PATTERNS = [
+    re.compile(r"Statement of (Standalone|Consolidated)[\s\S]{0,80}?Financial Results", re.IGNORECASE),
+    # Order A: "...Standalone Unaudited Financial Results..." (qualifier before audited-word)
+    re.compile(r"(Standalone|Consolidated)[\s\S]{0,20}?(?:Un-?)?[Aa]udited[\s\S]{0,10}?Financial Results", re.IGNORECASE),
+    # Order B: "...Unaudited Standalone Financial Results..." (audited-word before qualifier —
+    # NSE's actual real-world ordering, confirmed from a live filing: "STATEMENT OF UNAUDITED
+    # STANDALONE FINANCIAL RESULTS..."). Order A above does NOT catch this — the audited-word
+    # comes before, not after, Standalone/Consolidated, so this tier is required separately.
+    re.compile(r"(?:Un-?)?[Aa]udited[\s\S]{0,10}?(Standalone|Consolidated)[\s\S]{0,20}?Financial Results", re.IGNORECASE),
+    re.compile(r"(?:Un-?)?[Aa]udited Financial Results\s+for\s+the\s+(?:Quarter|Year)", re.IGNORECASE),
+]
+# Boilerplate lead-in phrases that precede a heading-like match inside the
+# auditor's review report cover letter rather than the actual results
+# table — e.g. "...reviewed the accompanying Statement of unaudited
+# financial results..." or "...the accompanying Statement of Standalone...".
+# Checked against the ~40 chars immediately before the match.
+_PDF_BOILERPLATE_PRECEDE_RE = re.compile(r"(accompanying|reviewed)[\s\S]{0,15}$", re.IGNORECASE)
 _PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
 _PDF_FORMULA_REF_RE = re.compile(r"\(\s*\d+\s*[+\-]\s*\d+\s*\)")
 _PDF_NUM_TOKEN_RE = r"\(?-?[\d,]+\.?\d*\)?|-|—"
+
+
+def _pdf_find_heading_candidates(text: str):
+    """Returns [(start, end, nature)] for every non-boilerplate heading-like
+    match across all three pattern tiers, sorted by position. `nature` is
+    "Standalone" or "Consolidated" (defaulting to "Standalone" when the
+    matched pattern has no qualifier group, i.e. tier 3)."""
+    candidates = []
+    for pat in _PDF_HEADING_PATTERNS:
+        for m in pat.finditer(text):
+            pre = text[max(0, m.start() - 40):m.start()]
+            if _PDF_BOILERPLATE_PRECEDE_RE.search(pre):
+                continue
+            nature = "Standalone"
+            if m.groups() and m.group(1) and m.group(1).lower() in ("standalone", "consolidated"):
+                nature = m.group(1).capitalize()
+            candidates.append((m.start(), m.end(), nature))
+    # de-dup near-identical positions across pattern tiers (same real
+    # heading can match more than one tier's pattern)
+    candidates.sort(key=lambda c: c[0])
+    deduped = []
+    for c in candidates:
+        if deduped and c[0] - deduped[-1][0] < 20:
+            continue
+        deduped.append(c)
+    return deduped
 
 
 def _is_board_outcome_pdf(it: dict) -> bool:
@@ -683,56 +730,88 @@ def parse_financial_results_pdf(content: bytes, link: str):
     Consolidated results table over Standalone when a PDF contains both.
     Returns None if this isn't a financial-results outcome (e.g. a PDF only
     about KMP appointments) or the core numbers can't be found."""
-    from pypdf import PdfReader
+    # pdfplumber's layout=True mode reconstructs text using each word's
+    # actual (x,y) position on the page, rather than following the PDF
+    # content stream's draw order. This matters a lot for these tables:
+    # pypdf's extract_text() was confirmed (via a live UNO MINDA filing) to
+    # dump the entire "Particulars" label column first, then the entire
+    # numbers column separately hundreds of lines later — completely
+    # breaking the same-line label→number matching every regex below
+    # depends on. layout=True keeps each row's label and its numbers
+    # together as they actually appear.
+    import pdfplumber
     import io as _io
 
     fname_dbg = link.rsplit("/", 1)[-1]
 
     try:
-        reader = PdfReader(_io.BytesIO(content))
-        text = "\n".join((p.extract_text() or "") for p in reader.pages)
+        with pdfplumber.open(_io.BytesIO(content)) as pdf:
+            text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
     except Exception as e:
-        print(f"    · [{fname_dbg}] PdfReader/extract_text raised: {type(e).__name__}: {e}")
+        print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
         return None
     if not text.strip():
         print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
         return None
 
-    headings = list(_PDF_STATEMENT_HEADING_RE.finditer(text))
-    used_fallback = False
-    if not headings:
-        headings = list(_PDF_STATEMENT_HEADING_FALLBACK_RE.finditer(text))
-        used_fallback = True
+    headings = _pdf_find_heading_candidates(text)
     if not headings:
         snippets = []
         for m_fr in list(re.finditer(r"financial results", text, re.IGNORECASE))[:3]:
             start = max(0, m_fr.start() - 60)
             snippets.append(text[start:m_fr.end() + 20].replace("\n", "⏎"))
         snippet_text = " || ".join(snippets)
-        print(f"    · [{fname_dbg}] no 'Standalone/Consolidated ... Financial Results' "
-              f"heading found (tried both primary and fallback patterns) — not a results table "
-              f"(governance/KMP-only outcome PDF), or heading wording differs further from expected"
+        print(f"    · [{fname_dbg}] no non-boilerplate 'Financial Results' heading found across all "
+              f"3 pattern tiers — not a results table (governance/KMP-only outcome PDF), or every "
+              f"match was inside the auditor-report cover letter"
               + (f" | occurrences: ...{snippet_text}..." if snippet_text else " | 'financial results' not found in text at all"))
         return None  # no results table in this PDF (pure governance/KMP outcome)
-    if used_fallback:
-        print(f"    · [{fname_dbg}] matched via fallback heading pattern (primary 'Statement of ...' pattern missed it)")
 
-    chosen = next((h for h in headings if h.group(1).lower() == "consolidated"), headings[0])
-    nature = "Consolidated" if chosen.group(1).lower() == "consolidated" else "Standalone"
-    start = chosen.end()
-    later = [h.start() for h in headings if h.start() > start]
-    section = text[start: min(later) if later else len(text)]
+    # Try candidates in order: Consolidated first (preferred when both bases
+    # are present), then by document position. Take the FIRST candidate
+    # whose section actually yields Revenue or PAT — a heading-shaped match
+    # with no extractable numbers right after it (e.g. a stray mention, or
+    # a table our label regexes don't recognize) isn't usable, so we keep
+    # trying rather than giving up on the first match.
+    ordered = sorted(headings, key=lambda c: (0 if c[2] == "Consolidated" else 1, c[0]))
 
-    revenue_c        = _pdf_numbers_after(section, r"Revenue from operations")
-    other_income_c   = _pdf_numbers_after(section, r"Other income")
-    total_income_c   = _pdf_numbers_after(section, r"Total income")
-    total_expenses_c = _pdf_numbers_after(section, r"Total expenses")
-    pbt_c            = _pdf_numbers_after(section, r"\)\s*before tax")
-    tax_expense_c    = _pdf_numbers_after(section, r"Total tax expense")
-    pat_c            = _pdf_numbers_after(section, r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period")
-    comprehensive_c  = _pdf_numbers_after(section, r"Total comprehensive.*?for the period")
-    eps_basic_c      = _pdf_numbers_after(section, r"\(a\)\s*Basic")
-    eps_diluted_c    = _pdf_numbers_after(section, r"\(b\)\s*Diluted")
+    chosen_section = chosen_nature = None
+    chosen_numbers = None
+    tried_snippets = []
+    for start, end, nature in ordered:
+        later = [c[0] for c in headings if c[0] > start]
+        section = text[end: min(later) if later else len(text)]
+
+        revenue_c        = _pdf_numbers_after(section, r"Revenue from operations")
+        other_income_c   = _pdf_numbers_after(section, r"Other income")
+        total_income_c   = _pdf_numbers_after(section, r"Total income")
+        total_expenses_c = _pdf_numbers_after(section, r"Total expenses")
+        pbt_c            = _pdf_numbers_after(section, r"\)\s*before tax")
+        tax_expense_c    = _pdf_numbers_after(section, r"Total tax expense")
+        pat_c            = _pdf_numbers_after(section, r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period")
+        comprehensive_c  = _pdf_numbers_after(section, r"Total comprehensive.*?for the period")
+        eps_basic_c      = _pdf_numbers_after(section, r"\(a\)\s*Basic")
+        eps_diluted_c    = _pdf_numbers_after(section, r"\(b\)\s*Diluted")
+
+        if revenue_c[0] is not None or pat_c[0] is not None:
+            chosen_section = section
+            chosen_nature = nature
+            chosen_numbers = (revenue_c, other_income_c, total_income_c, total_expenses_c,
+                               pbt_c, tax_expense_c, pat_c, comprehensive_c, eps_basic_c, eps_diluted_c)
+            break
+        tried_snippets.append(f"[{nature} @ {start}] {section[:200].replace(chr(10), '⏎')}")
+
+    if chosen_section is None:
+        joined = " || ".join(tried_snippets[:3])
+        print(f"    · [{fname_dbg}] found {len(headings)} heading candidate(s) but none yielded "
+              f"Revenue or PAT numbers — label regex likely doesn't match this PDF's exact wording"
+              f" | tried: ...{joined}...")
+        return None  # couldn't find the table's actual numbers — don't fabricate a record
+
+    section = chosen_section
+    nature = chosen_nature
+    (revenue_c, other_income_c, total_income_c, total_expenses_c,
+     pbt_c, tax_expense_c, pat_c, comprehensive_c, eps_basic_c, eps_diluted_c) = chosen_numbers
 
     revenue, other_income, total_income, total_expenses = revenue_c[0], other_income_c[0], total_income_c[0], total_expenses_c[0]
     pbt, tax_expense, pat, comprehensive = pbt_c[0], tax_expense_c[0], pat_c[0], comprehensive_c[0]
