@@ -25,6 +25,16 @@ UPSTOX_NSE_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NS
 UPSTOX_OHLC_URL = "https://api.upstox.com/v3/market-quote/ohlc"
 
 UPSTOX_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "").strip()
+
+# ── TEMP DEBUG — remove once the token-not-received mystery is solved ──
+# Prints length only, never the actual token value, so it's safe to leave
+# in Actions logs while diagnosing.
+_raw_upstox_env = os.environ.get("UPSTOX_ACCESS_TOKEN")
+_upstox_preview = repr(UPSTOX_TOKEN[:4]) if UPSTOX_TOKEN else "EMPTY"
+print(f"🔑 DEBUG UPSTOX_ACCESS_TOKEN: env_var_present={_raw_upstox_env is not None}, "
+      f"raw_len={len(_raw_upstox_env) if _raw_upstox_env is not None else 'N/A'}, "
+      f"stripped_len={len(UPSTOX_TOKEN)}, "
+      f"first4={_upstox_preview}")
 OUTPUT_FILE     = "master.json"
 BSE_OUTPUT_FILE = "bse.json"
 
