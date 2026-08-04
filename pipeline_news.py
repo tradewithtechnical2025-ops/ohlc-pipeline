@@ -555,7 +555,13 @@ FUNDAMENTALS_FILE = "fundamentals_summary.json"
 
 _PDF_SUBJECT_RE = re.compile(r"outcome of board meeting", re.IGNORECASE)
 _PDF_STATEMENT_HEADING_RE = re.compile(
-    r"Statement of (Standalone|Consolidated)[^\n]{0,80}?Financial Results", re.IGNORECASE
+    r"Statement of (Standalone|Consolidated)[\s\S]{0,80}?Financial Results", re.IGNORECASE
+)
+# Fallback for filings that don't use the "Statement of ..." prefix at all —
+# e.g. just "STANDALONE UNAUDITED FINANCIAL RESULTS FOR THE QUARTER ENDED...".
+# Tried only if the primary pattern above finds nothing.
+_PDF_STATEMENT_HEADING_FALLBACK_RE = re.compile(
+    r"(Standalone|Consolidated)[\s\S]{0,40}?Financial Results", re.IGNORECASE
 )
 _PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
 _PDF_FORMULA_REF_RE = re.compile(r"\(\s*\d+\s*[+\-]\s*\d+\s*\)")
@@ -693,11 +699,23 @@ def parse_financial_results_pdf(content: bytes, link: str):
         return None
 
     headings = list(_PDF_STATEMENT_HEADING_RE.finditer(text))
+    used_fallback = False
     if not headings:
-        print(f"    · [{fname_dbg}] no 'Statement of Standalone/Consolidated ... Financial Results' "
-              f"heading found — not a results table (governance/KMP-only outcome PDF), "
-              f"or heading wording differs from expected pattern")
+        headings = list(_PDF_STATEMENT_HEADING_FALLBACK_RE.finditer(text))
+        used_fallback = True
+    if not headings:
+        snippet = ""
+        m_fr = re.search(r"financial results", text, re.IGNORECASE)
+        if m_fr:
+            start = max(0, m_fr.start() - 60)
+            snippet = text[start:m_fr.end() + 20].replace("\n", "⏎")
+        print(f"    · [{fname_dbg}] no 'Standalone/Consolidated ... Financial Results' "
+              f"heading found (tried both primary and fallback patterns) — not a results table "
+              f"(governance/KMP-only outcome PDF), or heading wording differs further from expected"
+              + (f" | nearby text: ...{snippet}..." if snippet else " | 'financial results' not found in text at all"))
         return None  # no results table in this PDF (pure governance/KMP outcome)
+    if used_fallback:
+        print(f"    · [{fname_dbg}] matched via fallback heading pattern (primary 'Statement of ...' pattern missed it)")
 
     chosen = next((h for h in headings if h.group(1).lower() == "consolidated"), headings[0])
     nature = "Consolidated" if chosen.group(1).lower() == "consolidated" else "Standalone"
