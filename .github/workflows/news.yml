@@ -18,7 +18,7 @@ jobs:
           python-version: '3.11'
           cache: pip
       - name: Install dependencies
-        run: pip install httpx feedparser requests pypdf
+        run: pip install httpx feedparser requests pypdf pdfplumber
       - name: Run Insider Trading Pipeline
         run: python pipeline_insider.py
         env:
