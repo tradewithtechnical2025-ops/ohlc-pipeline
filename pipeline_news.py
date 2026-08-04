@@ -725,7 +725,7 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
     if not prior_header or not any(v is not None for v in prior.values()):
         return None
     out = {"basis": "reported", "basis_verified": True, "prior_header": prior_header}
-    field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
+    field_map = {"revenue": "sales", "total_income": "total_income", "pat": "pat", "eps_basic": "eps"}
     got_any = False
     for cur_field, out_field in field_map.items():
         cur_v, prior_v = cur.get(cur_field), prior.get(cur_field)
@@ -766,9 +766,9 @@ Your job:
 2. If both Standalone and Consolidated tables are present, use the CONSOLIDATED table. Otherwise use whichever is present.
 3. Extract values ONLY from the MAIN results table's own rows — never from a subsidiary/joint-venture footnote, a segment-wise breakdown table, or the auditor's report's boilerplate sentences, even if they mention similar words ("total income", "net profit") with numbers nearby. The main table is the one with the full standard line-item structure (Revenue, Expenses, Profit before tax, Tax expense, Profit for the period, EPS).
 4. Use the CURRENT quarter column only (the most recent quarter, i.e. the first/leftmost data column — NOT a prior-year or prior-quarter comparative column).
-5. Report the unit the table itself states (look for "₹ in Crore", "Rs in Crores", "₹ in Million", "₹ in Lakh", or similar near the table header) — if genuinely no unit statement exists anywhere, use "Crore" as the default (NSE's most common convention).
+5. Report the unit the table itself states (look for "₹ in Crore", "Rs in Crores", "₹ in Million", "₹ in Lakh"/"₹ in Lakhs"/"Rs. in Lacs"/"Rs. in Lac" — "Lac"/"Lacs" is a very common alternate spelling of Lakh in Indian filings, treat it identically — or similar near the table header) — if genuinely no unit statement exists anywhere, use "Crore" as the default (NSE's most common convention).
 6. Ignore any numbers inside formula references like "(3+4)" or "[3-4]" next to line-item labels — those are row-number citations, not data.
-7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, PAT, and EPS if visible as separate columns in the same main table, plus each comparison column's period-end date.
+7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, total_income, PAT, and EPS if visible as separate columns in the same main table, plus each comparison column's period-end date.
 8. Extract the quarter-end date (the date this result is FOR, e.g. "quarter ended June 30, 2026" -> "2026-06-30").
 
 Return ONLY valid JSON (no markdown fences, no other text) matching exactly this schema:
@@ -789,8 +789,8 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
     "eps_basic": number or null,
     "eps_diluted": number or null
   },
-  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null},
-  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null}
+  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null},
+  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null}
 }
 
 All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS."""
@@ -831,7 +831,7 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         return None
 
 
-def _parse_pdf_regex(text: str, link: str, fname_dbg: str):
+def _parse_pdf_regex(text: str, link: str, fname_dbg: str, rss_title: str = ""):
     """Regex/label-matching fallback parser — used when AI extraction is
     unavailable (no ANTHROPIC_API_KEY) or fails. Takes already-extracted
     text (see parse_financial_results_pdf, which does the pdfplumber
@@ -943,11 +943,11 @@ def _parse_pdf_regex(text: str, link: str, fname_dbg: str):
     # its own /1e7 to display Crores — so we must scale up by the ACTUAL
     # unit multiplier here, not a hardcoded Crore assumption (which would
     # silently make Million-denominated filers' numbers 10x too large).
-    unit_m = re.search(r"[₹Rs\.]*\s*in\s*(Crores?|Millions?|Lakh[s]?)", text, re.IGNORECASE)
+    unit_m = re.search(r"[₹Rs\.]*\s*in\s*(Crores?|Millions?|Lakh[s]?|Lac[s]?)", text, re.IGNORECASE)
     unit_word = unit_m.group(1).lower() if unit_m else None
     if unit_word and unit_word.startswith("million"):
         unit_multiplier, unit_label = 1e6, "Million"
-    elif unit_word and unit_word.startswith("lakh"):
+    elif unit_word and (unit_word.startswith("lakh") or unit_word.startswith("lac")):
         unit_multiplier, unit_label = 1e5, "Lakh"
     else:
         unit_multiplier, unit_label = 1e7, "Crore"  # NSE default when no header found — most common
@@ -1026,8 +1026,13 @@ def _parse_pdf_regex(text: str, link: str, fname_dbg: str):
     m_aud = re.search(r"\((Unaudited|Audited)\)", section, re.IGNORECASE)
     audited = m_aud.group(1).capitalize() if m_aud else None
 
+    # Prefer the NSE RSS feed's own <title> (e.g. "Uno Minda Limited") over
+    # guessing from the PDF's first line — that guess was confirmed
+    # unreliable in practice (grabbed dates, website URLs, reference
+    # numbers, or name+address as if they were the company name).
     first_line = text.strip().split("\n", 1)[0].strip()
-    company_name = first_line if first_line and len(first_line) < 80 else symbol
+    company_name = rss_title.strip() if rss_title and rss_title.strip() else (
+        first_line if first_line and len(first_line) < 80 else symbol)
 
     quarter = {
         "revenue": revenue,
@@ -1066,10 +1071,12 @@ def _parse_pdf_regex(text: str, link: str, fname_dbg: str):
     # database fallback since it's the filing's own reported figures.
     header_dates = _pdf_header_dates(section)
     qoq_prior = {
-        "revenue": revenue_c[1], "pat": pat_c[1], "eps_basic": eps_basic_c[1], "total_expenses": total_expenses_c[1],
+        "revenue": revenue_c[1], "total_income": total_income_c[1], "pat": pat_c[1],
+        "eps_basic": eps_basic_c[1], "total_expenses": total_expenses_c[1],
     }
     yoy_prior = {
-        "revenue": revenue_c[2], "pat": pat_c[2], "eps_basic": eps_basic_c[2], "total_expenses": total_expenses_c[2],
+        "revenue": revenue_c[2], "total_income": total_income_c[2], "pat": pat_c[2],
+        "eps_basic": eps_basic_c[2], "total_expenses": total_expenses_c[2],
     }
     qoq_header = _quarter_header(header_dates[1]) if header_dates[1] else None
     yoy_header = _quarter_header(header_dates[2]) if header_dates[2] else None
@@ -1083,7 +1090,7 @@ def _parse_pdf_regex(text: str, link: str, fname_dbg: str):
     return result
 
 
-def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str):
+def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = ""):
     """Converts the AI extraction's JSON into the same {meta, quarter,
     qoq_fundamentals, yoy_fundamentals} shape _parse_pdf_regex produces.
     Applies unit scaling and the same total_income sanity check used on
@@ -1152,7 +1159,8 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str):
     audited = m_aud.group(1).capitalize() if m_aud else None
 
     first_line = text.strip().split("\n", 1)[0].strip()
-    company_name = first_line if first_line and len(first_line) < 80 else symbol
+    company_name = rss_title.strip() if rss_title and rss_title.strip() else (
+        first_line if first_line and len(first_line) < 80 else symbol)
 
     quarter = {
         "revenue": revenue, "other_income": other_income, "total_income": total_income,
@@ -1180,12 +1188,14 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str):
     qoq = ai.get("qoq_prior") or {}
     yoy = ai.get("yoy_prior") or {}
     qoq_prior = {
-        "revenue": scale(qoq.get("revenue")), "pat": scale(qoq.get("pat")),
-        "eps_basic": qoq.get("eps_basic"), "total_expenses": scale(qoq.get("total_expenses")),
+        "revenue": scale(qoq.get("revenue")), "total_income": scale(qoq.get("total_income")),
+        "pat": scale(qoq.get("pat")), "eps_basic": qoq.get("eps_basic"),
+        "total_expenses": scale(qoq.get("total_expenses")),
     }
     yoy_prior = {
-        "revenue": scale(yoy.get("revenue")), "pat": scale(yoy.get("pat")),
-        "eps_basic": yoy.get("eps_basic"), "total_expenses": scale(yoy.get("total_expenses")),
+        "revenue": scale(yoy.get("revenue")), "total_income": scale(yoy.get("total_income")),
+        "pat": scale(yoy.get("pat")), "eps_basic": yoy.get("eps_basic"),
+        "total_expenses": scale(yoy.get("total_expenses")),
     }
     qoq_header = _quarter_header(qoq.get("period_end")) if qoq.get("period_end") else None
     yoy_header = _quarter_header(yoy.get("period_end")) if yoy.get("period_end") else None
@@ -1199,7 +1209,7 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str):
     return result
 
 
-async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str):
+async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = ""):
     """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
     {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
     flow through the same grouping/dedup/Telegram code.
@@ -1214,6 +1224,12 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     (_parse_pdf_regex) when AI is unavailable, fails, or its result fails
     validation — so the pipeline still functions (in a more limited way)
     without an API key configured.
+
+    rss_title is the company name straight from the NSE RSS feed's own
+    <title> element (e.g. "Uno Minda Limited") — used as company_name
+    instead of guessing from the PDF's first line, which was confirmed
+    unreliable (grabbed dates, website URLs, reference numbers, or
+    name+address as if they were the company name).
     """
     import pdfplumber
     import io as _io
@@ -1232,7 +1248,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
 
     ai = await _ai_extract_financials(client, text, fname_dbg)
     if ai and ai.get("is_results_table"):
-        result = _build_result_from_ai(ai, text, link, fname_dbg)
+        result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title)
         if result:
             return result
         print(f"    · [{fname_dbg}] AI result failed validation — falling back to regex parser")
@@ -1240,7 +1256,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         print(f"    · [{fname_dbg}] AI says this isn't a results table — trying regex parser too "
               f"(defense in depth, in case AI is wrong)")
 
-    return _parse_pdf_regex(text, link, fname_dbg)
+    return _parse_pdf_regex(text, link, fname_dbg, rss_title)
 
 
 async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
@@ -1472,12 +1488,19 @@ def _telegram_basis_block(parsed: dict) -> list:
     the caller so two bases for the same company share a single message."""
     q = parsed.get("quarter", {})
     revenue = q.get("revenue")
+    total_income = q.get("total_income")
+    # Headline "Rev" shows Total Income (Revenue + Other Income) when
+    # available — some filers (e.g. real-estate, holding companies) have
+    # Other Income that's a material share of the top line, so Total
+    # Income is the more complete current-quarter figure. Falls back to
+    # Revenue from Operations if total_income wasn't extracted.
+    rev_display = total_income if total_income is not None else revenue
     pat = q.get("pat")
     pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
     cur_header = _quarter_header(q.get("period_end")) or ""
 
     lines = [f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>"]
-    lines.append(f"Rev: <b>{_fmt_cr(revenue)}</b>")
+    lines.append(f"Rev: <b>{_fmt_cr(rev_display)}</b>")
     lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
     if q.get("eps_basic") is not None:
         lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
@@ -1487,37 +1510,64 @@ def _telegram_basis_block(parsed: dict) -> list:
             return None
         return (cur_v - prior_v) / abs(prior_v) * 100
 
-    def _section(title, prior_header, cur_rev, cur_pat, rev_pct, pat_pct, opm_current_pct=None, opm_pp=None, prefix=""):
+    def _section(title, prior_header, cur_rev, cur_pat, prior_rev, prior_pat,
+                 rev_pct, pat_pct, opm_current_pct=None, opm_pp=None, prefix=""):
         sec = ["", f"<b>{title}{' (vs ' + prior_header + ')' if prior_header else ''}</b>"]
         if cur_rev is not None and rev_pct is not None:
-            sec.append(f"Rev: {_fmt_cr(cur_rev)} ({prefix}{'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%)")
+            prior_txt = f" from {_fmt_cr(prior_rev)}" if prior_rev is not None else ""
+            sec.append(f"Rev: {_fmt_cr(cur_rev)} ({prefix}{'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%{prior_txt})")
         if cur_pat is not None and pat_pct is not None:
-            sec.append(f"PAT: {_fmt_cr(cur_pat)} ({prefix}{'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%)")
+            prior_txt = f" from {_fmt_cr(prior_pat)}" if prior_pat is not None else ""
+            sec.append(f"PAT: {_fmt_cr(cur_pat)} ({prefix}{'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%{prior_txt})")
         if opm_current_pct is not None and opm_pp is not None:
             sec.append(f"OPM: {opm_current_pct}% ({prefix}{'+' if opm_pp >= 0 else ''}{opm_pp:.1f}pp)")
         return sec if len(sec) > 2 else []
 
     cur_opm_pct = round(q["opm"] * 100, 2) if q.get("opm") is not None else None
 
+    def _pick_rev_basis(cur_ti, cur_rev, prior_ti, prior_rev, pct_ti, pct_rev):
+        """Prefers Total Income (matches the Current-Qtr headline above) when
+        both current and prior Total Income are available; falls back to
+        Revenue from Operations otherwise (e.g. the XBRL-fundamentals-DB
+        YoY fallback path, which doesn't track Total Income at all)."""
+        if cur_ti is not None and prior_ti is not None and pct_ti is not None:
+            return cur_ti, prior_ti, pct_ti
+        return cur_rev, prior_rev, pct_rev
+
     qf = parsed.get("qoq_fundamentals")
     if qf:
         prefix = "" if qf.get("basis_verified") else "~"
-        lines += _section("QoQ", qf.get("prior_header"), revenue, pat,
-                           qf.get("sales_qoq_pct"), qf.get("pat_qoq_pct"),
+        cur_r, prior_r, pct_r = _pick_rev_basis(
+            total_income, revenue, qf.get("total_income_prior"), qf.get("sales_prior"),
+            qf.get("total_income_qoq_pct"), qf.get("sales_qoq_pct"),
+        )
+        lines += _section("QoQ", qf.get("prior_header"), cur_r, pat,
+                           prior_r, qf.get("pat_prior"),
+                           pct_r, qf.get("pat_qoq_pct"),
                            cur_opm_pct, qf.get("opm_qoq_pp"), prefix)
 
     yoy = parsed.get("yoy_comparison")
     yf = parsed.get("yoy_fundamentals")
     if yoy:
-        rev_pct = _pct(revenue, yoy.get("revenue"))
+        ti_pct = _pct(total_income, yoy.get("total_income"))
+        cur_r, prior_r, pct_r = _pick_rev_basis(
+            total_income, revenue, yoy.get("total_income"), yoy.get("revenue"),
+            ti_pct, _pct(revenue, yoy.get("revenue")),
+        )
         pat_pct = _pct(pat, yoy.get("pat"))
         yoy_header = _quarter_header(yoy.get("period_end"))
         opm_pp = round((q["opm"] - yoy["opm"]) * 100, 2) if q.get("opm") is not None and yoy.get("opm") is not None else None
-        lines += _section("YoY", yoy_header, revenue, pat, rev_pct, pat_pct, cur_opm_pct, opm_pp)
+        lines += _section("YoY", yoy_header, cur_r, pat, prior_r, yoy.get("pat"),
+                           pct_r, pat_pct, cur_opm_pct, opm_pp)
     elif yf:
         prefix = "" if yf.get("basis_verified") else "~"
-        lines += _section("YoY", yf.get("prior_header"), revenue, pat,
-                           yf.get("sales_yoy_pct"), yf.get("pat_yoy_pct"),
+        cur_r, prior_r, pct_r = _pick_rev_basis(
+            total_income, revenue, yf.get("total_income_prior"), yf.get("sales_prior"),
+            yf.get("total_income_yoy_pct"), yf.get("sales_yoy_pct"),
+        )
+        lines += _section("YoY", yf.get("prior_header"), cur_r, pat,
+                           prior_r, yf.get("pat_prior"),
+                           pct_r, yf.get("pat_yoy_pct"),
                            cur_opm_pct, yf.get("opm_yoy_pp"), prefix)
 
     if q.get("yoy_caution"):
@@ -1743,7 +1793,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                     print(f"  ⚠ PDF fetch returned empty for {fname}")
                     failed_links.append(it["link"])
                     return None
-                parsed = await parse_financial_results_pdf(client, content, it["link"])
+                parsed = await parse_financial_results_pdf(client, content, it["link"], it.get("title", ""))
                 if not parsed:
                     print(f"  ⚠ PDF parse returned None for {fname} "
                           f"(no results table / no statement heading / missing quarter-end match — "
