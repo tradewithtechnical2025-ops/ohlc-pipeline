@@ -30,6 +30,17 @@ ist = pytz.timezone('Asia/Kolkata')
 def now_ts():
     return datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
+# ----------------------------------------------------------------------
+# FIX: Chartink's `tradeTimes` epoch (ms) must be parsed as UTC first,
+# then converted to IST — before this fix, datetime.fromtimestamp(ts/1000)
+# did a NAIVE conversion using the runner's local timezone (UTC on GitHub
+# Actions), which shifted the trading date back by one day (values stayed
+# correct, only the date label was off). Use this helper everywhere a
+# chartink epoch needs to become a date.
+# ----------------------------------------------------------------------
+def epoch_ms_to_ist(ts_ms):
+    return datetime.fromtimestamp(ts_ms / 1000, tz=pytz.UTC).astimezone(ist)
+
 start_time = time.time()
 
 # ----------------------
@@ -265,7 +276,10 @@ def run_backtest_scanners_counts():
                     stocks = data["aggregatedStockList"]
 
                     for i, ts in enumerate(dates):
-                        dt = datetime.fromtimestamp(ts / 1000)
+                        # FIX: was datetime.fromtimestamp(ts / 1000) — naive
+                        # conversion using the runner's local tz (UTC on GH
+                        # Actions), which shifted the date back by one day.
+                        dt = epoch_ms_to_ist(ts)
                         if dt not in results:
                             results[dt] = {}
                         try:
@@ -321,7 +335,8 @@ def run_backtest_scanners_weekly():
                     stocks = data["aggregatedStockList"]
 
                     for i, ts in enumerate(dates):
-                        dt = datetime.fromtimestamp(ts / 1000)
+                        # FIX: same UTC->IST correction as the counts fetch above.
+                        dt = epoch_ms_to_ist(ts)
                         if dt not in results:
                             results[dt] = {}
                         try:
@@ -390,7 +405,10 @@ def run_ep_backtest_and_append():
                     stocks = data["aggregatedStockList"]
 
                     for i, ts in enumerate(dates):
-                        dt = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+                        # FIX: same UTC->IST correction — this feeds a .strftime()
+                        # directly, so it was the most visible source of the
+                        # "date is one day old" symptom in the EP sheet.
+                        dt = epoch_ms_to_ist(ts).strftime("%Y-%m-%d")
                         try:
                             stock_list = [stocks[i][j] for j in range(0, len(stocks[i]), 3)]
                         except Exception:
