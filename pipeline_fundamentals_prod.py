@@ -694,8 +694,7 @@ async def run_full(part=0):
 
 async def run_daily():
     today = today_ist()
-    if not is_trading_day(today):
-        log.info(f"⏭  {today} not a trading day"); return
+    
 
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient() as client:
