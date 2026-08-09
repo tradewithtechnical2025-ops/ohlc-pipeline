@@ -120,8 +120,8 @@ counts_backtest_scanners = {
     "3MH": "( {cash} (  daily high =  daily max( 50 ,  daily high ) and  daily close >  0 and  market cap >  10 ) )",
     "3ML": "( {cash} (  daily low =  daily min( 50 ,  daily low ) and  daily close >  0 and  market cap >  10 ) )",
     "3ML": "( {cash} (  daily low =  daily min( 50 ,  daily low ) and  daily close >  1 and  market cap >  10 ) )",
-    "UpVol": "( {cash} (  daily volume >  daily sma(  daily close , 20 ) *  1.5 and  daily close >  0 and  market cap >  1 ) )",
-    "DVol": "( {cash} (  daily volume <  daily sma(  daily close , 20 ) *  0.5 and  daily close >  0 and  market cap >  1 ) )",
+    "UpVol": "( {cash} (  daily volume >  daily sma(  daily volume , 20 ) *  1.5 and  daily close >  0 and  market cap >  1 ) )",
+    "DVol": "( {cash} (  daily volume <  daily sma(  daily volume , 20 ) *  0.5 and  daily close >  0 and  market cap >  1 ) )",
 }
 
 # Weekly-periodicity scanner(s) — kept separate from daily counts so dates don't mismatch
