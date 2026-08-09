@@ -342,7 +342,7 @@ def _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
 
     # hi is the very last available bar -> the pole just completed today
     # with zero days of consolidation yet — label distinctly.
-    if flag_days == 0 and status == "forming":
+    if flag_days < flag_min_days and status == "forming":
         status = "pole_just_formed"
 
     # ── Post-breakout tracking ──
