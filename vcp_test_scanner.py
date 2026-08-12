@@ -198,7 +198,7 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
 def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_contractions=6,
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.02,
                 max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
-                max_52wh_dist=0.20):
+                max_52wh_dist=0.20, max_post_breakout_run=0.03):
     """
     VCP (Volatility Contraction Pattern) detector.
 
@@ -336,6 +336,20 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
         if pivot_price <= 0: return None
         dist = (pivot_price - last_close) / pivot_price
         if dist > max_dist_from_pivot or dist < -0.02: return None
+
+        # ---- 7b. Reject if this is a POST-BREAKOUT RETEST, not a fresh
+        # pre-breakout setup. dist alone can't tell these apart: a stock
+        # that broke out weeks ago, rallied well past the pivot, and has
+        # now pulled back down near/below it again will show the same
+        # small "dist" as a stock that's genuinely still approaching the
+        # pivot for the first time. Check whether price ever closed
+        # meaningfully above the pivot at any point since the base's
+        # final low — if so, the breakout already happened. ----
+        post_base_start = run[-1][2] + 1
+        if post_base_start < n:
+            highs_since = [highs[idx] for idx in range(post_base_start, n) if highs[idx] is not None]
+            if highs_since and max(highs_since) > pivot_price * (1 + max_post_breakout_run):
+                return None
 
         # ---- 8. Volume dry-up — informational / scoring only ----
         def _leg_vol(c):
