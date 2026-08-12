@@ -24,7 +24,6 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install httpx requests
-
       - name: Classification
         uses: nick-fields/retry@v3
         with:
@@ -32,7 +31,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline_classification.py classification
-
       - name: Daily OHLC
         uses: nick-fields/retry@v3
         with:
@@ -40,7 +38,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py daily
-
       - name: Today OHLC
         uses: nick-fields/retry@v3
         with:
@@ -48,7 +45,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py today
-
       - name: HLR Scan
         uses: nick-fields/retry@v3
         with:
@@ -56,7 +52,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py hlr_scan
-
       - name: Pattern Scan
         uses: nick-fields/retry@v3
         with:
@@ -64,7 +59,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py pattern_scan
-
       - name: HTF Scan
         uses: nick-fields/retry@v3
         with:
@@ -72,7 +66,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python htf_test_scan.py --r2-key htf_test_results.json
-
       - name: Shakeout Scan
         uses: nick-fields/retry@v3
         with:
@@ -80,7 +73,13 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python shakeout_scanner.py --r2-key shakeout_signals.json
-
+      - name: VCP Scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py vcp_scan
       - name: Fundamentals
         uses: nick-fields/retry@v3
         with:
@@ -88,7 +87,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline_fundamentals_prod.py daily
-
       - name: EP Scan
         uses: nick-fields/retry@v3
         with:
@@ -96,7 +94,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py ep_scan
-
       - name: Indices Pipeline
         uses: nick-fields/retry@v3
         with:
@@ -104,7 +101,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline_indices.py
-
       - name: Telegram fallback on workflow failure
         if: failure()
         run: |
