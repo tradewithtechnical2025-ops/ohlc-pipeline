@@ -289,6 +289,49 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
                 i += 2
             else:
                 i += 1
+
+        # ---- 4b. Live/in-progress final leg — the tightest leg in a real
+        # VCP is often the MOST RECENT one, and can genuinely be smaller
+        # than zigzag_pct — which means the pivot detector's own threshold
+        # could never "confirm" it as a discrete pivot on its own. Build a
+        # live final leg from whatever's happened since the last CONFIRMED
+        # pivot, using true intrabar highs/lows through TODAY rather than
+        # waiting for a full threshold-confirmed reversal on either side:
+        #   - if the chain currently ends on an H, extend that H's low
+        #     using the true minimum low seen since, through today;
+        #   - if it ends on an L, price may have already rallied to a
+        #     fresh (unconfirmed) peak since then and be pulling back
+        #     again — find that live peak's true high, then the true
+        #     minimum low since THAT peak, through today.
+        # Only replaces/extends an existing contraction when today's true
+        # low is genuinely DEEPER than what's already recorded — this
+        # never shrinks or removes an already-valid confirmed leg.
+        last_piv = seq[-1]
+        live_leg = None
+        if last_piv[2] == "H":
+            hi, hp = last_piv[0], last_piv[1]
+            span = [(idx, lows[idx]) for idx in range(hi + 1, n) if lows[idx] is not None]
+            if span:
+                li, lp = min(span, key=lambda x: x[1])
+                if hp > 0 and li - hi >= 2:
+                    live_leg = (hi, hp, li, lp, (hp - lp) / hp)
+        else:  # last_piv[2] == "L"
+            after = [(idx, highs[idx]) for idx in range(last_piv[0] + 1, n) if highs[idx] is not None]
+            if after:
+                hi, hp = max(after, key=lambda x: x[1])
+                span = [(idx, lows[idx]) for idx in range(hi + 1, n) if lows[idx] is not None]
+                if span:
+                    li, lp = min(span, key=lambda x: x[1])
+                    if hp > 0 and li - hi >= 2:
+                        live_leg = (hi, hp, li, lp, (hp - lp) / hp)
+
+        if live_leg is not None:
+            if contractions and contractions[-1][0] == live_leg[0]:
+                if live_leg[3] < contractions[-1][3]:
+                    contractions[-1] = live_leg
+            elif not contractions or live_leg[0] > contractions[-1][0]:
+                contractions.append(live_leg)
+
         if len(contractions) < min_contractions: return None
 
         # ---- 5. Longest tightening run ending at most recent contraction ----
