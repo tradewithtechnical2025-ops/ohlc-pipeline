@@ -47,5 +47,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: vcp-test-results
-          path: vcp_test_results.json
+          path: vcp_signals.json
           if-no-files-found: warn
