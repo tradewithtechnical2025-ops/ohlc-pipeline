@@ -1773,6 +1773,42 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
 
 
 # ══════════════════════════════════════════════════════════════
+# SCAN HISTORY — daily dated snapshot of screener_feed.json so the
+# frontend can let users browse past days' scan results ("yesterday
+# ka data"). Independent of the live screener_feed.json which always
+# holds only the latest snapshot.
+#
+# Stored as: history/screener_feed_YYYY-MM-DD.json
+# Index at:  history/manifest.json  → {"dates": [...], "updated": "..."}
+#
+# NOTE: this only trims the *manifest* (so old dates stop being listed/
+# offered in the frontend dropdown) — it does NOT delete the underlying
+# R2 objects, since r2_upload/r2_download here have no delete endpoint.
+# If you want old blobs physically removed too, either add a DELETE
+# route to the Cloudflare Worker, or set an R2 lifecycle rule on the
+# "history/" prefix in the Cloudflare dashboard.
+# ══════════════════════════════════════════════════════════════
+
+HISTORY_KEEP_DAYS = 15  # how many past days stay visible in the History dropdown
+
+async def archive_screener_feed_history(client, screener_feed, today, keep_days=HISTORY_KEEP_DAYS):
+    fname = f"history/screener_feed_{today}.json"
+    await r2_upload(client, fname, json.dumps(screener_feed))
+
+    manifest = await r2_download(client, "history/manifest.json")
+    dates = set(manifest.get("dates", [])) if isinstance(manifest, dict) else set()
+    dates.add(today)
+
+    cutoff = (date.fromisoformat(today) - timedelta(days=keep_days)).isoformat()
+    dates = {d for d in dates if d >= cutoff}
+
+    await r2_upload(client, "history/manifest.json", json.dumps({
+        "dates": sorted(dates), "updated": today,
+    }))
+    log.info(f"  🗄  history: saved {fname}  (manifest now has {len(dates)} dates)")
+
+
+# ══════════════════════════════════════════════════════════════
 # run_ep_scan
 # ══════════════════════════════════════════════════════════════
 
@@ -2040,6 +2076,7 @@ async def run_ep_scan() -> None:
                 upload_str_with_manifest(client, r2_upload, "screener_meta.json", json.dumps(screener_meta),
                                           schema_v=1, extra_meta={}),
                 backup_pattern_history(client,screener_feed,today,gap_new=gap_new,gap_filled=gap_filled),
+                archive_screener_feed_history(client, screener_feed, today),
             )
             log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
         status.success()
