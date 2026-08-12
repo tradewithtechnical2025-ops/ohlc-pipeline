@@ -199,7 +199,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.02,
                 max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
-                live_min_bars=5, live_min_depth=0.02):
+                live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=10):
     """
     VCP (Volatility Contraction Pattern) detector.
 
@@ -363,6 +363,12 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
         run = contractions[j+1:]
         run_depths = [c[4] for c in run]
         if not (min_contractions <= len(run) <= max_contractions): return None
+
+        # ---- 5a. First contraction must span a meaningful minimum
+        # duration, measured H-to-NEXT-H (the full down-and-recovery
+        # cycle) — a short 2-4 day whip can produce a deep-looking %
+        # depth without representing a genuine base-forming move. ----
+        if len(run) >= 2 and (run[1][0] - run[0][0]) < min_first_leg_bars: return None
 
         # ---- 5b. No contraction low must be broken by subsequent price ----
         for k in range(len(run)):
