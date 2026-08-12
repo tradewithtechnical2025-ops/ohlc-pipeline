@@ -1,26 +1,51 @@
-name: VCP Scan
+name: VCP Test Pipeline
+
 on:
   workflow_dispatch:
+    inputs:
+      params:
+        description: 'Optional param overrides, e.g. zigzag_pct=0.05,max_final_depth=0.15'
+        required: false
+        default: ''
+      r2_key:
+        description: 'R2 filename to save results under'
+        required: false
+        default: 'vcp_signals_test.json'
+
+concurrency:
+  group: vcp-test-pipeline
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  WORKER_URL:   ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
 
 jobs:
-  vcp_scan:
+  vcp-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: pip install httpx
-      - name: Print UTC Time
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Dependencies
+        run: pip install httpx
+
+      - name: Run VCP Test Scan (full universe)
         run: |
-          echo "UTC Time:"
-          date -u
-          echo "Runner Local Time:"
-          date
-      - name: Run VCP Scan
-        env:
-          UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
-          WORKER_URL:    ${{ secrets.WORKER_URL }}
-          WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
-          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-        run: python pipeline.py vcp_scan
+          if [ -n "${{ github.event.inputs.params }}" ]; then
+            python vcp_test_scanner.py --all --save vcp_test_results.json --r2-key "${{ github.event.inputs.r2_key }}" --params "${{ github.event.inputs.params }}"
+          else
+            python vcp_test_scanner.py --all --save vcp_test_results.json --r2-key "${{ github.event.inputs.r2_key }}"
+          fi
+
+      - name: Upload results as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vcp-test-results
+          path: vcp_test_results.json
+          if-no-files-found: warn
