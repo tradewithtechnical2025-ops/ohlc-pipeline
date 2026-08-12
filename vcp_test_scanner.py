@@ -198,7 +198,8 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
 def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_contractions=6,
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.02,
                 max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
-                max_52wh_dist=0.20, max_post_breakout_run=0.03):
+                max_52wh_dist=0.20, max_post_breakout_run=0.03,
+                live_min_bars=5, live_min_depth=0.02):
     """
     VCP (Volatility Contraction Pattern) detector.
 
@@ -306,6 +307,11 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
         # Only replaces/extends an existing contraction when today's true
         # low is genuinely DEEPER than what's already recorded — this
         # never shrinks or removes an already-valid confirmed leg.
+        # Gated by a minimum span of live_min_bars (a full trading week by
+        # default) AND a minimum depth (live_min_depth) — without both,
+        # a pullback that only just started 1-2 days ago (which could
+        # easily just be routine daily noise, not a real leg yet) would
+        # get treated as a confirmed contraction prematurely.
         last_piv = seq[-1]
         live_leg = None
         if last_piv[2] == "H":
@@ -313,8 +319,9 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
             span = [(idx, lows[idx]) for idx in range(hi + 1, n) if lows[idx] is not None]
             if span:
                 li, lp = min(span, key=lambda x: x[1])
-                if hp > 0 and li - hi >= 2:
-                    live_leg = (hi, hp, li, lp, (hp - lp) / hp)
+                depth = (hp - lp) / hp if hp > 0 else 0
+                if hp > 0 and li - hi >= live_min_bars and depth >= live_min_depth:
+                    live_leg = (hi, hp, li, lp, depth)
         else:  # last_piv[2] == "L"
             after = [(idx, highs[idx]) for idx in range(last_piv[0] + 1, n) if highs[idx] is not None]
             if after:
@@ -322,8 +329,9 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
                 span = [(idx, lows[idx]) for idx in range(hi + 1, n) if lows[idx] is not None]
                 if span:
                     li, lp = min(span, key=lambda x: x[1])
-                    if hp > 0 and li - hi >= 2:
-                        live_leg = (hi, hp, li, lp, (hp - lp) / hp)
+                    depth = (hp - lp) / hp if hp > 0 else 0
+                    if hp > 0 and li - hi >= live_min_bars and depth >= live_min_depth:
+                        live_leg = (hi, hp, li, lp, depth)
 
         if live_leg is not None:
             if contractions and contractions[-1][0] == live_leg[0]:
