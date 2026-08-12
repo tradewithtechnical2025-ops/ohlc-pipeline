@@ -3097,7 +3097,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.02,
                 max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
-                live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=10):
+                live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15):
     """
     VCP (Volatility Contraction Pattern) detector.
 
