@@ -307,11 +307,13 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
         # Only replaces/extends an existing contraction when today's true
         # low is genuinely DEEPER than what's already recorded — this
         # never shrinks or removes an already-valid confirmed leg.
-        # Gated by a minimum span of live_min_bars (a full trading week by
-        # default) AND a minimum depth (live_min_depth) — without both,
-        # a pullback that only just started 1-2 days ago (which could
-        # easily just be routine daily noise, not a real leg yet) would
-        # get treated as a confirmed contraction prematurely.
+        # The pullback itself can be quick (even just 1-2 days, or the
+        # low can be today) — what's gated is live_min_bars of AGE on
+        # the HIGH itself, through today. That confirms the peak has
+        # genuinely rolled over (no new high made in that many days),
+        # rather than being a still-forming top that could easily go
+        # higher tomorrow. Also requires a minimum depth (live_min_depth)
+        # so a trivially shallow wiggle doesn't count either.
         last_piv = seq[-1]
         live_leg = None
         if last_piv[2] == "H":
@@ -320,7 +322,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
             if span:
                 li, lp = min(span, key=lambda x: x[1])
                 depth = (hp - lp) / hp if hp > 0 else 0
-                if hp > 0 and li - hi >= live_min_bars and depth >= live_min_depth:
+                if hp > 0 and (n - 1 - hi) >= live_min_bars and depth >= live_min_depth:
                     live_leg = (hi, hp, li, lp, depth)
         else:  # last_piv[2] == "L"
             after = [(idx, highs[idx]) for idx in range(last_piv[0] + 1, n) if highs[idx] is not None]
@@ -330,7 +332,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_con
                 if span:
                     li, lp = min(span, key=lambda x: x[1])
                     depth = (hp - lp) / hp if hp > 0 else 0
-                    if hp > 0 and li - hi >= live_min_bars and depth >= live_min_depth:
+                    if hp > 0 and (n - 1 - hi) >= live_min_bars and depth >= live_min_depth:
                         live_leg = (hi, hp, li, lp, depth)
 
         if live_leg is not None:
