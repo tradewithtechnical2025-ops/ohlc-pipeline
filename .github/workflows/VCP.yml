@@ -10,7 +10,7 @@ on:
       r2_key:
         description: 'R2 filename to save results under'
         required: false
-        default: 'vcp_signals_test.json'
+        default: 'vcp_signals.json'
 
 concurrency:
   group: vcp-test-pipeline
