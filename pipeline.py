@@ -1227,7 +1227,7 @@ def _build_mswing_json(all_data, mswing_data):
     return rows
 
 
-PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo","shakeout"]
+PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo"]
 HLR_STATE_KEYS={"BO":"hlr_bo","Near HLR":"hlr_near","Consolidating near HLR":"hlr_consol"}
 GAP_STATE_KEYS={"Near Gap":"gap_near","Consolidating near Gap":"gap_consol","Gap Filled":"gap_just_filled"}
 
@@ -1586,7 +1586,7 @@ def _today_gap_events(gaps_by_sym, today):
 # ══════════════════════════════════════════════════════════════
 
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
-    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, shakeout_map=None, w_pb_map=None):
+    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None):
     cls_map={}
     for x in (classification or []):
         sym=x.get("symbol") or x.get("nse_code")
@@ -1763,10 +1763,27 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             "hlr_state":(hlr_map or {}).get(sym,{}).get("state"),"hlr_res":(hlr_map or {}).get(sym,{}).get("resistance"),
             "hlr_dist":(hlr_map or {}).get(sym,{}).get("dist_pct"),"hlr_touches":(hlr_map or {}).get(sym,{}).get("touches"),
             "pullback":sym in (pb_map or {}),"circuit":sh_info.get("circuit"),"hpbc":sh_info.get("hpbc"),"tl_hl_bo":sh_info.get("tl_hl_bo"),
-            "shakeout":sym in (shakeout_map or {}),"shakeout_type":(shakeout_map or {}).get(sym,{}).get("wick_type"),
-            "shakeout_support":(shakeout_map or {}).get(sym,{}).get("support_type"),
             "w_pullback":sym in (w_pb_map or {}),"w_pullback_date":(w_pb_map or {}).get(sym,{}).get("signal_date"),
-            "w_pullback_ema":(w_pb_map or {}).get(sym,{}).get("signal_ema")}
+            "w_pullback_ema":(w_pb_map or {}).get(sym,{}).get("signal_ema"),
+            "w_hlr_state":(w_hlr_map or {}).get(sym,{}).get("state"),"w_hlr_res":(w_hlr_map or {}).get(sym,{}).get("resistance"),
+            "w_hlr_dist":(w_hlr_map or {}).get(sym,{}).get("dist_pct"),"w_hlr_touches":(w_hlr_map or {}).get(sym,{}).get("touches"),
+            "m_pullback":sym in (m_pb_map or {}),"m_pullback_date":(m_pb_map or {}).get(sym,{}).get("date"),
+            "m_pullback_ema":(m_pb_map or {}).get(sym,{}).get("ema_touch")}
+        _es_cats=(ema_shakeout_map or {}).get(sym)
+        if _es_cats:
+            _es_today=[cat for cat,rec in _es_cats.items() if rec.get("recovery_date")==today]
+            row["ema_shakeout"]=bool(_es_today)
+            row["ema_shakeout_cats"]=_es_today or list(_es_cats.keys())
+        else:
+            row["ema_shakeout"]=False; row["ema_shakeout_cats"]=[]
+        _htf_rec=(htf_map or {}).get(sym,{}).get("HTF")
+        _mhtf_rec=(htf_map or {}).get(sym,{}).get("MiniHTF")
+        row["htf_status"]=_htf_rec.get("status") if _htf_rec else None
+        row["htf_forming"]=bool(_htf_rec and _htf_rec.get("status")=="forming")
+        row["htf_pole_gain"]=_htf_rec.get("pole_gain_pct") if _htf_rec else None
+        row["mini_htf_status"]=_mhtf_rec.get("status") if _mhtf_rec else None
+        row["mini_htf_forming"]=bool(_mhtf_rec and _mhtf_rec.get("status")=="forming")
+        row["mini_htf_pole_gain"]=_mhtf_rec.get("pole_gain_pct") if _mhtf_rec else None
         feed.append(row)
     log.info(f"screener_feed: {len(feed)} stocks")
     return feed
@@ -1789,7 +1806,7 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
 # "history/" prefix in the Cloudflare dashboard.
 # ══════════════════════════════════════════════════════════════
 
-HISTORY_KEEP_DAYS = 15  # how many past days stay visible in the History dropdown
+HISTORY_KEEP_DAYS = 90  # how many past days stay visible in the History dropdown
 
 async def archive_screener_feed_history(client, screener_feed, today, keep_days=HISTORY_KEEP_DAYS):
     fname = f"history/screener_feed_{today}.json"
@@ -1837,7 +1854,7 @@ async def run_ep_scan() -> None:
             ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
             (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
              idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
-             hlr_raw,pb_raw,pat_raw,w_pb_raw)=await asyncio.gather(
+             hlr_raw,pb_raw,pat_raw,w_pb_raw,w_hlr_raw,m_pb_raw,ema_shakeout_raw,htf_raw)=await asyncio.gather(
                 asyncio.gather(*ohlc_tasks,return_exceptions=True),
                 r2_download(client,"screener.json"),
                 r2_download(client,"fundamentals_summary.json"),   # ← CHANGED (was r2_download_fund(client))
@@ -1848,6 +1865,9 @@ async def run_ep_scan() -> None:
                 r2_download(client,"index_daily.json"),r2_download(client,"sheet_data.json"),
                 r2_download(client,"hlr_signals.json"),r2_download(client,"pullback_signals.json"),
                 r2_download(client,"pattern_signals.json"),r2_download(client,"weekly_pullback_signals.json"),
+                r2_download(client,"weekly_hlr_signals.json"),r2_download(client,"monthly_pullback_signals.json"),
+                r2_download(client,"shakeout_signals.json"),   # ← NEW: shakeout_scanner.py's EMA-breakdown+recovery signals
+                r2_download(client,"htf_test_results.json"),   # ← NEW: htf_test_scan.py's HTF / Mini-HTF flag-pole signals
             )
             all_data={}
             for i,res in enumerate(ohlc_results):
@@ -1913,6 +1933,51 @@ async def run_ep_scan() -> None:
                     sym=sig.get("symbol")
                     if sym and (sym not in w_pb_map or sig.get("signal_date","") > w_pb_map[sym].get("signal_date","")):
                         w_pb_map[sym]=sig
+
+            # ─── FIX: weekly HLR + monthly pullback were computed in run_hlr_scan()
+            # and saved to R2 (weekly_hlr_signals.json / monthly_pullback_signals.json)
+            # but never read back into screener_feed — so the frontend's "W-HLR BO/
+            # Near/Consol" and "M-PullBack" filters always showed 0 stocks. ───
+            w_hlr_map={}
+            if isinstance(w_hlr_raw,dict):
+                for sig in (w_hlr_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym:
+                        if sym not in w_hlr_map or sig.get("touches",0)>w_hlr_map[sym].get("touches",0): w_hlr_map[sym]=sig
+            m_pb_map={}
+            if isinstance(m_pb_raw,dict):
+                for sig in (m_pb_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym: m_pb_map[sym]=sig
+
+            # ─── shakeout_scanner.py (EMA breakdown+recovery shakeout —
+            # the old wick/Supertrend-based _detect_shakeout has been removed;
+            # this is now the only shakeout detector) writes shakeout_signals.json
+            # to R2. Merge it into screener_feed here. ───
+            ema_shakeout_map={}
+            if isinstance(ema_shakeout_raw,dict):
+                for sig in (ema_shakeout_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if not sym: continue
+                    cat="Combo" if sig.get("compound") else f"EMA{(sig.get('ema_periods') or [0])[0]}"
+                    ema_shakeout_map.setdefault(sym,{})
+                    existing=ema_shakeout_map[sym].get(cat)
+                    if not existing or (sig.get("recovery_date") or "")>(existing.get("recovery_date") or ""):
+                        ema_shakeout_map[sym][cat]=sig
+
+            # ─── FIX: htf_test_scan.py (HTF / Mini-HTF flag-pole signals) also
+            # writes to R2 fine, but was never read back into screener_feed.json
+            # either — same gap as the shakeout scanner above. Merge it in too. ───
+            htf_map={}
+            if isinstance(htf_raw,dict):
+                for src_key,cat in (("HTF","HTF"),("Mini HTF","MiniHTF")):
+                    for sig in ((htf_raw.get(src_key) or {}).get("signals") or []):
+                        sym=sig.get("symbol")
+                        if not sym: continue
+                        htf_map.setdefault(sym,{})
+                        existing=htf_map[sym].get(cat)
+                        if not existing or (sig.get("flag_end_date") or "")>(existing.get("flag_end_date") or ""):
+                            htf_map[sym][cat]=sig
 
             # ─── FIX: fresh enrichment helpers ───
             cls_map_ep={}
@@ -2004,10 +2069,7 @@ async def run_ep_scan() -> None:
             gaps_by_sym=await update_gap_tracker(client,all_data,today)
             gap_state=_build_gap_state(all_data,gaps_by_sym,today)
             gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
-            shakeout_signals=_detect_shakeout(all_data)
-            shakeout_map={sig["symbol"]:sig for sig in shakeout_signals}
-            log.info(f"Shakeout signals: {len(shakeout_signals)}")
-            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,shakeout_map=shakeout_map,w_pb_map=w_pb_map)
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map)
             mtf_ma_map=_calc_multi_tf_ma(all_data)
             log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
             for row in screener_feed:
@@ -2026,10 +2088,19 @@ async def run_ep_scan() -> None:
                     row["eps_ch"]=round((e0-e4)/abs(e4)*100,1) if e0 is not None and e4 else None
                 else: row["sales_ch"]=None; row["eps_ch"]=None
                 pats=set()
-                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC"),("shakeout","Shakeout"),("w_pullback","W-Pullback")]:
+                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC"),("w_pullback","W-Pullback"),("m_pullback","M-PullBack")]:
                     if row.get(flag): pats.add(label)
                 if row.get("gap_fill"): pats.add(row["gap_fill"])
                 if row.get("hlr_state"): pats.add(row["hlr_state"])
+                # FIX: weekly HLR was computed (weekly_hlr_signals.json) but never
+                # merged into screener_feed — frontend's "W-HLR BO/Near/Consol"
+                # filters always showed 0. Map to the exact labels the frontend
+                # chips expect (see fdrTogSig's _exHlr / data-sig in screener.html).
+                _w_hlr_labels={"BO":"W-HLR BO","Consolidating near HLR":"W-HLR Consol","Near HLR":"W-HLR Near"}
+                if row.get("w_hlr_state") in _w_hlr_labels: pats.add(_w_hlr_labels[row["w_hlr_state"]])
+                if row.get("ema_shakeout"): pats.add("EMA Shakeout")
+                if row.get("htf_forming"): pats.add("HTF")
+                if row.get("mini_htf_forming"): pats.add("Mini HTF")
                 if sym in ep_pat_map: pats|=ep_pat_map[sym]
                 row["patterns"]="||".join(sorted(pats))
             feed_pat={row["symbol"]:row["patterns"] for row in screener_feed}
@@ -3283,84 +3354,6 @@ def _calc_supertrend(highs, lows, closes, period=10, mult=3):
             trend[i] = 1   # first valid bar — default uptrend seed
         st[i] = lower[i] if trend[i] == 1 else upper[i]
     return st
-
-
-def _detect_shakeout(all_data, min_close=20.0, min_turnover_20d=10_00_000,
-                      wick_third=3.0, recovery_ratio=1.03, recovery_mult=4.0,
-                      sma_period=50, ema_period=21, st_period=10, st_mult=3,
-                      mswing_map=None, min_mswing=-0.5):
-    """
-    Shakeout scanner — long lower-wick candle (red, close-near-high OR
-    green, open-near-high) that dipped through Supertrend(10,3) / EMA21 /
-    SMA50 intraday and closed back above it. Mirrors the chartink scan.
-
-    mswing_map: optional {symbol: {"mswing": val}} — pass _calculate_mswing()'s
-    output if you want the "Mswing Homma >= min_mswing" leg applied too.
-    Left off by default — chartink's "Mswing Homma" is likely a different
-    indicator from your own mswing calc, wire it up only if confirmed.
-    """
-    signals = []
-    min_n = max(sma_period, ema_period, st_period) + 5
-    for sym, s in all_data.items():
-        dates, opens, highs, lows, closes, volumes = s["d"], s["o"], s["h"], s["l"], s["c"], s["v"]
-        n = len(dates)
-        if n < min_n: continue
-        o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
-        if None in (o, h, l, c): continue
-        if c < min_close: continue
-
-        avg_vol20 = _calc_sma(volumes, 20)[-1]
-        avg_close20 = _calc_sma(closes, 20)[-1]
-        if avg_vol20 is None or avg_close20 is None: continue
-        if avg_vol20 * avg_close20 < min_turnover_20d: continue
-
-        sma50 = _calc_sma(closes, sma_period)
-        if sma50[-1] is None or h < sma50[-1]: continue
-
-        if mswing_map is not None:
-            ms = mswing_map.get(sym, {}).get("mswing")
-            if ms is None or ms < min_mswing: continue
-
-        rng = h - l
-        if rng <= 0: continue
-
-        shape_a = (h - c) <= rng / wick_third and c <= o and (h - c) <= (c - l)
-        shape_b = (h - o) <= rng / wick_third and c >= o and (h - o) <= (o - l)
-        if not (shape_a or shape_b): continue
-
-        def _recovery_ok(ref):
-            if l is None or l <= 0: return False
-            if ref / l >= recovery_ratio: return True
-            denom = h - ref
-            return denom > 0 and rng / denom >= recovery_mult
-
-        wick_type = None
-        if shape_a and _recovery_ok(c): wick_type = "Bearish (close-near-high)"
-        elif shape_b and _recovery_ok(o): wick_type = "Bullish (open-near-high)"
-        if wick_type is None: continue
-
-        ema21 = _calc_ema(closes, ema_period)
-        st10_3 = _calc_supertrend(highs, lows, closes, st_period, st_mult)
-
-        support_type = support_level = None
-        if st10_3[-1] is not None and c >= st10_3[-1] and l <= st10_3[-1] * 1.01:
-            support_type, support_level = "Supertrend(10,3)", st10_3[-1]
-        elif ema21[-1] is not None and c >= ema21[-1] and l <= ema21[-1]:
-            support_type, support_level = f"EMA{ema_period}", ema21[-1]
-        elif sma50[-1] is not None and c >= sma50[-1] and l <= sma50[-1]:
-            support_type, support_level = f"SMA{sma_period}", sma50[-1]
-        if support_type is None: continue
-
-        signals.append({
-            "symbol": sym, "date": dates[-1],
-            "open": round(o, 2), "high": round(h, 2), "low": round(l, 2), "close": round(c, 2),
-            "wick_type": wick_type, "support_type": support_type,
-            "support_level": round(support_level, 2),
-            "dist_from_support_pct": round((c - support_level) / support_level * 100, 2),
-        })
-    return signals
-
-
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
