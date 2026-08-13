@@ -3093,7 +3093,7 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
     return out
 
 
-def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=2, max_contractions=6,
+def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_contractions=6,
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.02,
                 max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
