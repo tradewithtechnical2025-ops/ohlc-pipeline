@@ -22,9 +22,11 @@ jobs:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
         run: |
           python pipeline_master.py
-      - name: Upload turnover debug artifact
+      - name: Upload debug artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: turnover-debug-${{ github.run_id }}
-          path: turnover_rejected_debug.json
+          name: debug-${{ github.run_id }}
+          path: |
+            turnover_rejected_debug.json
+            suspended_stale_debug.json
