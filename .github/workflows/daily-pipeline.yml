@@ -80,13 +80,7 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py vcp_scan
-      - name: Fundamentals
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 15
-          max_attempts: 3
-          retry_wait_seconds: 15
-          command: python pipeline_fundamentals_prod.py daily
+     
       - name: EP Scan
         uses: nick-fields/retry@v3
         with:
