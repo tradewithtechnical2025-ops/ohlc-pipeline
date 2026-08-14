@@ -37,6 +37,7 @@ print(f"🔑 DEBUG UPSTOX_ACCESS_TOKEN: env_var_present={_raw_upstox_env is not 
       f"first4={_upstox_preview}")
 OUTPUT_FILE     = "master.json"
 BSE_OUTPUT_FILE = "bse.json"
+IPO_DATA_FILE   = "ipo_data.json"   # IPO tracker file, also stored in the same R2 bucket
 
 RATE_DELAY = 0.20
 RETRY = 3
@@ -953,6 +954,144 @@ async def inject_manual_symbols(client, master, upstox_nse, nse_isin_map, nse_ik
 
 
 # =========================================================
+# IPO LISTINGS INJECTION  (mainboard only, from ipo_data.json in R2)
+# =========================================================
+
+async def inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse_ikey_map):
+    """
+    Pulls the IPO tracker file (IPO_DATA_FILE) from R2 and force-adds any
+    MAINBOARD stock (issue_type == "regular") that has already LISTED
+    (status == "listed") but isn't in master yet. SME IPOs (issue_type ==
+    "sme") are always skipped.
+
+    Matches by ISIN against Upstox's NSE master — more reliable than the
+    IPO tracker's own symbol field, which can differ slightly from the
+    real exchange trading symbol (e.g. "SHIPROCKET" vs whatever NSE
+    actually lists it as). Resolves live price/volume from Upstox OHLC;
+    if that has no candle yet (very fresh listing, first day or two),
+    falls back to the IPO's own listing_price so the stock isn't dropped
+    entirely — just flagged with zero volume/turnover until real trade
+    data shows up.
+    """
+    print()
+    print("=" * 50)
+    print("     IPO Listings Injection (mainboard only)")
+    print("=" * 50)
+
+    ipo_data = await r2_download(client, IPO_DATA_FILE)
+    if not ipo_data or "ipos" not in ipo_data:
+        print(f"  ⚠️  Could not load {IPO_DATA_FILE} from R2 — skipping")
+        print("=" * 50)
+        return 0
+
+    candidates = [
+        x for x in ipo_data["ipos"]
+        if x.get("status") == "listed" and x.get("issue_type") == "regular"
+    ]
+    print(f"  📋 Mainboard + listed IPOs in tracker : {len(candidates)}")
+
+    existing = {s["symbol"] for s in master}
+
+    # ISIN -> upstox NSE entry (for matching + instrument_key + real trading symbol)
+    isin_map = {}
+    for x in upstox_nse:
+        if x.get("segment") != "NSE_EQ":
+            continue
+        isin = str(x.get("isin") or "").strip()
+        if isin and isin not in isin_map:
+            isin_map[isin] = x
+
+    injected      = 0
+    already_there = 0
+    no_match      = 0
+    used_fallback = 0
+
+    for ipo in candidates:
+        isin = str(ipo.get("isin") or "").strip()
+        upstox_entry = isin_map.get(isin)
+
+        # Prefer the real Upstox trading symbol (ISIN match) over the IPO
+        # tracker's own symbol field, since they can differ.
+        symbol = str((upstox_entry or {}).get("trading_symbol") or ipo.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+
+        if symbol in existing:
+            already_there += 1
+            continue
+
+        name = ipo.get("name") or (upstox_entry or {}).get("name") or symbol
+        name = re.sub(r"\s+IPO$", "", str(name)).strip() or symbol  # "Shiprocket IPO" -> "Shiprocket"
+
+        ikey = (upstox_entry or {}).get("instrument_key") or nse_ikey_map.get(symbol)
+
+        price  = None
+        volume = 0.0
+        if ikey:
+            ohlc = await fetch_upstox_ohlc(client, [ikey])
+            d = None
+            for k, v in ohlc.items():
+                if k.split(":")[-1].strip().upper() == symbol:
+                    d = v
+                    break
+            if d:
+                candle = d.get("live_ohlc") or d.get("prev_ohlc") or {}
+                try:
+                    price = float(d.get("last_price") or candle.get("close") or 0) or None
+                except Exception:
+                    price = None
+                try:
+                    volume = float(candle.get("volume") or 0)
+                except Exception:
+                    volume = 0.0
+
+        is_fallback = False
+        if price is None:
+            # No OHLC candle yet — fall back to the IPO's own listing price
+            # rather than dropping a real, valid stock entirely.
+            lp = ipo.get("listing_price")
+            if lp:
+                price = float(lp)
+                is_fallback = True
+                used_fallback += 1
+            else:
+                print(f"  ⚠️  {symbol}: no ISIN match / no OHLC / no listing_price — skipped")
+                no_match += 1
+                continue
+
+        turnover_cr = round((price * volume) / 1e7, 2) if price and volume else 0.0
+
+        master.append({
+            "symbol":           symbol,
+            "name":             name,
+            "exchange":         "NSE",
+            "bse_code":         None,
+            "nse_code":         symbol,
+            "isin":             isin or nse_isin_map.get(symbol, ""),
+            "consolidated_ind": False,
+            "market_cap_cr":    0,
+            "price":            price,
+            "volume":           volume,
+            "turnover_cr":      turnover_cr,
+            "source":           "ipo",
+        })
+        existing.add(symbol)
+        injected += 1
+        tag = " (fallback=listing_price, no live data yet)" if is_fallback else ""
+        print(f"  ✅ {symbol}: injected @ ₹{price} (name={name!r}){tag}")
+
+    master.sort(key=lambda x: (x["market_cap_cr"] or 0), reverse=True)
+
+    print(f"  ✓ Injected                      : {injected}")
+    print(f"  ⏭️  Already in master            : {already_there}")
+    print(f"  ✗ No ISIN match/OHLC/fallback   : {no_match}")
+    print(f"  ⚠️  Used listing_price fallback : {used_fallback}")
+    print("=" * 50)
+
+    return injected
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
@@ -1052,6 +1191,8 @@ async def main():
         master, turnover_rejected_list = await build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_vol_map)
 
         await inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map)
+
+        await inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse_ikey_map)
 
         await inject_manual_symbols(client, master, upstox_nse, nse_isin_map, nse_ikey_map)
 
