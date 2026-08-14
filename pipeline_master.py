@@ -68,6 +68,36 @@ HEADERS = {
 }
 
 # =========================================================
+# MANUAL STOCK OVERRIDES
+# =========================================================
+# Use this to force-inject specific symbols into the master list that the
+# automated Finedge/Upstox pipeline keeps missing or filtering out — e.g.
+# brand-new listings (like ARDEE) that don't have Upstox OHLC history yet,
+# or that sit in Finedge's quotes with broken/zero data for the first few
+# days after listing (so they never even reach inject_missing_from_upstox,
+# since that function only looks at symbols that are TRULY absent from
+# Finedge's quotes).
+#
+# Two ways to specify a symbol:
+#   1) Just the symbol string — script tries to auto-resolve name/price/
+#      volume/isin from Upstox's NSE master + OHLC API.
+#   2) A dict with explicit overrides — anything you set here wins over
+#      whatever auto-resolve finds. Use this when Upstox OHLC also has
+#      no data yet (very common on listing day / day 2).
+#
+# Examples:
+#   MANUAL_ADD_SYMBOLS = ["ARDEE"]
+#   MANUAL_ADD_SYMBOLS = [
+#       {"symbol": "ARDEE", "price": 45.6, "volume": 120000,
+#        "name": "Ardee Engineering Ltd", "market_cap_cr": 350},
+#   ]
+#
+# NOTE: manually added stocks BYPASS all price/turnover/mcap filters.
+MANUAL_ADD_SYMBOLS = [
+    # "ARDEE",
+]
+
+# =========================================================
 # FILTERS
 # =========================================================
 
@@ -807,6 +837,122 @@ async def inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isi
 
 
 # =========================================================
+# MANUAL INJECTION  (force-add symbols, bypass all filters)
+# =========================================================
+
+async def inject_manual_symbols(client, master, upstox_nse, nse_isin_map, nse_ikey_map):
+    """
+    Force-add every symbol in MANUAL_ADD_SYMBOLS into master, bypassing
+    price/turnover/mcap filters entirely. Meant for cases like ARDEE where
+    the automated pipeline (Finedge quotes + Upstox missing-injection)
+    keeps dropping a real, valid stock — usually because:
+      - it's already present in Finedge's quotes (so inject_missing_from_upstox
+        never even looks at it) but with broken/zero data, OR
+      - Upstox has no OHLC candle for it yet (very common in the first
+        1-2 trading days after listing).
+
+    If price/volume aren't given explicitly in MANUAL_ADD_SYMBOLS, this
+    tries to auto-resolve them from Upstox's live OHLC. If that also has
+    no data, you MUST supply price/volume manually in the config dict.
+    """
+    print()
+    print("=" * 50)
+    print("     Manual Symbol Injection")
+    print("=" * 50)
+
+    if not MANUAL_ADD_SYMBOLS:
+        print("  ℹ️  No manual symbols configured (MANUAL_ADD_SYMBOLS is empty)")
+        print("=" * 50)
+        return 0
+
+    existing = {s["symbol"] for s in master}
+    injected = 0
+
+    nse_by_tsym = {}
+    for x in upstox_nse:
+        if x.get("segment") != "NSE_EQ":
+            continue
+        tsym = str(x.get("trading_symbol") or "").strip().upper()
+        if tsym:
+            nse_by_tsym[tsym] = x
+
+    for raw_entry in MANUAL_ADD_SYMBOLS:
+        entry = {"symbol": raw_entry} if isinstance(raw_entry, str) else dict(raw_entry)
+
+        symbol = str(entry.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+
+        if symbol in existing:
+            print(f"  ⏭️  {symbol}: already in master — skipping (remove duplicate override, or it's already flowing through fine)")
+            continue
+
+        upstox_entry = nse_by_tsym.get(symbol)
+        ikey = (upstox_entry or {}).get("instrument_key") or nse_ikey_map.get(symbol)
+
+        name   = entry.get("name")  or (upstox_entry or {}).get("name") or symbol
+        isin   = entry.get("isin")  or (upstox_entry or {}).get("isin") or nse_isin_map.get(symbol, "")
+        price  = entry.get("price")
+        volume = entry.get("volume")
+
+        # Auto-resolve from Upstox OHLC if not explicitly overridden
+        if (price is None or volume is None) and ikey:
+            ohlc = await fetch_upstox_ohlc(client, [ikey])
+            d = None
+            for k, v in ohlc.items():
+                if k.split(":")[-1].strip().upper() == symbol:
+                    d = v
+                    break
+            if d:
+                candle = d.get("live_ohlc") or d.get("prev_ohlc") or {}
+                if price is None:
+                    try:
+                        price = float(d.get("last_price") or candle.get("close") or 0)
+                    except Exception:
+                        price = None
+                if volume is None:
+                    try:
+                        volume = float(candle.get("volume") or 0)
+                    except Exception:
+                        volume = None
+
+        price  = float(price or 0)
+        volume = float(volume or 0)
+        turnover_cr = round((price * volume) / 1e7, 2) if price and volume else 0.0
+
+        if price <= 0:
+            print(f"  ⚠️  {symbol}: could not resolve a price (Upstox OHLC empty/unavailable). "
+                  f"Add it with an explicit price in MANUAL_ADD_SYMBOLS, e.g.:")
+            print(f"      {{\"symbol\": \"{symbol}\", \"price\": <last_traded_price>, \"volume\": <approx_volume>}}")
+            continue
+
+        master.append({
+            "symbol":           symbol,
+            "name":             name,
+            "exchange":         "NSE",
+            "bse_code":         None,
+            "nse_code":         symbol,
+            "isin":             isin,
+            "consolidated_ind": False,
+            "market_cap_cr":    entry.get("market_cap_cr", 0),
+            "price":            price,
+            "volume":           volume,
+            "turnover_cr":      turnover_cr,
+            "source":           "manual",
+        })
+        existing.add(symbol)
+        injected += 1
+        print(f"  ✅ {symbol}: manually injected @ ₹{price} (name={name!r}, turnover={turnover_cr} cr)")
+
+    master.sort(key=lambda x: (x["market_cap_cr"] or 0), reverse=True)
+
+    print(f"  ✓ Manually injected     : {injected}")
+    print("=" * 50)
+
+    return injected
+
+
+# =========================================================
 # MAIN
 # =========================================================
 
@@ -906,6 +1052,8 @@ async def main():
         master, turnover_rejected_list = await build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_vol_map)
 
         await inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map)
+
+        await inject_manual_symbols(client, master, upstox_nse, nse_isin_map, nse_ikey_map)
 
         master_uploaded = await r2_upload_guarded(client, OUTPUT_FILE, master, MASTER_DROP_ALERT_PCT)
 
