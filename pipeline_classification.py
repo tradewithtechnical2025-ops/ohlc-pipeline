@@ -16,8 +16,9 @@ WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 
 OUTPUT_FILE          = "classification.json"
 FUNDAMENTAL_FILE     = "fundamental.json"
+IPO_DATA_FILE        = "ipo_data.json"   # same tracker file the master pipeline reads
 
-CONCURRENCY = 3
+CONCURRENCY = 4
 BATCH_SIZE  = 25
 RATE_DELAY  = 0.25
 RETRY       = 3
@@ -510,6 +511,56 @@ INDUSTRY_MAP = {
 # the sub_industry map for these categories
 # =========================================================
 
+# =========================================================
+# IPO TRACKER INDUSTRY MAP
+# ipo_data.json's own "industry" field (a different, smaller taxonomy
+# than Finedge's sub_industry) → (sector_group, display_industry).
+# Used as a fallback when Finedge has no usable classification yet for a
+# freshly-listed IPO stock — see IPO_INDUSTRY_FALLBACK usage below.
+# =========================================================
+
+IPO_TRACKER_INDUSTRY_MAP = {
+    "Agriculture":                          ("Agriculture", "Agri Products"),
+    "Aluminium & Aluminium Products":       ("Metals & Mining", "Aluminium"),
+    "Automobile Two & Three Wheelers":      ("Automobiles", "2/3 Wheelers"),
+    "Cable":                                ("Wires & Cables", "Wires & Cables"),
+    "Chemicals":                            ("Chemicals", "Specialty Chemicals"),
+    "Consumer Food":                        ("FMCG", "Packaged Foods"),
+    "Diamond & Jewellery":                  ("Consumer Durables", "Jewellery"),
+    "Educational Institutions":             ("Education", "Education"),
+    "Electric Equipment":                   ("Electrical Equipment", "Electrical Equipment"),
+    "Engineering":                          ("Industrials", "Industrial Products"),
+    "Engineering - Construction":           ("Infrastructure", "Civil Construction"),
+    "Film Production":                      ("Entertainment", "Film & OTT"),
+    "Finance - Asset Management":           ("Financial Services", "Asset Management"),
+    "Finance - Investment":                 ("Financial Services", "Investment Cos"),
+    "Finance - NBFC":                       ("Financial Services", "NBFC"),
+    "Finance - Others":                     ("Financial Services", "Other Financials"),
+    "Glass":                                ("Consumer Durables", "Building Materials"),
+    "Hospital & Healthcare Services":       ("Healthcare", "Hospitals"),
+    "Hotel":                                ("Travel & Hospitality", "Hotels"),
+    "IT - Software":                        ("Information Technology", "IT Services"),
+    "Logistics":                            ("Logistics", "3PL Logistics"),
+    "Metal - Ferrous":                      ("Metals & Mining", "Steel"),
+    "Metal - Non Ferrous":                  ("Metals & Mining", "Non-Ferrous Metals"),
+    "Mining & Minerals":                    ("Metals & Mining", "Minerals & Mining"),
+    "Oil Exploration":                      ("Energy", "Oil E&P"),
+    "Packaging":                            ("Industrials", "Packaging"),
+    "Paper & Paper Products":               ("Paper & Packaging", "Paper"),
+    "Petrochemicals":                       ("Chemicals", "Petrochemicals"),
+    "Pharmaceuticals & Drugs":              ("Pharma", "Pharmaceuticals"),
+    "Plastic Products":                     ("Industrials", "Plastic Products"),
+    "Power Generation/Distribution":        ("Power", "Power Generation"),
+    "Retailing":                            ("Retail", "Diversified Retail"),
+    "Rubber Products":                      ("Industrials", "Rubber"),
+    "Steel & Iron Products":                ("Metals & Mining", "Steel"),
+    "Steel/Sponge Iron/Pig Iron":           ("Metals & Mining", "Steel"),
+    "Telecommunication - Service Provider": ("Telecom", "Telecom Services"),
+    "Textile":                              ("Textiles", "Textiles"),
+    "Travel Services":                      ("Travel & Hospitality", "Travel Services"),
+    "e-Commerce":                           ("Retail", "E-Commerce"),
+}
+
 DESCRIPTION_OVERRIDE_EXEMPT = {
     "Private Sector Bank",
     "Public Sector Bank",
@@ -872,12 +923,78 @@ async def fetch_profile(client, symbol, semaphore):
 # PROCESS STOCK
 # =========================================================
 
-async def process_stock(client, stock, semaphore, fundamentals: dict):
+async def process_stock(client, stock, semaphore, fundamentals: dict, ipo_industry_map: dict):
     symbol = stock["symbol"]
+    is_ipo_source = stock.get("source") == "ipo"
 
     profile = await fetch_profile(client, symbol, semaphore)
 
-    if not profile:
+    master_mcap = stock.get("market_cap_cr")
+
+    # Does the profile actually carry usable classification data? Finedge
+    # sometimes returns a profile shell for freshly-listed stocks with
+    # sector/industry/sub_industry all blank (not just market_cap = 0 —
+    # that part alone doesn't block classify() below).
+    profile_has_classification = bool(
+        profile and (
+            (profile.get("sector") or "").strip()
+            or (profile.get("industry") or "").strip()
+            or (profile.get("sub_industry") or "").strip()
+        )
+    )
+
+    # ── IPO-sourced stocks: never filter on market cap ──
+    # market_cap_cr sits at 0 in master.json for freshly-injected IPO rows
+    # (no shares-outstanding data yet at injection time), and Finedge's own
+    # profile.market_cap can also read 0 for the first several days even
+    # once sector/industry data itself is populated (see MANIPALHOS: sector
+    # + sub_industry were correct, market_cap was still 0). Filtering on an
+    # unreliable field would just re-create the original drop bug. A real
+    # market cap will show up in master.json on its own once NSE/BSE
+    # propagate shares-outstanding data — this script doesn't compute it.
+    if is_ipo_source:
+        if not profile or not profile_has_classification:
+            # No profile yet, or profile has no usable sector/industry —
+            # fall back to the IPO tracker's own (smaller) industry
+            # taxonomy so the stock isn't dumped into "Unclassified" for
+            # no reason when we actually know its industry.
+            ipo_industry = ipo_industry_map.get(stock.get("isin") or "", "")
+            mapped = IPO_TRACKER_INDUSTRY_MAP.get(ipo_industry)
+
+            market_cap = float(master_mcap) if master_mcap else float((profile or {}).get("market_cap") or 0)
+
+            if mapped:
+                sector_group, display_industry = mapped
+                print(f"⚠ {symbol} | no Finedge classification yet — using IPO tracker industry "
+                      f"'{ipo_industry}' → {sector_group} / {display_industry}")
+            else:
+                sector_group, display_industry = "Unclassified", "Unclassified"
+                reason = "no profile" if not profile else "profile has no sector/industry/sub_industry"
+                print(f"⚠ {symbol} | {reason}, no IPO tracker industry match either — kept as Unclassified")
+
+            return {
+                "symbol":           symbol,
+                "name":             stock.get("name"),
+                "exchange":         stock.get("exchange"),
+                "market_cap_cr":    market_cap,
+                "macro_sector":     (profile or {}).get("macro_sector"),
+                "sector_group":     sector_group,
+                "display_industry": display_industry,
+                "sector":           (profile or {}).get("sector"),
+                "industry":         (profile or {}).get("industry"),
+                "sub_industry":     (profile or {}).get("sub_industry"),
+                "bse_code":         (profile or {}).get("bse_code"),
+                "nse_code":         (profile or {}).get("nse_code"),
+                "consolidated_ind": stock.get("consolidated_ind", False),
+                "themes":           [],
+            }
+        # else: profile exists AND has real classification data — fall
+        # through to the normal path below, just skipping the mcap filter.
+
+    elif not profile:
+        # Non-IPO stock with no Finedge profile at all — unchanged from
+        # original behaviour, this is a genuine "we don't know what this
+        # is" case, not a freshly-listed-stock data lag.
         print(f"✗ {symbol} | profile fail")
         return None
 
@@ -887,11 +1004,10 @@ async def process_stock(client, stock, semaphore, fundamentals: dict):
     # the live quote endpoint and is fresher — prefer that when present.
     # Fall back to profile's value only when master doesn't have one yet
     # (e.g. a stock freshly injected via Upstox with no Finedge quote).
-    master_mcap  = stock.get("market_cap_cr")
     profile_mcap = float(profile.get("market_cap") or 0)
     market_cap   = float(master_mcap) if master_mcap else profile_mcap
 
-    if market_cap < MIN_MARKET_CAP_CR:
+    if not is_ipo_source and market_cap < MIN_MARKET_CAP_CR:
         print(f"✗ {symbol} | market cap < {MIN_MARKET_CAP_CR}cr")
         return None
 
@@ -945,13 +1061,29 @@ async def main():
         master = await r2_download(client, "master.json")
         print(f"Loaded {len(master)} stocks")
 
+        print("\nDownloading ipo_data.json (fallback classification for fresh IPOs)...")
+        ipo_industry_map: dict = {}
+        try:
+            ipo_data = await r2_download(client, IPO_DATA_FILE)
+            if ipo_data and "ipos" in ipo_data:
+                for ipo in ipo_data["ipos"]:
+                    isin = (ipo.get("isin") or "").strip()
+                    industry = (ipo.get("industry") or "").strip()
+                    if isin and industry:
+                        ipo_industry_map[isin] = industry
+                print(f"  📋 ISIN → industry lookup built : {len(ipo_industry_map)} entries")
+            else:
+                print("  ⚠️  ipo_data.json missing/empty — IPO fallback classification unavailable this run")
+        except Exception as e:
+            print(f"  ⚠️  Could not load ipo_data.json: {e} — IPO fallback classification unavailable this run")
+
         results = []
         total   = len(master)
 
         for i in range(0, total, BATCH_SIZE):
             batch = master[i:i + BATCH_SIZE]
             tasks = [
-                process_stock(client, stock, semaphore, fundamentals)
+                process_stock(client, stock, semaphore, fundamentals, ipo_industry_map)
                 for stock in batch
             ]
             batch_results = await asyncio.gather(*tasks)
