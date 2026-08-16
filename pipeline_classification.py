@@ -18,7 +18,7 @@ OUTPUT_FILE          = "classification.json"
 FUNDAMENTAL_FILE     = "fundamental.json"
 IPO_DATA_FILE        = "ipo_data.json"   # same tracker file the master pipeline reads
 
-CONCURRENCY = 4
+CONCURRENCY = 5
 BATCH_SIZE  = 25
 RATE_DELAY  = 0.25
 RETRY       = 3
@@ -561,10 +561,38 @@ IPO_TRACKER_INDUSTRY_MAP = {
     "e-Commerce":                           ("Retail", "E-Commerce"),
 }
 
+# =========================================================
+# Sub-industries whose sub_industry mapping is already a reliable,
+# well-established primary-business signal from Finedge — description
+# keyword overrides are skipped for these so an ancillary business line
+# mentioned in the company description (e.g. a metals/mining company's
+# captive solar/wind power plants) can't hijack the whole company's
+# classification. Originally only banks were exempt; extended after
+# HINDZINC (core business: zinc/lead/silver mining — sub_industry "Zinc")
+# got reclassified as sector_group "Power" purely because its description
+# mentions "Wind Energy" (a captive/ancillary segment), matching the
+# renewable-energy keyword rule in DESCRIPTION_SECTOR_MAP below.
+# =========================================================
+
 DESCRIPTION_OVERRIDE_EXEMPT = {
     "Private Sector Bank",
     "Public Sector Bank",
     "Other Bank",
+    "Iron & Steel",
+    "Iron & Steel Products",
+    "Aluminium",
+    "Zinc",
+    "Copper",
+    "Industrial Minerals",
+    "Diversified Metals",
+    "Precious Metals",
+    "Ferro & Silica Manganese",
+    "Trading - Metals",
+    "Sponge Iron",
+    "Pig Iron",
+    "Trading - Minerals",
+    "Aluminium, Copper & Zinc Products",
+    "Aluminium Copper & Zinc Products",
 }
 
 # =========================================================
@@ -773,9 +801,12 @@ def get_description_overrides(description: str, profile: dict = None):
     """
     Extract sector_group, display_industry, themes from description.
 
-    If the stock's sub_industry is in DESCRIPTION_OVERRIDE_EXEMPT (e.g. banks),
-    sector_group and display_industry overrides are skipped — the sub_industry
-    map already gives the correct values. Themes are still extracted from
+    If the stock's sub_industry is in DESCRIPTION_OVERRIDE_EXEMPT (e.g. banks,
+    or an established metals/mining sub_industry), sector_group and
+    display_industry overrides are skipped — the sub_industry map already
+    gives the correct values, and letting description keywords (like an
+    ancillary "Wind Energy" captive-power segment) override it would
+    misclassify the whole company. Themes are still extracted from
     description for all stocks.
     """
     if not description:
