@@ -3094,7 +3094,7 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
 
 
 def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_contractions=6,
-                max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.02,
+                max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.03,
                 max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
                 live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15):
@@ -3250,14 +3250,26 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
         # A ceiling that stays flat OR declines is always fine — that's
         # completely normal for both flat-resistance and descending-
         # resistance (converging triangle) VCP shapes.
+        # NOTE: the ceiling check compares each new leg's high against the
+        # RUNNING MAX of every high already included in the chain so far —
+        # not just its immediate previous neighbor. Pairwise-only comparison
+        # wrongly broke the chain when an interior leg dipped deep and then
+        # simply re-tested the base's own already-established ceiling (not
+        # a fresh breakout into an unrelated new base). Comparing against
+        # the running ceiling still correctly blocks a leg whose high truly
+        # exceeds everything seen so far by more than max_ceiling_jump — a
+        # genuine breakout — while continuing to allow legitimate descending-
+        # resistance legs (each high already below the running ceiling by
+        # construction) and legitimate ceiling revisits.
         depths = [c[4] for c in contractions]
         run_end = len(depths) - 1
         j = run_end - 1
         while j >= 0:
             if depths[j] < depths[j+1] - tighten_tol:
                 break
-            hi_a, hi_b = contractions[j][1], contractions[j+1][1]
-            if hi_b > hi_a * (1 + max_ceiling_jump):
+            hi_this = contractions[j+1][1]
+            earlier_ceiling = max(c[1] for c in contractions[:j+1])
+            if hi_this > earlier_ceiling * (1 + max_ceiling_jump):
                 break
             j -= 1
         run = contractions[j+1:]
@@ -3278,9 +3290,10 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                 if lows[idx] is not None and lows[idx] < low_k:
                     return None
 
-        # ---- 6. Strictly decreasing depths ----
+        # ---- 6. Strictly decreasing depths (same tighten_tol as Step 5's
+        # chain walk, so both use one consistent definition of "tightening") ----
         for k in range(1, len(run_depths)):
-            if run_depths[k] >= run_depths[k-1]:
+            if run_depths[k] >= run_depths[k-1] + tighten_tol:
                 return None
 
         base_depth  = run_depths[0]
