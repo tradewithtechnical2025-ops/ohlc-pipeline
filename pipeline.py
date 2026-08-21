@@ -3419,8 +3419,8 @@ async def run_vcp_scan() -> None:
 
 def _calculate_cpr(high, low, close, atr=None):
     pivot = (high + low + close) / 3
-    bc    = (pivot + low) / 2
-    tc    = (pivot + high) / 2
+    bc    = (high + low) / 2
+    tc    = (2 * pivot) - bc
     width = abs(tc - bc)
     width_pct  = round((width / pivot) * 100, 3) if pivot else 0
     atr_ratio  = round(width / atr, 3) if atr and atr > 0 else None
