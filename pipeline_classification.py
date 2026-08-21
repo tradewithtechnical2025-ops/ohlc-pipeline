@@ -18,7 +18,7 @@ OUTPUT_FILE          = "classification.json"
 FUNDAMENTAL_FILE     = "fundamental.json"
 IPO_DATA_FILE        = "ipo_data.json"   # same tracker file the master pipeline reads
 
-CONCURRENCY = 5
+CONCURRENCY = 4
 BATCH_SIZE  = 25
 RATE_DELAY  = 0.25
 RETRY       = 3
