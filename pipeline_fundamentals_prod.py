@@ -4,6 +4,9 @@ Finedge Fundamentals — PRODUCTION pipeline (v3, R2-wired)
 ============================================================
 (See module docstring history in repo — dual-track quarters added July 2026,
 see notes near _build_summary_entry below.)
+
+FIX (Aug 2026): insurance P&L fields were resolving to None — see the note
+above CORE_PL_ALIASES for details.
 """
 
 import asyncio, hashlib, json, logging, os, sys
@@ -32,6 +35,13 @@ BS_PERIODS    = ["annual", "quarterly"]
 CF_PERIODS    = ["annual", "quarterly", "ytd"]
 RATIO_TYPES   = ["pr", "le", "li", "ef"]
 QUARTERLY_CAP = 12
+
+# CONFIRMED (Aug 2026, from live docs) — /segment-revenue/{symbol}.
+# statement_type: c/s (same as elsewhere). statement_code: pl/bs only (no
+# cf). period: quarterly/annual/halfyearly/ttm — halfyearly isn't fetched
+# here (not used elsewhere in this pipeline); add it to SEGMENT_PERIODS if
+# needed later.
+SEGMENT_PERIODS = ["annual", "quarterly"]
 
 MAX_PENDING_ATTEMPTS = 5
 
@@ -257,12 +267,32 @@ def _classify_company(profile):
 # CORE FIELD ALIAS RESOLUTION — PL, BS, CF
 # ══════════════════════════════════════════════════════════════
 
+# NOTE (fix, Aug 2026): FinEdge uses 4 different P&L schemas — regular /
+# bank / life-insurance / general-insurance (see
+# FinEdge_API_field_reference_guide.pdf). "sales"/"pbt"/"pat"/"tax_expense"
+# previously only carried the regular+bank field names, so insurance
+# companies' PAT, Tax, and (for general insurance) Sales/Expenses/PBT
+# resolved to None end-to-end (confirmed live on SBILIFE and GICRE).
+# company_type isn't threaded into alias resolution anywhere in this file,
+# so rather than plumb that through, each affected key's alias list is a
+# UNION across all 4 schemas. Safe because none of these field names
+# collide across company types (verified against the PDF).
 CORE_PL_ALIASES = {
     "year": ["year"], "period_end": ["period_end"], "period_start": ["period_start"],
-    "sales": ["revenueFromOperations", "income"],
-    "expenses": ["expenses", "expenditureExcludingProvisions"],
-    "pbt": ["profitBeforeTax", "profitLossBeforeTax"],
-    "pat": ["profitLossForPeriod", "profitLossForThePeriod"],
+    "sales": [
+        "revenueFromOperations", "income",
+        "operatingIncome",          # general insurance (PDF p.4 row 1)
+    ],
+    "expenses": ["expenses", "expenditureExcludingProvisions", "operatingExpenses"],
+    "pbt": [
+        "profitBeforeTax", "profitLossBeforeTax",
+        "profitOrLossBeforeTax",    # general insurance (PDF p.4 row 31)
+    ],
+    "pat": [
+        "profitLossForPeriod", "profitLossForThePeriod",
+        "profitLossAfterTaxAndExtraordinaryItems",  # life insurance (PDF p.3 row 39)
+        "profitLossAfterTax",                        # general insurance (PDF p.4 row 33)
+    ],
     "pat_attributable": ["profitOrLossAttributableToOwners"],
     "eps": ["eps"],
     "other_income": ["otherIncome"],
@@ -272,7 +302,11 @@ CORE_PL_ALIASES = {
     "exceptional_items": ["exceptionalItemsBeforeTax", "exceptionalItems"],
     "minority_interest": ["nonControllingInterests", "profitLossOfMinorityInterest"],
     "associates_share": ["profitOrLossOfAssociates", "profitLossOfAssociates"],
-    "tax_expense": ["taxExpense"],
+    "tax_expense": [
+        "taxExpense",
+        "provisionForTax",          # life insurance (PDF p.3 row 24)
+        "provisionsForTaxes",       # general insurance (PDF p.4 row 32)
+    ],
     "diluted_shares": ["dilutedOutstandingShares"],
     "interest_earned": ["interestEarned"],
     "interest_expended": ["interestExpended"],
@@ -289,7 +323,9 @@ CORE_BS_ALIASES = {
     "reserves": ["reserves"],
     "equity_capital": ["equityCapital", "capital"],
     "cash": ["cashAndCashEquivalents", "cashAndBalancesWithRBI"],
-    "investments": ["investments", "noncurrentInvestments"],
+    # FIX (Aug 2026): was missing currentInvestments — only non-current was
+    # ever captured, so short-term investments dropped out of the total.
+    "investments": ["investments", "noncurrentInvestments", "currentInvestments"],
     "fixed_assets": ["propertyPlantAndEquipment", "fixedAssets"],
     "borrowings_current": ["borrowingsCurrent"],
     "borrowings_noncurrent": ["borrowingsNoncurrent"],
@@ -392,6 +428,43 @@ async def _fetch_basic_financials_dual(client, sem, sym):
     for stype in ("c", "s"):
         d = await _finedge_get(client, sem, f"basic-financials/{sym}", {"statement_type": stype, "statement_code": "pl"})
         out[stype] = (d or {}).get("ratios", [])
+    return out
+
+
+def _build_segment_core(entry):
+    """Flattens one segment_revenues[] entry (company-level 'data' block +
+    per-segment 'segments' list) into a simpler shape. Field names taken
+    directly from the confirmed live response (see ITC sample, Aug 2026)."""
+    d = entry.get("data") or {}
+    return {
+        "header": entry.get("header"),
+        "total_revenue": d.get("segmentRevenue"),
+        "total_revenue_from_operations": d.get("segmentRevenueFromOperations"),
+        "inter_segment_revenue": d.get("interSegmentRevenue"),
+        "total_pbt": d.get("segmentProfitBeforeTax"),
+        "total_pbt_before_finance_costs": d.get("segmentProfitLossBeforeTaxAndFinanceCosts"),
+        "finance_costs": d.get("segmentFinanceCosts"),
+        "net_unallocable_expense": d.get("netOtherUnallocableExpense"),
+        "segments": [
+            {
+                "name": s.get("name"),
+                "revenue": (s.get("data") or {}).get("segmentRevenue"),
+                "pbt_before_finance_costs": (s.get("data") or {}).get("segmentProfitLossBeforeTaxAndFinanceCosts"),
+            }
+            for s in (entry.get("segments") or [])
+        ],
+    }
+
+
+async def _fetch_segment_revenue_dual(client, sem, sym):
+    out = {}
+    for period in SEGMENT_PERIODS:
+        out[period] = {}
+        for stype in ("c", "s"):
+            d = await _finedge_get(client, sem, f"segment-revenue/{sym}",
+                                    {"statement_type": stype, "statement_code": "pl", "period": period})
+            rows = (d or {}).get("segment_revenues", [])
+            out[period][stype] = {"core": [_build_segment_core(r) for r in rows], "raw": rows}
     return out
 
 
@@ -624,7 +697,7 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
     profile = await _fetch_profile_raw(client, sem, sym)
     company_type = _classify_company(profile)
 
-    pl, basic, bs, cf, ratios, growth, price_ratios = await asyncio.gather(
+    pl, basic, bs, cf, ratios, growth, price_ratios, segment_revenue = await asyncio.gather(
         _fetch_financials_dual(client, sem, sym, "pl", PL_PERIODS, build_core_fn=_build_pl_core),
         _fetch_basic_financials_dual(client, sem, sym),
         _fetch_financials_single(client, sem, sym, "bs", BS_PERIODS, build_core_fn=_build_bs_core),
@@ -632,6 +705,7 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
         _fetch_ratios_single(client, sem, sym),
         _fetch_growth_metrics_single(client, sem, sym),
         _fetch_annual_price_ratios_single(client, sem, sym),
+        _fetch_segment_revenue_dual(client, sem, sym),
     )
 
     obj = {
@@ -646,6 +720,7 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
         "ratios": ratios,
         "growth_metrics": growth,
         "annual_price_ratios": price_ratios,
+        "segment_revenue": segment_revenue,
     }
     classification = (classification_lookup or {}).get(sym)
     summary_entry = _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf, classification)
@@ -694,7 +769,12 @@ async def run_full(part=0):
 
 async def run_daily():
     today = today_ist()
-    
+
+    # FIX (Aug 2026): guard against non-trading days — was defined but never
+    # wired in, so weekend/NSE-holiday cron triggers would still burn a
+    # fetch_one_symbol() call per carried-over pending symbol for nothing.
+    if not is_trading_day(today):
+        log.info(f"{today} is not a trading day — skipping"); return
 
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient() as client:
@@ -714,12 +794,26 @@ async def run_daily():
                     "first_seen": today,
                 }
 
-        check_list = list(pending.keys())
+        # FIX (Aug 2026): FinEdge picks up a company's result late night or
+        # the next day, not same-day — checking a symbol the moment it's
+        # added to pending (first_seen == today) almost always burns a full
+        # fetch_one_symbol() call for a guaranteed no-op. Skip those; they
+        # get their first real check on the next daily run, where attempts
+        # starts counting from 1 as before.
+        skipped_same_day = [s for s, p in pending.items() if p["first_seen"] == today]
+        check_list = [s for s, p in pending.items() if p["first_seen"] != today]
         if not check_list:
-            log.info("No pending result symbols to check — exiting"); return
+            if skipped_same_day:
+                log.info(f"No symbols to check yet — {len(skipped_same_day)} added today, "
+                          f"first check will be on the next daily run")
+            else:
+                log.info("No pending result symbols to check — exiting")
+            await r2_upload_pending(client, pending)
+            return
 
         log.info(f"━━━ Fundamentals Daily {today} — checking {len(check_list)} symbols "
-                  f"({len(todays_new)} new, {len(check_list) - len(todays_new)} carried over) ━━━")
+                  f"({len(skipped_same_day)} new today deferred to next run, "
+                  f"{len(check_list)} carried over from earlier) ━━━")
 
         updated = still_pending = dropped = failed = 0
         for sym in check_list:
