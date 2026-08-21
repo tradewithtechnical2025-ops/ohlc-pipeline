@@ -65,7 +65,7 @@ SECTOR_GROUP_MAP = {
     # ── Banks ──
     "Private Sector Bank":                      "Banks",
     "Public Sector Bank":                       "Banks",
-    "Other Bank":                               "Banks",
+    "Other Bank":                                "Banks",
 
     # ── Financial Services ──
     "Non Banking Financial Company (NBFC)":     "Financial Services",
@@ -95,7 +95,7 @@ SECTOR_GROUP_MAP = {
     "Auto Components & Equipments":             "Automobiles",
     "Tyres & Rubber Products":                  "Automobiles",
     "Tractors":                                 "Automobiles",
-    "Auto -Dealer":                             "Automobiles",
+    "Auto -Dealer":                              "Automobiles",
     "Trading - Auto Components":                "Automobiles",
     "Construction Vehicles":                    "Automobiles",
     "Dealers-Commercial Vehicles, Tractors, Construction Vehicles": "Automobiles",
@@ -167,7 +167,7 @@ SECTOR_GROUP_MAP = {
     "Packaged Foods":                           "FMCG",
     "Personal Care":                            "FMCG",
     "Other Beverages":                          "FMCG",
-    "Tea & Coffee":                             "FMCG",
+    "Tea & Coffee":                              "FMCG",
     "Edible Oil":                               "FMCG",
     "Dairy Products":                           "FMCG",
     "Breweries & Distilleries":                 "FMCG",
@@ -201,28 +201,28 @@ SECTOR_GROUP_MAP = {
     "Fertilizers":                              "Agriculture",
     "Pesticides & Agrochemicals":               "Agriculture",
     "Animal Feed":                              "Agriculture",
-    "Sugar":                                    "Agriculture",
+    "Sugar":                                     "Agriculture",
     "Other Agricultural Products":              "Agriculture",
     "Meat Products including Poultry":          "Agriculture",
-    "Seafood":                                  "Agriculture",
+    "Seafood":                                   "Agriculture",
 
     # ── Logistics ──
     "Logistics Solution Provider":              "Logistics",
-    "Shipping":                                 "Logistics",
+    "Shipping":                                  "Logistics",
     "Port & Port services":                     "Logistics",
     "Airport & Airport services":               "Logistics",
     "Road Transport":                           "Logistics",
     "Transport Related Services":               "Logistics",
-    "Dredging":                                 "Logistics",
+    "Dredging":                                  "Logistics",
 
     # ── Travel & Hospitality ──
     "Hotels & Resorts":                         "Travel & Hospitality",
-    "Airline":                                  "Travel & Hospitality",
-    "Restaurants":                              "Travel & Hospitality",
+    "Airline":                                   "Travel & Hospitality",
+    "Restaurants":                               "Travel & Hospitality",
     "Tour, Travel Related Services":            "Travel & Hospitality",
     "Amusement Parks/ Other Recreation":        "Travel & Hospitality",
     "Tour Travel Related Services":             "Travel & Hospitality",
-    "Wellness":                                 "Travel & Hospitality",
+    "Wellness":                                  "Travel & Hospitality",
 
     # ── Industrials ──
     "Industrial Products":                      "Industrials",
@@ -232,33 +232,33 @@ SECTOR_GROUP_MAP = {
     "Castings & Forgings":                      "Industrials",
     "Abrasives & Bearings":                     "Industrials",
     "Plastic Products - Industrial":            "Industrials",
-    "Packaging":                                "Industrials",
+    "Packaging":                                 "Industrials",
     "Glass - Industrial":                       "Industrials",
     "Electrodes & Refractories":                "Industrials",
     "Railway Wagons":                           "Industrials",
-    "Rubber":                                   "Industrials",
+    "Rubber":                                    "Industrials",
 
     # ── Consumer Durables ──
     "Household Appliances":                     "Consumer Durables",
     "Consumer Electronics":                     "Consumer Durables",
     "Granites & Marbles":                       "Consumer Durables",
     "Leisure Products":                         "Consumer Durables",
-    "Cycles":                                   "Consumer Durables",
+    "Cycles":                                    "Consumer Durables",
     "Diversified consumer products":            "Consumer Durables",
-    "Footwear":                                 "Consumer Durables",
+    "Footwear":                                  "Consumer Durables",
     "Furniture, Home Furnishing":               "Consumer Durables",
     "Furniture Home Furnishing":                "Consumer Durables",
-    "Houseware":                                "Consumer Durables",
-    "Sanitary Ware":                            "Consumer Durables",
-    "Plywood Boards/ Laminates":                "Consumer Durables",
-    "Glass - Consumer":                         "Consumer Durables",
-    "Leather And Leather Products":             "Consumer Durables",
-    "Plastic Products - Consumer":              "Consumer Durables",
-    "Ceramics":                                 "Consumer Durables",
-    "Gems, Jewellery And Watches":              "Consumer Durables",
-    "Gems Jewellery And Watches":               "Consumer Durables",
-    "Paints":                                   "Consumer Durables",
-    "Stationary":                               "Consumer Durables",
+    "Houseware":                                 "Consumer Durables",
+    "Sanitary Ware":                             "Consumer Durables",
+    "Plywood Boards/ Laminates":                 "Consumer Durables",
+    "Glass - Consumer":                          "Consumer Durables",
+    "Leather And Leather Products":              "Consumer Durables",
+    "Plastic Products - Consumer":               "Consumer Durables",
+    "Ceramics":                                  "Consumer Durables",
+    "Gems, Jewellery And Watches":               "Consumer Durables",
+    "Gems Jewellery And Watches":                "Consumer Durables",
+    "Paints":                                    "Consumer Durables",
+    "Stationary":                                "Consumer Durables",
 
     # ── Entertainment ──
     "Media & Entertainment":                    "Entertainment",
@@ -266,36 +266,36 @@ SECTOR_GROUP_MAP = {
     "Film Production, Distribution & Exhibition": "Entertainment",
     "Film Production Distribution & Exhibition":  "Entertainment",
     "Digital Entertainment":                    "Entertainment",
-    "Advertising & Media Agencies":             "Entertainment",
-    "Web based media and service":              "Entertainment",
-    "Print Media":                              "Entertainment",
-    "Printing & Publication":                   "Entertainment",
-    "Electronic Media":                         "Entertainment",
+    "Advertising & Media Agencies":              "Entertainment",
+    "Web based media and service":               "Entertainment",
+    "Print Media":                               "Entertainment",
+    "Printing & Publication":                    "Entertainment",
+    "Electronic Media":                          "Entertainment",
 
     # ── Business Services ──
-    "Diversified Commercial Services":          "Business Services",
-    "Trading & Distributors":                   "Business Services",
-    "Consulting Services":                      "Business Services",
+    "Diversified Commercial Services":           "Business Services",
+    "Trading & Distributors":                    "Business Services",
+    "Consulting Services":                       "Business Services",
     "Business Process Outsourcing (BPO)/ Knowledge Process Outsourcing (KPO)": "Business Services",
-    "Other Consumer Services":                  "Business Services",
-    "Data Processing Services":                 "Business Services",
+    "Other Consumer Services":                   "Business Services",
+    "Data Processing Services":                  "Business Services",
 
     # ── Education ──
-    "Education":                                "Education",
-    "E-Learning":                               "Education",
+    "Education":                                 "Education",
+    "E-Learning":                                "Education",
 
     # ── Paper & Packaging ──
-    "Paper & Paper Products":                   "Paper & Packaging",
-    "Forest Products":                          "Paper & Packaging",
-    "Jute & Jute Products":                     "Paper & Packaging",
+    "Paper & Paper Products":                    "Paper & Packaging",
+    "Forest Products":                           "Paper & Packaging",
+    "Jute & Jute Products":                      "Paper & Packaging",
 
     # ── Textiles ──
-    "Other Textile Products":                   "Textiles",
-    "Garments & Apparels":                      "Textiles",
-    "Trading - Textile Products":               "Textiles",
+    "Other Textile Products":                    "Textiles",
+    "Garments & Apparels":                       "Textiles",
+    "Trading - Textile Products":                "Textiles",
 
     # ── Diversified ──
-    "Diversified":                              "Diversified",
+    "Diversified":                               "Diversified",
 }
 
 # =========================================================
@@ -937,9 +937,11 @@ async def fetch_profile(client, symbol, semaphore):
                 print(f"{symbol} -> 429")
                 await asyncio.sleep(15)
                 continue
-            if r.status_code == 503:
-                print(f"{symbol} -> 503")
-                await asyncio.sleep(5)
+            # 502/503/504 are typically transient gateway/server hiccups —
+            # retry with increasing backoff instead of giving up immediately.
+            if r.status_code in (502, 503, 504):
+                print(f"{symbol} -> {r.status_code} (retrying, attempt {attempt + 1}/{RETRY})")
+                await asyncio.sleep(5 * (attempt + 1))
                 continue
             if r.status_code != 200:
                 print(f"{symbol} -> HTTP {r.status_code}")
