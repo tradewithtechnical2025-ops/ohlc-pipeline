@@ -20,7 +20,7 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import httpx
 
@@ -125,8 +125,11 @@ def parse_action(raw):
     if action_type not in VALID_TYPES:
         return None
 
+    detail_text = raw.get("subject") or raw.get("detail") or action_raw or ""
     ex_date = raw.get("ex_date") or raw.get("date")
-    ratio   = raw.get("ratio") or extract_ratio(action_raw)
+    # The ratio (e.g. "1:1") usually appears in the descriptive text
+    # (subject/detail), not the short action keyword — try that first.
+    ratio = raw.get("ratio") or extract_ratio(detail_text) or extract_ratio(action_raw)
 
     return {
         "type"             : action_type,
@@ -138,13 +141,42 @@ def parse_action(raw):
         "adj_amount"       : to_float(raw.get("adj_amount")),
         "div_pct"          : to_float(raw.get("div_pct") or raw.get("dividend_pct")),
         "ratio"            : ratio,
-        "detail"           : raw.get("subject") or raw.get("detail") or action_raw or "",
+        "detail"           : detail_text,
     }
 
 
 # ──────────────────────────────────────────────
 # R2
 # ──────────────────────────────────────────────
+
+async def r2_download(client, filename):
+    r = await client.get(f"{WORKER_URL}/{filename}", headers=WORKER_HEADERS, timeout=120)
+    if r.status_code != 200:
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+async def build_bse_to_nse_map(client):
+    """classification.json (from the classification pipeline) carries both
+    bse_code and symbol (NSE) per stock — use it to remap any numeric BSE
+    scrip codes FinEdge returns instead of NSE trading symbols, since the
+    frontend matches corporate actions against the NSE symbol only."""
+    classification = await r2_download(client, "classification.json")
+    if not classification:
+        log.warning("  classification.json not found — BSE code remap skipped")
+        return {}
+    bse_map = {}
+    for row in classification:
+        bse_code = str(row.get("bse_code") or "").strip()
+        symbol   = (row.get("symbol") or "").strip()
+        if bse_code and symbol:
+            bse_map[bse_code] = symbol
+    log.info(f"  BSE→NSE map built: {len(bse_map)} entries")
+    return bse_map
+
 
 async def r2_upload(client, filename, data):
     payload = json.dumps(data, separators=(",", ":")).encode()
@@ -232,6 +264,70 @@ async def run():
         # Sort each symbol's actions by ex_date, most recent/soonest last-known first
         for symbol in output:
             output[symbol].sort(key=lambda x: x["ex_date"] or "", reverse=True)
+
+        # Some FinEdge records key by numeric BSE scrip code instead of the
+        # NSE trading symbol — remap those so the frontend (which matches
+        # on NSE symbol) can actually find them.
+        bse_map = await build_bse_to_nse_map(client)
+        remapped, unresolved = 0, 0
+        for raw_symbol in list(output.keys()):
+            if raw_symbol.isdigit():
+                nse_symbol = bse_map.get(raw_symbol)
+                if nse_symbol:
+                    output.setdefault(nse_symbol, []).extend(output.pop(raw_symbol))
+                    remapped += 1
+                else:
+                    unresolved += 1  # leave as-is — better than losing the data entirely
+        if remapped or unresolved:
+            log.info(f"  BSE codes remapped to NSE symbol : {remapped}")
+            log.info(f"  BSE codes with no NSE match       : {unresolved}")
+
+        # Re-sort after any merges from remapping
+        for symbol in output:
+            output[symbol].sort(key=lambda x: x["ex_date"] or "", reverse=True)
+
+        # ── Cumulative history archive (for chart markers), rolling 1 year ──
+        # We can't cheaply backfill deep past history (the no-symbol query
+        # is capped at 30-day windows), so instead we build history forward:
+        # every day's current+future fetch gets merged into a persistent
+        # archive. As today's "future" action's ex_date passes, it becomes
+        # part of the historical record automatically — no extra API calls
+        # needed. To keep the file from growing forever, anything older
+        # than 1 year (by ex_date) is pruned on every run.
+        log.info("Merging into cumulative history archive (rolling 1 year)…")
+        history = await r2_download(client, "corporate_actions_history.json") or {}
+
+        cutoff = (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                  .replace(year=datetime.now(timezone.utc).year - 1)).strftime("%Y-%m-%d")
+
+        def _dedup_key(a):
+            return (a["type"], a["ex_date"], a["amount"], a["ratio"], a["detail"])
+
+        added, pruned = 0, 0
+        for symbol, acts in output.items():
+            existing = history.setdefault(symbol, [])
+            existing_keys = {_dedup_key(a) for a in existing}
+            for a in acts:
+                if _dedup_key(a) not in existing_keys:
+                    existing.append(a)
+                    existing_keys.add(_dedup_key(a))
+                    added += 1
+
+        # Prune anything older than the rolling cutoff, across all symbols
+        # (not just ones touched this run) and drop symbols left with none.
+        for symbol in list(history.keys()):
+            before = len(history[symbol])
+            history[symbol] = [a for a in history[symbol] if (a.get("ex_date") or "") >= cutoff]
+            pruned += before - len(history[symbol])
+            history[symbol].sort(key=lambda x: x["ex_date"] or "", reverse=True)
+            if not history[symbol]:
+                del history[symbol]
+
+        log.info(f"  New records added to history : {added}")
+        log.info(f"  Old records pruned (> 1yr)   : {pruned}")
+        log.info(f"  History now covers           : {len(history)} symbols")
+
+        await r2_upload(client, "corporate_actions_history.json", history)
 
         total_acts = sum(len(v) for v in output.values())
         log.info(f"  Symbols with actions : {len(output)}")
