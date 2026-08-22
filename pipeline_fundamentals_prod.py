@@ -9,7 +9,8 @@ FIX (Aug 2026): insurance P&L fields were resolving to None — see the note
 above CORE_PL_ALIASES for details.
 """
 
-import asyncio, hashlib, json, logging, os, sys
+import asyncio, hashlib, json, logging, os, re, sys
+from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -352,14 +353,29 @@ CORE_CF_ALIASES = {
 
 
 def _resolve_aliases(row, alias_map):
+    # FIX (Aug 2026): FinEdge pads every /financials response with field
+    # names from ALL FOUR P&L schemas (regular/bank/life-insurance/general-
+    # insurance) — fields not native to a company's actual type come back
+    # as a literal 0, not null. Confirmed live on GICRE (general insurance):
+    # row["income"]=0 (regular-schema placeholder) sits right next to
+    # row["operatingIncome"]=133605400000 (GI's real revenue field). The
+    # old `is not None` check treated 0 as "present" and locked onto
+    # whichever alias came first in the list — which, for "sales"/"pbt"/
+    # "expenses", happened to be the regular/bank placeholder, not the real
+    # GI value — regardless of alias ordering. Collecting every non-null
+    # candidate and preferring the first NON-ZERO one fixes this without
+    # needing to guess a "correct" alias order per company type; falls back
+    # to the first candidate (possibly 0) only when every alias for a key
+    # is 0, so a genuinely-zero figure (e.g. finance_costs=0 that quarter)
+    # still comes through correctly.
     out = {}
     for key, aliases in alias_map.items():
-        val = None
-        for a in aliases:
-            if a in row and row[a] is not None:
-                val = row[a]
-                break
-        out[key] = val
+        candidates = [row[a] for a in aliases if a in row and row[a] is not None]
+        if not candidates:
+            out[key] = None
+        else:
+            nonzero = next((v for v in candidates if v != 0), None)
+            out[key] = nonzero if nonzero is not None else candidates[0]
     return out
 
 
@@ -431,29 +447,99 @@ async def _fetch_basic_financials_dual(client, sem, sym):
     return out
 
 
+def _seg_val(d, keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+
 def _build_segment_core(entry):
     """Flattens one segment_revenues[] entry (company-level 'data' block +
-    per-segment 'segments' list) into a simpler shape. Field names taken
-    directly from the confirmed live response (see ITC sample, Aug 2026)."""
+    per-segment 'segments' list) into a simpler shape.
+
+    FIX (Aug 2026): confirmed live on GICRE (general insurance) that
+    insurers use a COMPLETELY DISJOINT field set from regular companies —
+    zero key overlap with ITC's schema (see comment on _seg_val callers
+    below). The original version only knew the regular-company field names
+    (segmentRevenue / segmentProfitLossBeforeTaxAndFinanceCosts), so every
+    insurer's segment data silently came out all-null even though the
+    company-provided segment names (e.g. "Fire", "Aviation", "Personal
+    Accident") were present. For insurers there's no direct "revenue" line
+    in segment reporting — netPremium (premium income for that line of
+    business) is the closest available proxy, and operatingProfitOrLoss is
+    used as the profit proxy in place of PBT-before-finance-costs. Note:
+    FinEdge's own field name has a typo — "incomeFormInvestments", not
+    "...From..." — kept as-is since it's the live API's actual key.
+    """
     d = entry.get("data") or {}
     return {
         "header": entry.get("header"),
-        "total_revenue": d.get("segmentRevenue"),
+        "total_revenue": _seg_val(d, ["segmentRevenue", "netPremium"]),
         "total_revenue_from_operations": d.get("segmentRevenueFromOperations"),
         "inter_segment_revenue": d.get("interSegmentRevenue"),
         "total_pbt": d.get("segmentProfitBeforeTax"),
-        "total_pbt_before_finance_costs": d.get("segmentProfitLossBeforeTaxAndFinanceCosts"),
+        "total_pbt_before_finance_costs": _seg_val(d, ["segmentProfitLossBeforeTaxAndFinanceCosts", "operatingProfitOrLoss"]),
         "finance_costs": d.get("segmentFinanceCosts"),
         "net_unallocable_expense": d.get("netOtherUnallocableExpense"),
         "segments": [
             {
                 "name": s.get("name"),
-                "revenue": (s.get("data") or {}).get("segmentRevenue"),
-                "pbt_before_finance_costs": (s.get("data") or {}).get("segmentProfitLossBeforeTaxAndFinanceCosts"),
+                "revenue": _seg_val((s.get("data") or {}), ["segmentRevenue", "netPremium"]),
+                "pbt_before_finance_costs": _seg_val((s.get("data") or {}), ["segmentProfitLossBeforeTaxAndFinanceCosts", "operatingProfitOrLoss"]),
             }
             for s in (entry.get("segments") or [])
         ],
     }
+
+
+def _seg_canon_key(name):
+    """Case/whitespace/hyphen-spacing-insensitive key for grouping segment
+    name spelling variants — "FMCG - Others"/"FMCG- Others"/"FMCG-Others"/
+    "FMCg - Others" all collapse to the same key."""
+    if not name:
+        return ""
+    s = re.sub(r"\s+", " ", str(name).strip().lower())
+    s = re.sub(r"\s*-\s*", "-", s)
+    return s
+
+
+def _canonicalize_segment_series(core_rows):
+    """FIX (Aug 2026): confirmed live on ITC — the same business segment
+    gets spelled slightly differently across different quarters'/years'
+    filings (extra/missing space around the hyphen, inconsistent
+    capitalization — e.g. "FMCG - Cigarettes" vs "FMCG-Cigarettes" vs
+    "FMCg - Others"). Treating these as distinct segments produced a table
+    full of near-duplicate rows that were empty everywhere except the one
+    period using that exact spelling. Groups by a normalized key
+    (_seg_canon_key), picks the most-common raw spelling across the whole
+    series as the canonical display label, and rewrites every period's
+    segments to use it — merging same-key entries within a single row
+    (defensive; not expected in practice, but keeps output well-formed if
+    a filing ever lists a segment twice under two spellings in one row)."""
+    label_counts = defaultdict(Counter)
+    for row in core_rows:
+        for s in (row.get("segments") or []):
+            key = _seg_canon_key(s.get("name"))
+            if key:
+                label_counts[key][s.get("name")] += 1
+    canonical_label = {key: counts.most_common(1)[0][0] for key, counts in label_counts.items()}
+
+    for row in core_rows:
+        merged = {}
+        for s in (row.get("segments") or []):
+            key = _seg_canon_key(s.get("name"))
+            if not key:
+                continue
+            label = canonical_label[key]
+            if label not in merged:
+                merged[label] = {"name": label, "revenue": None, "pbt_before_finance_costs": None}
+            for field in ("revenue", "pbt_before_finance_costs"):
+                v = s.get(field)
+                if v is not None:
+                    merged[label][field] = (merged[label][field] or 0) + v
+        row["segments"] = list(merged.values())
+    return core_rows
 
 
 async def _fetch_segment_revenue_dual(client, sem, sym):
@@ -464,7 +550,8 @@ async def _fetch_segment_revenue_dual(client, sem, sym):
             d = await _finedge_get(client, sem, f"segment-revenue/{sym}",
                                     {"statement_type": stype, "statement_code": "pl", "period": period})
             rows = (d or {}).get("segment_revenues", [])
-            out[period][stype] = {"core": [_build_segment_core(r) for r in rows], "raw": rows}
+            core = _canonicalize_segment_series([_build_segment_core(r) for r in rows])
+            out[period][stype] = {"core": core, "raw": rows}
     return out
 
 
