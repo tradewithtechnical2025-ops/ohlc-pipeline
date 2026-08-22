@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """
-Corporate Actions Pipeline — GitHub Actions
-Fetches corporate actions for all NSE stocks from Upstox per-ISIN endpoint
-and uploads to R2 as corporate_actions.json
+Corporate Actions Pipeline — GitHub Actions (FinEdge API version)
+
+Migrated from the old per-ISIN Upstox pipeline. FinEdge's corporate-actions
+endpoint returns current + future actions for ALL symbols in a single call
+when no filters are passed — no more sequential per-symbol requests, no more
+429 skip-logic needed.
+
+Docs: GET https://data.finedgeapi.com/api/v1/corporate-actions/all
+      "If no parameters are provided, current and future corporate actions
+       are returned."
+
+Output format is kept identical to the old Upstox-based pipeline
+(corporate_actions.json = { SYMBOL: [ {type, sub_type, ex_date, ...}, ... ] })
+so the frontend (hubRenderMovers / _corpActionsMap) needs no changes.
 """
 
 import asyncio
@@ -21,15 +32,14 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-UPSTOX_TOKEN = os.environ["UPSTOX_TOKEN"]
-WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
-WORKER_TOKEN = os.environ["WORKER_TOKEN"]
+FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
+WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 
-UPSTOX_BASE    = "https://api.upstox.com/v2"
+FINEDGE_URL    = "https://data.finedgeapi.com/api/v1/corporate-actions/all"
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
-DELAY   = 0.5   # seconds between each request (sequential)
-RETRY   = 2     # retries only on network error, NOT on 429
+RETRY = 3
 
 TYPE_MAP = {
     "dividend"     : "Dividend",
@@ -53,100 +63,88 @@ VALID_TYPES = {
 # Helpers
 # ──────────────────────────────────────────────
 
-def _headers():
-    return {
-        "Accept"       : "application/json",
-        "Authorization": f"Bearer {UPSTOX_TOKEN}",
-    }
-
+import re
 
 def normalize_type(v):
-    return TYPE_MAP.get(str(v).strip().lower(), str(v).strip().title())
+    v = str(v).strip().lower()
+    if v in TYPE_MAP:
+        return TYPE_MAP[v]
+    # Some record shapes embed the type inside a longer description string,
+    # e.g. "Bonus issue 1:2" — search for a known keyword instead of an
+    # exact match in that case.
+    for kw, mapped in TYPE_MAP.items():
+        if kw in v:
+            return mapped
+    return v.title()
+
+
+RATIO_RE = re.compile(r"(\d+\s*[:\-]\s*\d+)")
+
+def extract_ratio(text):
+    if not text:
+        return None
+    m = RATIO_RE.search(str(text))
+    return m.group(1).replace(" ", "") if m else None
 
 
 def parse_date(v):
+    """FinEdge sample format is '04-Jun-2024' (%d-%b-%Y). Falls back to
+    ISO (YYYY-MM-DD) and a couple other common formats just in case
+    different action types return dates differently."""
     if not v:
         return ""
     v = str(v).strip()
     if len(v) == 10 and v[4] == "-":
-        return v
-    for fmt in ("%d %b %Y", "%d-%b-%Y", "%d/%m/%Y"):
+        return v  # already ISO
+    for fmt in ("%d-%b-%Y", "%d %b %Y", "%d-%B-%Y", "%d/%m/%Y"):
         try:
             return datetime.strptime(v, fmt).strftime("%Y-%m-%d")
         except ValueError:
             pass
-    return v
+    return v  # leave as-is if unrecognized — better than dropping the record
 
 
-def extract_detail(event_details, name):
-    for item in (event_details or []):
-        if str(item.get("name", "")).strip().lower() == name.lower():
-            return item.get("value")
-    return None
+def to_float(v):
+    try:
+        return float(v) if v not in (None, "") else None
+    except (ValueError, TypeError):
+        return None
 
 
 def parse_action(raw):
-    action_type = normalize_type(raw.get("name", ""))
+    """Maps one FinEdge corporate-actions record to our normalized schema.
+    Uses .get() everywhere and tries multiple possible field names, since
+    the /all endpoint's dividend sample used ex_date/amount/subject, but
+    the per-symbol split/bonus/rights endpoint (a different endpoint) uses
+    date/action-as-description instead — /all *should* include all types
+    per its own docs, but we don't yet have a confirmed sample of what a
+    bonus/split/rights record looks like inside /all, so this stays
+    tolerant of either shape until a real pipeline run confirms it."""
+    action_raw = raw.get("action", "")
+    action_type = normalize_type(action_raw)
     if action_type not in VALID_TYPES:
         return None
 
-    details = raw.get("event_details") or []
-
-    ex_date = parse_date(
-        extract_detail(details, "Ex dividend date")
-        or extract_detail(details, "Ex date")
-        or raw.get("expiry_date")
-    )
-    record_date       = parse_date(extract_detail(details, "Record date"))
-    announcement_date = parse_date(extract_detail(details, "Announcement date"))
-    sub_type          = extract_detail(details, "Dividend type") or ""
-
-    amount = raw.get("amount")
-    try:
-        amount = float(amount) if amount not in (None, "") else None
-    except (ValueError, TypeError):
-        amount = None
-
-    ratio = raw.get("ratio") or None
-
-    div_pct = extract_detail(details, "Dividend %")
-    try:
-        div_pct = float(div_pct) if div_pct not in (None, "") else None
-    except (ValueError, TypeError):
-        div_pct = None
-
-    detail = extract_detail(details, "Details") or ""
+    ex_date = raw.get("ex_date") or raw.get("date")
+    ratio   = raw.get("ratio") or extract_ratio(action_raw)
 
     return {
         "type"             : action_type,
-        "sub_type"         : sub_type,
-        "announcement_date": announcement_date,
-        "ex_date"          : ex_date,
-        "record_date"      : record_date,
-        "amount"           : amount,
-        "div_pct"          : div_pct,
+        "sub_type"         : raw.get("dividend_type") or raw.get("type") or "",
+        "announcement_date": parse_date(raw.get("announcement_date")),
+        "ex_date"          : parse_date(ex_date),
+        "record_date"      : parse_date(raw.get("record_date")),
+        "amount"           : to_float(raw.get("amount")),
+        "adj_amount"       : to_float(raw.get("adj_amount")),
+        "div_pct"          : to_float(raw.get("div_pct") or raw.get("dividend_pct")),
         "ratio"            : ratio,
-        "detail"           : detail,
+        "detail"           : raw.get("subject") or raw.get("detail") or action_raw or "",
     }
 
 
 # ──────────────────────────────────────────────
 # R2
 # ──────────────────────────────────────────────
-
-async def r2_download(client, filename):
-    r = await client.get(
-        f"{WORKER_URL}/{filename}",
-        headers=WORKER_HEADERS,
-        timeout=120,
-    )
-    if r.status_code != 200:
-        return None
-    try:
-        return r.json()
-    except Exception:
-        return None
-
 
 async def r2_upload(client, filename, data):
     payload = json.dumps(data, separators=(",", ":")).encode()
@@ -162,67 +160,43 @@ async def r2_upload(client, filename, data):
 
 
 # ──────────────────────────────────────────────
-# Fetch — sequential, no retry on 429
+# Fetch — single call, current + future, all symbols
 # ──────────────────────────────────────────────
 
-async def fetch_all(client, isin_map):
-    output    = {}
-    skipped   = 0
-    errors    = 0
-    total     = len(isin_map)
-
-    items = list(isin_map.items())
-
-    for idx, (symbol, isin) in enumerate(items, 1):
-
-        await asyncio.sleep(DELAY)
-
-        url = f"{UPSTOX_BASE}/fundamentals/{isin}/corporate-actions"
-
+async def fetch_all(client):
+    for attempt in range(RETRY):
         try:
-            r = await client.get(url, headers=_headers(), timeout=20)
+            r = await client.get(
+                FINEDGE_URL,
+                params={"token": FINEDGE_TOKEN},
+                timeout=60,
+            )
         except httpx.RequestError as e:
-            log.warning(f"  Network error {symbol}: {e}")
-            errors += 1
+            log.warning(f"Network error (attempt {attempt+1}/{RETRY}): {e}")
+            await asyncio.sleep(3 * (attempt + 1))
             continue
 
         if r.status_code == 401:
-            log.error("❌ UPSTOX_TOKEN invalid")
+            log.error("❌ FINEDGE_TOKEN invalid")
             raise SystemExit(1)
 
-        if r.status_code == 429:
-            # Skip — do not retry, just move on
-            log.warning(f"  429 skip {symbol} ({idx}/{total})")
-            skipped += 1
-            continue
-
-        if r.status_code == 404:
+        if r.status_code in (429, 502, 503, 504):
+            log.warning(f"  {r.status_code} — retrying (attempt {attempt+1}/{RETRY})")
+            await asyncio.sleep(5 * (attempt + 1))
             continue
 
         if r.status_code != 200:
-            errors += 1
-            continue
+            raise RuntimeError(f"FinEdge corporate-actions fetch failed: HTTP {r.status_code}")
 
         try:
-            raw_list = r.json().get("data") or []
-        except Exception:
-            errors += 1
-            continue
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse FinEdge response: {e}")
 
-        parsed = []
-        for raw in raw_list:
-            item = parse_action(raw)
-            if item:
-                parsed.append(item)
+        # Response is a flat list of action records, each carrying its own "symbol"
+        return data if isinstance(data, list) else []
 
-        if parsed:
-            parsed.sort(key=lambda x: x["ex_date"] or "", reverse=True)
-            output[symbol] = parsed
-
-        if idx % 100 == 0:
-            log.info(f"  Progress: {idx}/{total} | found={len(output)} skipped={skipped}")
-
-    return output, skipped, errors
+    raise RuntimeError("FinEdge corporate-actions fetch failed after retries")
 
 
 # ──────────────────────────────────────────────
@@ -231,30 +205,38 @@ async def fetch_all(client, isin_map):
 
 async def run():
 
-    log.info("━━━ Corporate Actions Pipeline ━━━")
+    log.info("━━━ Corporate Actions Pipeline (FinEdge) ━━━")
 
     async with httpx.AsyncClient() as client:
 
-        log.info("Downloading master.json…")
-        master = await r2_download(client, "master.json")
-        if not master:
-            raise RuntimeError("master.json download failed")
+        log.info("Fetching current + future corporate actions from FinEdge…")
+        raw_records = await fetch_all(client)
+        log.info(f"  {len(raw_records)} raw records received")
 
-        isin_map = {
-            s["symbol"]: s["isin"]
-            for s in master
-            if s.get("isin")
-        }
-        log.info(f"  {len(isin_map)} symbols with ISIN")
+        output  = {}
+        skipped = 0
 
-        log.info(f"Fetching corporate actions (sequential, {DELAY}s delay)…")
-        output, skipped, errors = await fetch_all(client, isin_map)
+        for raw in raw_records:
+            symbol = (raw.get("symbol") or "").strip()
+            if not symbol:
+                skipped += 1
+                continue
+
+            item = parse_action(raw)
+            if not item:
+                skipped += 1
+                continue
+
+            output.setdefault(symbol, []).append(item)
+
+        # Sort each symbol's actions by ex_date, most recent/soonest last-known first
+        for symbol in output:
+            output[symbol].sort(key=lambda x: x["ex_date"] or "", reverse=True)
 
         total_acts = sum(len(v) for v in output.values())
         log.info(f"  Symbols with actions : {len(output)}")
         log.info(f"  Total actions        : {total_acts}")
-        log.info(f"  Skipped (429)        : {skipped}")
-        log.info(f"  Errors               : {errors}")
+        log.info(f"  Skipped (bad type/no symbol) : {skipped}")
 
         await r2_upload(client, "corporate_actions.json", output)
 
