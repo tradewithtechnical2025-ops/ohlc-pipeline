@@ -301,11 +301,19 @@ async def run():
                   .replace(year=datetime.now(timezone.utc).year - 1)).strftime("%Y-%m-%d")
 
         def _dedup_key(a):
-            return (a["type"], a["ex_date"], a["amount"], a["ratio"], a["detail"])
+            if not isinstance(a, dict):
+                return None
+            return (a.get("type", ""), a.get("ex_date", ""), a.get("amount"), a.get("ratio"), a.get("detail", ""))
 
-        added, pruned = 0, 0
+        added, pruned, dropped_malformed = 0, 0, 0
         for symbol, acts in output.items():
             existing = history.setdefault(symbol, [])
+            # Drop anything that isn't a well-formed record (e.g. leftover
+            # from an older/different history file format on R2)
+            clean_existing = [a for a in existing if isinstance(a, dict) and "ex_date" in a]
+            dropped_malformed += len(existing) - len(clean_existing)
+            existing = history[symbol] = clean_existing
+
             existing_keys = {_dedup_key(a) for a in existing}
             for a in acts:
                 if _dedup_key(a) not in existing_keys:
@@ -317,15 +325,16 @@ async def run():
         # (not just ones touched this run) and drop symbols left with none.
         for symbol in list(history.keys()):
             before = len(history[symbol])
-            history[symbol] = [a for a in history[symbol] if (a.get("ex_date") or "") >= cutoff]
+            history[symbol] = [a for a in history[symbol] if isinstance(a, dict) and (a.get("ex_date") or "") >= cutoff]
             pruned += before - len(history[symbol])
-            history[symbol].sort(key=lambda x: x["ex_date"] or "", reverse=True)
+            history[symbol].sort(key=lambda x: x.get("ex_date") or "", reverse=True)
             if not history[symbol]:
                 del history[symbol]
 
-        log.info(f"  New records added to history : {added}")
-        log.info(f"  Old records pruned (> 1yr)   : {pruned}")
-        log.info(f"  History now covers           : {len(history)} symbols")
+        log.info(f"  New records added to history      : {added}")
+        log.info(f"  Old records pruned (> 1yr)        : {pruned}")
+        log.info(f"  Malformed legacy records dropped  : {dropped_malformed}")
+        log.info(f"  History now covers                : {len(history)} symbols")
 
         await r2_upload(client, "corporate_actions_history.json", history)
 
