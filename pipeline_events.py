@@ -177,16 +177,19 @@ def parse_announcement(raw, bse_map):
     numeric bse_code via classification.json (same bse_map already built
     for corporate actions below — reused here, not rebuilt).
 
-    Timestamp handling: confirmed live that "ex_date" here is actually an
-    IST-localized announcement/filing timestamp (NOT a dividend ex-date —
-    unfortunate field-name reuse from a different FinEdge endpoint) and
-    "timestamp_unix" is the same moment as a UTC epoch int. Verified they
-    agree exactly (timestamp_unix converted to IST == the ex_date string).
-    timestamp_unix is used as the authoritative sort/dedup/prune key since
-    it's an unambiguous int; the ex_date string is kept as-is for display
-    under the renamed field "announced_at" (renamed specifically to avoid
-    confusion with corporate_actions.json's "ex_date", which means a
-    completely different thing there).
+    Timestamp handling: the docs' sample showed "ex_date" as a populated
+    IST-localized announcement timestamp, and verified it agreed exactly
+    with timestamp_unix converted to IST — but confirmed on a REAL pipeline
+    run (Aug 2026) that ex_date comes back BLANK on 100% of live records
+    (501/501), while timestamp_unix was present on all of them. So
+    announced_at is derived from timestamp_unix (converted to IST) as the
+    primary path now, falling back to the raw ex_date string only if
+    timestamp_unix is somehow missing — the reverse of what the docs
+    sample would have suggested. timestamp_unix itself remains the
+    authoritative sort/dedup/prune key regardless. Field renamed to
+    "announced_at" specifically to avoid confusion with
+    corporate_actions.json's "ex_date", which means a completely different
+    thing there.
 
     pdf_file_link_hist: the docs' sample value for this field is literally
     the placeholder string "string" (Swagger/OpenAPI example filler, not
@@ -204,7 +207,16 @@ def parse_announcement(raw, bse_map):
         ts = int(ts) if ts not in (None, "") else None
     except (ValueError, TypeError):
         ts = None
-    announced_at = str(raw.get("ex_date") or "")
+
+    IST = timezone(timedelta(hours=5, minutes=30))
+    announced_at = ""
+    if ts is not None:
+        try:
+            announced_at = datetime.fromtimestamp(ts, tz=IST).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError, OverflowError):
+            announced_at = ""
+    if not announced_at:
+        announced_at = str(raw.get("ex_date") or "")
 
     pdf_link = raw.get("pdf_file_link") or ""
     pdf_link_hist = raw.get("pdf_file_link_hist") or ""
