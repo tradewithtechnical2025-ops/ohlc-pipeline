@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Corporate Actions Pipeline — GitHub Actions (FinEdge API version)
+Corporate Actions + Announcements Pipeline — GitHub Actions (FinEdge API version)
 
 Migrated from the old per-ISIN Upstox pipeline. FinEdge's corporate-actions
 endpoint returns current + future actions for ALL symbols in a single call
@@ -14,13 +14,28 @@ Docs: GET https://data.finedgeapi.com/api/v1/corporate-actions/all
 Output format is kept identical to the old Upstox-based pipeline
 (corporate_actions.json = { SYMBOL: [ {type, sub_type, ex_date, ...}, ... ] })
 so the frontend (hubRenderMovers / _corpActionsMap) needs no changes.
+
+ADDED (Aug 2026): Corporate Announcements section.
+Docs: GET https://data.finedgeapi.com/api/v1/corp-announcements
+      "Consolidated daily feed of corporate announcements published by
+       companies listed on NSE and BSE... retrieve announcements for up to
+       last 7 days from the current date... If symbol not provided,
+       from_date/to_date cannot be more than 7 days apart."
+This is the same "bulk daily feed, no per-symbol calls" shape as
+corporate-actions/all, so it's handled with the same build-history-forward
+approach: call with no params (defaults to from_date=today-1, to_date=today
+per the docs), merge into a rolling archive, don't try to backfill deep
+history in one shot since the API doesn't support that without a symbol.
+Output format: corp_announcements.json / corp_announcements_history.json,
+same { SYMBOL: [ {...}, ... ] } shape as the corporate actions files, for
+frontend consistency.
 """
 
 import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -36,10 +51,18 @@ FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 
-FINEDGE_URL    = "https://data.finedgeapi.com/api/v1/corporate-actions/all"
+FINEDGE_URL              = "https://data.finedgeapi.com/api/v1/corporate-actions/all"
+FINEDGE_ANNOUNCEMENTS_URL = "https://data.finedgeapi.com/api/v1/corp-announcements"
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
 RETRY = 3
+
+# Announcements are far higher-volume than corporate actions (a company can
+# file several a week vs a handful of dividends/bonuses a year), so this
+# uses a shorter retention window than corp actions' 1-year one to keep the
+# archive file size reasonable. Tune if a longer/shorter Documents-tab
+# history is wanted later.
+ANNOUNCEMENTS_RETENTION_DAYS = 180
 
 TYPE_MAP = {
     "dividend"     : "Dividend",
@@ -145,6 +168,61 @@ def parse_action(raw):
     }
 
 
+def parse_announcement(raw, bse_map):
+    """Maps one FinEdge corp-announcements record to our normalized schema.
+
+    Symbol resolution: sample response carries both stock_symbol and
+    nse_code (equal in the sample, "ITC") plus a numeric bse_code — prefer
+    stock_symbol, fall back to nse_code, and as a last resort remap a
+    numeric bse_code via classification.json (same bse_map already built
+    for corporate actions below — reused here, not rebuilt).
+
+    Timestamp handling: confirmed live that "ex_date" here is actually an
+    IST-localized announcement/filing timestamp (NOT a dividend ex-date —
+    unfortunate field-name reuse from a different FinEdge endpoint) and
+    "timestamp_unix" is the same moment as a UTC epoch int. Verified they
+    agree exactly (timestamp_unix converted to IST == the ex_date string).
+    timestamp_unix is used as the authoritative sort/dedup/prune key since
+    it's an unambiguous int; the ex_date string is kept as-is for display
+    under the renamed field "announced_at" (renamed specifically to avoid
+    confusion with corporate_actions.json's "ex_date", which means a
+    completely different thing there).
+
+    pdf_file_link_hist: the docs' sample value for this field is literally
+    the placeholder string "string" (Swagger/OpenAPI example filler, not
+    real data) — only kept if it actually looks like a URL.
+    """
+    symbol = (raw.get("stock_symbol") or raw.get("nse_code") or "").strip()
+    if not symbol:
+        bse_code = str(raw.get("bse_code") or "").strip()
+        symbol = bse_map.get(bse_code, "")
+    if not symbol:
+        return None, None
+
+    ts = raw.get("timestamp_unix")
+    try:
+        ts = int(ts) if ts not in (None, "") else None
+    except (ValueError, TypeError):
+        ts = None
+    announced_at = str(raw.get("ex_date") or "")
+
+    pdf_link = raw.get("pdf_file_link") or ""
+    pdf_link_hist = raw.get("pdf_file_link_hist") or ""
+    if not str(pdf_link_hist).startswith("http"):
+        pdf_link_hist = ""
+
+    item = {
+        "category"     : raw.get("category") or "",
+        "sub_category" : raw.get("sub_category") or "",
+        "description"  : raw.get("description") or "",
+        "announced_at" : announced_at,
+        "pdf_link"     : pdf_link,
+        "pdf_link_hist": pdf_link_hist,
+        "timestamp_unix": ts,
+    }
+    return symbol, item
+
+
 # ──────────────────────────────────────────────
 # R2
 # ──────────────────────────────────────────────
@@ -192,7 +270,7 @@ async def r2_upload(client, filename, data):
 
 
 # ──────────────────────────────────────────────
-# Fetch — single call, current + future, all symbols
+# Fetch — corporate actions: single call, current + future, all symbols
 # ──────────────────────────────────────────────
 
 async def fetch_all(client):
@@ -232,6 +310,50 @@ async def fetch_all(client):
 
 
 # ──────────────────────────────────────────────
+# Fetch — corporate announcements: daily bulk feed, all symbols
+# ──────────────────────────────────────────────
+
+async def fetch_announcements(client):
+    """No symbol param → defaults apply (from_date=today-1, to_date=today
+    per the docs), giving ~2 days of announcements across ALL companies in
+    one call. Meant to be run daily and merged into a rolling history
+    archive (see run()) rather than backfilled in one shot, since without a
+    symbol the API caps from_date/to_date at 7 days apart anyway."""
+    for attempt in range(RETRY):
+        try:
+            r = await client.get(
+                FINEDGE_ANNOUNCEMENTS_URL,
+                params={"token": FINEDGE_TOKEN},
+                timeout=60,
+            )
+        except httpx.RequestError as e:
+            log.warning(f"Network error (attempt {attempt+1}/{RETRY}): {e}")
+            await asyncio.sleep(3 * (attempt + 1))
+            continue
+
+        if r.status_code == 401:
+            log.error("❌ FINEDGE_TOKEN invalid")
+            raise SystemExit(1)
+
+        if r.status_code in (429, 502, 503, 504):
+            log.warning(f"  {r.status_code} — retrying (attempt {attempt+1}/{RETRY})")
+            await asyncio.sleep(5 * (attempt + 1))
+            continue
+
+        if r.status_code != 200:
+            raise RuntimeError(f"FinEdge corp-announcements fetch failed: HTTP {r.status_code}")
+
+        try:
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse FinEdge announcements response: {e}")
+
+        return data if isinstance(data, list) else []
+
+    raise RuntimeError("FinEdge corp-announcements fetch failed after retries")
+
+
+# ──────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────
 
@@ -267,7 +389,8 @@ async def run():
 
         # Some FinEdge records key by numeric BSE scrip code instead of the
         # NSE trading symbol — remap those so the frontend (which matches
-        # on NSE symbol) can actually find them.
+        # on NSE symbol) can actually find them. bse_map is reused below
+        # for corporate announcements too, so it's built once per run.
         bse_map = await build_bse_to_nse_map(client)
         remapped, unresolved = 0, 0
         for raw_symbol in list(output.keys()):
@@ -345,7 +468,82 @@ async def run():
 
         await r2_upload(client, "corporate_actions.json", output)
 
-    log.info("✅ corporate_actions.json uploaded")
+        log.info("✅ corporate_actions.json uploaded")
+
+        # ══════════════════════════════════════════════════════════════
+        # CORPORATE ANNOUNCEMENTS (added Aug 2026)
+        # ══════════════════════════════════════════════════════════════
+        log.info("━━━ Corporate Announcements Pipeline (FinEdge) ━━━")
+        log.info("Fetching daily corporate announcements feed from FinEdge…")
+        raw_announcements = await fetch_announcements(client)
+        log.info(f"  {len(raw_announcements)} raw announcement records received")
+
+        ann_output  = {}
+        ann_skipped = 0
+        for raw in raw_announcements:
+            symbol, item = parse_announcement(raw, bse_map)
+            if not symbol or not item:
+                ann_skipped += 1
+                continue
+            ann_output.setdefault(symbol, []).append(item)
+
+        for symbol in ann_output:
+            ann_output[symbol].sort(key=lambda x: x.get("timestamp_unix") or 0, reverse=True)
+
+        log.info(f"  Symbols with announcements : {len(ann_output)}")
+        log.info(f"  Skipped (no resolvable symbol) : {ann_skipped}")
+
+        await r2_upload(client, "corp_announcements.json", ann_output)
+
+        # ── Cumulative history archive, rolling ANNOUNCEMENTS_RETENTION_DAYS ──
+        # Same build-history-forward approach as corporate actions above —
+        # today's daily-feed fetch gets merged into a persistent archive
+        # rather than trying to backfill deep history (not possible without
+        # a symbol param per the API's own 7-day window cap).
+        log.info(f"Merging into announcements history archive (rolling {ANNOUNCEMENTS_RETENTION_DAYS} days)…")
+        ann_history = await r2_download(client, "corp_announcements_history.json") or {}
+
+        ann_cutoff_ts = int((datetime.now(timezone.utc) - timedelta(days=ANNOUNCEMENTS_RETENTION_DAYS)).timestamp())
+
+        def _ann_dedup_key(a):
+            if not isinstance(a, dict):
+                return None
+            return (a.get("timestamp_unix"), a.get("pdf_link"), a.get("description"))
+
+        ann_added, ann_pruned, ann_dropped_malformed = 0, 0, 0
+        for symbol, items in ann_output.items():
+            existing = ann_history.setdefault(symbol, [])
+            clean_existing = [a for a in existing if isinstance(a, dict) and "timestamp_unix" in a]
+            ann_dropped_malformed += len(existing) - len(clean_existing)
+            existing = ann_history[symbol] = clean_existing
+
+            existing_keys = {_ann_dedup_key(a) for a in existing}
+            for a in items:
+                if _ann_dedup_key(a) not in existing_keys:
+                    existing.append(a)
+                    existing_keys.add(_ann_dedup_key(a))
+                    ann_added += 1
+
+        for symbol in list(ann_history.keys()):
+            before = len(ann_history[symbol])
+            ann_history[symbol] = [
+                a for a in ann_history[symbol]
+                if isinstance(a, dict) and (a.get("timestamp_unix") or 0) >= ann_cutoff_ts
+            ]
+            ann_pruned += before - len(ann_history[symbol])
+            ann_history[symbol].sort(key=lambda x: x.get("timestamp_unix") or 0, reverse=True)
+            if not ann_history[symbol]:
+                del ann_history[symbol]
+
+        log.info(f"  New records added to history      : {ann_added}")
+        log.info(f"  Old records pruned (> {ANNOUNCEMENTS_RETENTION_DAYS}d)      : {ann_pruned}")
+        log.info(f"  Malformed legacy records dropped  : {ann_dropped_malformed}")
+        log.info(f"  History now covers                : {len(ann_history)} symbols")
+
+        await r2_upload(client, "corp_announcements_history.json", ann_history)
+
+        log.info("✅ corp_announcements.json uploaded")
+
     log.info("━━━ Done ━━━")
 
 
