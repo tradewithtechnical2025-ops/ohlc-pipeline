@@ -144,7 +144,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                 max_ceiling_jump=0.02, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
                 live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15,
-                ceiling_band_tol=0.04, min_leg_span_bars=5, debug=False):
+                ceiling_band_tol=0.04, min_leg_span_bars=5, max_depth_ratio=0.75, debug=False):
     highs  = hist.get("h") or []
     lows   = hist.get("l") or []
     closes = hist.get("c") or []
@@ -258,9 +258,25 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
         # base's own ceiling count as contraction boundaries; smaller
         # internal highs that never approach the ceiling are treated as
         # noise inside the base, not separate contractions) ----
-        h_only = [c for c in contractions if True]  # contractions are H->L legs; each c[1] is an H
         ceiling = max(c[1] for c in contractions)
         node_idxs = [idx for idx, c in enumerate(contractions) if c[1] >= ceiling * (1 - ceiling_band_tol)]
+        # Same immediate-neighbor rule as Method A: no ceiling-touching
+        # node's high may jump up more than max_ceiling_jump versus the
+        # node right before it -- being within the overall ceiling band is
+        # not enough on its own (that let a leg jump ~4% versus its own
+        # immediate predecessor slip through, e.g. MAHSCOOTER's 26-May ->
+        # 04-Aug node pair, even though both happened to sit within 4% of
+        # the much-older Feb high). Walk backward and keep only the
+        # longest trailing run of nodes satisfying this.
+        if len(node_idxs) >= 2:
+            k = len(node_idxs) - 1
+            while k >= 1:
+                hi_prev = contractions[node_idxs[k-1]][1]
+                hi_cur  = contractions[node_idxs[k]][1]
+                if hi_cur > hi_prev * (1 + max_ceiling_jump):
+                    break
+                k -= 1
+            node_idxs = node_idxs[k:]
         run_b = None
         if len(node_idxs) >= 2:
             run_b = []
@@ -289,6 +305,12 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                     if lows[idx] is not None and lows[idx] < low_k: return None
             for k in range(1, len(run_depths)):
                 if run_depths[k] >= run_depths[k-1] + tighten_tol: return None
+            # ---- Each contraction must be meaningfully tighter than the
+            # previous one -- at most max_depth_ratio (75%) of its size --
+            # not just "a bit smaller within tolerance". A leg that's 90%
+            # the size of the one before it is barely contracting at all.
+            for k in range(1, len(run_depths)):
+                if run_depths[k] >= run_depths[k-1] * max_depth_ratio: return None
             base_depth  = run_depths[0]
             final_depth = run_depths[-1]
             if base_depth > max_base_depth: return None
