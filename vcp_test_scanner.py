@@ -144,7 +144,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                 max_ceiling_jump=0.02, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
                 live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15,
-                ceiling_band_tol=0.04, debug=False):
+                ceiling_band_tol=0.04, min_leg_span_bars=5, debug=False):
     highs  = hist.get("h") or []
     lows   = hist.get("l") or []
     closes = hist.get("c") or []
@@ -195,7 +195,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                 else:
                     li, lp = seq[i+1][0], seq[i+1][1]
                 n_bars = li - hi
-                if hp > 0 and n_bars >= 2:
+                if hp > 0 and n_bars >= min_leg_span_bars:
                     contractions.append((hi, hp, li, lp, (hp - lp) / hp))
                 i += 2
             else:
