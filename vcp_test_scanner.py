@@ -231,31 +231,27 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
 
         if len(contractions) < min_contractions: return None
 
-        # ---- METHOD A: two-pass zigzag-chain walk (handles descending
-        # resistance and minor same-base ceiling revisits) ----
+        # ---- METHOD A: two-pass zigzag-chain walk. Ceiling check is
+        # IMMEDIATE-NEIGHBOR only -- no high may jump up more than
+        # max_ceiling_jump versus the leg right before it, anywhere in the
+        # chain (not just the final/pivot leg). Legitimate revisits of an
+        # OLDER, higher ceiling (like ABB's case) are handled separately by
+        # METHOD B (ceiling-cluster) below, so Method A no longer needs to
+        # reach back through unconfirmed earlier legs to excuse a jump --
+        # that was what let CRISIL's chain through with a 9.7% jump on its
+        # final leg versus its immediate neighbor, which is exactly the
+        # pattern that shouldn't be excused.
         depths = [c[4] for c in contractions]
         run_end = len(depths) - 1
         j = run_end - 1
         while j >= 0:
             if depths[j] < depths[j+1] - tighten_tol:
                 break
-            j -= 1
-        depth_start = j + 1
-
-        ws = depth_start
-        while ws <= run_end:
-            running_ceiling = contractions[ws][1]
-            ok = True
-            for k in range(ws + 1, run_end + 1):
-                hi_k = contractions[k][1]
-                if hi_k > running_ceiling * (1 + max_ceiling_jump):
-                    ok = False
-                    break
-                running_ceiling = max(running_ceiling, hi_k)
-            if ok:
+            hi_a, hi_b = contractions[j][1], contractions[j+1][1]
+            if hi_b > hi_a * (1 + max_ceiling_jump):
                 break
-            ws += 1
-        run_a = contractions[ws:run_end+1]
+            j -= 1
+        run_a = contractions[j+1:]
 
         # ---- METHOD B: ceiling-cluster (handles flat-top, multi-touch
         # cup-with-handle shapes -- only the H's that actually touch the
