@@ -141,7 +141,7 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
 
 def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_contractions=6,
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.03,
-                max_ceiling_jump=0.02, max_dist_from_pivot=0.08, min_prior_move=0.20,
+                max_ceiling_jump=0.025, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
                 live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15,
                 ceiling_band_tol=0.04, min_leg_span_bars=5, max_depth_ratio=0.75, debug=False):
@@ -305,12 +305,18 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                     if lows[idx] is not None and lows[idx] < low_k: return None
             for k in range(1, len(run_depths)):
                 if run_depths[k] >= run_depths[k-1] + tighten_tol: return None
-            # ---- Each contraction must be meaningfully tighter than the
-            # previous one -- at most max_depth_ratio (75%) of its size --
-            # not just "a bit smaller within tolerance". A leg that's 90%
-            # the size of the one before it is barely contracting at all.
-            for k in range(1, len(run_depths)):
-                if run_depths[k] >= run_depths[k-1] * max_depth_ratio: return None
+            # ---- The FIRST contraction must be meaningfully tighter than
+            # the base leg -- at most max_depth_ratio (75%) of its size --
+            # since the base leg's initial pullback should be dramatically
+            # deeper than the next one for a base to be credibly starting
+            # to tighten. Later legs only need the milder additive
+            # tighten_tol check above; requiring every single later pair
+            # to also clear 75% was rejecting valid patterns where the
+            # tail-end legs are already both quite tight (e.g. 6.3% ->
+            # 5.9%), which is a fine, still-valid final approach to the
+            # pivot -- not a sign the base isn't tightening.
+            if len(run_depths) >= 2 and run_depths[1] >= run_depths[0] * max_depth_ratio:
+                return None
             base_depth  = run_depths[0]
             final_depth = run_depths[-1]
             if base_depth > max_base_depth: return None
