@@ -103,7 +103,7 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
 
 def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_contractions=6,
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.03,
-                max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
+                max_ceiling_jump=0.02, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
                 live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15, debug=False):
     highs  = hist.get("h") or []
@@ -192,21 +192,49 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
 
         if len(contractions) < min_contractions: return None
 
-        # ---- CHANGE 1: running-ceiling chain walk (replaces pairwise) ----
+        # ---- CHANGE 1 (v2 — bug-fixed): two-pass chain walk ----
+        # Pass 1 finds the longest tail satisfying depth-tightening alone
+        # (ignoring ceiling). Pass 2 then walks FORWARD *within that window
+        # only* and truncates further from the front if any leg's high
+        # exceeds the running ceiling built from legs *already confirmed
+        # inside the window* — never reaching back to older, unconfirmed,
+        # possibly unrelated legs outside it (that was the bug: an old,
+        # unrelated high from before an intervening crash could wrongly
+        # "excuse" what was actually a fresh breakout much later).
         depths = [c[4] for c in contractions]
         run_end = len(depths) - 1
         j = run_end - 1
         while j >= 0:
             if depths[j] < depths[j+1] - tighten_tol:
                 break
-            hi_this = contractions[j+1][1]
-            earlier_ceiling = max(c[1] for c in contractions[:j+1])
-            if hi_this > earlier_ceiling * (1 + max_ceiling_jump):
-                break
             j -= 1
-        run = contractions[j+1:]
+        depth_start = j + 1
+
+        ws = depth_start
+        while ws <= run_end:
+            running_ceiling = contractions[ws][1]
+            ok = True
+            for k in range(ws + 1, run_end + 1):
+                hi_k = contractions[k][1]
+                if hi_k > running_ceiling * (1 + max_ceiling_jump):
+                    ok = False
+                    break
+                running_ceiling = max(running_ceiling, hi_k)
+            if ok:
+                break
+            ws += 1
+        run = contractions[ws:run_end+1]
         run_depths = [c[4] for c in run]
         if not (min_contractions <= len(run) <= max_contractions): return None
+
+        # ---- Rising lows: each contraction's low must not undercut the
+        # PREVIOUS contraction's low. Textbook VCP requires the base to
+        # make progressively higher lows alongside tightening highs -- a
+        # lower low mid-chain means support itself is breaking down, not
+        # just the range narrowing, which isn't a genuine contraction.
+        for k in range(1, len(run)):
+            if run[k][3] < run[k-1][3]:
+                return None
 
         if len(run) >= 2 and (run[1][0] - run[0][0]) < min_first_leg_bars: return None
 
