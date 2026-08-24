@@ -1,25 +1,63 @@
 #!/usr/bin/env python3
 """
-Final combined patch over pipeline.py's _detect_vcp():
+vcp_test_scanner.py
+--------------------
+Standalone VCP (Volatility Contraction Pattern) tester — separate from
+pipeline.py so it can be run/tuned/debugged without touching the main
+production pipeline. Uses the EXACT same detection logic as pipeline.py's
+_detect_vcp() (resistance/pivot-chain based, percentage-ZigZag on closes,
+nested-swing filtering, asymmetric ceiling check for flat/descending
+resistance bases).
 
-CHANGE 1 (bug fix, low risk) — Step 5 ceiling-jump check now compares each
-new leg's high against the RUNNING MAX of all highs already included in the
-tentative chain (i.e. the base's own established ceiling), instead of only
-its immediate previous neighbor. This correctly allows:
-  - descending-resistance VCPs (each high legitimately lower — always passes)
-  - flat-resistance VCPs where an interior leg dips deep then price
-    RE-TESTS the base's own original ceiling (previously misread as a
-    fresh breakout into an unrelated new base)
-It still correctly BLOCKS a leg whose high exceeds everything seen so far
-in the chain by more than max_ceiling_jump — a genuine breakout.
+USAGE — single stock from a TradingView CSV export:
+    python vcp_test_scanner.py --csv NSE_SOLARINDS__1D.csv
+    python vcp_test_scanner.py --csv NSE_SOLARINDS__1D.csv --debug
+    python vcp_test_scanner.py --csv NSE_SOLARINDS__1D.csv --end-date 2024-03-02
 
-CHANGE 2 (tolerance widen, real behavior change) — tighten_tol raised from
-2% -> 3%, and applied CONSISTENTLY in both the run-boundary walk (Step 5)
-and the final strict-decreasing depth check (Step 6), which previously used
-two different (inconsistent) strictness levels for the same "should depths
-keep shrinking" idea.
+USAGE — single stock, or full universe, from R2 (same OHLC store as pipeline.py):
+    export WORKER_URL="https://your-worker-url"
+    export WORKER_TOKEN="your-secret-token"
+    python vcp_test_scanner.py --symbol SOLARINDS
+    python vcp_test_scanner.py --all --save vcp_test_results.json
+    python vcp_test_scanner.py --all --r2-key vcp_signals_test.json
+
+Flags:
+    --csv PATH        Read OHLC from a TradingView-exported CSV (time,open,
+                       high,low,close,...,Volume,...). Overrides --symbol/--all.
+    --symbol SYM       Fetch just one symbol's history from R2 (ohlc_*.json chunks).
+    --all              Scan every symbol in R2 (same universe as pipeline.py vcp_scan).
+    --end-date YYYY-MM-DD
+                       Truncate history to end on/before this date — useful for
+                       replaying "what would the scan have said on that day",
+                       e.g. testing a base right before a historical breakout.
+    --debug            Print the full pivot list, nested-filter before/after,
+                       and every candidate base tried (not just the winner).
+    --params k=v,k=v   Override any _detect_vcp() keyword arg, e.g.
+                       --params zigzag_pct=0.05,max_final_depth=0.15
+    --save PATH        Write results as JSON to a local file.
+    --r2-key NAME      Push results JSON to R2 under this filename.
 """
-import csv, json
+
+import argparse
+import csv
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+import httpx
+
+R2_CHUNKS = 8
+WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
+
+
+# ══════════════════════════════════════════════════════════════
+# VCP core detection logic — kept byte-identical to pipeline.py so this
+# script always tests exactly what production runs. If you tune params
+# here, port the same change back into pipeline.py's _detect_vcp.
+# ══════════════════════════════════════════════════════════════
 
 def _vcp_sma(arr, period, end=None):
     end = len(arr) if end is None else end
@@ -295,6 +333,11 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                 "base_start_date": dates[run[0][0]] if dates else None,
                 "base_end_date": dates[run[-1][2]] if dates else None,
                 "resistance_shape": "descending" if run[0][1] > run[-1][1] * 1.01 else "flat",
+                "contraction_dates": [
+                    {"h_date": dates[c[0]], "h_price": round(c[1], 2),
+                     "l_date": dates[c[2]], "l_price": round(c[3], 2)}
+                    for c in run if dates
+                ],
                 "dist_from_pivot_pct": round(dist * 100, 2),
                 "vol_dryup": vol_dryup,
                 "prior_move_pct": round(prior_move * 100, 1),
@@ -324,15 +367,23 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
     return best
 
 
+
+
 def load_csv(path, end_date=None):
     with open(path, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
+    if not rows:
+        raise ValueError(f"{path}: no rows found")
+
     vol_col = next((c for c in rows[0].keys() if c.strip().lower() == "volume"), None)
+
     dates, opens, highs, lows, closes, vols = [], [], [], [], [], []
     for r in rows:
         d = r.get("time", "").strip()
-        if not d: continue
-        if end_date and d > end_date: break
+        if not d:
+            continue
+        if end_date and d > end_date:
+            break
         try:
             dates.append(d)
             opens.append(float(r["open"]))
@@ -342,4 +393,227 @@ def load_csv(path, end_date=None):
             vols.append(float(r[vol_col]) if vol_col and r.get(vol_col) else None)
         except (KeyError, ValueError):
             continue
+
+    if not dates:
+        raise ValueError(f"{path}: no usable rows (check --end-date isn't before all data)")
+
     return {"d": dates, "o": opens, "h": highs, "l": lows, "c": closes, "v": vols}
+
+
+# ══════════════════════════════════════════════════════════════
+# R2 helpers (same convention as pipeline.py / shakeout_scanner.py)
+# ══════════════════════════════════════════════════════════════
+
+def _require_r2():
+    if not WORKER_URL or not WORKER_TOKEN:
+        print("ERROR: set WORKER_URL and WORKER_TOKEN env vars first.")
+        sys.exit(1)
+
+
+def download_all_chunks():
+    _require_r2()
+    all_data = {}
+    with httpx.Client() as client:
+        for i in range(R2_CHUNKS):
+            fname = f"ohlc_{i+1}.json"
+            r = client.get(f"{WORKER_URL}/{fname}", headers=WORKER_HEADERS, timeout=90)
+            if r.status_code != 200:
+                print(f"  [warn] {fname} -> HTTP {r.status_code}, skipping")
+                continue
+            data = r.json()
+            stocks = data.get("stocks", {})
+            all_data.update(stocks)
+            print(f"  {fname}: {len(stocks)} stocks")
+    return all_data
+
+
+def download_one_symbol(symbol):
+    all_data = download_all_chunks()
+    s = all_data.get(symbol.upper())
+    if s is None:
+        print(f"ERROR: {symbol} not found in R2 OHLC store.")
+        sys.exit(1)
+    return s
+
+
+def upload_to_r2(filename, data_str):
+    _require_r2()
+    url = f"{WORKER_URL}?file={filename}"
+    with httpx.Client() as client:
+        r = client.post(url, headers={**WORKER_HEADERS, "Content-Type": "application/json"},
+                         content=data_str.encode(), timeout=90)
+    if r.status_code != 200:
+        print(f"  [warn] R2 upload failed for {filename}: HTTP {r.status_code} {r.text[:200]}")
+        return False
+    print(f"  ↑ {filename} ({len(data_str)/1024:.1f} KB) uploaded to R2")
+    return True
+
+
+def _check_liquidity(volumes, closes, n, min_turnover=3_00_00_000):
+    lookback = min(50, n)
+    if lookback < 20:
+        return True
+    vols = [v for v in volumes[-lookback:] if v is not None]
+    prices = [c for c in closes[-lookback:] if c is not None and c > 0]
+    if len(vols) < 20 or len(prices) < 20:
+        return False
+    return (sum(vols)/len(vols) * sum(prices)/len(prices)) >= min_turnover
+
+
+# ══════════════════════════════════════════════════════════════
+# Debug printing
+# ══════════════════════════════════════════════════════════════
+
+def print_debug_trace(hist, params):
+    highs, lows, closes, dates = hist["h"], hist["l"], hist["c"], hist["d"]
+    n = len(closes)
+    lookback = params.get("lookback", 150)
+    zigzag_pct = params.get("zigzag_pct", 0.04)
+
+    lb = min(lookback, n)
+    start = n - lb
+    h_w, l_w, c_w = highs[start:], lows[start:], closes[start:]
+
+    piv_raw = _vcp_zigzag_close_pct(h_w, l_w, c_w, zigzag_pct)
+    piv_raw = [(i + start, p, k) for (i, p, k) in piv_raw]
+    piv_filtered = _vcp_filter_nested(piv_raw, params.get("max_nested_ratio", 0.65))
+
+    print(f"\n--- DEBUG: pivots within last {lb} days (zigzag_pct={zigzag_pct*100:.0f}%) ---")
+    print(f"Before nested-filter ({len(piv_raw)} pivots):")
+    for i, p, k in piv_raw:
+        print(f"   {dates[i]}  {k}  {p:.2f}")
+    print(f"\nAfter nested-filter ({len(piv_filtered)} pivots):")
+    for i, p, k in piv_filtered:
+        print(f"   {dates[i]}  {k}  {p:.2f}")
+
+    h_pivots = [p for p in piv_filtered if p[2] == "H"]
+    print(f"\nCandidate base_high anchors tried (most recent first): "
+          f"{[dates[p[0]] for p in sorted(h_pivots, key=lambda x: -x[0])]}")
+    print()
+
+
+def print_result(symbol, result):
+    if not result:
+        print(f"{symbol}: no VCP detected")
+        return
+    print(f"\n{symbol}  —  VCP detected  (score {result['score']}/100, "
+          f"shape: {result['resistance_shape']})")
+    print(f"  Pivot (buy point): ₹{result['pivot']}  ({result['dist_from_pivot_pct']}% from last close)")
+    print(f"  Contractions ({result['contractions']}):")
+    for c in result["contraction_dates"]:
+        print(f"    {c['h_date']}  ₹{c['h_price']}  ->  {c['l_date']}  ₹{c['l_price']}")
+    print(f"  Depths: {result['depths_pct']}")
+    print(f"  Base: {result['base_start_date']} -> {result['base_end_date']}  "
+          f"({result['base_len']} days)")
+    print(f"  Prior move: {result['prior_move_pct']}%  |  Vol dry-up: {result['vol_dryup']}")
+
+
+# ══════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════
+
+def _parse_params(s):
+    out = {}
+    if not s:
+        return out
+    for pair in s.split(","):
+        if "=" not in pair:
+            continue
+        k, v = pair.split("=", 1)
+        k, v = k.strip(), v.strip()
+        try:
+            out[k] = float(v) if "." in v or "e" in v.lower() else int(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Standalone VCP detector tester")
+    ap.add_argument("--csv", help="path to a TradingView-exported daily CSV")
+    ap.add_argument("--symbol", help="fetch one symbol's OHLC from R2")
+    ap.add_argument("--all", action="store_true", help="scan every symbol in R2")
+    ap.add_argument("--end-date", help="truncate history to end on/before this date (YYYY-MM-DD)")
+    ap.add_argument("--debug", action="store_true", help="print pivot/filter trace")
+    ap.add_argument("--params", help="override _detect_vcp kwargs, e.g. zigzag_pct=0.05,max_final_depth=0.15")
+    ap.add_argument("--save", help="save results as JSON to this local path")
+    ap.add_argument("--r2-key", help="push results JSON to R2 under this filename")
+    args = ap.parse_args()
+
+    extra_params = _parse_params(args.params)
+
+    if args.csv:
+        hist = load_csv(args.csv, end_date=args.end_date)
+        symbol = os.path.basename(args.csv).split(".")[0]
+        print(f"Loaded {len(hist['d'])} days: {hist['d'][0]} -> {hist['d'][-1]}")
+        if args.debug:
+            print_debug_trace(hist, extra_params)
+        result = _detect_vcp(hist, **extra_params)
+        print_result(symbol, result)
+        if args.save:
+            with open(args.save, "w") as f:
+                json.dump({"symbol": symbol, "result": result}, f, indent=2)
+            print(f"\nSaved to {args.save}")
+        return
+
+    if args.symbol:
+        s = download_one_symbol(args.symbol)
+        if args.end_date:
+            keep = [i for i, d in enumerate(s["d"]) if d <= args.end_date]
+            s = {k: [v[i] for i in keep] for k, v in s.items()}
+        print(f"Loaded {len(s['d'])} days: {s['d'][0]} -> {s['d'][-1]}")
+        if args.debug:
+            print_debug_trace(s, extra_params)
+        result = _detect_vcp(s, **extra_params)
+        print_result(args.symbol.upper(), result)
+        if args.save:
+            with open(args.save, "w") as f:
+                json.dump({"symbol": args.symbol.upper(), "result": result}, f, indent=2)
+            print(f"\nSaved to {args.save}")
+        return
+
+    if args.all:
+        print("Downloading OHLC chunks...")
+        all_data = download_all_chunks()
+        print(f"\nTotal loaded: {len(all_data)} stocks\n")
+
+        signals = []
+        skipped_illiquid = 0
+        for sym, s in all_data.items():
+            if not _check_liquidity(s.get("v", []), s.get("c", []), len(s.get("d", []))):
+                skipped_illiquid += 1
+                continue
+            r = _detect_vcp(s, **extra_params)
+            if r:
+                signals.append({"symbol": sym, **r})
+
+        signals.sort(key=lambda x: x["score"], reverse=True)
+        print(f"Skipped (illiquid): {skipped_illiquid}")
+        print(f"VCP signals found: {len(signals)}\n")
+        for sig in signals[:30]:
+            print(f"  {sig['symbol']:<15} score={sig['score']:<6} "
+                  f"shape={sig['resistance_shape']:<11} "
+                  f"contractions={sig['contractions']}  "
+                  f"pivot=₹{sig['pivot']}  dist={sig['dist_from_pivot_pct']}%")
+        if len(signals) > 30:
+            print(f"  ... and {len(signals)-30} more")
+
+        result = {
+            "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "count": len(signals),
+            "signals": signals,
+        }
+        if args.save:
+            with open(args.save, "w") as f:
+                json.dump(result, f, indent=2)
+            print(f"\nSaved to {args.save}")
+        if args.r2_key:
+            print(f"\nPushing results to R2 as {args.r2_key}...")
+            upload_to_r2(args.r2_key, json.dumps(result))
+        return
+
+    ap.print_help()
+
+
+if __name__ == "__main__":
+    main()
