@@ -805,6 +805,20 @@ def _band_dir(chg: dict) -> str:
         return "down"
 
 
+def _band_sort_val(chg: dict) -> int:
+    """
+    Sort key for circuit-band Telegram alert ordering. `to` is usually a
+    numeric percentage, but NSE sometimes reports non-numeric band states
+    like "No Band" (band removed) — int() on those raises ValueError.
+    Treat any non-numeric value as lowest priority (sorts to the bottom
+    when reverse=True) rather than crashing the whole run.
+    """
+    try:
+        return int(chg.get("to", 0))
+    except (ValueError, TypeError):
+        return -1
+
+
 async def run():
     status = PipelineStatus("pipeline_nse")
     try:
@@ -1194,12 +1208,12 @@ async def run():
             if increased:
                 msg_lines.append("")
                 msg_lines.append("🟢 <b>Band Increased</b>")
-                for sym, chg in sorted(increased.items(), key=lambda x: int(x[1].get("to", 0)), reverse=True):
+                for sym, chg in sorted(increased.items(), key=lambda x: _band_sort_val(x[1]), reverse=True):
                     msg_lines.append(f"<code>{sym}</code>: {chg.get('from')}% → {chg.get('to')}%")
             if decreased:
                 msg_lines.append("")
                 msg_lines.append("🔴 <b>Band Decreased</b>")
-                for sym, chg in sorted(decreased.items(), key=lambda x: int(x[1].get("to", 0)), reverse=True):
+                for sym, chg in sorted(decreased.items(), key=lambda x: _band_sort_val(x[1]), reverse=True):
                     msg_lines.append(f"<code>{sym}</code>: {chg.get('from')}% → {chg.get('to')}%")
             send_message("\n".join(msg_lines))
 
