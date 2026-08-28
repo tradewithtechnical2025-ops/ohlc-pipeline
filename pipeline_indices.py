@@ -401,9 +401,14 @@ def merge_daily_into_history(parsed, daily_row):
     - If today isn't present yet, APPEND a new row built from daily-feed.
     - No-op if there's no daily-feed row for this symbol, or if the
       history is empty (nothing to anchor the merge to).
+
+    Returns (parsed, status) where status is one of:
+      "appended" | "replaced" | "no-daily-row" | "empty-history"
     """
-    if not daily_row or not parsed:
-        return parsed
+    if not parsed:
+        return parsed, "empty-history"
+    if not daily_row:
+        return parsed, "no-daily-row"
 
     today_str = date.today().isoformat()
     merged_row = {
@@ -421,9 +426,11 @@ def merge_daily_into_history(parsed, daily_row):
     last_date = str(parsed[-1].get("date", ""))[:10]
     if last_date == today_str:
         parsed[-1] = merged_row
+        status = "replaced"
     else:
         parsed.append(merged_row)
-    return parsed
+        status = "appended"
+    return parsed, status
 
 
 async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, daily_row=None):
@@ -432,15 +439,15 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
         parsed = parse_index_history(rows)
         if not parsed:
             print(f"[{i}/{total}] ✗ {symbol} | no data")
-            return symbol, None, None, False
-        parsed = merge_daily_into_history(parsed, daily_row)
+            return symbol, None, None, False, "no-history"
+        parsed, merge_status = merge_daily_into_history(parsed, daily_row)
         weekly = compute_weekly_return(parsed)
         msw = compute_index_mswing(parsed)
         await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
                                     schema_v=1, extra_meta={"candle_count": len(parsed)})
         years_note = f" ({EXTENDED_HISTORY_DAYS[symbol] // 365}Y)" if symbol in EXTENDED_HISTORY_DAYS else ""
-        print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles{years_note}")
-        return symbol, weekly, msw, True
+        print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles{years_note} | daily-merge: {merge_status}")
+        return symbol, weekly, msw, True, merge_status
 
 
 def compute_weekly_return(history):
@@ -617,7 +624,9 @@ async def main():
         success = failed = 0
         weekly_map = {}
         mswing_map = {}
-        for symbol, weekly, msw, ok in results:
+        merge_counts = {"appended": 0, "replaced": 0, "no-daily-row": 0, "empty-history": 0, "no-history": 0}
+        for symbol, weekly, msw, ok, merge_status in results:
+            merge_counts[merge_status] = merge_counts.get(merge_status, 0) + 1
             if ok:
                 success += 1
                 if weekly:
@@ -645,6 +654,9 @@ async def main():
         print("\n=================================")
         print(" INDEX PIPELINE COMPLETED")
         print("=================================")
+        print(f"\n📅 Daily-merge into history — appended: {merge_counts['appended']} | "
+              f"replaced: {merge_counts['replaced']} | no daily row: {merge_counts['no-daily-row']} | "
+              f"empty history: {merge_counts['empty-history']} | no history at all: {merge_counts['no-history']}")
         print(f"\n✅ Success: {success}")
         print(f"❌ Failed : {failed}")
         print(f"📦 Total  : {total}\n")
