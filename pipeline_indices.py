@@ -390,13 +390,50 @@ def parse_index_history(rows):
     } for r in rows]
 
 
-async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta):
+def merge_daily_into_history(parsed, daily_row):
+    """
+    Merge today's daily-feed row into the historical candle list, so
+    index_history/{symbol}.json always reflects the latest price even on
+    days when Finedge's historical endpoint hasn't caught up yet.
+
+    - If the last historical row is already dated today, REPLACE it with
+      the daily-feed row (daily-feed is the more current/live source).
+    - If today isn't present yet, APPEND a new row built from daily-feed.
+    - No-op if there's no daily-feed row for this symbol, or if the
+      history is empty (nothing to anchor the merge to).
+    """
+    if not daily_row or not parsed:
+        return parsed
+
+    today_str = date.today().isoformat()
+    merged_row = {
+        "date"         : today_str,
+        "open"         : daily_row.get("open"),
+        "high"         : daily_row.get("high"),
+        "low"          : daily_row.get("low"),
+        "close"        : daily_row.get("close"),
+        "change_pct"   : daily_row.get("change_pct"),
+        "points_change": daily_row.get("points_change"),
+        "volume"       : daily_row.get("volume"),
+        "turnover"     : daily_row.get("turnover"),
+    }
+
+    last_date = str(parsed[-1].get("date", ""))[:10]
+    if last_date == today_str:
+        parsed[-1] = merged_row
+    else:
+        parsed.append(merged_row)
+    return parsed
+
+
+async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, daily_row=None):
     async with sem:
         rows = await fetch_index_history_one(client, meta["api_symbol"], symbol)
         parsed = parse_index_history(rows)
         if not parsed:
             print(f"[{i}/{total}] ✗ {symbol} | no data")
             return symbol, None, None, False
+        parsed = merge_daily_into_history(parsed, daily_row)
         weekly = compute_weekly_return(parsed)
         msw = compute_index_mswing(parsed)
         await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
@@ -569,7 +606,10 @@ async def main():
         sem = asyncio.Semaphore(HISTORY_CONCURRENCY)
 
         tasks = [
-            fetch_parse_upload_one_history(client, sem, i, total, symbol, meta)
+            fetch_parse_upload_one_history(
+                client, sem, i, total, symbol, meta,
+                daily_row=daily_parsed.get(symbol),
+            )
             for i, (symbol, meta) in enumerate(symbols, 1)
         ]
         results = await asyncio.gather(*tasks)
