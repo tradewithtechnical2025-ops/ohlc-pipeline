@@ -390,6 +390,25 @@ def parse_index_history(rows):
     } for r in rows]
 
 
+def build_ohlc_arrays(parsed):
+    """
+    Convert a symbol's parsed history (list of {date,open,high,low,close,
+    volume,...} row-dicts) into parallel arrays {d,o,h,l,c,v} — the exact
+    shape the frontend's stock ohlc_N.json chunks already use (see
+    index.html's mergeStocksIntoCache). Feeding index_ohlc.json in this
+    same shape means the frontend reuses its existing merge code unchanged
+    for indices too.
+    """
+    return {
+        "d": [r.get("date") for r in parsed],
+        "o": [r.get("open") for r in parsed],
+        "h": [r.get("high") for r in parsed],
+        "l": [r.get("low") for r in parsed],
+        "c": [r.get("close") for r in parsed],
+        "v": [r.get("volume") for r in parsed],
+    }
+
+
 def merge_daily_into_history(parsed, daily_row):
     """
     Merge today's daily-feed row into the historical candle list, so
@@ -439,15 +458,16 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
         parsed = parse_index_history(rows)
         if not parsed:
             print(f"[{i}/{total}] ✗ {symbol} | no data")
-            return symbol, None, None, False, "no-history"
+            return symbol, None, None, False, "no-history", None
         parsed, merge_status = merge_daily_into_history(parsed, daily_row)
         weekly = compute_weekly_return(parsed)
         msw = compute_index_mswing(parsed)
+        ohlc_arrays = build_ohlc_arrays(parsed)
         await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
                                     schema_v=1, extra_meta={"candle_count": len(parsed)})
         years_note = f" ({EXTENDED_HISTORY_DAYS[symbol] // 365}Y)" if symbol in EXTENDED_HISTORY_DAYS else ""
         print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles{years_note} | daily-merge: {merge_status}")
-        return symbol, weekly, msw, True, merge_status
+        return symbol, weekly, msw, True, merge_status, ohlc_arrays
 
 
 def compute_weekly_return(history):
@@ -624,8 +644,9 @@ async def main():
         success = failed = 0
         weekly_map = {}
         mswing_map = {}
+        index_ohlc_map = {}
         merge_counts = {"appended": 0, "replaced": 0, "no-daily-row": 0, "empty-history": 0, "no-history": 0}
-        for symbol, weekly, msw, ok, merge_status in results:
+        for symbol, weekly, msw, ok, merge_status, ohlc_arrays in results:
             merge_counts[merge_status] = merge_counts.get(merge_status, 0) + 1
             if ok:
                 success += 1
@@ -633,6 +654,8 @@ async def main():
                     weekly_map[symbol] = weekly
                 if msw:
                     mswing_map[symbol] = msw
+                if ohlc_arrays:
+                    index_ohlc_map[symbol] = ohlc_arrays
             else:
                 failed += 1
 
@@ -642,6 +665,16 @@ async def main():
         await upload_with_manifest(client, r2_upload, "index_mswing.json", mswing_map,
                                     schema_v=1, extra_meta={"index_count": len(mswing_map)})
         print(f"✅ index_mswing.json uploaded ({len(mswing_map)} indices)\n")
+
+        # index_ohlc.json — { symbol: {d,o,h,l,c,v} }, single combined file
+        # in the SAME array shape the frontend's stock ohlc_N.json chunks
+        # use. Lets the chart page merge indices into its existing symbol
+        # pool with one fetch instead of 119 separate index_history/*.json
+        # requests. Built from history already fetched above — no extra
+        # Finedge calls.
+        await upload_with_manifest(client, r2_upload, "index_ohlc.json", index_ohlc_map,
+                                    schema_v=1, extra_meta={"index_count": len(index_ohlc_map)})
+        print(f"✅ index_ohlc.json uploaded ({len(index_ohlc_map)} indices)\n")
 
         if returns_rows is not None:
             returns_parsed = parse_index_returns(returns_rows, valid_symbols, weekly_map)
