@@ -928,7 +928,7 @@ def _finedge_quote_batches(symbols):
 async def _finedge_quote_fetch(client, sem, symbols):
     """One /v2/quote call for up to FINEDGE_OHLC_BATCH symbols.
     Returns {symbol: {open_price, high_price, low_price, current_price, volume, ...}}"""
-    params = {"symbol": ",".join(symbols), "token": FINEDGE_TOKEN}
+    params = {"symbol": symbols, "token": FINEDGE_TOKEN}  # array param → httpx sends symbol=A&symbol=B&symbol=C
     async with sem:
         for attempt in range(RETRY):
             await asyncio.sleep(FINEDGE_OHLC_DELAY)
@@ -960,8 +960,10 @@ async def fetch_finedge_quotes_all(client, symbols) -> dict:
     batches = list(_finedge_quote_batches(symbols))
     results = await asyncio.gather(*[_finedge_quote_fetch(client, sem, b) for b in batches])
     merged = {}
-    for res in results:
+    for batch, res in zip(batches, results):
         merged.update(res)
+        if len(res) < len(batch) * 0.5:
+            log.warning(f"  Finedge batch: sent {len(batch)}, got {len(res)} — possible param/delimiter issue")
     log.info(f"Finedge quote: {len(merged)}/{len(symbols)} symbols returned")
     return merged
 
