@@ -12,6 +12,7 @@ Usage:
   python pipeline.py fund_daily
   python pipeline.py fund_full
   python pipeline.py fund_full_1..10
+  python pipeline.py finedge_daily   # standalone Finedge OHLC snapshot → own R2 history
   python pipeline.py ep_scan
   python pipeline.py hlr_scan
   python pipeline.py pattern_scan
@@ -64,6 +65,13 @@ RATE_DELAY         = 0.4
 RETRY              = 5
 FUND_CONCURRENCY   = 4
 FINEDGE_DELAY      = 0.25
+
+# ── Finedge daily-OHLC (standalone system — does NOT touch Upstox OHLC) ──
+FINEDGE_QUOTE_URL      = "https://data.finedgeapi.com/api/v2/quote"
+FINEDGE_OHLC_BATCH     = 100   # max symbols per call (non-premium limit)
+FINEDGE_OHLC_CONCURRENCY = 3
+FINEDGE_OHLC_DELAY     = 0.3
+FINEDGE_OHLC_CHUNKS    = 4     # separate chunk count from Upstox R2_CHUNKS
 
 HERE = Path(__file__).parent
 
@@ -900,6 +908,148 @@ async def fetch_one_fundamental(client, sem, sym, isin=""):
         obj["book_value_ps"]=round((eq_cap+res)/shares,2) if shares else None
         obj["net_debt"]=round(borr-cash) if (borr or cash) else None
     return sym, obj
+
+
+# ══════════════════════════════════════════════════════════════
+# FINEDGE DAILY OHLC  (standalone system — separate storage from Upstox)
+#
+# Finedge /v2/quote only gives a live/current-day snapshot, no history.
+# So every day we fetch today's snapshot and APPEND it into our own
+# rolling per-symbol series, stored in its own R2 chunk files
+# (finedge_ohlc_1.json..finedge_ohlc_N.json). Upstox ohlc_*.json chunks
+# are never read or written by any function in this section.
+# ══════════════════════════════════════════════════════════════
+
+def _finedge_quote_batches(symbols):
+    """Split symbol list into ≤FINEDGE_OHLC_BATCH-sized groups."""
+    for i in range(0, len(symbols), FINEDGE_OHLC_BATCH):
+        yield symbols[i:i + FINEDGE_OHLC_BATCH]
+
+async def _finedge_quote_fetch(client, sem, symbols):
+    """One /v2/quote call for up to FINEDGE_OHLC_BATCH symbols.
+    Returns {symbol: {open_price, high_price, low_price, current_price, volume, ...}}"""
+    params = {"symbol": ",".join(symbols), "token": FINEDGE_TOKEN}
+    async with sem:
+        for attempt in range(RETRY):
+            await asyncio.sleep(FINEDGE_OHLC_DELAY)
+            try:
+                r = await client.get(FINEDGE_QUOTE_URL, params=params, timeout=30)
+            except httpx.RequestError as e:
+                log.warning(f"  Finedge quote network error: {e}, retry {attempt+1}")
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code == 401:
+                log.error("❌ FINEDGE TOKEN INVALID"); sys.exit(1)
+            if r.status_code == 429:
+                log.warning("  Finedge quote rate limit — 20s"); await asyncio.sleep(20); continue
+            if r.status_code in (502, 503, 504):
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code != 200 or not r.text.strip():
+                log.warning(f"  Finedge quote batch failed: HTTP {r.status_code}")
+                return {}
+            try:
+                data = r.json()
+                return data if isinstance(data, dict) else {}
+            except Exception as e:
+                log.warning(f"  Finedge quote parse error: {e}")
+                return {}
+    return {}
+
+async def fetch_finedge_quotes_all(client, symbols) -> dict:
+    """Fetches /v2/quote for the full symbol universe, batched + concurrent."""
+    sem = asyncio.Semaphore(FINEDGE_OHLC_CONCURRENCY)
+    batches = list(_finedge_quote_batches(symbols))
+    results = await asyncio.gather(*[_finedge_quote_fetch(client, sem, b) for b in batches])
+    merged = {}
+    for res in results:
+        merged.update(res)
+    log.info(f"Finedge quote: {len(merged)}/{len(symbols)} symbols returned")
+    return merged
+
+def _finedge_quote_to_candle(today: str, q: dict):
+    """Maps a /v2/quote record to our OHLC candle shape. Close = current_price
+    (final EOD close once market has closed for the day)."""
+    o, h, l, c = q.get("open_price"), q.get("high_price"), q.get("low_price"), q.get("current_price")
+    if None in (o, h, l, c):
+        return None
+    return {"d": today, "o": o, "h": h, "l": l, "c": c, "v": q.get("volume")}
+
+def upsert_finedge_candle(all_data, sym, candle):
+    """Same upsert semantics as Upstox's upsert_candle, but on the
+    finedge-only series (no 'oi' field — Finedge quote has no open interest)."""
+    if sym not in all_data:
+        all_data[sym] = {k: [] for k in ("d", "o", "h", "l", "c", "v")}
+    s = all_data[sym]
+    if candle["d"] in s["d"]:
+        idx = s["d"].index(candle["d"])
+        for k in ("o", "h", "l", "c", "v"): s[k][idx] = candle[k]
+    else:
+        for k in s: s[k].append(candle[k])
+        order = sorted(range(len(s["d"])), key=lambda i: s["d"][i])
+        for k in s: s[k] = [s[k][i] for i in order]
+
+async def download_finedge_chunks(client) -> dict:
+    tasks = [r2_download(client, f"finedge_ohlc_{i+1}.json") for i in range(FINEDGE_OHLC_CHUNKS)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_data = {}
+    for i, res in enumerate(results):
+        if isinstance(res, Exception): log.warning(f"  finedge_ohlc_{i+1}.json error: {res}")
+        elif res and "stocks" in res: all_data.update(res["stocks"])
+    log.info(f"Finedge OHLC master: {len(all_data)} stocks across {FINEDGE_OHLC_CHUNKS} chunks")
+    return all_data
+
+async def upload_finedge_chunks(client, all_data, today):
+    symbols = sorted(all_data.keys()); n = len(symbols)
+    size = (n + FINEDGE_OHLC_CHUNKS - 1) // FINEDGE_OHLC_CHUNKS; tasks = []
+    for i in range(FINEDGE_OHLC_CHUNKS):
+        chunk_syms = symbols[i*size:(i+1)*size]; chunk = {s: all_data[s] for s in chunk_syms}
+        payload = json.dumps({"updated": today, "chunk": i+1, "total": FINEDGE_OHLC_CHUNKS, "stocks": chunk})
+        tasks.append(upload_str_with_manifest(
+            client, r2_upload, f"finedge_ohlc_{i+1}.json", payload,
+            schema_v=1, extra_meta={"chunk": i+1, "total": FINEDGE_OHLC_CHUNKS, "stock_count": len(chunk_syms)}
+        ))
+    await asyncio.gather(*tasks)
+    log.info(f"✓ {FINEDGE_OHLC_CHUNKS} Finedge OHLC chunks uploaded ({n} stocks)")
+
+async def run_finedge_daily() -> None:
+    """Standalone daily job: snapshot today's OHLC from Finedge /v2/quote
+    and append it to our own rolling history in finedge_ohlc_*.json.
+    Completely independent of the Upstox ohlc_*.json chunks/pipeline."""
+    status = PipelineStatus("run_finedge_daily")
+    try:
+        today = today_ist()
+        if not is_trading_day(today):
+            log.info(f"⏭  {today} not a trading day — skipping Finedge daily")
+            return
+        log.info(f"━━━ Finedge Daily  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            symbols = sorted(ISIN_MAP.keys())  # NSE trading symbols, matches Finedge's "ITC"-style keys
+            log.info(f"Universe: {len(symbols)} NSE symbols")
+
+            quotes, all_data = await asyncio.gather(
+                fetch_finedge_quotes_all(client, symbols),
+                download_finedge_chunks(client),
+            )
+
+            delta = {}
+            for sym, q in quotes.items():
+                candle = _finedge_quote_to_candle(today, q)
+                if candle is None: continue
+                upsert_finedge_candle(all_data, sym, candle)
+                delta[sym] = candle
+
+            log.info(f"✅ Finedge candles today: {len(delta)}")
+            await asyncio.gather(
+                upload_finedge_chunks(client, all_data, today),
+                upload_str_with_manifest(client, r2_upload, "finedge_ohlc_delta.json",
+                                          json.dumps({"date": today, "stocks": delta}),
+                                          schema_v=1, extra_meta={"stock_count": len(delta)}),
+            )
+        status.success()
+        log.info("━━━ Finedge Daily complete ━━━")
+    except Exception as e:
+        status.failure(e)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3647,6 +3797,7 @@ if __name__ == "__main__":
         case "fund_full_8":   asyncio.run(run_fund_full(8))
         case "fund_full_9":   asyncio.run(run_fund_full(9))
         case "fund_full_10":  asyncio.run(run_fund_full(10))
+        case "finedge_daily": asyncio.run(run_finedge_daily())
         case "ep_scan":       asyncio.run(run_ep_scan())
         case "hlr_scan":      asyncio.run(run_hlr_scan())
         case "pattern_scan":  asyncio.run(run_pattern_scan())
