@@ -21,6 +21,8 @@ Usage:
 """
 
 import asyncio
+import bisect
+import calendar
 import json
 import logging
 import os
@@ -232,6 +234,26 @@ def prev_trading_day(d: str) -> str:
 
 def rolling_cutoff(anchor: str) -> str:
     return (date.fromisoformat(anchor) - timedelta(days=ROLLING_DAYS)).isoformat()
+
+def _subtract_months(d: date, months: int) -> date:
+    """Calendar-correct month subtraction (04/09 -1mo -> 04/08, clamps day to
+    target month length e.g. 31/03 -1mo -> 28/02 or 29/02 on leap years)."""
+    total = d.month - 1 - months
+    year = d.year + total // 12
+    month = total % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last_day))
+
+def _calendar_lookback_close(dates, closes, anchor_date: str, months: int):
+    """Close price on the nearest available trading day ON OR BEFORE
+    (anchor_date - `months` calendar months). `dates` must be sorted
+    ascending ISO strings. Returns None if no such day exists in range."""
+    target = _subtract_months(date.fromisoformat(anchor_date), months).isoformat()
+    pos = bisect.bisect_right(dates, target) - 1
+    if pos < 0:
+        return None
+    return closes[pos]
+
 def _is_week_complete(today_d: str) -> bool:
     """True agar today_d ke baad is ISO week mein koi trading day nahi bacha."""
     dt_today = date.fromisoformat(today_d)
@@ -1754,8 +1776,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         
         if n < 2: continue   # 20 → 2, sirf pct_ch ke liye prev candle chahiye
         
-        # Last valid close (None nahi)
-        ltp = next((v for v in reversed(closes) if v), None)
+        # Last valid close (None nahi) + uska actual date index
+        ltp_idx = next((i for i in range(n-1, -1, -1) if closes[i]), None)
+        ltp = closes[ltp_idx] if ltp_idx is not None else None
         if not ltp: continue  # genuinely no price data ever
         
         prev_cls = next((closes[i] for i in range(n-2, -1, -1) if closes[i]), None)
@@ -1797,11 +1820,11 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         emad10=round((ltp-ema10)/ema10*100,2) if ema10 else None
         emad21=round((ltp-ema21)/ema21*100,2) if ema21 else None
         emad50=round((ltp-ema50)/ema50*100,2) if ema50 else None
-        def ret(n_days):
-            idx=n-1-n_days
-            if idx<0 or closes[idx] is None or not closes[idx]: return None
-            return round((ltp-closes[idx])/closes[idx]*100,2)
-        mg1=ret(21); mg3=ret(63); mg6=ret(126); mg9=ret(189); mg12=ret(252)
+        def ret_cal(months):
+            close_then = _calendar_lookback_close(dates, closes, dates[ltp_idx], months)
+            if not close_then: return None
+            return round((ltp-close_then)/close_then*100,2)
+        mg1=ret_cal(1); mg3=ret_cal(3); mg6=ret_cal(6); mg9=ret_cal(9); mg12=ret_cal(12)
         def rng(n_days):
             h=[v for v in highs[-n_days:] if v]; l=[v for v in lows[-n_days:] if v]
             if not h or not l or not ltp: return None
