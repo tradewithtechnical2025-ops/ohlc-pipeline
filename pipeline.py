@@ -60,7 +60,7 @@ FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
 UPSTOX_BASE  = "https://api.upstox.com/v2"
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
-ROLLING_DAYS       = 730
+ROLLING_DAYS       = 1100
 R2_CHUNKS          = 8
 CONCURRENCY        = 5
 RATE_DELAY         = 0.4
