@@ -22,12 +22,13 @@ FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 # and only after confirming failure rate stays near zero.
 HISTORY_CONCURRENCY = 3
 
-# Symbols that need a longer historical lookback than the default 365 days.
-# Add entries here if another symbol ever needs extended history — no
-# other code changes required.
+# Default historical lookback for every index (3 years, matches the stock
+# pipeline's ROLLING_DAYS). EXTENDED_HISTORY_DAYS is only for a symbol that
+# ever needs a lookback LONGER than this baseline — no other code changes
+# required to add one.
+DEFAULT_HISTORY_DAYS = 365 * 3
+
 EXTENDED_HISTORY_DAYS = {
-    "NIFMID400": 365 * 3,
-    "NIFTY50":   365 * 3,
 }
 
 WORKER_HEADERS = {
@@ -353,10 +354,10 @@ def parse_index_returns(rows, valid_symbols, weekly_map=None):
 # ─────────────────────────────────────────────
 
 async def fetch_index_history_one(client, api_symbol, symbol):
-    # Most symbols get the default 365-day window. A small set of symbols
-    # (see EXTENDED_HISTORY_DAYS) need a longer lookback — everything else
-    # is unaffected.
-    lookback_days = EXTENDED_HISTORY_DAYS.get(symbol, 365)
+    # Every symbol now gets a 3-year lookback by default (DEFAULT_HISTORY_DAYS).
+    # EXTENDED_HISTORY_DAYS is only for a symbol that ever needs a lookback
+    # LONGER than this baseline — currently empty since 3Y is the baseline.
+    lookback_days = EXTENDED_HISTORY_DAYS.get(symbol, DEFAULT_HISTORY_DAYS)
     today     = datetime.now().date()
     from_date = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     to_date   = today.strftime("%Y-%m-%d")
