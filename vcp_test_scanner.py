@@ -58,7 +58,17 @@ WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 # script always tests exactly what production runs. If you tune params
 # here, port the same change back into pipeline.py's _detect_vcp.
 # ══════════════════════════════════════════════════════════════
-
+def _vcp_atr(highs, lows, closes, period=14):
+    """Average True Range over the trailing `period` bars."""
+    n = len(highs)
+    if n < period + 1: return 0.0
+    trs = []
+    for i in range(1, n):
+        h, l, c_prev = highs[i], lows[i], closes[i - 1]
+        if h is None or l is None or c_prev is None: continue
+        trs.append(max(h - l, abs(h - c_prev), abs(l - c_prev)))
+    if len(trs) < period: return 0.0
+    return sum(trs[-period:]) / period
 def _vcp_sma(arr, period, end=None):
     end = len(arr) if end is None else end
     if end < period: return None
@@ -66,7 +76,7 @@ def _vcp_sma(arr, period, end=None):
     if not seg or any(v is None for v in seg): return None
     return sum(seg) / period
 
-def _vcp_zigzag_pct(highs, lows, pct_threshold=0.04):
+def _vcp_zigzag_abs(highs, lows, atr_threshold):
     n = len(highs)
     if n < 2: return []
     piv = []
@@ -79,26 +89,77 @@ def _vcp_zigzag_pct(highs, lows, pct_threshold=0.04):
         if ext_high is None or h > ext_high: ext_high, ext_high_idx = h, i
         if ext_low  is None or l < ext_low:  ext_low,  ext_low_idx  = l, i
         if direction is None:
-            if ext_high is not None and l <= ext_high * (1 - pct_threshold):
+            if ext_high is not None and l <= ext_high - atr_threshold:
                 piv.append((ext_high_idx, ext_high, "H", i))
                 direction = "down"; ext_low, ext_low_idx = l, i
-            elif ext_low is not None and h >= ext_low * (1 + pct_threshold):
+            elif ext_low is not None and h >= ext_low + atr_threshold:
                 piv.append((ext_low_idx, ext_low, "L", i))
                 direction = "up"; ext_high, ext_high_idx = h, i
         elif direction == "up":
-            if l <= ext_high * (1 - pct_threshold):
+            if l <= ext_high - atr_threshold:
                 piv.append((ext_high_idx, ext_high, "H", i))
                 direction = "down"; ext_low, ext_low_idx = l, i
         else:
-            if h >= ext_low * (1 + pct_threshold):
+            if h >= ext_low + atr_threshold:
                 piv.append((ext_low_idx, ext_low, "L", i))
                 direction = "up"; ext_high, ext_high_idx = h, i
     return piv
 
-def _vcp_zigzag_close_pct(highs, lows, closes, pct_threshold=0.04):
+
+def _vcp_zigzag_close_atr(highs, lows, closes, atr_threshold):
     n = len(closes)
     if n < 2: return []
-    close_piv = _vcp_zigzag_pct(closes, closes, pct_threshold)
+    close_piv = _vcp_zigzag_abs(closes, closes, atr_threshold)
+    if not close_piv: return []
+    piv = []
+    span_start = 0
+    for idx, _price, kind, confirm_idx in close_piv:
+        scan_end = confirm_idx
+        seg = highs[span_start:scan_end+1] if kind == "H" else lows[span_start:scan_end+1]
+        vals = [(span_start + off, v) for off, v in enumerate(seg) if v is not None]
+        if vals:
+            true_idx, true_price = (max(vals, key=lambda x: x[1]) if kind == "H"
+                                     else min(vals, key=lambda x: x[1]))
+            piv.append((true_idx, true_price, kind))
+            span_start = true_idx + 1
+        else:
+            span_start = idx + 1
+    return piv
+
+def _vcp_zigzag_abs(highs, lows, atr_threshold):
+    n = len(highs)
+    if n < 2: return []
+    piv = []
+    ext_high = highs[0]; ext_high_idx = 0
+    ext_low  = lows[0];  ext_low_idx  = 0
+    direction = None
+    for i in range(1, n):
+        h, l = highs[i], lows[i]
+        if h is None or l is None: continue
+        if ext_high is None or h > ext_high: ext_high, ext_high_idx = h, i
+        if ext_low  is None or l < ext_low:  ext_low,  ext_low_idx  = l, i
+        if direction is None:
+            if ext_high is not None and l <= ext_high - atr_threshold:
+                piv.append((ext_high_idx, ext_high, "H", i))
+                direction = "down"; ext_low, ext_low_idx = l, i
+            elif ext_low is not None and h >= ext_low + atr_threshold:
+                piv.append((ext_low_idx, ext_low, "L", i))
+                direction = "up"; ext_high, ext_high_idx = h, i
+        elif direction == "up":
+            if l <= ext_high - atr_threshold:
+                piv.append((ext_high_idx, ext_high, "H", i))
+                direction = "down"; ext_low, ext_low_idx = l, i
+        else:
+            if h >= ext_low + atr_threshold:
+                piv.append((ext_low_idx, ext_low, "L", i))
+                direction = "up"; ext_high, ext_high_idx = h, i
+    return piv
+
+
+def _vcp_zigzag_close_atr(highs, lows, closes, atr_threshold):
+    n = len(closes)
+    if n < 2: return []
+    close_piv = _vcp_zigzag_abs(closes, closes, atr_threshold)
     if not close_piv: return []
     piv = []
     span_start = 0
@@ -139,12 +200,14 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
     return out
 
 
-def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_contractions=6,
+def _detect_vcp(hist, lookback=150, atr_multiplier=1.5, atr_period=14,
+                min_contractions=3, max_contractions=6,
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.03,
                 max_ceiling_jump=0.025, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
                 live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15,
-                ceiling_band_tol=0.04, min_leg_span_bars=5, max_depth_ratio=0.75, debug=False):
+                ceiling_band_tol=0.04, min_leg_span_bars=5, max_depth_ratio=0.75,
+                min_pattern_days=15, max_pattern_days=325, debug=False):
     highs  = hist.get("h") or []
     lows   = hist.get("l") or []
     closes = hist.get("c") or []
@@ -164,7 +227,12 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
     lb = min(lookback, n)
     start = n - lb
     h_w = highs[start:]; l_w = lows[start:]; c_w = closes[start:]
-    piv = _vcp_zigzag_close_pct(h_w, l_w, c_w, zigzag_pct)
+
+    atr_val = _vcp_atr(h_w, l_w, c_w, atr_period)
+    if atr_val <= 0: return None
+    atr_threshold = atr_val * atr_multiplier
+
+    piv = _vcp_zigzag_close_atr(h_w, l_w, c_w, atr_threshold)
     piv = [(i + start, p, k) for (i, p, k) in piv]
     piv = _vcp_filter_nested(piv)
     if len(piv) < 3: return None
@@ -339,7 +407,8 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
             vol_dryup = last_vol < first_vol * 0.75 if first_vol else False
             base_start = run[0][0]; base_end = run[-1][2]
             base_len = base_end - base_start
-            if base_len < 10: return None
+            if base_len < min_pattern_days: return None
+            if base_len > max_pattern_days: return None
             score = 0
             score += min(len(run), 4) * 10
             score += max(0, (max_final_depth - final_depth) / max_final_depth) * 25
@@ -492,13 +561,12 @@ def print_debug_trace(hist, params):
     highs, lows, closes, dates = hist["h"], hist["l"], hist["c"], hist["d"]
     n = len(closes)
     lookback = params.get("lookback", 150)
-    zigzag_pct = params.get("zigzag_pct", 0.04)
-
-    lb = min(lookback, n)
-    start = n - lb
-    h_w, l_w, c_w = highs[start:], lows[start:], closes[start:]
-
-    piv_raw = _vcp_zigzag_close_pct(h_w, l_w, c_w, zigzag_pct)
+    atr_multiplier = params.get("atr_multiplier", 1.5)
+    atr_period = params.get("atr_period", 14)
+    
+    atr_val = _vcp_atr(h_w, l_w, c_w, atr_period)
+    atr_threshold = atr_val * atr_multiplier if atr_val > 0 else 0
+    piv_raw = _vcp_zigzag_close_atr(h_w, l_w, c_w, atr_threshold)
     piv_raw = [(i + start, p, k) for (i, p, k) in piv_raw]
     piv_filtered = _vcp_filter_nested(piv_raw, params.get("max_nested_ratio", 0.65))
 
