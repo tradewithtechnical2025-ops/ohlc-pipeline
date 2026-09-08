@@ -1,0 +1,31 @@
+name: Find Upstox Indices
+
+# Manual trigger only — this is a one-off discovery tool, not a scheduled job.
+# Run it from the Actions tab whenever you need to look up index instrument keys.
+on:
+  workflow_dispatch:
+    inputs:
+      keywords:
+        description: "Comma-separated search keywords (optional, defaults used if blank)"
+        required: false
+        default: ""
+
+jobs:
+  find-indices:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run index finder
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+        run: python find_indices.py
