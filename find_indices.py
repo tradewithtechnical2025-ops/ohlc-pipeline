@@ -18,13 +18,13 @@ HEADERS = {
     "Authorization": f"Bearer {UPSTOX_TOKEN}",
 }
 
-# Instrument Search API — segment + instrument_type filter, free-text query.
+# Instrument Search API — v2, segments/exchanges filter, free-text query.
 # Docs: https://upstox.com/developer/api-documentation/instrument-search/
-SEARCH_URL = "https://api.upstox.com/v3/instruments/search"
+SEARCH_URL = "https://api.upstox.com/v2/instruments/search"
 
 
 def search_indices(query="NIFTY"):
-    """Search NSE_INDEX segment for a keyword. Returns list of matches."""
+    """Search NSE+BSE INDEX segments for a keyword. Returns list of matches."""
     all_results = []
     page = 1
     while True:
@@ -32,11 +32,10 @@ def search_indices(query="NIFTY"):
             SEARCH_URL,
             params={
                 "query": query,
-                "exchange": "NSE",
-                "segment": "INDEX",
-                "instrument_type": "INDEX",
-                "page_num": page,
-                "page_size": 30,  # max allowed
+                "exchanges": "NSE,BSE",
+                "segments": "INDEX",
+                "page_number": page,
+                "records": 30,  # max allowed
             },
             headers=HEADERS,
             timeout=30,
@@ -45,12 +44,15 @@ def search_indices(query="NIFTY"):
             print(f"  ERR {r.status_code}: {r.text[:200]}")
             break
 
-        data = r.json().get("data", [])
+        body = r.json()
+        data = body.get("data", [])
         if not data:
             break
 
         all_results.extend(data)
-        if len(data) < 30:
+
+        total_pages = body.get("meta_data", {}).get("page", {}).get("total_pages", 1)
+        if page >= total_pages:
             break
         page += 1
 
