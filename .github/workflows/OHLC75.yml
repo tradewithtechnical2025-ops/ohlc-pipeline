@@ -1,0 +1,49 @@
+name: 75-min OHLC Pipeline
+
+on:
+  # Scheduled daily run — adjust the cron time to match whenever your
+  # existing daily OHLC pipeline runs (this should fire AFTER market
+  # close + a buffer, e.g. 15:45 IST = 10:15 UTC). GitHub Actions cron
+  # is always UTC, so IST = UTC + 5:30.
+  schedule:
+    - cron: '15 10 * * 1-5'   # 15:45 IST, Mon-Fri
+
+  # Manual trigger — pick the mode from the dropdown when running by hand.
+  # Use "full" the very first time (backfill), "daily" to test/re-run a
+  # day's update, "status" to just check what's currently stored.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Pipeline mode'
+        required: true
+        default: 'daily'
+        type: choice
+        options:
+          - daily
+          - full
+          - status
+
+jobs:
+  run-75min-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run 75-min OHLC pipeline
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        # Scheduled runs (cron) always use "daily" since there's no
+        # workflow_dispatch input to read; manual runs use whatever
+        # mode was picked from the dropdown.
+        run: python pipeline_75min.py ${{ inputs.mode || 'daily' }}
