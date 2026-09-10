@@ -5,8 +5,7 @@ on:
   # existing daily OHLC pipeline runs (this should fire AFTER market
   # close + a buffer, e.g. 15:45 IST = 10:15 UTC). GitHub Actions cron
   # is always UTC, so IST = UTC + 5:30.
-  schedule:
-    - cron: '15 10 * * 1-5'   # 15:45 IST, Mon-Fri
+  
 
   # Manual trigger — pick the mode from the dropdown when running by hand.
   # Use "full" the very first time (backfill), "daily" to test/re-run a
