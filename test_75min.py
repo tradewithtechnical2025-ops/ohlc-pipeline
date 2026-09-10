@@ -78,7 +78,7 @@ async def test_intraday_75m(client):
     return payload
 
 
-async def test_historical_75m(client, days_back=5):
+async def test_historical_75m(client, days_back=35):
     """V3 historical endpoint — a completed past trading day (avoids any
     'today's session still in progress' ambiguity in the intraday check)."""
     to_date = date.today().isoformat()
