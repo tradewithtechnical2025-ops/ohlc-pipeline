@@ -1,0 +1,37 @@
+name: Test Upstox 75-min Endpoint
+
+# Manual trigger only — this is a one-off diagnostic, not a scheduled job.
+# Go to Actions tab → "Test Upstox 75-min Endpoint" → "Run workflow" to
+# fire it. Pick "historical" if you want to test a real past trading day
+# instead of today's (possibly still-in-progress) session.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Test mode'
+        required: true
+        default: 'intraday'
+        type: choice
+        options:
+          - intraday
+          - historical
+
+jobs:
+  test-75min:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run 75-min endpoint test
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+        run: python test_75min.py ${{ inputs.mode }}
