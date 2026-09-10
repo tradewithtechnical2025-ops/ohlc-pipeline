@@ -45,6 +45,13 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py today
+      - name: 75-min OHLC
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline_75min.py daily
       - name: HLR Scan
         uses: nick-fields/retry@v3
         with:
