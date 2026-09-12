@@ -1,0 +1,37 @@
+name: Chart Pattern Scan (Test)
+
+# Manual trigger only, for now -- this is for testing/tuning the
+# pattern-detection thresholds before wiring it into the main
+# scheduled pipeline (twt-pipeline.yml).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Mode'
+        required: true
+        default: 'scan'
+        type: choice
+        options:
+          - scan
+          - status
+
+jobs:
+  pattern-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run pattern scan
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline_patterns.py ${{ inputs.mode }}
