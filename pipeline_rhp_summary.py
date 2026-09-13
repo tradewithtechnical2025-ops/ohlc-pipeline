@@ -36,6 +36,12 @@ Optional:
                      to keep job duration and API usage predictable)
   ONLY_MAINBOARD   — defaults to "true". Skips SME IPOs (issue_type=="sme")
                      for now — set to "false" to include them too once ready.
+  SKIP_LISTED      — defaults to "true". Skips IPOs whose status is already
+                     "listed" — the Snapshot button only shows for Open/
+                     Upcoming/Closed cards right now (Listed uses a plain
+                     table), so there's no point spending API calls on them
+                     yet. Set to "false" once the Listed table also gets a
+                     Snapshot button.
 
 Usage:
   python pipeline_rhp_summary.py
@@ -71,6 +77,7 @@ IPO_DATA_PATH  = os.environ.get("IPO_DATA_PATH", "ipo_data.json")
 MANIFEST_PATH  = os.environ.get("MANIFEST_PATH", "rhp_manifest.json")
 MAX_PER_RUN    = int(os.environ.get("MAX_PER_RUN", "8"))
 ONLY_MAINBOARD = os.environ.get("ONLY_MAINBOARD", "true").lower() == "true"
+SKIP_LISTED    = os.environ.get("SKIP_LISTED", "true").lower() == "true"
 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 DOWNLOAD_HEADERS = {
@@ -428,6 +435,12 @@ async def run():
             candidates = [x for x in candidates if x.get("issue_type") == "regular"]
             log.info(f"ONLY_MAINBOARD is on — skipping {before - len(candidates)} SME IPOs for now "
                      f"({len(candidates)} mainboard candidates remain)")
+
+        if SKIP_LISTED:
+            before = len(candidates)
+            candidates = [x for x in candidates if x.get("status") != "listed"]
+            log.info(f"SKIP_LISTED is on — skipping {before - len(candidates)} already-listed IPOs "
+                     f"({len(candidates)} candidates remain)")
 
         todo = candidates[:MAX_PER_RUN]
         if len(candidates) > MAX_PER_RUN:
