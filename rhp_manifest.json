@@ -1,0 +1,39 @@
+{
+  "processed": {
+    "veegaland-developers-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 14:37",
+      "error": "response doesn't look like a PDF (9162 bytes)"
+    },
+    "maharaja-and-speedex-india-ipo": {
+      "status": "done",
+      "at": "2026-09-13 14:38"
+    },
+    "om-galaxy-ipo": {
+      "status": "done",
+      "at": "2026-09-13 14:39"
+    },
+    "panchatv-bharat-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 14:40",
+      "error": ""
+    },
+    "raksan-transformers-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-13 14:42"
+    },
+    "manika-plastech-ipo": {
+      "status": "done",
+      "at": "2026-09-13 14:43"
+    },
+    "century-business-media-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-13 14:44"
+    },
+    "injecto-polymers-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 14:45",
+      "error": ""
+    }
+  }
+}
