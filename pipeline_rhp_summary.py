@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
 RHP Summary Pipeline — GitHub Actions
-Reads ipo_data.json (produced by pipeline_ipo.py in the same job), downloads
-the RHP/DRHP PDF for each IPO that has one, extracts key sections, summarizes
-via the Gemini API (free tier — no card required), and uploads the resulting
+Reads ipo_data.json — either a local copy if pipeline_ipo.py wrote one in
+this same job, or fetched directly from R2 otherwise — downloads the RHP/DRHP
+PDF for each IPO that has one, extracts key sections, summarizes via the
+Gemini API (free tier — no card required), and uploads the resulting
 structured JSON to R2 at ipo_summaries/{id}.json.
 
-Run this as a step AFTER pipeline_ipo.py in the same GitHub Actions job, so
-ipo_data.json is available locally on disk — no need to fetch it back from R2.
+Can run either as a step right after pipeline_ipo.py in the same job (fast
+path: reads the local file, no extra network round-trip) or entirely on its
+own schedule (falls back to GET {WORKER_URL}/ipo_data.json with the same
+X-Secret-Token header used for uploads — the same pattern already proven in
+vcp_test_scanner.py's download_all_chunks(), i.e. this worker's GET path
+takes the service token directly; no Firebase user auth needed here).
 
 Progress is tracked in a small manifest file (rhp_manifest.json) that this
 script commits back to the repo, so already-processed IPOs are skipped on
-future runs (R2 itself can't easily be read back from a script — the Worker's
-GET path expects a Firebase user token, not a service credential).
+future runs.
 
 Required environment variables:
   GEMINI_API_KEY   — from https://aistudio.google.com/app/apikey (free, no card)
@@ -24,7 +28,9 @@ Optional:
                      these periodically; if you start seeing 404 errors,
                      check https://aistudio.google.com/app/apikey for the
                      current free-tier model name and set this env var.
-  IPO_DATA_PATH    — defaults to "ipo_data.json" (same dir pipeline_ipo.py wrote it)
+  IPO_DATA_PATH    — defaults to "ipo_data.json". If present locally, used
+                     as-is; otherwise fetched fresh from R2 under this same
+                     filename.
   MANIFEST_PATH    — defaults to "rhp_manifest.json"
   MAX_PER_RUN      — cap how many new PDFs to process in one run (default 8,
                      to keep job duration and API usage predictable)
@@ -338,31 +344,47 @@ async def process_one_ipo(client: httpx.AsyncClient, entry: dict) -> dict | None
     return {"ipo_id": ipo_id, "status": "done"}
 
 
+async def load_ipo_data(client: httpx.AsyncClient) -> dict:
+    """Prefer a local ipo_data.json if pipeline_ipo.py happens to have written
+    one in this job; otherwise fetch it from R2 directly, using the same
+    GET-with-X-Secret-Token pattern already proven in vcp_test_scanner.py's
+    download_all_chunks() — this worker's GET path takes the secret token
+    the same way its POST (upload) path does, no Firebase auth needed for
+    server-to-server calls."""
+    if os.path.exists(IPO_DATA_PATH):
+        log.info(f"Found local {IPO_DATA_PATH}, using it")
+        return json.load(open(IPO_DATA_PATH))
+
+    log.info(f"No local {IPO_DATA_PATH} — fetching from R2 instead")
+    r = await client.get(f"{WORKER_URL}/ipo_data.json", headers={"X-Secret-Token": WORKER_TOKEN}, timeout=90)
+    if r.status_code != 200:
+        log.error(f"❌ Could not fetch ipo_data.json from R2 either: HTTP {r.status_code} — {r.text[:200]}")
+        sys.exit(1)
+    return r.json()
+
+
 async def run():
     log.info("━━━ RHP Summary Pipeline ━━━")
 
-    if not os.path.exists(IPO_DATA_PATH):
-        log.error(f"❌ {IPO_DATA_PATH} not found — run pipeline_ipo.py first in the same job")
-        sys.exit(1)
-    ipo_data = json.load(open(IPO_DATA_PATH))
-    ipos = ipo_data.get("ipos", [])
-
-    manifest = load_manifest()
-    processed = manifest["processed"]
-
-    candidates = [x for x in ipos if (x.get("rhp_url") or x.get("drhp_url")) and x["id"] not in processed]
-    log.info(f"{len(candidates)} IPOs have a document and are not yet processed "
-             f"(of {len(ipos)} total, {len(processed)} already done)")
-
-    todo = candidates[:MAX_PER_RUN]
-    if len(candidates) > MAX_PER_RUN:
-        log.info(f"Processing {MAX_PER_RUN} this run (MAX_PER_RUN cap); {len(candidates) - MAX_PER_RUN} remain for next run")
-
-    if not todo:
-        log.info("Nothing to do.")
-        return
-
     async with httpx.AsyncClient() as client:
+        ipo_data = await load_ipo_data(client)
+        ipos = ipo_data.get("ipos", [])
+
+        manifest = load_manifest()
+        processed = manifest["processed"]
+
+        candidates = [x for x in ipos if (x.get("rhp_url") or x.get("drhp_url")) and x["id"] not in processed]
+        log.info(f"{len(candidates)} IPOs have a document and are not yet processed "
+                 f"(of {len(ipos)} total, {len(processed)} already done)")
+
+        todo = candidates[:MAX_PER_RUN]
+        if len(candidates) > MAX_PER_RUN:
+            log.info(f"Processing {MAX_PER_RUN} this run (MAX_PER_RUN cap); {len(candidates) - MAX_PER_RUN} remain for next run")
+
+        if not todo:
+            log.info("Nothing to do.")
+            return
+
         for i, entry in enumerate(todo):
             result = await process_one_ipo(client, entry)
             if result:
