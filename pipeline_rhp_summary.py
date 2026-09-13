@@ -183,6 +183,13 @@ def extract_pdf_sections(pdf_bytes: bytes) -> dict:
     idx = locate_sections(quick_pages)
     log.info(f"  section pages: {idx}")
 
+    if all(v < 0 for v in idx.values()):
+        total_chars = sum(len(p) for p in quick_pages)
+        avg_chars_per_page = total_chars / len(quick_pages) if quick_pages else 0
+        log.warning(f"  no sections found at all — {len(quick_pages)} pages, "
+                    f"{total_chars} total chars extracted (avg {avg_chars_per_page:.0f}/page). "
+                    f"{'Looks like a scanned/image-only PDF with no text layer.' if avg_chars_per_page < 100 else 'Text was extracted but headings did not match expected patterns — document structure may differ from what this pipeline expects.'}")
+
     needed_ranges = []
     if idx["risk"] >= 0: needed_ranges.append((idx["risk"], idx["risk"] + 18))
     if idx["objects"] >= 0: needed_ranges.append((idx["objects"], idx["objects"] + 4))
@@ -358,23 +365,36 @@ async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, _is_retry: bool =
                 if _is_retry:
                     raise RuntimeError(f"got another HTML page, not a PDF, when following the extracted link")
                 html_text = content.decode("utf-8", errors="ignore")
-                m = re.search(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', html_text, re.I)
-                if m:
-                    pdf_url = m.group(1)
-                    if pdf_url.startswith("/"):
-                        from urllib.parse import urlsplit
-                        parts = urlsplit(url)
-                        pdf_url = f"{parts.scheme}://{parts.netloc}{pdf_url}"
-                    elif not pdf_url.startswith("http"):
-                        pdf_url = url.rsplit("/", 1)[0] + "/" + pdf_url
-                    pdf_url = resolve_sebi_viewer_url(pdf_url)  # in case the extracted link is itself a viewer-wrapper
+
+                # SEBI filing-detail pages often list TWO links: a short
+                # "Abridged Prospectus" summary AND the actual full RHP
+                # (wrapped in a /web/?file=... viewer link). Prefer the
+                # viewer-wrapped one — it's the real, full document; a plain
+                # .pdf href is frequently just the abridged summary, which
+                # is far too thin for meaningful risk/financials extraction.
+                all_hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html_text, re.I)
+                pdf_url = None
+                for h in all_hrefs:
+                    if "/web/?file=" in h or "/web/?file=" in h.replace("../", ""):
+                        pdf_url = h
+                        break
+                if not pdf_url:
+                    for h in all_hrefs:
+                        if ".pdf" in h.lower():
+                            pdf_url = h
+                            break
+
+                if pdf_url:
+                    from urllib.parse import urljoin
+                    pdf_url = urljoin(url, pdf_url)  # correctly resolves ../../../ relative paths
+                    pdf_url = resolve_sebi_viewer_url(pdf_url)  # unwrap if it's a viewer link
                     log.info(f"  landing page detected — following extracted PDF link: {pdf_url}")
                     return await fetch_pdf_bytes(client, pdf_url, _is_retry=True)
                 raise RuntimeError(f"got an HTML page instead of a PDF, and couldn't find a .pdf link inside it ({len(content)} bytes)")
 
             raise RuntimeError(f"response doesn't look like a PDF ({len(content)} bytes, content-type={content_type!r})")
 
-        except (httpx.TimeoutException, httpx.ConnectError) as e:
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError) as e:
             last_err = e
             if attempt == 0:
                 log.info(f"  download attempt 1 failed ({type(e).__name__}), retrying once...")
