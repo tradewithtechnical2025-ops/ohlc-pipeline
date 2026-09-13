@@ -3,6 +3,12 @@ name: IPO Scan
 on:
      
   workflow_dispatch:
+    inputs:
+      rebuild_summary_index:
+        description: 'Rebuild ipo_summaries_all.json from existing R2 files only (no new PDFs processed — use this once after manually uploading JSONs to ipo_summaries/)'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   ipo-scan:
@@ -17,7 +23,9 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install httpx pdfplumber
+
       - name: Run IPO scan
+        if: ${{ !inputs.rebuild_summary_index }}
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           WORKER_URL:   ${{ secrets.WORKER_URL }}
@@ -26,12 +34,14 @@ jobs:
 
       - name: Run RHP summary pipeline
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          WORKER_URL:     ${{ secrets.WORKER_URL }}
-          WORKER_TOKEN:   ${{ secrets.WORKER_TOKEN }}
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          WORKER_URL:           ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:         ${{ secrets.WORKER_TOKEN }}
+          REBUILD_INDEX_ONLY:   ${{ inputs.rebuild_summary_index }}
         run: python pipeline_rhp_summary.py
 
       - name: Commit updated RHP manifest
+        if: ${{ !inputs.rebuild_summary_index }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
