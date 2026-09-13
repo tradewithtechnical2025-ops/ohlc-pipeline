@@ -34,6 +34,12 @@ Optional:
   MANIFEST_PATH    — defaults to "rhp_manifest.json"
   MAX_PER_RUN      — cap how many new PDFs to process in one run (default 8,
                      to keep job duration and API usage predictable)
+  MAX_RETRIES      — defaults to 3. Failed IPOs (download/processing/upload
+                     errors) are retried on future runs up to this many
+                     attempts, then left alone (still in the manifest with
+                     their error, but no longer retried automatically) so a
+                     permanently-broken source URL can't keep eating a slot
+                     every run. Only status "done" is skipped forever.
   ONLY_MAINBOARD   — defaults to "true". Skips SME IPOs (issue_type=="sme")
                      for now — set to "false" to include them too once ready.
   SKIP_LISTED      — defaults to "true". Skips IPOs whose status is already
@@ -76,6 +82,7 @@ WORKER_TOKEN   = os.environ["WORKER_TOKEN"]
 IPO_DATA_PATH  = os.environ.get("IPO_DATA_PATH", "ipo_data.json")
 MANIFEST_PATH  = os.environ.get("MANIFEST_PATH", "rhp_manifest.json")
 MAX_PER_RUN    = int(os.environ.get("MAX_PER_RUN", "8"))
+MAX_RETRIES    = int(os.environ.get("MAX_RETRIES", "3"))
 ONLY_MAINBOARD = os.environ.get("ONLY_MAINBOARD", "true").lower() == "true"
 SKIP_LISTED    = os.environ.get("SKIP_LISTED", "true").lower() == "true"
 
@@ -238,7 +245,7 @@ def build_prompt(sections: dict, company_name: str) -> str:
     "note": "one sentence describing the fresh/OFS split and whether any selling shareholder has a notably low cost of acquisition (WACA)"
   }},
   "promoters": [array of promoter names],
-  "registrar": string, "lead_manager": string, "listing_exchange": "BSE and NSE" or as applicable
+  "registrar": string, "lead_manager": "comma-separated list of ALL lead managers/BRLMs named in the document, not just the first one", "listing_exchange": "BSE and NSE" or as applicable
 }}
 
 Rules:
@@ -269,7 +276,7 @@ async def call_gemini(client: httpx.AsyncClient, prompt: str) -> str:
     url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192, "responseMimeType": "application/json"},
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": 8192, "responseMimeType": "application/json"},
     }
     r = await client.post(url, json=body, timeout=90)
     if r.status_code != 200:
@@ -309,14 +316,33 @@ async def r2_upload(client: httpx.AsyncClient, filename: str, data: dict):
 # MAIN
 # ══════════════════════════════════════════════════════════════
 
+def resolve_sebi_viewer_url(url: str) -> str:
+    """SEBI often links to its own embedded PDF-viewer page rather than the
+    PDF directly — e.g. https://www.sebi.gov.in/web/?file=<actual-pdf-url>#page=1&zoom=...
+    Fetching that URL as-is returns the viewer's HTML shell, not the PDF.
+    The real PDF URL is sitting right there in the 'file' query parameter —
+    pull it out directly rather than downloading and parsing HTML."""
+    from urllib.parse import urlsplit, parse_qs, urljoin
+    parts = urlsplit(url)
+    if "sebi.gov.in" in parts.netloc and parts.path.rstrip("/").endswith("/web"):
+        qs = parse_qs(parts.query)
+        file_val = qs.get("file", [None])[0]
+        if file_val:
+            return urljoin(f"{parts.scheme}://{parts.netloc}/", file_val)
+    return url
+
+
 async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, _is_retry: bool = False) -> bytes:
-    """Downloads a URL and returns its bytes as a PDF, with two safety nets:
-      1. Retries once on timeout/connection errors (slow document hosts are common).
-      2. If the URL turns out to be an HTML landing page rather than the PDF
-         itself (SEBI's filing pages do this — the rhp_url in ipo_data.json
-         points to an HTML page that *links to* the actual PDF, not the PDF),
-         scan the HTML for a link ending in .pdf and follow it once.
+    """Downloads a URL and returns its bytes as a PDF, with three safety nets:
+      1. SEBI viewer-page URLs (sebi.gov.in/web/?file=...) get unwrapped to
+         the real PDF URL before ever being fetched.
+      2. Retries once on timeout/connection errors (slow document hosts are common).
+      3. If the URL turns out to be an HTML landing page rather than the PDF
+         itself (some SEBI filing pages do this too — the rhp_url points to
+         an HTML page that *links to* the actual PDF, not the PDF), scan the
+         HTML for a link ending in .pdf and follow it once.
     """
+    url = resolve_sebi_viewer_url(url)
     last_err = None
     for attempt in range(2):
         try:
@@ -341,6 +367,7 @@ async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, _is_retry: bool =
                         pdf_url = f"{parts.scheme}://{parts.netloc}{pdf_url}"
                     elif not pdf_url.startswith("http"):
                         pdf_url = url.rsplit("/", 1)[0] + "/" + pdf_url
+                    pdf_url = resolve_sebi_viewer_url(pdf_url)  # in case the extracted link is itself a viewer-wrapper
                     log.info(f"  landing page detected — following extracted PDF link: {pdf_url}")
                     return await fetch_pdf_bytes(client, pdf_url, _is_retry=True)
                 raise RuntimeError(f"got an HTML page instead of a PDF, and couldn't find a .pdf link inside it ({len(content)} bytes)")
@@ -426,9 +453,20 @@ async def run():
         manifest = load_manifest()
         processed = manifest["processed"]
 
-        candidates = [x for x in ipos if (x.get("rhp_url") or x.get("drhp_url")) and x["id"] not in processed]
-        log.info(f"{len(candidates)} IPOs have a document and are not yet processed "
-                 f"(of {len(ipos)} total, {len(processed)} already done)")
+        def is_eligible(x):
+            p = processed.get(x["id"])
+            if p is None:
+                return True
+            if p.get("status") == "done":
+                return False
+            return p.get("attempts", 0) < MAX_RETRIES
+
+        candidates = [x for x in ipos if (x.get("rhp_url") or x.get("drhp_url")) and is_eligible(x)]
+        n_done = sum(1 for v in processed.values() if v.get("status") == "done")
+        n_retryable = sum(1 for v in processed.values() if v.get("status") != "done" and v.get("attempts", 0) < MAX_RETRIES)
+        n_exhausted = sum(1 for v in processed.values() if v.get("status") != "done" and v.get("attempts", 0) >= MAX_RETRIES)
+        log.info(f"{len(candidates)} IPOs eligible this run "
+                 f"(of {len(ipos)} total: {n_done} done, {n_retryable} retryable, {n_exhausted} retries-exhausted)")
 
         if ONLY_MAINBOARD:
             before = len(candidates)
@@ -442,6 +480,10 @@ async def run():
             log.info(f"SKIP_LISTED is on — skipping {before - len(candidates)} already-listed IPOs "
                      f"({len(candidates)} candidates remain)")
 
+        # never-tried candidates go first, then retries with fewer attempts first,
+        # so fresh IPOs don't get stuck behind a backlog of stubborn retries
+        candidates.sort(key=lambda x: processed.get(x["id"], {}).get("attempts", 0))
+
         todo = candidates[:MAX_PER_RUN]
         if len(candidates) > MAX_PER_RUN:
             log.info(f"Processing {MAX_PER_RUN} this run (MAX_PER_RUN cap); {len(candidates) - MAX_PER_RUN} remain for next run")
@@ -453,9 +495,11 @@ async def run():
         for i, entry in enumerate(todo):
             result = await process_one_ipo(client, entry)
             if result:
+                prior_attempts = processed.get(result["ipo_id"], {}).get("attempts", 0)
                 processed[result["ipo_id"]] = {
                     "status": result["status"],
                     "at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "attempts": prior_attempts + 1,
                 }
                 if result["status"] != "done":
                     processed[result["ipo_id"]]["error"] = result.get("error", "")
