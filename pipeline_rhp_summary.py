@@ -34,6 +34,8 @@ Optional:
   MANIFEST_PATH    — defaults to "rhp_manifest.json"
   MAX_PER_RUN      — cap how many new PDFs to process in one run (default 8,
                      to keep job duration and API usage predictable)
+  ONLY_MAINBOARD   — defaults to "true". Skips SME IPOs (issue_type=="sme")
+                     for now — set to "false" to include them too once ready.
 
 Usage:
   python pipeline_rhp_summary.py
@@ -68,6 +70,7 @@ WORKER_TOKEN   = os.environ["WORKER_TOKEN"]
 IPO_DATA_PATH  = os.environ.get("IPO_DATA_PATH", "ipo_data.json")
 MANIFEST_PATH  = os.environ.get("MANIFEST_PATH", "rhp_manifest.json")
 MAX_PER_RUN    = int(os.environ.get("MAX_PER_RUN", "8"))
+ONLY_MAINBOARD = os.environ.get("ONLY_MAINBOARD", "true").lower() == "true"
 
 GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 DOWNLOAD_HEADERS = {
@@ -299,6 +302,53 @@ async def r2_upload(client: httpx.AsyncClient, filename: str, data: dict):
 # MAIN
 # ══════════════════════════════════════════════════════════════
 
+async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, _is_retry: bool = False) -> bytes:
+    """Downloads a URL and returns its bytes as a PDF, with two safety nets:
+      1. Retries once on timeout/connection errors (slow document hosts are common).
+      2. If the URL turns out to be an HTML landing page rather than the PDF
+         itself (SEBI's filing pages do this — the rhp_url in ipo_data.json
+         points to an HTML page that *links to* the actual PDF, not the PDF),
+         scan the HTML for a link ending in .pdf and follow it once.
+    """
+    last_err = None
+    for attempt in range(2):
+        try:
+            resp = await client.get(url, headers=DOWNLOAD_HEADERS, timeout=120, follow_redirects=True)
+            resp.raise_for_status()
+            content = resp.content
+            content_type = resp.headers.get("content-type", "")
+
+            if content.startswith(b"%PDF") and len(content) >= 5000:
+                return content
+
+            if "html" in content_type.lower() or content.lstrip().startswith(b"<"):
+                if _is_retry:
+                    raise RuntimeError(f"got another HTML page, not a PDF, when following the extracted link")
+                html_text = content.decode("utf-8", errors="ignore")
+                m = re.search(r'href=["\']([^"\']+\.pdf[^"\']*)["\']', html_text, re.I)
+                if m:
+                    pdf_url = m.group(1)
+                    if pdf_url.startswith("/"):
+                        from urllib.parse import urlsplit
+                        parts = urlsplit(url)
+                        pdf_url = f"{parts.scheme}://{parts.netloc}{pdf_url}"
+                    elif not pdf_url.startswith("http"):
+                        pdf_url = url.rsplit("/", 1)[0] + "/" + pdf_url
+                    log.info(f"  landing page detected — following extracted PDF link: {pdf_url}")
+                    return await fetch_pdf_bytes(client, pdf_url, _is_retry=True)
+                raise RuntimeError(f"got an HTML page instead of a PDF, and couldn't find a .pdf link inside it ({len(content)} bytes)")
+
+            raise RuntimeError(f"response doesn't look like a PDF ({len(content)} bytes, content-type={content_type!r})")
+
+        except (httpx.TimeoutException, httpx.ConnectError) as e:
+            last_err = e
+            if attempt == 0:
+                log.info(f"  download attempt 1 failed ({type(e).__name__}), retrying once...")
+                continue
+            raise
+    raise last_err
+
+
 async def process_one_ipo(client: httpx.AsyncClient, entry: dict) -> dict | None:
     ipo_id = entry["id"]
     name = entry.get("name", "")
@@ -309,14 +359,10 @@ async def process_one_ipo(client: httpx.AsyncClient, entry: dict) -> dict | None
     log.info(f"→ {name} ({ipo_id})")
     log.info(f"  downloading {doc_url}")
     try:
-        resp = await client.get(doc_url, headers=DOWNLOAD_HEADERS, timeout=60, follow_redirects=True)
-        resp.raise_for_status()
-        pdf_bytes = resp.content
-        if len(pdf_bytes) < 5000 or not pdf_bytes.startswith(b"%PDF"):
-            raise RuntimeError(f"response doesn't look like a PDF ({len(pdf_bytes)} bytes)")
+        pdf_bytes = await fetch_pdf_bytes(client, doc_url)
     except Exception as e:
-        log.warning(f"  ✗ download failed: {e}")
-        return {"ipo_id": ipo_id, "status": "download_failed", "error": str(e)}
+        log.warning(f"  ✗ download failed: {type(e).__name__}: {e}")
+        return {"ipo_id": ipo_id, "status": "download_failed", "error": f"{type(e).__name__}: {e}"}
 
     try:
         sections = extract_pdf_sections(pdf_bytes)
@@ -376,6 +422,12 @@ async def run():
         candidates = [x for x in ipos if (x.get("rhp_url") or x.get("drhp_url")) and x["id"] not in processed]
         log.info(f"{len(candidates)} IPOs have a document and are not yet processed "
                  f"(of {len(ipos)} total, {len(processed)} already done)")
+
+        if ONLY_MAINBOARD:
+            before = len(candidates)
+            candidates = [x for x in candidates if x.get("issue_type") == "regular"]
+            log.info(f"ONLY_MAINBOARD is on — skipping {before - len(candidates)} SME IPOs for now "
+                     f"({len(candidates)} mainboard candidates remain)")
 
         todo = candidates[:MAX_PER_RUN]
         if len(candidates) > MAX_PER_RUN:
