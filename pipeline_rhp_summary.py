@@ -279,6 +279,13 @@ Company name (if known): {company_name or '(not provided — extract from the do
 """
 
 
+class GeminiQuotaError(Exception):
+    """Raised specifically on HTTP 429 — an account-wide quota/rate-limit
+    issue, not something wrong with the particular document being processed.
+    Callers should stop the whole run rather than burning retry attempts."""
+    pass
+
+
 async def call_gemini(client: httpx.AsyncClient, prompt: str) -> str:
     url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
     body = {
@@ -286,6 +293,8 @@ async def call_gemini(client: httpx.AsyncClient, prompt: str) -> str:
         "generationConfig": {"temperature": 0.05, "maxOutputTokens": 8192, "responseMimeType": "application/json"},
     }
     r = await client.post(url, json=body, timeout=90)
+    if r.status_code == 429:
+        raise GeminiQuotaError(f"Gemini quota/rate limit hit: {r.text[:300]}")
     if r.status_code != 200:
         raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:400]}")
     data = r.json()
@@ -426,6 +435,8 @@ async def process_one_ipo(client: httpx.AsyncClient, entry: dict) -> dict | None
         prompt = build_prompt(sections, name)
         raw_text = await call_gemini(client, prompt)
         parsed = parse_json_response(raw_text)
+    except GeminiQuotaError:
+        raise  # let this bubble all the way up — it's not this document's fault
     except Exception as e:
         log.warning(f"  ✗ processing failed: {e}")
         return {"ipo_id": ipo_id, "status": "processing_failed", "error": str(e)}
@@ -441,7 +452,7 @@ async def process_one_ipo(client: httpx.AsyncClient, entry: dict) -> dict | None
         return {"ipo_id": ipo_id, "status": "upload_failed", "error": str(e)}
 
     log.info(f"  ✅ done: {ipo_id}")
-    return {"ipo_id": ipo_id, "status": "done"}
+    return {"ipo_id": ipo_id, "status": "done", "data": parsed}
 
 
 async def load_ipo_data(client: httpx.AsyncClient) -> dict:
@@ -463,11 +474,39 @@ async def load_ipo_data(client: httpx.AsyncClient) -> dict:
     return r.json()
 
 
+COMBINED_SUMMARIES_FILE = "ipo_summaries_all.json"
+
+
+async def load_combined_summaries(client: httpx.AsyncClient) -> dict:
+    """The frontend preloads ONE file with every summary generated so far
+    (rather than fetching each one individually on click, which is what made
+    Snapshot feel slow, and gave no way to show "summary ready" on the card
+    up front). This loads the existing combined file from R2 so this run
+    appends to it instead of clobbering previously-generated summaries."""
+    r = await client.get(f"{WORKER_URL}/{COMBINED_SUMMARIES_FILE}", headers={"X-Secret-Token": WORKER_TOKEN}, timeout=90)
+    if r.status_code == 200:
+        try:
+            data = r.json()
+            log.info(f"Loaded existing {COMBINED_SUMMARIES_FILE} with {len(data.get('summaries', {}))} summaries")
+            return data
+        except Exception:
+            pass
+    log.info(f"No existing {COMBINED_SUMMARIES_FILE} found — starting fresh")
+    return {"summaries": {}}
+
+
+async def save_combined_summaries(client: httpx.AsyncClient, combined: dict):
+    combined["updated"] = datetime.now().strftime("%Y-%m-%d")
+    combined["count"] = len(combined["summaries"])
+    await r2_upload(client, COMBINED_SUMMARIES_FILE, combined)
+
+
 async def run():
     log.info("━━━ RHP Summary Pipeline ━━━")
 
     async with httpx.AsyncClient() as client:
         ipo_data = await load_ipo_data(client)
+        combined_summaries = await load_combined_summaries(client)
         ipos = ipo_data.get("ipos", [])
 
         manifest = load_manifest()
@@ -513,7 +552,13 @@ async def run():
             return
 
         for i, entry in enumerate(todo):
-            result = await process_one_ipo(client, entry)
+            try:
+                result = await process_one_ipo(client, entry)
+            except GeminiQuotaError as e:
+                log.error(f"❌ Gemini quota/rate limit exceeded — stopping this run early "
+                          f"(this doesn't count against {entry['id']}'s retry budget; it'll just "
+                          f"be tried again next run once quota resets). {e}")
+                break
             if result:
                 prior_attempts = processed.get(result["ipo_id"], {}).get("attempts", 0)
                 processed[result["ipo_id"]] = {
@@ -524,6 +569,13 @@ async def run():
                 if result["status"] != "done":
                     processed[result["ipo_id"]]["error"] = result.get("error", "")
                 save_manifest(manifest)  # save after every item so partial progress isn't lost
+
+                if result["status"] == "done" and "data" in result:
+                    combined_summaries["summaries"][result["ipo_id"]] = result["data"]
+                    try:
+                        await save_combined_summaries(client, combined_summaries)
+                    except Exception as e:
+                        log.warning(f"  ✗ could not update {COMBINED_SUMMARIES_FILE}: {e}")
             if i < len(todo) - 1:
                 await asyncio.sleep(GEMINI_DELAY_SEC)
 
@@ -531,5 +583,48 @@ async def run():
     log.info(f"━━━ Pipeline complete. Manifest: {done} done / {len(processed)} tracked total ━━━")
 
 
+async def rebuild_combined_index(client: httpx.AsyncClient):
+    """One-off maintenance mode: scans EVERY IPO in ipo_data.json, tries to
+    fetch ipo_summaries/{id}.json for each (including ones this pipeline
+    never generated — e.g. summaries uploaded manually via rhp_extractor.html
+    before ipo_summaries_all.json existed), and merges whatever it finds into
+    a freshly rebuilt ipo_summaries_all.json.
+
+    R2 has no directory-listing here, so this brute-forces it by trying every
+    known id rather than listing what's actually there — fine for a one-off
+    rebuild (a few hundred lightweight GETs, no Gemini calls, no cost)."""
+    log.info("━━━ Rebuilding ipo_summaries_all.json from existing R2 files ━━━")
+    ipo_data = await load_ipo_data(client)
+    ipos = ipo_data.get("ipos", [])
+    candidates = [x for x in ipos if x.get("rhp_url") or x.get("drhp_url")]
+    log.info(f"Checking {len(candidates)} IPOs that have a source document...")
+
+    combined = {"summaries": {}}
+    found, missing = 0, 0
+    for entry in candidates:
+        ipo_id = entry["id"]
+        try:
+            r = await client.get(f"{WORKER_URL}/ipo_summaries/{ipo_id}.json",
+                                  headers={"X-Secret-Token": WORKER_TOKEN}, timeout=30)
+            if r.status_code == 200:
+                combined["summaries"][ipo_id] = r.json()
+                found += 1
+            else:
+                missing += 1
+        except Exception as e:
+            log.warning(f"  ✗ {ipo_id}: {type(e).__name__}: {e}")
+            missing += 1
+
+    log.info(f"Found {found} existing summaries, {missing} not present yet")
+    await save_combined_summaries(client, combined)
+    log.info(f"━━━ Rebuild complete: {found} summaries in {COMBINED_SUMMARIES_FILE} ━━━")
+
+
 if __name__ == "__main__":
-    asyncio.run(run())
+    if os.environ.get("REBUILD_INDEX_ONLY", "false").lower() == "true":
+        async def _rebuild():
+            async with httpx.AsyncClient() as client:
+                await rebuild_combined_index(client)
+        asyncio.run(_rebuild())
+    else:
+        asyncio.run(run())
