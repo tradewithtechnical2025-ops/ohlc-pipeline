@@ -34,6 +34,42 @@
       "status": "download_failed",
       "at": "2026-09-13 14:45",
       "error": ""
+    },
+    "national-stock-exchange-of-india-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-13 14:56"
+    },
+    "ss-retail-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-13 14:58"
+    },
+    "jindal-supreme-india-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-13 15:00"
+    },
+    "hero-motors-ipo": {
+      "status": "done",
+      "at": "2026-09-13 15:02"
+    },
+    "sonaselection-india-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:03",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (9112 bytes)"
+    },
+    "reliance-jio-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:03",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (8909 bytes)"
+    },
+    "deltatech-gaming-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:03",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "biba-fashions-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:03",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
     }
   }
 }
