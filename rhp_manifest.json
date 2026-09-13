@@ -70,6 +70,46 @@
       "status": "download_failed",
       "at": "2026-09-13 15:03",
       "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "droom-technology-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:06",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "puranik-builders-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:06",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "bharat-fih-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:06",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "fabindia-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:06",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (8172 bytes)"
+    },
+    "oyo-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:06",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "ebixcash-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:06",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "boat-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:06",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+    },
+    "navi-technologies-ipo": {
+      "status": "download_failed",
+      "at": "2026-09-13 15:07",
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
     }
   }
 }
