@@ -22,9 +22,14 @@ TELEGRAM_RESULTS_CHAT_ID = os.environ.get("TELEGRAM_RESULTS_CHAT_ID", "")
 # Used for AI-assisted PDF financial-results extraction (fallback/primary
 # when regex label-matching fails or produces implausible values — see
 # _ai_extract_financials). Pipeline runs regex-only (degraded but
-# functional) when this isn't set.
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-AI_PDF_MODEL = "claude-sonnet-5"
+# functional) when this isn't set. Gemini instead of Claude specifically
+# because the free tier needs no card on file (vs Anthropic billing,
+# which hit setup friction) — same system prompt/schema either way, this
+# just swaps which API answers it. Model name drifts periodically as
+# Google renames/retires versions (already hit once this project) —
+# check https://aistudio.google.com/app/apikey if this starts 404ing.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+AI_PDF_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
@@ -763,18 +768,24 @@ _AI_EXTRACT_SYSTEM_PROMPT = """You extract structured financial data from the te
 
 Your job:
 1. Determine if this document contains an actual quarterly financial results TABLE (the "Statement of Standalone/Consolidated Financial Results" with line items like Revenue, Expenses, Profit, EPS). If it's only a cover letter, merger intimation, KMP change notice, AGM notice, or similar with no such table, set is_results_table to false and leave other fields null.
-2. If both Standalone and Consolidated tables are present, use the CONSOLIDATED table. Otherwise use whichever is present.
+2. Indian results filings very often show BOTH Standalone and Consolidated tables — usually as two SEPARATE tables further apart in the document, not side by side. SEARCH THE ENTIRE TEXT for a table explicitly labeled "Consolidated" before concluding only Standalone exists — don't stop at the first table you see. If a genuine Consolidated table exists, use it throughout (every field below, don't mix bases). Only use Standalone if no Consolidated table is present at all. Record which one you used in "basis" — this field is REQUIRED, never omit it.
 3. Extract values ONLY from the MAIN results table's own rows — never from a subsidiary/joint-venture footnote, a segment-wise breakdown table, or the auditor's report's boilerplate sentences, even if they mention similar words ("total income", "net profit") with numbers nearby. The main table is the one with the full standard line-item structure (Revenue, Expenses, Profit before tax, Tax expense, Profit for the period, EPS).
-4. Use the CURRENT quarter column only (the most recent quarter, i.e. the first/leftmost data column — NOT a prior-year or prior-quarter comparative column).
+4. Use the CURRENT quarter column only (the most recent quarter, i.e. the first/leftmost data column — NOT a prior-year or prior-quarter comparative column) for the "current" object.
 5. Report the unit the table itself states (look for "₹ in Crore", "Rs in Crores", "₹ in Million", "₹ in Lakh"/"₹ in Lakhs"/"Rs. in Lacs"/"Rs. in Lac" — "Lac"/"Lacs" is a very common alternate spelling of Lakh in Indian filings, treat it identically — or similar near the table header) — if genuinely no unit statement exists anywhere, use "Crore" as the default (NSE's most common convention).
 6. Ignore any numbers inside formula references like "(3+4)" or "[3-4]" next to line-item labels — those are row-number citations, not data.
-7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, total_income, PAT, and EPS if visible as separate columns in the same main table, plus each comparison column's period-end date.
+7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, total_income, PAT, EPS, finance_costs and depreciation if visible as separate columns in the same main table, plus each comparison column's period-end date.
 8. Extract the quarter-end date (the date this result is FOR, e.g. "quarter ended June 30, 2026" -> "2026-06-30").
+9. "pat" MUST be the figure the filing's own reported EPS is actually derived from (usually "Profit attributable to Owners/Shareholders of the Company" — NOT a larger "total" figure that also includes non-controlling/minority interest, if the filing distinguishes between the two). Cross-check: PAT divided by shares outstanding should roughly reconcile to the reported EPS.
+10. finance_costs and depreciation are separate P&L line items (usually "Finance Costs" and "Depreciation and Amortisation Expense") — extract them if the table shows them; the caller computes EBITDA from these, don't compute it yourself.
+11. Segment-wise revenue is usually in its own table/note (often titled "Segment Information" or "Segment Revenue") — look for it actively rather than only checking the main P&L; most listed operating companies with multiple business lines report this. Omit segment_breakup entirely if the company doesn't report segments.
+12. management_commentary: 1-3 sentence summary of any outlook/commentary/guidance mentioned in the document (not the standard boilerplate disclaimers), or null if there's none.
+13. key_highlights: 2-5 short, specific, numbers-first strings on the most notable things about this result (big beats/misses, one-off items, margin changes, notable segment performance) — omit if nothing stands out beyond the raw numbers already captured.
+14. board_meeting_outcome: brief note on any OTHER board decisions mentioned (dividend, bonus, other corporate actions), or null if there's nothing beyond the results approval itself.
 
 Return ONLY valid JSON (no markdown fences, no other text) matching exactly this schema:
 {
   "is_results_table": true or false,
-  "nature": "Standalone" or "Consolidated" or null,
+  "basis": "Standalone" or "Consolidated" or null,
   "unit": "Crore" or "Million" or "Lakh" or null,
   "period_end": "YYYY-MM-DD" or null,
   "current": {
@@ -782,6 +793,8 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
     "other_income": number or null,
     "total_income": number or null,
     "total_expenses": number or null,
+    "finance_costs": number or null,
+    "depreciation": number or null,
     "pbt": number or null,
     "tax_expense": number or null,
     "pat": number or null,
@@ -789,40 +802,49 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
     "eps_basic": number or null,
     "eps_diluted": number or null
   },
-  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null},
-  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null}
+  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
+  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
+  "segment_breakup": [{"segment": string, "revenue": number}] or omitted,
+  "management_commentary": string or null,
+  "key_highlights": [string, ...] or omitted,
+  "board_meeting_outcome": string or null
 }
 
-All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS."""
+All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
 
 
 async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str):
-    """Calls Claude Sonnet to extract structured financial data directly from
+    """Calls Gemini to extract structured financial data directly from
     the raw extracted PDF text. Returns the parsed JSON dict, or None if the
     API isn't configured, the call fails, or the response doesn't parse as
-    valid JSON. Caller is responsible for unit-scaling and sanity checks."""
-    if not ANTHROPIC_API_KEY:
+    valid JSON. Caller is responsible for unit-scaling and sanity checks.
+
+    Same _AI_EXTRACT_SYSTEM_PROMPT and same output schema as the old
+    Claude-based version — _build_result_from_ai() downstream needs no
+    changes. Gemini has no separate system-prompt slot in this endpoint,
+    so the instructions are prepended to the single user turn instead."""
+    if not GEMINI_API_KEY:
         return None
     try:
         r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
             json={
-                "model": AI_PDF_MODEL,
-                "max_tokens": 700,
-                "system": _AI_EXTRACT_SYSTEM_PROMPT,
-                "messages": [{"role": "user", "content": text[:14000]}],
+                "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:14000]}]}],
+                "generationConfig": {"temperature": 0.05, "maxOutputTokens": 700, "responseMimeType": "application/json"},
             },
             timeout=30,
         )
+        if r.status_code == 429:
+            print(f"    · [{fname_dbg}] AI extraction skipped: Gemini quota/rate limit hit")
+            return None
         r.raise_for_status()
         data = r.json()
-        blocks = data.get("content", [])
-        raw_text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+        candidates = data.get("candidates") or []
+        if not candidates or "content" not in candidates[0]:
+            print(f"    · [{fname_dbg}] AI extraction: unexpected Gemini response shape")
+            return None
+        parts = candidates[0]["content"].get("parts") or []
+        raw_text = "".join(p.get("text", "") for p in parts).strip()
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
         parsed = json.loads(cleaned)
         return parsed
@@ -833,7 +855,7 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
 
 def _parse_pdf_regex(text: str, link: str, fname_dbg: str, rss_title: str = ""):
     """Regex/label-matching fallback parser — used when AI extraction is
-    unavailable (no ANTHROPIC_API_KEY) or fails. Takes already-extracted
+    unavailable (no GEMINI_API_KEY) or fails. Takes already-extracted
     text (see parse_financial_results_pdf, which does the pdfplumber
     extraction once and tries AI first)."""
     headings = _pdf_find_heading_candidates(text)
@@ -1092,13 +1114,17 @@ def _parse_pdf_regex(text: str, link: str, fname_dbg: str, rss_title: str = ""):
 
 def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = ""):
     """Converts the AI extraction's JSON into the same {meta, quarter,
-    qoq_fundamentals, yoy_fundamentals} shape _parse_pdf_regex produces.
+    qoq_fundamentals, yoy_fundamentals} shape _parse_pdf_regex produces — plus
+    segment_breakup / management_commentary / key_highlights / board_meeting_outcome
+    as additional top-level keys when the AI found them (not every filing has these;
+    XBRL and the regex path never populate them, so downstream code that doesn't
+    know about them yet just won't see the keys — no other function needs to change).
     Applies unit scaling and the same total_income sanity check used on
     the regex path. Returns None if the AI result fails basic validation
     (missing revenue+PAT, bad date, unmatched filename) — caller falls
     back to the regex parser in that case."""
     cur = ai.get("current") or {}
-    nature = ai.get("nature") or "Standalone"
+    nature = ai.get("basis") or "Standalone"
     unit_word = (ai.get("unit") or "Crore").lower()
     if unit_word.startswith("million"):
         unit_multiplier = 1e6
@@ -1114,12 +1140,20 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     other_income = scale(cur.get("other_income"))
     total_income = scale(cur.get("total_income"))
     total_expenses = scale(cur.get("total_expenses"))
+    finance_costs = scale(cur.get("finance_costs"))
+    depreciation = scale(cur.get("depreciation"))
     pbt = scale(cur.get("pbt"))
     tax_expense = scale(cur.get("tax_expense"))
     pat = scale(cur.get("pat"))
     comprehensive = scale(cur.get("comprehensive_income"))
     eps_basic = cur.get("eps_basic")      # per-share rupee amount — never scaled
     eps_diluted = cur.get("eps_diluted")
+
+    # EBITDA = PBT + Finance Costs + Depreciation (no Other Income subtraction,
+    # matching the convention validated against several real filings' own stated
+    # EBITDA — not company-defined "Adjusted EBITDA", which can differ). Only
+    # computed when the filing's table actually broke out both line items.
+    ebitda = (pbt + finance_costs + depreciation) if (pbt is not None and finance_costs is not None and depreciation is not None) else None
 
     if revenue is None and pat is None:
         print(f"    · [{fname_dbg}] AI returned is_results_table=true but no revenue/PAT — treating as invalid")
@@ -1164,7 +1198,8 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
 
     quarter = {
         "revenue": revenue, "other_income": other_income, "total_income": total_income,
-        "total_expenses": total_expenses, "pbt": pbt, "tax_expense": tax_expense, "pat": pat,
+        "total_expenses": total_expenses, "finance_costs": finance_costs, "depreciation": depreciation,
+        "pbt": pbt, "tax_expense": tax_expense, "pat": pat, "ebitda": ebitda,
         "comprehensive_income": comprehensive, "eps_basic": eps_basic, "eps_diluted": eps_diluted,
         "period_end": period_end,
     }
@@ -1184,6 +1219,18 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         },
         "quarter": quarter,
     }
+
+    # Narrative/extra fields the AI schema captures that XBRL and the regex
+    # path don't — attached only when present so callers that don't know
+    # about them yet (Telegram formatting, R2 schema) are unaffected.
+    if ai.get("segment_breakup"):
+        result["segment_breakup"] = ai["segment_breakup"]
+    if ai.get("management_commentary"):
+        result["management_commentary"] = ai["management_commentary"]
+    if ai.get("key_highlights"):
+        result["key_highlights"] = ai["key_highlights"]
+    if ai.get("board_meeting_outcome"):
+        result["board_meeting_outcome"] = ai["board_meeting_outcome"]
 
     qoq = ai.get("qoq_prior") or {}
     yoy = ai.get("yoy_prior") or {}
@@ -1215,7 +1262,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     flow through the same grouping/dedup/Telegram code.
 
     Tries AI extraction first (see _ai_extract_financials) when
-    ANTHROPIC_API_KEY is configured — this reads the document the way a
+    GEMINI_API_KEY is configured — this reads the document the way a
     human would, sidestepping the regex pitfalls that repeatedly produced
     silently-wrong numbers across many real filings: wrong-row picks from
     subsidiary/JV footnotes, formula-ref bracket vs parenthesis confusion,
