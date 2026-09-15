@@ -22,7 +22,7 @@ Usage:
   python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
-  python pipeline.py weinstein_debug SYMBOL  # week-by-week close/sma30/slope/stage for ONE symbol, no R2 writes
+  python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
 """
 
 import asyncio
@@ -3259,35 +3259,47 @@ TRANSITION_LABELS = {
 }
 
 
-def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
+def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
                               flat_threshold_pct=1.0, min_weeks=40,
-                              early_breakout_lookback=26, sma_short_period=10,
+                              early_breakout_lookback=26, ema_short_period=10,
                               min_weeks_in_prior_stage=3, confirm_weeks=2):
     """
     Stan Weinstein's original 4-Stage Analysis (his book "Secrets for Profiting
-    in Bull and Bear Markets") — WEEKLY chart, sma_period-week SMA (Weinstein
-    used 30-week, ≈150-day daily).
+    in Bull and Bear Markets") — WEEKLY chart, ema_period-week average
+    (Weinstein used a 30-week SMA; this uses EMA instead — see EMA NOTE below).
 
-      Stage 1 (Basing)     — price hovering near a flat SMA, after a decline
-      Stage 2 (Advancing)  — price > 10-week SMA > 30-week SMA, slope rising
-      Stage 3 (Topping)    — price hovering near a flat SMA, after an advance
-      Stage 4 (Declining)  — price < 10-week SMA < 30-week SMA, slope falling
+      Stage 1 (Basing)     — price hovering near a flat average, after a decline
+      Stage 2 (Advancing)  — price > 10-week EMA > 30-week EMA, slope rising
+      Stage 3 (Topping)    — price hovering near a flat average, after an advance
+      Stage 4 (Declining)  — price < 10-week EMA < 30-week EMA, slope falling
 
-    SMA slope over slope_lookback weeks decides rising/falling/flat (threshold
-    flat_threshold_pct%). Flat/ambiguous weeks are 1-vs-3 by carrying forward
-    the last confirmed trending stage (2 or 4) — the standard resolution for
-    this ambiguity, since basing and topping look identical on MA+price alone.
+    EMA NOTE (why not SMA): Weinstein's original method used a simple 30-week
+    SMA, which weighs a week from 6 months ago the same as last week. That
+    causes real lag after a big prior move — e.g. a stock that ran up 3x then
+    spent 2 months declining can still show a "rising" SMA slope, because the
+    old rally is still baked into the average with full weight, even while
+    price has clearly turned down. EMA weights recent weeks more heavily, so
+    it reflects a genuine trend change faster — at the cost of being somewhat
+    more reactive to short-term noise, which is why the confirmation layers
+    below (EMA10 agreement + confirm_weeks persistence) matter more, not less,
+    with EMA.
 
-    SMA10>SMA30 CONFIRMATION + 2-WEEK PERSISTENCE (anti-whipsaw / anti-poison):
-    a single borderline week — price barely above SMA30 with slope just over
+    Average slope over slope_lookback weeks decides rising/falling/flat
+    (threshold flat_threshold_pct%). Flat/ambiguous weeks are 1-vs-3 by
+    carrying forward the last confirmed trending stage (2 or 4) — the
+    standard resolution for this ambiguity, since basing and topping look
+    identical on average+price alone.
+
+    EMA10>EMA30 CONFIRMATION + 2-WEEK PERSISTENCE (anti-whipsaw / anti-poison):
+    a single borderline week — price barely above EMA30 with slope just over
     the flat_threshold — used to be enough to flip Stage 4→2 outright, which
     then "poisoned" last_trend for months afterward (every later ambiguous
     week got called Topping instead of Basing, since last_trend was wrongly
-    left at 2). Three defenses now: (a) price itself must be above the faster
-    10-week SMA too, not just the 30-week one (price > SMA10 > SMA30 for
+    left at 2). Three defenses: (a) price itself must be above the faster
+    10-week EMA too, not just the 30-week one (price > EMA10 > EMA30 for
     Stage 2, reversed for Stage 4) — a stronger, stricter entry condition
-    than price vs SMA30 alone, (b) that 10-week SMA must be on the correct
-    side of the 30-week SMA, and (c) even when a week's raw read is 2 or 4,
+    than price vs EMA30 alone, (b) that 10-week EMA must be on the correct
+    side of the 30-week EMA, and (c) even when a week's raw read is 2 or 4,
     `last_trend` (the value the 1-vs-3 fallback actually uses) only updates
     once that raw read repeats for confirm_weeks CONSECUTIVE weeks. That
     single week's `stage` is still shown honestly (it can momentarily read 2
@@ -3302,16 +3314,15 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
     dressed up with a named pattern label.
 
     EARLY TRANSITION (fixes the lag): the official `stage` field only flips
-    to 2 once the 30-week SMA's slope confirms — which takes several weeks
-    AFTER a base-high breakout, since a slow 30-week average doesn't move
-    fast. To catch the breakout itself, while stage is still 1 (Basing) we
-    separately check if this week's close broke above the highest close of
-    the prior early_breakout_lookback weeks (the base range) — if so,
-    early_transition=True ("Possible Stage 2 — base breakout, SMA30 slope
-    not yet confirmed"), even though `stage` still correctly reads 1.
-    Symmetric check while stage==3 (Topping) flags a range breakdown as a
-    possible early Stage 4. Use `stage` for the confirmed/reliable read and
-    `early_transition` for a faster (noisier) heads-up.
+    to 2 once the 30-week EMA's slope confirms — which can still take a few
+    weeks after a base-high breakout. To catch the breakout itself, while
+    stage is still 1 (Basing) we separately check if this week's close broke
+    above the highest close of the prior early_breakout_lookback weeks (the
+    base range) — if so, early_transition=True ("Possible Stage 2 — base
+    breakout, EMA30 slope not yet confirmed"), even though `stage` still
+    correctly reads 1. Symmetric check while stage==3 (Topping) flags a range
+    breakdown as a possible early Stage 4. Use `stage` for the confirmed/
+    reliable read and `early_transition` for a faster (noisier) heads-up.
 
     NOT SEQUENTIAL: each week's stage is recomputed independently from that
     week's price/slope — it does NOT require passing through 1→2→3→4 in
@@ -3323,7 +3334,7 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
 
     Returns:
       current_signals  -> [{symbol, week, stage, prev_stage, stage_change,
-                             weeks_in_stage, close, sma30}] as of latest week
+                             weeks_in_stage, close, ema30}] as of latest week
       breadth_history  -> [{week, stage1, stage2, stage3, stage4}] full history
     """
     current_signals = []
@@ -3337,12 +3348,12 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
 
         w_labels, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, "W")
         n = len(wc)
-        if n < sma_period + slope_lookback + min_weeks:
+        if n < ema_period + slope_lookback + min_weeks:
             continue
 
-        sma = _calc_sma(wc, sma_period)
-        sma_short = _calc_sma(wc, sma_short_period)
-        start = sma_period + slope_lookback
+        ema30_arr = _calc_ema(wc, ema_period)
+        ema10_arr = _calc_ema(wc, ema_short_period)
+        start = ema_period + slope_lookback
 
         last_trend = None      # CONFIRMED trend (2 or 4) — only this decides the 1-vs-3 fallback
         candidate_trend = None
@@ -3350,16 +3361,16 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
         stage_seq = [None] * start
 
         for i in range(start, n):
-            price, s30, s30_prev = wc[i], sma[i], sma[i - slope_lookback]
-            s10 = sma_short[i]
-            if price is None or s30 is None or s30_prev is None or s30_prev == 0 or s10 is None:
+            price, e30, e30_prev = wc[i], ema30_arr[i], ema30_arr[i - slope_lookback]
+            e10 = ema10_arr[i]
+            if price is None or e30 is None or e30_prev is None or e30_prev == 0 or e10 is None:
                 stage_seq.append(None)
                 continue
-            slope_pct = (s30 - s30_prev) / s30_prev * 100
+            slope_pct = (e30 - e30_prev) / e30_prev * 100
 
-            if price > s10 > s30 and slope_pct > flat_threshold_pct:
+            if price > e10 > e30 and slope_pct > flat_threshold_pct:
                 stage = 2
-            elif price < s10 < s30 and slope_pct < -flat_threshold_pct:
+            elif price < e10 < e30 and slope_pct < -flat_threshold_pct:
                 stage = 4
             else:
                 stage = 3 if last_trend == 2 else 1   # default Stage 1 if unknown
@@ -3368,7 +3379,7 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
             # a raw 2/4 read repeats for confirm_weeks CONSECUTIVE weeks — a
             # single borderline week is shown honestly as that week's stage,
             # but can't by itself "poison" every later ambiguous week into
-            # the wrong bucket (see docstring: SMA10 CONFIRMATION section).
+            # the wrong bucket (see docstring: EMA10 CONFIRMATION section).
             if stage in (2, 4):
                 if stage == candidate_trend:
                     candidate_streak += 1
@@ -3420,13 +3431,13 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
                         range_ref = round(base_high, 2)
                         if today_close > base_high:
                             early_transition = True
-                            early_transition_label = "Possible Stage 2 — base breakout, SMA30 slope not yet confirmed"
+                            early_transition_label = "Possible Stage 2 — base breakout, EMA30 slope not yet confirmed"
                     else:  # cur_stage == 3
                         range_low = min(prior_closes)
                         range_ref = round(range_low, 2)
                         if today_close < range_low:
                             early_transition = True
-                            early_transition_label = "Possible Stage 4 — range breakdown, SMA30 slope not yet confirmed"
+                            early_transition_label = "Possible Stage 4 — range breakdown, EMA30 slope not yet confirmed"
 
             current_signals.append({
                 "symbol": sym, "week": w_labels[i_last], "stage": cur_stage,
@@ -3436,8 +3447,8 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
                 "weeks_in_stage": weeks_in_stage,
                 "weeks_in_prev_stage": weeks_in_prev_stage,
                 "close": round(wc[i_last], 2),
-                "sma30": round(sma[i_last], 2) if sma[i_last] is not None else None,
-                "sma10": round(sma_short[i_last], 2) if sma_short[i_last] is not None else None,
+                "ema30": round(ema30_arr[i_last], 2) if ema30_arr[i_last] is not None else None,
+                "ema10": round(ema10_arr[i_last], 2) if ema10_arr[i_last] is not None else None,
                 "early_transition": early_transition,
                 "early_transition_label": early_transition_label,
                 "range_ref": range_ref,
@@ -3505,11 +3516,11 @@ async def backup_weinstein_transitions(client, signals):
               f"({len(transitions)} transitions this week, {len(hist)} weeks tracked)")
 
 
-async def debug_weinstein_symbol(symbol, sma_period=30, slope_lookback=4, flat_threshold_pct=1.0,
-                                  sma_short_period=10, min_weeks_in_prior_stage=3, confirm_weeks=2,
+async def debug_weinstein_symbol(symbol, ema_period=30, slope_lookback=4, flat_threshold_pct=1.0,
+                                  ema_short_period=10, min_weeks_in_prior_stage=3, confirm_weeks=2,
                                   weeks_shown=20) -> None:
     """
-    Diagnostic: prints week-by-week close/sma30/sma10/slope%/stage for ONE
+    Diagnostic: prints week-by-week close/ema30/ema10/slope%/stage for ONE
     symbol, using the EXACT same math as _detect_weinstein_stages() (duplicated
     here on purpose — read-only, no R2 writes, just for comparing against a
     chart when a classification looks wrong).
@@ -3545,33 +3556,33 @@ async def debug_weinstein_symbol(symbol, sma_period=30, slope_lookback=4, flat_t
     print(f"Last 3 weekly closes: {wc[-3:]}   highs: {wh[-3:]}   lows: {wl[-3:]}")
 
     min_weeks = 40
-    start = sma_period + slope_lookback
-    if n < sma_period + slope_lookback + min_weeks:
-        print(f"n={n} < required {sma_period + slope_lookback + min_weeks} (sma_period+slope_lookback+min_weeks) "
+    start = ema_period + slope_lookback
+    if n < ema_period + slope_lookback + min_weeks:
+        print(f"n={n} < required {ema_period + slope_lookback + min_weeks} (ema_period+slope_lookback+min_weeks) "
               f"— would be SKIPPED entirely by _detect_weinstein_stages (no signal at all).")
 
-    sma = _calc_sma(wc, sma_period)
-    sma_short = _calc_sma(wc, sma_short_period)
+    ema30_arr = _calc_ema(wc, ema_period)
+    ema10_arr = _calc_ema(wc, ema_short_period)
 
     last_trend = None
     candidate_trend = None
     candidate_streak = 0
     stage_seq_full = [None] * start   # for weeks_in_prev_stage / transition_type preview
-    print(f"\n{'Week':<12}{'Close':<10}{'SMA30':<10}{'SMA10':<10}{'Slope%':<10}{'Stage':<20}{'last_trend after'}")
+    print(f"\n{'Week':<12}{'Close':<10}{'EMA30':<10}{'EMA10':<10}{'Slope%':<10}{'Stage':<20}{'last_trend after'}")
     show_from = max(start, n - weeks_shown)
     for i in range(start, n):
-        price, s30, s30_prev = wc[i], sma[i], sma[i - slope_lookback]
-        s10 = sma_short[i]
+        price, e30, e30_prev = wc[i], ema30_arr[i], ema30_arr[i - slope_lookback]
+        e10 = ema10_arr[i]
         row_week = _isoweek_to_date(w_labels[i])
-        if price is None or s30 is None or s30_prev is None or s30_prev == 0 or s10 is None:
+        if price is None or e30 is None or e30_prev is None or e30_prev == 0 or e10 is None:
             stage_seq_full.append(None)
             if i >= show_from:
                 print(f"{row_week:<12}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'None (missing data)':<20}{last_trend}")
             continue
-        slope_pct = (s30 - s30_prev) / s30_prev * 100
-        if price > s10 > s30 and slope_pct > flat_threshold_pct:
+        slope_pct = (e30 - e30_prev) / e30_prev * 100
+        if price > e10 > e30 and slope_pct > flat_threshold_pct:
             stage = 2
-        elif price < s10 < s30 and slope_pct < -flat_threshold_pct:
+        elif price < e10 < e30 and slope_pct < -flat_threshold_pct:
             stage = 4
         else:
             stage = 3 if last_trend == 2 else 1
@@ -3586,7 +3597,7 @@ async def debug_weinstein_symbol(symbol, sma_period=30, slope_lookback=4, flat_t
             candidate_trend, candidate_streak = None, 0
         stage_seq_full.append(stage)
         if i >= show_from:
-            print(f"{row_week:<12}{price:<10.2f}{s30:<10.2f}{s10:<10.2f}{slope_pct:<10.2f}"
+            print(f"{row_week:<12}{price:<10.2f}{e30:<10.2f}{e10:<10.2f}{slope_pct:<10.2f}"
                   f"{STAGE_NAMES[stage]+' ('+str(stage)+')':<20}{last_trend}   (candidate={candidate_trend}x{candidate_streak})")
 
     print(f"\nFinal stage this run: {STAGE_NAMES[stage]} ({stage})")
@@ -3609,7 +3620,7 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
     dry_run=True: skip all R2 uploads (weinstein_stage_analysis.json +
     weinstein_stage_history.json + weinstein_transitions.json) and instead
     PRINT the top print_top_n signals per stage (symbol name, weeks_in_stage,
-    close, sma30) to the log — for manually cross-checking real stock names
+    close, ema30) to the log — for manually cross-checking real stock names
     against a chart before trusting the detector on live data.
     """
     status = PipelineStatus("run_weinstein_scan")
@@ -3648,7 +3659,7 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                         tag = f"  ⚡ {s['early_transition_label']} (range_ref={s['range_ref']})" if s["early_transition"] else ""
                         chg = f"  🔄 {s['transition_type']}" if s["stage_change"] else ""
                         log.info(f"  {s['symbol']:<15} weeks_in_stage={s['weeks_in_stage']:<5} "
-                                  f"close={s['close']:<10} sma30={s['sma30']:<10} "
+                                  f"close={s['close']:<10} ema30={s['ema30']:<10} "
                                   f"stage_change={s['stage_change']}{tag}{chg}")
                 early_watch = [s for s in signals if s["early_transition"]]
                 if early_watch:
