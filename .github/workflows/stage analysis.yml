@@ -1,0 +1,27 @@
+name: Test Weinstein Stage Detector
+
+on:
+  push:
+    paths:
+      - "pipeline.py"
+      - "test_weinstein_stage.py"
+  pull_request:
+    paths:
+      - "pipeline.py"
+      - "test_weinstein_stage.py"
+  workflow_dispatch:   # manual "Run workflow" button
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Weinstein stage detector test
+        run: python test_weinstein_stage.py
