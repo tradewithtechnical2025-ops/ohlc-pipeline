@@ -734,31 +734,21 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         r = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
             json={
-                # Full text, not a small head-of-document slice — Gemini
-                # flash's context window easily fits an entire results PDF
-                # (usually a few thousand words). 100000 chars (~25k tokens)
-                # is just a generous safety cap for the rare oversized filing,
-                # not a normal-case truncation point.
-                "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:100000]}]}],
-                # maxOutputTokens raised well beyond the visible-JSON size —
-                # on "thinking"-capable flash models, internal reasoning
-                # tokens are drawn from THIS SAME budget before any visible
-                # output is emitted, so a limit sized only for the JSON
-                # itself (e.g. 3000) can be entirely consumed by thinking,
-                # leaving the actual answer truncated after just a couple
-                # hundred characters (seen repeatedly: JSON cut off at
-                # char 200-800 regardless of how high this was raised).
-                # thinkingConfig explicitly caps/disables that reasoning
-                # budget so tokens go to the structured answer instead —
-                # this is a plain extraction task, not something that
-                # benefits from extended chain-of-thought. If the model
-                # doesn't support thinkingConfig, the API should ignore the
-                # unrecognized field rather than error.
+                # Matches the known-working browser-based RHP extractor's
+                # request shape exactly (same model, same generationConfig,
+                # same 60000-char text cap) — that tool reliably gets clean
+                # JSON back from this model. An earlier attempt here added
+                # a "thinkingConfig": {"thinkingBudget": 0} field that
+                # isn't present in the working reference at all; every
+                # response after adding it came back truncated a few
+                # hundred characters into the JSON regardless of how high
+                # maxOutputTokens was raised, so that field (not the token
+                # budget) was almost certainly the actual cause — removed.
+                "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:60000]}]}],
                 "generationConfig": {
                     "temperature": 0.05,
                     "maxOutputTokens": 8192,
                     "responseMimeType": "application/json",
-                    "thinkingConfig": {"thinkingBudget": 0},
                 },
             },
             timeout=60,
@@ -912,7 +902,16 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     # attached only when present so callers that don't know about them yet
     # (Telegram formatting, R2 schema) are unaffected.
     if ai.get("segment_breakup"):
-        result["segment_breakup"] = ai["segment_breakup"]
+        # Scale each segment's revenue the same way every other rupee
+        # figure above is scaled (Crore/Million/Lakh -> raw rupees) — the
+        # AI reports these in the filing's stated unit just like revenue/
+        # PAT/etc, so leaving them unscaled would make segment numbers
+        # ~1e5-1e7x smaller than everything else downstream expects
+        # (_fmt_cr divides by 1e7 assuming raw rupees).
+        result["segment_breakup"] = [
+            {"segment": s.get("segment"), "revenue": scale(s.get("revenue"))}
+            for s in ai["segment_breakup"] if isinstance(s, dict) and s.get("segment")
+        ]
     if ai.get("management_commentary"):
         result["management_commentary"] = ai["management_commentary"]
     if ai.get("key_highlights"):
@@ -1357,6 +1356,40 @@ def _telegram_basis_block(parsed: dict) -> list:
         lines.append("")
         lines.append("⚠️ Company notes: results may not be YoY comparable")
 
+    # ── AI-extracted narrative fields (segment breakup, commentary,
+    # highlights, other board decisions) — these come only from the AI
+    # PDF-extraction path (XBRL parsing never populates them), so most
+    # existing/XBRL-sourced records simply won't have these keys and these
+    # blocks are silently skipped for them.
+    segs = parsed.get("segment_breakup")
+    if segs:
+        lines.append("")
+        lines.append("<b>📦 Segment Revenue</b>")
+        for s in segs:
+            seg_name = s.get("segment")
+            seg_rev = s.get("revenue")
+            if seg_name and seg_rev is not None:
+                lines.append(f"{seg_name}: {_fmt_cr(seg_rev)}")
+
+    highlights = parsed.get("key_highlights")
+    if highlights:
+        lines.append("")
+        lines.append("<b>✨ Key Highlights</b>")
+        for h in highlights:
+            lines.append(f"• {h}")
+
+    commentary = parsed.get("management_commentary")
+    if commentary:
+        lines.append("")
+        lines.append("<b>🗣️ Management Commentary</b>")
+        lines.append(commentary)
+
+    board_outcome = parsed.get("board_meeting_outcome")
+    if board_outcome:
+        lines.append("")
+        lines.append("<b>🏛️ Other Board Decisions</b>")
+        lines.append(board_outcome)
+
     return lines
 
 
@@ -1392,7 +1425,17 @@ def _telegram_result_message(group) -> str:
             lines.append(f"━━ <b>{nature.upper()}</b> ━━")
         lines += _telegram_basis_block(parsed)
 
-    return "\n".join(lines)
+    msg = "\n".join(lines)
+    # Telegram's hard cap is 4096 chars per message. The narrative fields
+    # (segment breakup, highlights, commentary, board outcome — especially
+    # doubled up across Standalone + Consolidated in one message) can push
+    # past that on a verbose filing. Truncate defensively rather than let
+    # the send fail outright; the full data is still in
+    # nse_results_detailed.json regardless of what fits in the alert.
+    TELEGRAM_MAX_CHARS = 4000
+    if len(msg) > TELEGRAM_MAX_CHARS:
+        msg = msg[:TELEGRAM_MAX_CHARS].rsplit("\n", 1)[0] + "\n\n…(truncated, see full data on the site)"
+    return msg
 
 
 def _group_parsed_results(parsed_new: list) -> list:
