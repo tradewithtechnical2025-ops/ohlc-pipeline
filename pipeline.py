@@ -3412,13 +3412,49 @@ async def backup_weinstein_history(client, signals):
     log.info(f"  🗄  weinstein_stage_history: {week_key} → {fname}  ({len(signals)} stocks, {len(hist)} weeks)")
 
 
+async def backup_weinstein_transitions(client, signals):
+    """
+    Separate, LEAN log of ONLY the stage-transition events (stage_change=True)
+    — not a full weekly snapshot like weinstein_stage_history.json. Keyed by
+    the completed WEEK (idempotent, re-running mid-week overwrites that
+    week's entries). Lets you answer "when did SYMBOL last change stage" or
+    "show me every Failed Top ever" without scanning full snapshots.
+    {week_date: [{symbol, from_stage, from_stage_name, to_stage,
+                  to_stage_name, transition_type}, ...], ...}
+    in weinstein_transitions.json.
+    """
+    fname = "weinstein_transitions.json"
+    if not signals:
+        log.info("  🗄  weinstein transitions backup: no signals, skip")
+        return
+    week_key = _isoweek_to_date(signals[0]["week"])
+    transitions = [
+        {
+            "symbol": s["symbol"],
+            "from_stage": s["prev_stage"],
+            "from_stage_name": STAGE_NAMES.get(s["prev_stage"]),
+            "to_stage": s["stage"],
+            "to_stage_name": STAGE_NAMES.get(s["stage"]),
+            "transition_type": s["transition_type"],
+        }
+        for s in signals if s["stage_change"]
+    ]
+
+    hist = await r2_download(client, fname)
+    if not isinstance(hist, dict): hist = {}
+    hist[week_key] = transitions
+    await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
+    log.info(f"  🗄  weinstein_transitions: {week_key} → {fname}  "
+              f"({len(transitions)} transitions this week, {len(hist)} weeks tracked)")
+
+
 async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
     """
-    dry_run=True: skip both R2 uploads (weinstein_stage_analysis.json +
-    weinstein_stage_history.json) and instead PRINT the top print_top_n
-    signals per stage (symbol name, weeks_in_stage, close, sma30) to the log
-    — for manually cross-checking real stock names against a chart before
-    trusting the detector on live data.
+    dry_run=True: skip all R2 uploads (weinstein_stage_analysis.json +
+    weinstein_stage_history.json + weinstein_transitions.json) and instead
+    PRINT the top print_top_n signals per stage (symbol name, weeks_in_stage,
+    close, sma30) to the log — for manually cross-checking real stock names
+    against a chart before trusting the detector on live data.
     """
     status = PipelineStatus("run_weinstein_scan")
     try:
@@ -3433,8 +3469,9 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
             signals, breadth_history = _detect_weinstein_stages(all_data)
 
             if not dry_run:
-                # backup keyed on raw week label BEFORE we reformat "week" to a date string below
+                # backups keyed on raw week label BEFORE we reformat "week" to a date string below
                 await backup_weinstein_history(client, signals)
+                await backup_weinstein_transitions(client, signals)
 
             for sig in signals:
                 sig["stage_name"] = STAGE_NAMES[sig["stage"]]
@@ -3462,6 +3499,12 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                     log.info(f"\n⚡ {len(early_watch)} stocks with early_transition=True "
                               f"(base breakout / range breakdown ahead of SMA30 confirmation): "
                               f"{[s['symbol'] for s in early_watch]}")
+                transitioned = [s for s in signals if s["stage_change"]]
+                if transitioned:
+                    log.info(f"\n🔄 {len(transitioned)} stage transitions this week (would be logged "
+                              f"to weinstein_transitions.json in a real run):")
+                    for s in transitioned:
+                        log.info(f"  {s['symbol']:<15} {s['transition_type']}")
                 log.info("\n[DRY RUN] No R2 files written — copy symbol names above into "
                           "TradingView/your chart tool to cross-check.")
             else:
