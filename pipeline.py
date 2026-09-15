@@ -3270,20 +3270,29 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
     (Weinstein used a 30-week SMA; this uses EMA instead — see EMA NOTE below).
 
       Stage 1 (Basing)     — price hovering near a flat average, after a decline
-      Stage 2 (Advancing)  — price > 10wk EMA > 30wk EMA, slope rising,
-                              AND close > highest weekly HIGH of the prior
-                              swing_lookback weeks (genuine new swing high)
+      Stage 2 (Advancing)  — price > 10wk EMA > 30wk EMA, slope rising;
+                              ENTERING Stage 2 also requires close > highest
+                              weekly HIGH of the prior swing_lookback weeks
+                              (genuine new swing high) — once already in
+                              Stage 2, this swing check is not re-required
+                              every week (see SWING HIGH/LOW section)
       Stage 3 (Topping)    — price hovering near a flat average, after an advance
-      Stage 4 (Declining)  — price < 10wk EMA < 30wk EMA, slope falling,
-                              AND close < lowest weekly LOW of the prior
-                              swing_lookback weeks (genuine new swing low)
+      Stage 4 (Declining)  — price < 10wk EMA < 30wk EMA, slope falling;
+                              ENTERING Stage 4 also requires close < lowest
+                              weekly LOW of the prior swing_lookback weeks
 
-    SWING HIGH/LOW CONFIRMATION: on top of the EMA-based conditions, entry
-    into Stage 2/4 also requires the close to actually break the prior
-    swing_lookback weeks' real price extreme (weekly high for Stage 2, weekly
-    low for Stage 4 — wicks, not just closes) — a genuine breakout of recent
-    price structure, not merely an EMA crossover with no new high/low to show
-    for it.
+    SWING HIGH/LOW CONFIRMATION — ENTRY ONLY: on top of the EMA-based
+    conditions, the FIRST week of entering Stage 2/4 also requires the close
+    to actually break the prior swing_lookback weeks' real price extreme
+    (weekly high for Stage 2, weekly low for Stage 4 — wicks, not just
+    closes) — a genuine breakout of recent price structure, not merely an
+    EMA crossover with no new high/low to show for it. This check is NOT
+    re-applied on weeks where the stock is already reading Stage 2/4 (i.e.
+    last week's literal stage already matched) — otherwise a single volatile
+    prior week's wick (that closed lower) could choke a genuine ongoing
+    uptrend into a false Topping/Basing read purely because this week's
+    close sits below that one earlier wick, despite EMA/slope still being
+    solidly in trend.
 
     EMA NOTE (why not SMA): Weinstein's original method used a simple 30-week
     SMA, which weighs a week from 6 months ago the same as last week. That
@@ -3380,18 +3389,32 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
                 continue
             slope_pct = (e30 - e30_prev) / e30_prev * 100
 
-            swing_start = max(0, i - swing_lookback)
-            prior_highs = [v for v in wh[swing_start:i] if v is not None]
-            prior_lows = [v for v in wl[swing_start:i] if v is not None]
-            swing_high = max(prior_highs) if prior_highs else None
-            swing_low = min(prior_lows) if prior_lows else None
+            # Swing-high/low confirmation applies only at ENTRY into Stage 2/4
+            # (i.e. last week's literal stage wasn't already 2/4) — once
+            # already established, a stock doesn't need to clear a fresh
+            # 10-week high every single week just to continue, since a
+            # volatile prior week's wick can otherwise choke a genuine
+            # ongoing uptrend (e.g. last week's high spiked but closed lower,
+            # so this week's close — even while still rising cleanly on
+            # EMA/slope — sits below that one-off wick).
+            prior_literal_stage = stage_seq[-1] if stage_seq else None
+            raw2 = price > e10 > e30 and slope_pct > flat_threshold_pct
+            raw4 = price < e10 < e30 and slope_pct < -flat_threshold_pct
 
-            if (price > e10 > e30 and slope_pct > flat_threshold_pct
-                    and swing_high is not None and price > swing_high):
-                stage = 2
-            elif (price < e10 < e30 and slope_pct < -flat_threshold_pct
-                    and swing_low is not None and price < swing_low):
-                stage = 4
+            if raw2 and prior_literal_stage == 2:
+                stage = 2   # continuing — no fresh swing high required
+            elif raw4 and prior_literal_stage == 4:
+                stage = 4   # continuing — no fresh swing low required
+            elif raw2:
+                swing_start = max(0, i - swing_lookback)
+                prior_highs = [v for v in wh[swing_start:i] if v is not None]
+                swing_high = max(prior_highs) if prior_highs else None
+                stage = 2 if (swing_high is not None and price > swing_high) else (3 if last_trend == 2 else 1)
+            elif raw4:
+                swing_start = max(0, i - swing_lookback)
+                prior_lows = [v for v in wl[swing_start:i] if v is not None]
+                swing_low = min(prior_lows) if prior_lows else None
+                stage = 4 if (swing_low is not None and price < swing_low) else (3 if last_trend == 2 else 1)
             else:
                 stage = 3 if last_trend == 2 else 1   # default Stage 1 if unknown
 
@@ -3600,17 +3623,24 @@ async def debug_weinstein_symbol(symbol, ema_period=30, slope_lookback=4, flat_t
                 print(f"{row_week:<12}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'None (missing data)':<20}{last_trend}")
             continue
         slope_pct = (e30 - e30_prev) / e30_prev * 100
-        swing_start = max(0, i - swing_lookback)
-        prior_highs = [v for v in wh[swing_start:i] if v is not None]
-        prior_lows = [v for v in wl[swing_start:i] if v is not None]
-        swing_high = max(prior_highs) if prior_highs else None
-        swing_low = min(prior_lows) if prior_lows else None
-        if (price > e10 > e30 and slope_pct > flat_threshold_pct
-                and swing_high is not None and price > swing_high):
+        prior_literal_stage = stage_seq_full[-1] if stage_seq_full else None
+        raw2 = price > e10 > e30 and slope_pct > flat_threshold_pct
+        raw4 = price < e10 < e30 and slope_pct < -flat_threshold_pct
+        swing_high = swing_low = None
+        if raw2 and prior_literal_stage == 2:
             stage = 2
-        elif (price < e10 < e30 and slope_pct < -flat_threshold_pct
-                and swing_low is not None and price < swing_low):
+        elif raw4 and prior_literal_stage == 4:
             stage = 4
+        elif raw2:
+            swing_start = max(0, i - swing_lookback)
+            prior_highs = [v for v in wh[swing_start:i] if v is not None]
+            swing_high = max(prior_highs) if prior_highs else None
+            stage = 2 if (swing_high is not None and price > swing_high) else (3 if last_trend == 2 else 1)
+        elif raw4:
+            swing_start = max(0, i - swing_lookback)
+            prior_lows = [v for v in wl[swing_start:i] if v is not None]
+            swing_low = min(prior_lows) if prior_lows else None
+            stage = 4 if (swing_low is not None and price < swing_low) else (3 if last_trend == 2 else 1)
         else:
             stage = 3 if last_trend == 2 else 1
         if stage in (2, 4):
