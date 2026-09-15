@@ -735,7 +735,14 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
             f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
             json={
                 "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:14000]}]}],
-                "generationConfig": {"temperature": 0.05, "maxOutputTokens": 700, "responseMimeType": "application/json"},
+                # maxOutputTokens raised from 700 -> 3000. 700 was too tight
+                # for this schema once segment_breakup / key_highlights /
+                # management_commentary / qoq_prior / yoy_prior are all
+                # populated — Gemini's response was getting cut off mid-JSON,
+                # which surfaced as JSONDecodeError ("Unterminated string",
+                # "Expecting ',' delimiter", "Extra data") rather than a
+                # clean truncation signal. 3000 gives real headroom.
+                "generationConfig": {"temperature": 0.05, "maxOutputTokens": 3000, "responseMimeType": "application/json"},
             },
             timeout=30,
         )
@@ -979,7 +986,10 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     # ── AI extraction (sole extraction path — no regex fallback) ──
     ai = await _ai_extract_financials(client, text, fname_dbg)
     if not ai:
-        print(f"    · [{fname_dbg}] AI extraction unavailable/failed (no GEMINI_API_KEY, or call errored) — skipping")
+        if not GEMINI_API_KEY:
+            print(f"    · [{fname_dbg}] skipping — GEMINI_API_KEY not set")
+        else:
+            print(f"    · [{fname_dbg}] AI extraction failed or returned unparseable data — skipping")
         return None
     if not ai.get("is_results_table"):
         print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
