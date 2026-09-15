@@ -19,15 +19,15 @@ except ImportError:
 # Boss needs to create this channel and set the secret once.
 TELEGRAM_RESULTS_CHAT_ID = os.environ.get("TELEGRAM_RESULTS_CHAT_ID", "")
 
-# Used for AI-assisted PDF financial-results extraction (fallback/primary
-# when regex label-matching fails or produces implausible values — see
-# _ai_extract_financials). Pipeline runs regex-only (degraded but
-# functional) when this isn't set. Gemini instead of Claude specifically
-# because the free tier needs no card on file (vs Anthropic billing,
-# which hit setup friction) — same system prompt/schema either way, this
-# just swaps which API answers it. Model name drifts periodically as
-# Google renames/retires versions (already hit once this project) —
-# check https://aistudio.google.com/app/apikey if this starts 404ing.
+# Used for AI-assisted PDF financial-results extraction. This is now the
+# ONLY extraction path for PDFs (regex fallback removed) — if this isn't
+# set, PDF result parsing simply doesn't run (see parse_financial_results_pdf).
+# Gemini instead of Claude specifically because the free tier needs no card
+# on file (vs Anthropic billing, which hit setup friction) — same system
+# prompt/schema either way, this just swaps which API answers it. Model name
+# drifts periodically as Google renames/retires versions (already hit once
+# this project) — check https://aistudio.google.com/app/apikey if this
+# starts 404ing.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_PDF_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
@@ -557,15 +557,31 @@ FUNDAMENTALS_FILE = "fundamentals_summary.json"
 # NSE's XBRL filing for a result often lands noticeably later than the
 # "Outcome of Board Meeting" PDF for the same result (the PDF is filed the
 # moment the board approves it; XBRL is a separate, slower submission).
-# This is a best-effort text/regex parser — PDFs aren't a standardized
-# machine-readable format the way XBRL is, so it targets only the core
-# line items needed for the Telegram alert. When the XBRL filing for the
-# same symbol+quarter+nature shows up later, build_results_detailed's
-# "refiled" handling silently supersedes this record with the authoritative
-# XBRL data — so an imperfect PDF parse just gets corrected, it never
-# blocks or duplicates the real notification.
+#
+# Extraction is AI-only (Gemini) — see parse_financial_results_pdf. A cheap
+# regex heading pre-check (still using the pattern set below) decides
+# whether a PDF is even worth sending to the AI at all, to avoid burning an
+# API call on the majority of "Outcome of Board Meeting" PDFs that are
+# actually governance/KMP-only notices with no results table.
 
-_PDF_SUBJECT_RE = re.compile(r"outcome of board meeting", re.IGNORECASE)
+# SUBJECT tag phrasings NSE/filers use for a PDF that MIGHT contain a
+# results table. "Outcome of Board Meeting" is the most common, but some
+# filings are tagged directly with a results-flavoured subject instead
+# (e.g. "Financial Results", "Results for the Quarter", "Un-Audited
+# Financial Results") — without matching those too, such a PDF would never
+# even get downloaded, let alone reach the heading/AI check. Being broad
+# here is safe: a false-positive match still has to clear the in-PDF
+# heading check (_pdf_find_heading_candidates) before an AI call is made,
+# so casting a wider net at this stage costs at most a wasted PDF fetch,
+# never a wasted AI call.
+_PDF_SUBJECT_PATTERNS = [
+    r"outcome of board meeting",
+    r"financial results?",
+    r"results? for the (?:quarter|year|half.?year)",
+    r"(?:un-?)?audited financial results?",
+    r"integrated filing[\s\S]{0,20}financial",
+]
+_PDF_SUBJECT_RE = re.compile("|".join(_PDF_SUBJECT_PATTERNS), re.IGNORECASE)
 # Candidate heading patterns, tried in this priority order:
 #   1. "Statement of Standalone/Consolidated ... Financial Results" (most specific)
 #   2. "Standalone/Consolidated ... Financial Results" without the "Statement of" prefix
@@ -597,33 +613,17 @@ _PDF_HEADING_PATTERNS = [
 # Checked against the ~40 chars immediately before the match.
 _PDF_BOILERPLATE_PRECEDE_RE = re.compile(r"(accompanying|reviewed)[\s\S]{0,15}$", re.IGNORECASE)
 _PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
-_PDF_FORMULA_REF_RE = re.compile(r"[\(\[]\s*\d+\s*[+\-]\s*\d+\s*[\)\]]")
-_PDF_NUM_TOKEN_RE = r"\(?-?[\d,]+\.?\d*\)?|-|—"
-
-# Date token matching BOTH orderings NSE filers use: "30 June 2026" (day
-# first) and "June 30, 2026" (month first, with optional comma) — confirmed
-# both appear across different filers' PDFs in practice.
-_PDF_DATE_TOKEN_RE = r"(?:\d{1,2}\s+[A-Za-z]+,?\s+\d{4}|[A-Za-z]+\s+\d{1,2},?\s+\d{4})"
-
-
-def _pdf_parse_flex_date(s: str):
-    """Parses a date string in either 'DD Month YYYY'/'DD Month, YYYY' or
-    'Month DD, YYYY'/'Month DD YYYY' form. Returns a datetime or None."""
-    s = s.strip().rstrip(",")
-    s = re.sub(r"\s+", " ", s)
-    for fmt in ("%d %B %Y", "%d %B, %Y", "%B %d, %Y", "%B %d %Y", "%d %b %Y", "%b %d, %Y", "%b %d %Y"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            continue
-    return None
 
 
 def _pdf_find_heading_candidates(text: str):
     """Returns [(start, end, nature)] for every non-boilerplate heading-like
     match across all three pattern tiers, sorted by position. `nature` is
     "Standalone" or "Consolidated" (defaulting to "Standalone" when the
-    matched pattern has no qualifier group, i.e. tier 3)."""
+    matched pattern has no qualifier group, i.e. tier 3).
+
+    Used as a cheap pre-check before calling the AI — if this returns
+    empty, the PDF is (almost certainly) a governance/KMP-only outcome
+    letter with no actual results table, so we skip the AI call entirely."""
     candidates = []
     for pat in _PDF_HEADING_PATTERNS:
         for m in pat.finditer(text):
@@ -651,101 +651,6 @@ def _is_board_outcome_pdf(it: dict) -> bool:
         return False
     m = _SUBJECT_TAG_RE.search(it.get("summary", ""))
     return bool(m and _PDF_SUBJECT_RE.search(m.group(1)))
-
-
-def _pdf_parse_num(tok: str):
-    tok = tok.strip()
-    if tok in ("-", "—", ""):
-        return 0.0
-    neg = tok.startswith("(") and tok.endswith(")")
-    tok = tok.strip("()").replace(",", "").strip()
-    if not tok:
-        return None
-    try:
-        v = float(tok)
-        return -v if neg else v
-    except ValueError:
-        return None
-
-
-def _pdf_numbers_after(section: str, label_pattern: str, max_cols: int = 4):
-    """Finds the label, then reads up to max_cols numeric tokens on the same
-    line — the standard NSE quarterly-result row layout is
-    [current quarter, immediately-preceding quarter, same quarter last year,
-    full year], all on one line. Returns a list padded with None to
-    max_cols. Skips formula-reference parentheticals like "(3 - 4)"."""
-    m = re.search(label_pattern, section, re.IGNORECASE)
-    if not m:
-        return [None] * max_cols
-    nl = section.find("\n", m.end())
-    tail = section[m.end(): nl if nl != -1 else m.end() + 400]
-    tail = _PDF_FORMULA_REF_RE.sub(" ", tail)
-    vals = [_pdf_parse_num(t) for t in re.findall(_PDF_NUM_TOKEN_RE, tail)]
-    vals = vals[:max_cols]
-    return vals + [None] * (max_cols - len(vals))
-
-
-def _pdf_numbers_after_any(section: str, label_patterns: list, max_cols: int = 4):
-    """Tries each label pattern in order (different filers phrase the same
-    line item differently — e.g. 'Profit before tax' vs '...tax (3+4)' vs
-    'Profit/(Loss) before tax') and returns the first one whose column 0 is
-    non-None. Falls back to an all-None result if none match."""
-    for pat in label_patterns:
-        vals = _pdf_numbers_after(section, pat, max_cols)
-        if vals[0] is not None:
-            return vals
-    return [None] * max_cols
-
-
-def _pdf_number_after(section: str, label_pattern: str):
-    """Current-quarter (first column) convenience wrapper around
-    _pdf_numbers_after."""
-    return _pdf_numbers_after(section, label_pattern, max_cols=1)[0]
-
-
-def _pdf_header_dates(section: str):
-    """Extracts the column header dates from the results table's
-    'Particulars <date1> <date2> ...' row, e.g. ['30 June 2026',
-    '31 March 2026', '30 June 2025', '31 March 2026'] or the month-first
-    equivalent ('June 30, 2026', ...). Returns ISO dates, padded with None
-    to 4 columns."""
-    m = re.search(r"Particulars\s+((?:" + _PDF_DATE_TOKEN_RE + r"\s*){2,4})", section)
-    if not m:
-        return [None] * 4
-    raw_dates = re.findall(_PDF_DATE_TOKEN_RE, m.group(1))
-    iso_dates = []
-    for d in raw_dates[:4]:
-        parsed = _pdf_parse_flex_date(d)
-        iso_dates.append(parsed.strftime("%Y-%m-%d") if parsed else None)
-    return iso_dates + [None] * (4 - len(iso_dates))
-
-
-def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
-    """Builds a comparison dict in the same shape _compare_to_fundamentals()
-    produces (sales_prior/sales_{suffix}_pct, pat_..., eps_..., opm_...),
-    but computed directly from the PDF's own comparative column instead of
-    a separate fundamentals lookup — this is the filing's own reported
-    comparative figure, which is more precise than a database join.
-    basis="reported" flags this as sourced from the filing itself."""
-    if not prior_header or not any(v is not None for v in prior.values()):
-        return None
-    out = {"basis": "reported", "basis_verified": True, "prior_header": prior_header}
-    field_map = {"revenue": "sales", "total_income": "total_income", "pat": "pat", "eps_basic": "eps"}
-    got_any = False
-    for cur_field, out_field in field_map.items():
-        cur_v, prior_v = cur.get(cur_field), prior.get(cur_field)
-        if cur_v is not None and prior_v is not None and prior_v != 0:
-            out[f"{out_field}_prior"] = prior_v
-            out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
-            got_any = True
-    prior_rev, prior_exp = prior.get("revenue"), prior.get("total_expenses")
-    prior_opm = (prior_rev - prior_exp) / prior_rev if (prior_rev and prior_exp is not None and prior_rev != 0) else None
-    cur_opm = cur.get("opm")
-    if cur_opm is not None and prior_opm is not None:
-        out["opm_prior"] = round(prior_opm * 100, 2)
-        out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
-        got_any = True
-    return out if got_any else None
 
 
 def _pdf_quarter_label(period_end_iso: str):
@@ -853,276 +758,17 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         return None
 
 
-def _parse_pdf_regex(text: str, link: str, fname_dbg: str, rss_title: str = ""):
-    """Regex/label-matching fallback parser — used when AI extraction is
-    unavailable (no GEMINI_API_KEY) or fails. Takes already-extracted
-    text (see parse_financial_results_pdf, which does the pdfplumber
-    extraction once and tries AI first)."""
-    headings = _pdf_find_heading_candidates(text)
-    if not headings:
-        snippets = []
-        for m_fr in list(re.finditer(r"financial results", text, re.IGNORECASE))[:3]:
-            start = max(0, m_fr.start() - 60)
-            snippets.append(text[start:m_fr.end() + 20].replace("\n", "⏎"))
-        snippet_text = " || ".join(snippets)
-        print(f"    · [{fname_dbg}] no non-boilerplate 'Financial Results' heading found across all "
-              f"3 pattern tiers — not a results table (governance/KMP-only outcome PDF), or every "
-              f"match was inside the auditor-report cover letter"
-              + (f" | occurrences: ...{snippet_text}..." if snippet_text else " | 'financial results' not found in text at all"))
-        return None  # no results table in this PDF (pure governance/KMP outcome)
-
-    # Try candidates in order: Consolidated first (preferred when both bases
-    # are present), then by document position. Take the FIRST candidate
-    # whose section actually yields Revenue or PAT — a heading-shaped match
-    # with no extractable numbers right after it (e.g. a stray mention, or
-    # a table our label regexes don't recognize) isn't usable, so we keep
-    # trying rather than giving up on the first match.
-    ordered = sorted(headings, key=lambda c: (0 if c[2] == "Consolidated" else 1, c[0]))
-
-    chosen_section = chosen_nature = None
-    chosen_numbers = None
-    tried_snippets = []
-    for start, end, nature in ordered:
-        later = [c[0] for c in headings if c[0] > start]
-        section = text[end: min(later) if later else len(text)]
-
-        revenue_c        = _pdf_numbers_after_any(section, [
-            r"Total Revenue from operations",   # some filers split Sales + Other operating income
-            r"Revenue from operations",         # under a bare header line — try the summed row first
-        ])
-        other_income_c   = _pdf_numbers_after(section, r"Other income")
-        total_income_c   = _pdf_numbers_after(section, r"Total income")
-        total_expenses_c = _pdf_numbers_after(section, r"Total expenses")
-        pbt_c            = _pdf_numbers_after_any(section, [
-            r"\)\s*before tax",                                          # "...tax (3+4)" style (numbered formula ref)
-            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*before\s+tax(?!\s+and\s+exceptional)",
-            # ^ exact "Profit before tax" row — NOT the "before tax and
-            # exceptional items" subtotal row that often appears just above
-            # it (MSWIL: row 4 "before tax and exceptional items" vs row 6
-            # "before tax" — same value only when exceptional items = 0,
-            # so this must be excluded explicitly rather than relying on
-            # match order)
-            r"Profit before exceptional items and tax",
-            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*before\s+tax",             # last resort: allow the "and exceptional" row
-        ])                                                                # too, for filers with no separate plain PBT row
-        tax_expense_c    = _pdf_numbers_after_any(section, [
-            r"Total tax expense",
-            r"Tax expense\b",                                            # e.g. "Tax expense charge" (no numbers on this
-        ])                                                                # row for some filers — falls through to None, fine
-        pat_c            = _pdf_numbers_after_any(section, [
-            r"Net (?:profit|loss|\(loss\)|profit/\(loss\)).*?for the period",
-            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*after tax.*?for the period",   # Godrej: "Profit after tax for the period / year"
-            r"Profit(?:\s*/?\s*\(?Loss\)?)?\s*for the period.*?year",        # generic "Profit for the period/year"
-            r"Net (?:profit|loss|\(loss\)|profit/\(loss\))\b",               # Zyduswell: bare "Net Profit [5-6]", no "for the period"
-        ])
-        comprehensive_c  = _pdf_numbers_after(section, r"Total comprehensive.*?for the period")
-        eps_basic_c      = _pdf_numbers_after_any(section, [
-            r"\(a\)\s*Basic",
-            r"Basic\s+EPS",                                              # Godrej: "Basic EPS (* not annualized)"
-            r"Basic\s+earning[s]?\s+per\s+share",
-            r"Basic\s*\[?₹?\]?\s*(?=[\d(])",                             # Zyduswell: bare "Basic [₹]" row — lookahead
-        ])                                                                # requires a digit/paren right after, so it
-        eps_diluted_c    = _pdf_numbers_after_any(section, [              # doesn't match "Basic" in unrelated prose
-            r"\(b\)\s*Diluted",
-            r"Diluted\s+EPS",
-            r"Diluted\s+earning[s]?\s+per\s+share",
-            r"Diluted\s*\[?₹?\]?\s*(?=[\d(])",
-        ])
-
-        if revenue_c[0] is not None or pat_c[0] is not None:
-            chosen_section = section
-            chosen_nature = nature
-            chosen_numbers = (revenue_c, other_income_c, total_income_c, total_expenses_c,
-                               pbt_c, tax_expense_c, pat_c, comprehensive_c, eps_basic_c, eps_diluted_c)
-            break
-        rev_line = ""
-        m_rev = re.search(r"Revenue from operations[^\n]{0,150}", section, re.IGNORECASE)
-        if m_rev:
-            rev_line = m_rev.group(0).replace("\n", "⏎")
-        tried_snippets.append(
-            f"[{nature} @ {start}] revenue-line: {rev_line or '(not found in this section)'} "
-            f"| section-start: {section[:250].replace(chr(10), '⏎')}"
-        )
-
-    if chosen_section is None:
-        joined = " || ".join(tried_snippets[:3])
-        print(f"    · [{fname_dbg}] found {len(headings)} heading candidate(s) but none yielded "
-              f"Revenue or PAT numbers — label regex likely doesn't match this PDF's exact wording"
-              f" | tried: ...{joined}...")
-        return None  # couldn't find the table's actual numbers — don't fabricate a record
-
-    section = chosen_section
-    nature = chosen_nature
-    (revenue_c, other_income_c, total_income_c, total_expenses_c,
-     pbt_c, tax_expense_c, pat_c, comprehensive_c, eps_basic_c, eps_diluted_c) = chosen_numbers
-
-    # NSE's PDF tables report every rupee-value line item in whatever unit
-    # the table's own header states — most filers use "(₹ in Crore)" but
-    # some (confirmed: Zyduswell) use "(₹ in Million)", and a few smaller
-    # companies use Lakh. Every downstream consumer (this file's own
-    # _fmt_cr() for Telegram, the frontend's _fmtVal() in pgNews.js, and
-    # the XBRL parser's own field convention) expects RAW RUPEES and does
-    # its own /1e7 to display Crores — so we must scale up by the ACTUAL
-    # unit multiplier here, not a hardcoded Crore assumption (which would
-    # silently make Million-denominated filers' numbers 10x too large).
-    unit_m = re.search(r"[₹Rs\.]*\s*in\s*(Crores?|Millions?|Lakh[s]?|Lac[s]?)", text, re.IGNORECASE)
-    unit_word = unit_m.group(1).lower() if unit_m else None
-    if unit_word and unit_word.startswith("million"):
-        unit_multiplier, unit_label = 1e6, "Million"
-    elif unit_word and (unit_word.startswith("lakh") or unit_word.startswith("lac")):
-        unit_multiplier, unit_label = 1e5, "Lakh"
-    else:
-        unit_multiplier, unit_label = 1e7, "Crore"  # NSE default when no header found — most common
-    if not unit_m:
-        print(f"    · [{fname_dbg}] no '(₹ in Crore/Million/Lakh)' unit header found — "
-              f"defaulting to Crore (₹×1e7); verify this filing's actual unit if numbers look off")
-
-    def _scale_to_rupees(col):
-        return [v * unit_multiplier if v is not None else None for v in col]
-
-    revenue_c, other_income_c, total_income_c, total_expenses_c = (
-        _scale_to_rupees(revenue_c), _scale_to_rupees(other_income_c),
-        _scale_to_rupees(total_income_c), _scale_to_rupees(total_expenses_c),
-    )
-    pbt_c, tax_expense_c, pat_c, comprehensive_c = (
-        _scale_to_rupees(pbt_c), _scale_to_rupees(tax_expense_c),
-        _scale_to_rupees(pat_c), _scale_to_rupees(comprehensive_c),
-    )
-
-    revenue, other_income, total_income, total_expenses = revenue_c[0], other_income_c[0], total_income_c[0], total_expenses_c[0]
-    pbt, tax_expense, pat, comprehensive = pbt_c[0], tax_expense_c[0], pat_c[0], comprehensive_c[0]
-    eps_basic, eps_diluted = eps_basic_c[0], eps_diluted_c[0]
-
-    # Sanity check: Total Income is arithmetically Revenue + Other Income by
-    # definition in every NSE results table. If our extracted total_income
-    # doesn't reconcile, the label regex almost certainly grabbed a number
-    # from the wrong row (e.g. a "Total Income" mention inside a notes/
-    # segment sub-table further down the same section) rather than the
-    # main table's own row — recompute from the two components instead of
-    # publishing a number we know is wrong.
-    if revenue is not None and other_income is not None and total_income is not None:
-        expected = revenue + other_income
-        if abs(expected - total_income) > max(1e7, 0.02 * abs(expected)):
-            print(f"    · [{fname_dbg}] total_income sanity check failed: extracted ₹{total_income/1e7:.2f} Cr, "
-                  f"but revenue(₹{revenue/1e7:.2f} Cr) + other_income(₹{other_income/1e7:.2f} Cr) = "
-                  f"₹{expected/1e7:.2f} Cr — label regex likely matched a stray 'Total Income' mention "
-                  f"elsewhere (notes/segment sub-table); using the computed value instead")
-            total_income = round(expected, 2)
-
-    if revenue is None and pat is None:
-        section_snippet = section[:900].replace("\n", "⏎")
-        print(f"    · [{fname_dbg}] found a results heading but couldn't extract Revenue or PAT numbers "
-              f"— label regex likely didn't match this PDF's exact wording/layout"
-              f" | section text: ...{section_snippet}...")
-        return None  # couldn't find the table's actual numbers — don't fabricate a record
-
-    m_qend = re.search(r"quarter ended\s+(" + _PDF_DATE_TOKEN_RE + r")", text, re.IGNORECASE)
-    period_end = None
-    if m_qend:
-        d = _pdf_parse_flex_date(m_qend.group(1))
-        period_end = d.strftime("%Y-%m-%d") if d else None
-    if not period_end:
-        print(f"    · [{fname_dbg}] Revenue/PAT found but no 'quarter ended <date>' phrase matched "
-              f"— can't build the dedup key without it")
-        return None  # can't build a reliable dedup key without the quarter
-
-    fname = link.rsplit("/", 1)[-1]
-    m_fn = _PDF_FILENAME_TS_RE.match(fname)
-    if not m_fn:
-        print(f"    · [{fname_dbg}] all numbers found but filename doesn't match the expected "
-              f"'PREFIX_DDMMYYYYHHMMSS_...' timestamp pattern — can't derive board_meeting_date")
-        return None
-    board_meeting_date = f"{m_fn.group(4)}-{m_fn.group(3)}-{m_fn.group(2)}"
-
-    # The filename prefix is often an internal/uploader ID, NOT the real NSE
-    # trading symbol (e.g. "GLAXO1924_...", "NOCIL1961_...", "ESCORTS2_...",
-    # "TATACHEMYS_..." for GLAXO/NOCIL/ESCORTS/TATACHEM respectively) — using
-    # it as the dedup key's symbol would silently break the match against
-    # the later XBRL's authoritative symbol, causing a duplicate Telegram
-    # send instead of a quiet update. Pull the real symbol from the PDF's
-    # own "NSE Symbol: XXXX" line (present in every NSE outcome letter);
-    # fall back to the filename prefix only if that's not found.
-    m_sym = re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&]+)", text, re.IGNORECASE)
-    symbol = m_sym.group(1).upper() if m_sym else m_fn.group(1)
-
-    m_aud = re.search(r"\((Unaudited|Audited)\)", section, re.IGNORECASE)
-    audited = m_aud.group(1).capitalize() if m_aud else None
-
-    # Prefer the NSE RSS feed's own <title> (e.g. "Uno Minda Limited") over
-    # guessing from the PDF's first line — that guess was confirmed
-    # unreliable in practice (grabbed dates, website URLs, reference
-    # numbers, or name+address as if they were the company name).
-    first_line = text.strip().split("\n", 1)[0].strip()
-    company_name = rss_title.strip() if rss_title and rss_title.strip() else (
-        first_line if first_line and len(first_line) < 80 else symbol)
-
-    quarter = {
-        "revenue": revenue,
-        "other_income": other_income,
-        "total_income": total_income,
-        "total_expenses": total_expenses,
-        "pbt": pbt,
-        "tax_expense": tax_expense,
-        "pat": pat,
-        "comprehensive_income": comprehensive,
-        "eps_basic": eps_basic,
-        "eps_diluted": eps_diluted,
-        "period_end": period_end,
-    }
-    _compute_opm(quarter)
-
-    result = {
-        "meta": {
-            "symbol": symbol,
-            "company_name": company_name,
-            "board_meeting_date": board_meeting_date,
-            "standalone_consolidated": nature,
-            "audited": audited,
-            "quarter_label": _pdf_quarter_label(period_end),
-            "scrip_code": None,
-            "source": "pdf",
-            "extraction_method": "regex",
-        },
-        "quarter": quarter,
-    }
-
-    # QoQ (col 1) and YoY (col 2) comparisons, straight from the PDF's own
-    # comparative columns — same standard 4-column layout as SEBI Reg. 33
-    # quarterly disclosures: [current, immediately-preceding qtr,
-    # same qtr last year, full year]. More precise than the fundamentals-
-    # database fallback since it's the filing's own reported figures.
-    header_dates = _pdf_header_dates(section)
-    qoq_prior = {
-        "revenue": revenue_c[1], "total_income": total_income_c[1], "pat": pat_c[1],
-        "eps_basic": eps_basic_c[1], "total_expenses": total_expenses_c[1],
-    }
-    yoy_prior = {
-        "revenue": revenue_c[2], "total_income": total_income_c[2], "pat": pat_c[2],
-        "eps_basic": eps_basic_c[2], "total_expenses": total_expenses_c[2],
-    }
-    qoq_header = _quarter_header(header_dates[1]) if header_dates[1] else None
-    yoy_header = _quarter_header(header_dates[2]) if header_dates[2] else None
-    qoq_fund = _pdf_comparison(quarter, qoq_prior, qoq_header, "qoq")
-    yoy_fund = _pdf_comparison(quarter, yoy_prior, yoy_header, "yoy")
-    if qoq_fund:
-        result["qoq_fundamentals"] = qoq_fund
-    if yoy_fund:
-        result["yoy_fundamentals"] = yoy_fund
-
-    return result
-
-
 def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = ""):
-    """Converts the AI extraction's JSON into the same {meta, quarter,
-    qoq_fundamentals, yoy_fundamentals} shape _parse_pdf_regex produces — plus
-    segment_breakup / management_commentary / key_highlights / board_meeting_outcome
-    as additional top-level keys when the AI found them (not every filing has these;
-    XBRL and the regex path never populate them, so downstream code that doesn't
-    know about them yet just won't see the keys — no other function needs to change).
-    Applies unit scaling and the same total_income sanity check used on
-    the regex path. Returns None if the AI result fails basic validation
-    (missing revenue+PAT, bad date, unmatched filename) — caller falls
-    back to the regex parser in that case."""
+    """Converts the AI extraction's JSON into the {meta, quarter,
+    qoq_fundamentals, yoy_fundamentals} shape used throughout the pipeline —
+    plus segment_breakup / management_commentary / key_highlights /
+    board_meeting_outcome as additional top-level keys when the AI found
+    them (not every filing has these; XBRL parsing never populates them,
+    so downstream code that doesn't know about them just won't see the
+    keys — no other function needs to change).
+    Applies unit scaling and a total_income reconciliation sanity check.
+    Returns None if the AI result fails basic validation (missing
+    revenue+PAT, bad date, unmatched filename)."""
     cur = ai.get("current") or {}
     nature = ai.get("basis") or "Standalone"
     unit_word = (ai.get("unit") or "Crore").lower()
@@ -1159,9 +805,9 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         print(f"    · [{fname_dbg}] AI returned is_results_table=true but no revenue/PAT — treating as invalid")
         return None
 
-    # Same reconciliation sanity check as the regex path: Total Income must
-    # equal Revenue + Other Income by definition. Even AI extraction can
-    # occasionally pick up a stray number, so this stays as defense-in-depth.
+    # Total Income must equal Revenue + Other Income by definition. Even AI
+    # extraction can occasionally pick up a stray number from a notes/
+    # segment sub-table, so this stays as defense-in-depth.
     if revenue is not None and other_income is not None and total_income is not None:
         expected = revenue + other_income
         if abs(expected - total_income) > max(1e7, 0.02 * abs(expected)):
@@ -1220,9 +866,9 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         "quarter": quarter,
     }
 
-    # Narrative/extra fields the AI schema captures that XBRL and the regex
-    # path don't — attached only when present so callers that don't know
-    # about them yet (Telegram formatting, R2 schema) are unaffected.
+    # Narrative/extra fields the AI schema captures that XBRL doesn't —
+    # attached only when present so callers that don't know about them yet
+    # (Telegram formatting, R2 schema) are unaffected.
     if ai.get("segment_breakup"):
         result["segment_breakup"] = ai["segment_breakup"]
     if ai.get("management_commentary"):
@@ -1256,21 +902,51 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     return result
 
 
+def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
+    """Builds a comparison dict (sales_prior/sales_{suffix}_pct, pat_...,
+    eps_..., opm_...) computed directly from the PDF's own comparative
+    column via the AI extraction — this is the filing's own reported
+    comparative figure, which is more precise than a separate fundamentals
+    database lookup. basis="reported" flags this as sourced from the
+    filing itself."""
+    if not prior_header or not any(v is not None for v in prior.values()):
+        return None
+    out = {"basis": "reported", "basis_verified": True, "prior_header": prior_header}
+    field_map = {"revenue": "sales", "total_income": "total_income", "pat": "pat", "eps_basic": "eps"}
+    got_any = False
+    for cur_field, out_field in field_map.items():
+        cur_v, prior_v = cur.get(cur_field), prior.get(cur_field)
+        if cur_v is not None and prior_v is not None and prior_v != 0:
+            out[f"{out_field}_prior"] = prior_v
+            out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
+            got_any = True
+    prior_rev, prior_exp = prior.get("revenue"), prior.get("total_expenses")
+    prior_opm = (prior_rev - prior_exp) / prior_rev if (prior_rev and prior_exp is not None and prior_rev != 0) else None
+    cur_opm = cur.get("opm")
+    if cur_opm is not None and prior_opm is not None:
+        out["opm_prior"] = round(prior_opm * 100, 2)
+        out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
+        got_any = True
+    return out if got_any else None
+
+
 async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = ""):
     """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
     {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
     flow through the same grouping/dedup/Telegram code.
 
-    Tries AI extraction first (see _ai_extract_financials) when
-    GEMINI_API_KEY is configured — this reads the document the way a
-    human would, sidestepping the regex pitfalls that repeatedly produced
-    silently-wrong numbers across many real filings: wrong-row picks from
-    subsidiary/JV footnotes, formula-ref bracket vs parenthesis confusion,
-    unit ambiguity (Crore/Million/Lakh), wrong-quarter-column selection,
-    and one-off label wording per filer. Falls back to the regex parser
-    (_parse_pdf_regex) when AI is unavailable, fails, or its result fails
-    validation — so the pipeline still functions (in a more limited way)
-    without an API key configured.
+    AI-ONLY extraction (no regex fallback):
+      1. Extract text via pdfplumber.
+      2. Cheap regex heading pre-check (_pdf_find_heading_candidates) — if
+         no non-boilerplate 'Financial Results' heading is found at all,
+         this is (almost certainly) a governance/KMP-only outcome letter
+         with no results table, so we skip the AI call entirely rather than
+         spending an API call on it.
+      3. Only if a heading candidate exists do we call Gemini
+         (_ai_extract_financials) to actually extract the numbers. If the
+         AI call is unavailable (no GEMINI_API_KEY), fails, says
+         is_results_table=false, or its result fails validation, we
+         return None — there is no regex-based numeric fallback anymore.
 
     rss_title is the company name straight from the NSE RSS feed's own
     <title> element (e.g. "Uno Minda Limited") — used as company_name
@@ -1293,17 +969,26 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
         return None
 
-    ai = await _ai_extract_financials(client, text, fname_dbg)
-    if ai and ai.get("is_results_table"):
-        result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title)
-        if result:
-            return result
-        print(f"    · [{fname_dbg}] AI result failed validation — falling back to regex parser")
-    elif ai is not None and not ai.get("is_results_table"):
-        print(f"    · [{fname_dbg}] AI says this isn't a results table — trying regex parser too "
-              f"(defense in depth, in case AI is wrong)")
+    # ── Cheap pre-check BEFORE spending an AI call ──
+    # Most "Outcome of Board Meeting" PDFs are governance/KMP-only (no
+    # results table) — no point burning a Gemini call on those.
+    if not _pdf_find_heading_candidates(text):
+        print(f"    · [{fname_dbg}] no 'Financial Results' heading found — not a results PDF, skipping AI call")
+        return None
 
-    return _parse_pdf_regex(text, link, fname_dbg, rss_title)
+    # ── AI extraction (sole extraction path — no regex fallback) ──
+    ai = await _ai_extract_financials(client, text, fname_dbg)
+    if not ai:
+        print(f"    · [{fname_dbg}] AI extraction unavailable/failed (no GEMINI_API_KEY, or call errored) — skipping")
+        return None
+    if not ai.get("is_results_table"):
+        print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
+        return None
+
+    result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title)
+    if not result:
+        print(f"    · [{fname_dbg}] AI result failed validation (missing revenue/PAT, bad date, or filename mismatch) — skipping")
+    return result
 
 
 async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
@@ -1687,7 +1372,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         full-detail, but often published well after the board meeting.
       - "Outcome of Board Meeting" PDFs (board_items, nse_board_meetings.json)
         — a fast-path: usually available immediately, core numbers only,
-        best-effort regex parse (see parse_financial_results_pdf).
+        AI-extracted (see parse_financial_results_pdf).
     Both feed the same symbol+quarter+nature dedup key, so if a PDF result
     was already notified, the later XBRL for the same result just updates
     the record silently (see the "refiled" handling below) instead of
@@ -1843,8 +1528,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 parsed = await parse_financial_results_pdf(client, content, it["link"], it.get("title", ""))
                 if not parsed:
                     print(f"  ⚠ PDF parse returned None for {fname} "
-                          f"(no results table / no statement heading / missing quarter-end match — "
-                          f"see parse_financial_results_pdf's early-return points)")
+                          f"(no results heading / AI unavailable / AI said not a results table / "
+                          f"AI result failed validation — see parse_financial_results_pdf)")
                     failed_links.append(it["link"])  # not a results PDF — no point refetching forever
                     return None
                 parsed["link"] = it["link"]
@@ -2066,7 +1751,7 @@ async def run():
               f"{max(len(merged_pdf_feed) - len(existing_pdf_items), 0)} new = {len(merged_pdf_feed)} (capped at 500)")
         await r2_put(client, "nse_results_pdf_feed.json", make_payload(merged_pdf_feed))
 
-        # ── Financial results detail (P&L from XBRL) ────────────────────
+        # ── Financial results detail (P&L from XBRL / AI-extracted PDF) ──
         print("\nParsing financial results XBRL...")
         fundamentals = await r2_get(client, FUNDAMENTALS_FILE)
         fundamentals_stocks = (fundamentals or {}).get("stocks")
