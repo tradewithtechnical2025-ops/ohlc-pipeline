@@ -3278,7 +3278,7 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
                               flat_threshold_pct=1.0, min_weeks=40,
                               early_breakout_lookback=26, ema_short_period=10,
                               min_weeks_in_prior_stage=3, confirm_weeks=2,
-                              swing_lookback=10):
+                              swing_lookback=10, early_stage2_weeks=8):
     """
     Stan Weinstein's original 4-Stage Analysis (his book "Secrets for Profiting
     in Bull and Bear Markets") — WEEKLY chart, ema_period-week average
@@ -3367,6 +3367,14 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
     back to Declining, 1→4, skipping Advancing) are both real, valid outputs
     — not bugs. `transition_type` (via TRANSITION_LABELS) names exactly which
     kind of transition stage_change represents, including these two.
+
+    EARLY STAGE 2 (broader than "Base Breakout"): `transition_type` only
+    fires "Base Breakout" on the exact week Basing flips to Advancing —
+    miss checking that one week and there's no tag left showing the move
+    is still fresh. `early_stage2` stays True for every week the stock is
+    confirmed Stage 2 AND weeks_in_stage <= early_stage2_weeks (default 8)
+    — a wider "still early in the advance, better risk/reward" window,
+    not just the single flip week.
 
     Returns:
       current_signals  -> [{symbol, week, stage, prev_stage, stage_change,
@@ -3510,6 +3518,7 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
                 "early_transition": early_transition,
                 "early_transition_label": early_transition_label,
                 "range_ref": range_ref,
+                "early_stage2": cur_stage == 2 and weeks_in_stage <= early_stage2_weeks,
             })
 
     breadth_history = [
@@ -3555,6 +3564,7 @@ async def backup_weinstein_history(client, signals):
             "close": s["close"],
             "ema30": s["ema30"],
             "ema10": s["ema10"],
+            "early_stage2": s["early_stage2"],
         }
         for s in signals
     }
@@ -3756,14 +3766,20 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                     for s in stage_syms[:print_top_n]:
                         tag = f"  ⚡ {s['early_transition_label']} (range_ref={s['range_ref']})" if s["early_transition"] else ""
                         chg = f"  🔄 {s['transition_type']}" if s["stage_change"] else ""
+                        es2 = "  🌱 Early Stage 2" if s["early_stage2"] else ""
                         log.info(f"  {s['symbol']:<15} weeks_in_stage={s['weeks_in_stage']:<5} "
                                   f"close={s['close']:<10} ema30={s['ema30']:<10} "
-                                  f"stage_change={s['stage_change']}{tag}{chg}")
+                                  f"stage_change={s['stage_change']}{tag}{chg}{es2}")
                 early_watch = [s for s in signals if s["early_transition"]]
                 if early_watch:
                     log.info(f"\n⚡ {len(early_watch)} stocks with early_transition=True "
                               f"(base breakout / range breakdown ahead of SMA30 confirmation): "
                               f"{[s['symbol'] for s in early_watch]}")
+                early_stage2_watch = [s for s in signals if s["early_stage2"]]
+                if early_stage2_watch:
+                    log.info(f"\n🌱 {len(early_stage2_watch)} stocks in early_stage2=True "
+                              f"(confirmed Stage 2, still within its first few weeks): "
+                              f"{[s['symbol'] for s in early_stage2_watch]}")
                 transitioned = [s for s in signals if s["stage_change"]]
                 if transitioned:
                     log.info(f"\n🔄 {len(transitioned)} stage transitions this week (would be logged "
