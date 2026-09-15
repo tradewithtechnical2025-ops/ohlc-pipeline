@@ -734,7 +734,12 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         r = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
             json={
-                "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:14000]}]}],
+                # Full text, not a small head-of-document slice — Gemini
+                # flash's context window easily fits an entire results PDF
+                # (usually a few thousand words). 100000 chars (~25k tokens)
+                # is just a generous safety cap for the rare oversized filing,
+                # not a normal-case truncation point.
+                "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:100000]}]}],
                 # maxOutputTokens raised from 700 -> 3000. 700 was too tight
                 # for this schema once segment_breakup / key_highlights /
                 # management_commentary / qoq_prior / yoy_prior are all
@@ -758,7 +763,14 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         parts = candidates[0]["content"].get("parts") or []
         raw_text = "".join(p.get("text", "") for p in parts).strip()
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
-        parsed = json.loads(cleaned)
+        # strict=False allows literal control characters (unescaped raw
+        # newlines/tabs) inside JSON string values without raising —
+        # Gemini occasionally emits a raw newline inside a multi-line text
+        # field (e.g. management_commentary) instead of the JSON-escaped
+        # \n, which under strict (default) parsing surfaces as a confusing
+        # "Unterminated string starting at..." error even though the
+        # response is otherwise well-formed.
+        parsed = json.loads(cleaned, strict=False)
         return parsed
     except Exception as e:
         print(f"    · [{fname_dbg}] AI extraction failed: {type(e).__name__}: {e}")
@@ -984,6 +996,12 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         return None
 
     # ── AI extraction (sole extraction path — no regex fallback) ──
+    # Send the FULL extracted PDF text (not a truncated head-of-document
+    # slice) — Gemini flash's context window comfortably fits an entire
+    # results PDF, and truncating to a fixed prefix was clipping the actual
+    # table on filings with a long cover letter/auditor's report ahead of
+    # it. _ai_extract_financials still applies its own generous safety cap
+    # for the rare pathologically long document.
     ai = await _ai_extract_financials(client, text, fname_dbg)
     if not ai:
         if not GEMINI_API_KEY:
