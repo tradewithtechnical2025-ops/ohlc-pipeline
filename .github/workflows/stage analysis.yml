@@ -10,6 +10,11 @@ on:
       - "pipeline.py"
       - "test_weinstein_stage.py"
   workflow_dispatch:   # manual "Run workflow" button
+    inputs:
+      run_real_save:
+        description: 'Type YES to actually run weinstein_scan and SAVE to R2 (writes production files — skip this for just testing)'
+        required: false
+        default: ''
 
 jobs:
   test:
@@ -27,10 +32,11 @@ jobs:
         run: python test_weinstein_stage.py
 
   dry_run_real_data:
-    # Only runs when YOU manually click "Run workflow" — never on push/PR,
-    # since this hits real Upstox/R2 APIs (uses the same repo secrets your
-    # production pipeline already uses).
-    if: github.event_name == 'workflow_dispatch'
+    # Only runs when YOU manually click "Run workflow" AND leave run_real_save
+    # blank/anything other than YES — never on push/PR, since this hits real
+    # Upstox/R2 APIs (uses the same repo secrets your production pipeline
+    # already uses). Prints real symbol names, writes NOTHING to R2.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_real_save != 'YES'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -56,3 +62,36 @@ jobs:
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
         run: python pipeline.py weinstein_scan_dryrun
+
+  run_real_save:
+    # Only runs when YOU manually click "Run workflow" AND type exactly YES
+    # in the run_real_save input — this is the REAL production scan, it
+    # WRITES weinstein_stage_analysis.json, weinstein_stage_history.json,
+    # and weinstein_transitions.json to R2. The explicit "YES" input is a
+    # safety gate against accidentally overwriting production data.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_real_save == 'YES'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install httpx
+          fi
+
+      - name: Run Weinstein scan (REAL — writes to R2)
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+        run: python pipeline.py weinstein_scan
