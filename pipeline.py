@@ -22,6 +22,7 @@ Usage:
   python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
+  python pipeline.py weinstein_debug SYMBOL  # week-by-week close/sma30/slope/stage for ONE symbol, no R2 writes
 """
 
 import asyncio
@@ -3448,6 +3449,77 @@ async def backup_weinstein_transitions(client, signals):
               f"({len(transitions)} transitions this week, {len(hist)} weeks tracked)")
 
 
+async def debug_weinstein_symbol(symbol, sma_period=30, slope_lookback=4, flat_threshold_pct=1.0, weeks_shown=20) -> None:
+    """
+    Diagnostic: prints week-by-week close/sma30/slope%/stage for ONE symbol,
+    using the EXACT same math as _detect_weinstein_stages() (duplicated here
+    on purpose — read-only, no R2 writes, just for comparing against a chart
+    when a classification looks wrong).
+    Usage: python pipeline.py weinstein_debug SYMBOL
+    """
+    async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+        all_data = await download_all_chunks(client)
+
+    sym = symbol.upper().strip()
+    if sym not in all_data:
+        print(f"'{sym}' not found in all_data. {len(all_data)} symbols loaded — check spelling.")
+        return
+
+    s = all_data[sym]
+    dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+    n_daily = len(dates)
+    print(f"━━━ {sym} — daily bars: {n_daily}, last daily date: {dates[-1] if dates else None} ━━━")
+    liq = _check_liquidity(volumes, closes, n_daily)
+    print(f"Liquidity check (turnover >= 3,00,00,000): {liq}")
+    if not liq:
+        print("FAILS liquidity — would be SKIPPED entirely by _detect_weinstein_stages (no signal at all).")
+
+    w_labels, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, "W")
+    n = len(wc)
+    print(f"Weekly bars (complete weeks only): {n}")
+    if n < 3:
+        print("Not enough weekly bars.")
+        return
+    print(f"Last 3 weekly labels → dates: "
+          f"{[(w_labels[i], _isoweek_to_date(w_labels[i])) for i in range(max(0,n-3), n)]}")
+    print(f"Last 3 weekly closes: {wc[-3:]}   highs: {wh[-3:]}   lows: {wl[-3:]}")
+
+    min_weeks = 40
+    start = sma_period + slope_lookback
+    if n < sma_period + slope_lookback + min_weeks:
+        print(f"n={n} < required {sma_period + slope_lookback + min_weeks} (sma_period+slope_lookback+min_weeks) "
+              f"— would be SKIPPED entirely by _detect_weinstein_stages (no signal at all).")
+
+    sma = _calc_sma(wc, sma_period)
+
+    last_trend = None
+    print(f"\n{'Week':<12}{'Close':<10}{'SMA30':<10}{'Slope%':<10}{'Stage':<20}{'last_trend after'}")
+    show_from = max(start, n - weeks_shown)
+    for i in range(start, n):
+        price, s30, s30_prev = wc[i], sma[i], sma[i - slope_lookback]
+        row_week = _isoweek_to_date(w_labels[i])
+        if price is None or s30 is None or s30_prev is None or s30_prev == 0:
+            if i >= show_from:
+                print(f"{row_week:<12}{'—':<10}{'—':<10}{'—':<10}{'None (missing data)':<20}{last_trend}")
+            continue
+        slope_pct = (s30 - s30_prev) / s30_prev * 100
+        if price > s30 and slope_pct > flat_threshold_pct:
+            stage = 2
+        elif price < s30 and slope_pct < -flat_threshold_pct:
+            stage = 4
+        else:
+            stage = 3 if last_trend == 2 else 1
+        if stage in (2, 4):
+            last_trend = stage
+        if i >= show_from:
+            print(f"{row_week:<12}{price:<10.2f}{s30:<10.2f}{slope_pct:<10.2f}"
+                  f"{STAGE_NAMES[stage]+' ('+str(stage)+')':<20}{last_trend}")
+
+    print(f"\nFinal stage this run: {STAGE_NAMES[stage]} ({stage})")
+
+
 async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
     """
     dry_run=True: skip all R2 uploads (weinstein_stage_analysis.json +
@@ -4224,6 +4296,11 @@ if __name__ == "__main__":
         case "minervini_scan": asyncio.run(run_minervini_scan())
         case "weinstein_scan": asyncio.run(run_weinstein_scan())
         case "weinstein_scan_dryrun": asyncio.run(run_weinstein_scan(dry_run=True))
+        case "weinstein_debug":
+            if len(sys.argv) < 3:
+                print("Usage: python pipeline.py weinstein_debug SYMBOL")
+                sys.exit(1)
+            asyncio.run(debug_weinstein_symbol(sys.argv[2]))
         case "vcp_scan":      asyncio.run(run_vcp_scan())
         case _:
             print(__doc__)
