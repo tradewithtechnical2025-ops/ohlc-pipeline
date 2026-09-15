@@ -3143,12 +3143,27 @@ async def run_stage2_scan() -> None:
         status.failure(e)
 
 
+def _mv_hist_symbols(entry):
+    """A stored minervini_history_{year}.json date entry can be OLD-format
+    (list of plain symbol strings, from before this function stored full
+    detail) or NEW-format (list of full signal dicts) — handle both so old
+    dates already in R2 keep working."""
+    if not entry:
+        return []
+    if isinstance(entry[0], dict):
+        return [e.get("symbol") for e in entry if e.get("symbol")]
+    return list(entry)
+
+
 async def backup_minervini_history(client, signals, today):
     """
     Date-wise accumulating history, same convention as backup_pattern_history()
     → pattern_history_{year}.json. Downloads existing minervini_history_{year}.json
-    from R2, appends today's list of symbols, re-uploads. Builds real history
-    run-by-run (no retroactive RS issue — each day's entry is that day's actual scan).
+    from R2, appends today's FULL signal list (symbol, close, sma50/150/200,
+    pct_off_low/high, rs_rating, is_new), re-uploads. Builds real history
+    run-by-run (no retroactive RS issue — each day's entry is that day's actual
+    scan). Storing full detail (not just symbol names) lets History mode show
+    the same rich fields for a past date as the live view does.
 
     Also diffs today's symbol list against the most recent PRIOR date already
     in history (before today's own entry is added) to return:
@@ -3157,27 +3172,27 @@ async def backup_minervini_history(client, signals, today):
     Returns (new_syms, dropped_syms) — empty lists if no prior date exists yet.
     """
     fname = f"minervini_history_{today[:4]}.json"
-    syms = [s["symbol"] for s in signals]
+    today_syms = [s["symbol"] for s in signals]
 
     hist = await r2_download(client, fname)
     if not isinstance(hist, dict): hist = {}
 
     prior_dates = sorted(d for d in hist if d < today)
-    prior_syms = set(hist[prior_dates[-1]]) if prior_dates else None
-    today_set = set(syms)
+    prior_syms = set(_mv_hist_symbols(hist[prior_dates[-1]])) if prior_dates else None
+    today_set = set(today_syms)
     if prior_syms is None:
         new_syms, dropped_syms = [], []
     else:
         new_syms = sorted(today_set - prior_syms)
         dropped_syms = sorted(prior_syms - today_set)
 
-    if not syms:
+    if not signals:
         log.info(f"  🗄  minervini backup: no signals on {today}, skip")
         return new_syms, dropped_syms
 
-    hist[today] = syms
+    hist[today] = signals
     await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
-    log.info(f"  🗄  minervini_history: {today} → {fname}  ({len(syms)} stocks, {len(hist)} dates, "
+    log.info(f"  🗄  minervini_history: {today} → {fname}  ({len(today_syms)} stocks, {len(hist)} dates, "
               f"+{len(new_syms)} new, -{len(dropped_syms)} dropped)")
     return new_syms, dropped_syms
 
@@ -3508,7 +3523,17 @@ async def backup_weinstein_history(client, signals):
     """
     Accumulating history keyed by the completed WEEK (not the run date) —
     re-running mid-week overwrites that week's entry instead of duplicating
-    it. {week_date: {symbol: stage, ...}, ...} in weinstein_stage_history.json.
+    it. Stores each symbol's FULL signal detail (not just the bare stage
+    number) — stage, weeks_in_stage, stage_change, transition_type,
+    early_transition (+label), range_ref, close, ema30, ema10 — so History
+    mode can show the exact same rich fields for a past week as the live
+    view does, not just a bare stage number.
+    {week_date: {symbol: {stage, weeks_in_stage, stage_change,
+    transition_type, early_transition, early_transition_label, range_ref,
+    close, ema30, ema10}, ...}, ...} in weinstein_stage_history.json.
+
+    Older weeks already saved before this change are plain {symbol: stage_int}
+    — the frontend's historical loader handles both formats.
     """
     fname = "weinstein_stage_history.json"
     if not signals:
@@ -3518,7 +3543,21 @@ async def backup_weinstein_history(client, signals):
 
     hist = await r2_download(client, fname)
     if not isinstance(hist, dict): hist = {}
-    hist[week_key] = {s["symbol"]: s["stage"] for s in signals}
+    hist[week_key] = {
+        s["symbol"]: {
+            "stage": s["stage"],
+            "weeks_in_stage": s["weeks_in_stage"],
+            "stage_change": s["stage_change"],
+            "transition_type": s["transition_type"],
+            "early_transition": s["early_transition"],
+            "early_transition_label": s["early_transition_label"],
+            "range_ref": s["range_ref"],
+            "close": s["close"],
+            "ema30": s["ema30"],
+            "ema10": s["ema10"],
+        }
+        for s in signals
+    }
     await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
     log.info(f"  🗄  weinstein_stage_history: {week_key} → {fname}  ({len(signals)} stocks, {len(hist)} weeks)")
 
