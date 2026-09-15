@@ -18,6 +18,10 @@ Usage:
   python pipeline.py pattern_scan
   python pipeline.py pattern_scan_force   # bypass trading-day gate (use after holiday-list fixes)
   python pipeline.py vcp_scan
+  python pipeline.py stage2_scan
+  python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
+  python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
+  python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
 """
 
 import asyncio
@@ -3021,14 +3025,20 @@ def _calc_multi_tf_ma(all_data, daily_sma_periods=(10, 21, 50, 200),
 
 
 def _detect_stage2(all_data, sma_fast=50, sma_mid=150, sma_long=200,
-                    slope_lookback=25, pct_above_low_min=30.0, pct_below_high_max=25.0):
+                    slope_lookback=25, pct_above_low_min=30.0, pct_below_high_max=25.0,
+                    rs_data=None, min_rs_rating=None):
     """
-    Stage 2 (Advancing) — Minervini-style trend template, RS condition dropped.
+    Stage 2 (Advancing) — Minervini-style trend template.
     Rules (all must pass):
       1. close > sma50 > sma150 > sma200   (stacked order)
       2. sma200 today > sma200 N bars ago  (long-term trend up)
       3. close >= pct_above_low_min% above 52w low
       4. close within pct_below_high_max% of 52w high
+      5. (optional, when rs_data given) RS Rating >= min_rs_rating  — full 8-point template
+
+    Pass rs_data=None (default) for the original 4-rule Stage-2 scan (run_stage2_scan).
+    Pass rs_data=_calculate_rs(all_data) + min_rs_rating=70 for the full 8-point
+    Minervini Trend Template (run_minervini_scan) — criterion 8 (RS Rating).
 
     Returns:
       current_signals  -> list of stocks in Stage 2 as of latest bar
@@ -3073,9 +3083,13 @@ def _detect_stage2(all_data, sma_fast=50, sma_mid=150, sma_long=200,
             pct_off_low  = (c - low52) / low52 * 100
             pct_off_high = (high52 - c) / high52 * 100
 
+            rs_val = rs_data.get(sym, {}).get("rs") if rs_data is not None else None
+            rs_ok = True if rs_data is None else (rs_val is not None and rs_val >= min_rs_rating)
+
             is_s2 = (c > s50 > s150 > s200) and (s200 > s200_prev) \
                     and (pct_off_low >= pct_above_low_min) \
-                    and (pct_off_high <= pct_below_high_max)
+                    and (pct_off_high <= pct_below_high_max) \
+                    and rs_ok
 
             if is_s2:
                 d = dates[i]
@@ -3088,6 +3102,8 @@ def _detect_stage2(all_data, sma_fast=50, sma_mid=150, sma_long=200,
                     "sma50": round(s50, 2), "sma150": round(s150, 2), "sma200": round(s200, 2),
                     "pct_off_low": round(pct_off_low, 2), "pct_off_high": round(pct_off_high, 2),
                 }
+                if rs_data is not None:
+                    last_detail["rs_rating"] = rs_val
 
         if last_flag:
             current_signals.append(last_detail)
@@ -3124,6 +3140,266 @@ async def run_stage2_scan() -> None:
         log.info("━━━ Stage 2 Scan complete ━━━")
     except Exception as e:
         status.failure(e)
+
+
+async def backup_minervini_history(client, signals, today):
+    """
+    Date-wise accumulating history, same convention as backup_pattern_history()
+    → pattern_history_{year}.json. Downloads existing minervini_history_{year}.json
+    from R2, appends today's list of symbols, re-uploads. Builds real history
+    run-by-run (no retroactive RS issue — each day's entry is that day's actual scan).
+
+    Also diffs today's symbol list against the most recent PRIOR date already
+    in history (before today's own entry is added) to return:
+      new_syms     -> passed today, did NOT pass on the prior scan date
+      dropped_syms -> passed on the prior scan date, did NOT pass today
+    Returns (new_syms, dropped_syms) — empty lists if no prior date exists yet.
+    """
+    fname = f"minervini_history_{today[:4]}.json"
+    syms = [s["symbol"] for s in signals]
+
+    hist = await r2_download(client, fname)
+    if not isinstance(hist, dict): hist = {}
+
+    prior_dates = sorted(d for d in hist if d < today)
+    prior_syms = set(hist[prior_dates[-1]]) if prior_dates else None
+    today_set = set(syms)
+    if prior_syms is None:
+        new_syms, dropped_syms = [], []
+    else:
+        new_syms = sorted(today_set - prior_syms)
+        dropped_syms = sorted(prior_syms - today_set)
+
+    if not syms:
+        log.info(f"  🗄  minervini backup: no signals on {today}, skip")
+        return new_syms, dropped_syms
+
+    hist[today] = syms
+    await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
+    log.info(f"  🗄  minervini_history: {today} → {fname}  ({len(syms)} stocks, {len(hist)} dates, "
+              f"+{len(new_syms)} new, -{len(dropped_syms)} dropped)")
+    return new_syms, dropped_syms
+
+
+async def run_minervini_scan(min_rs_rating=70) -> None:
+    """
+    Full 8-point Minervini Trend Template = _detect_stage2 (criteria 1-7)
+    + RS Rating >= min_rs_rating (criterion 8), RS via existing _calculate_rs().
+
+    Today's signals go to minervini_trend_template.json — including top-level
+    "new_today" / "dropped_today" symbol lists (diffed against the last prior
+    scan date) and a per-signal "is_new" flag, so the frontend can filter
+    directly for new additions. Date-wise history accumulates separately via
+    backup_minervini_history() → same convention as pattern_history_{year}.json:
+    each pipeline run appends that day's actual symbol list, so history is
+    always exact (no retroactive RS issue).
+    """
+    status = PipelineStatus("run_minervini_scan")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Minervini Trend Template Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            rs_data = _calculate_rs(all_data)
+            signals, breadth_history = _detect_stage2(
+                all_data, rs_data=rs_data, min_rs_rating=min_rs_rating
+            )
+            signals.sort(key=lambda x: x["pct_off_high"])  # closest to 52w high first
+
+            log.info(f"Minervini Trend Template stocks today: {len(signals)}")
+            if breadth_history:
+                log.info(f"Breadth history: {len(breadth_history)} dates, latest count {breadth_history[-1]['count']}")
+
+            # Backup history first — diffs against the last prior scan date to get new/dropped
+            new_syms, dropped_syms = await backup_minervini_history(client, signals, today)
+            new_set = set(new_syms)
+            for sig in signals:
+                sig["is_new"] = sig["symbol"] in new_set
+
+            await upload_str_with_manifest(client, r2_upload, "minervini_trend_template.json", json.dumps({
+                "updated": today, "count": len(signals), "min_rs_rating": min_rs_rating,
+                "new_today": new_syms, "dropped_today": dropped_syms,
+                "signals": signals,
+            }), schema_v=1, extra_meta={"count": len(signals)})
+        status.success()
+        log.info("━━━ Minervini Trend Template Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# WEINSTEIN STAGE ANALYSIS — original 4-stage method
+# (weekly chart, 30-week SMA — separate from Minervini's daily Trend Template)
+# ══════════════════════════════════════════════════════════════
+
+STAGE_NAMES = {1: "Basing", 2: "Advancing", 3: "Topping", 4: "Declining"}
+
+
+def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
+                              flat_threshold_pct=1.0, min_weeks=40):
+    """
+    Stan Weinstein's original 4-Stage Analysis (his book "Secrets for Profiting
+    in Bull and Bear Markets") — WEEKLY chart, sma_period-week SMA (Weinstein
+    used 30-week, ≈150-day daily).
+
+      Stage 1 (Basing)     — price hovering near a flat SMA, after a decline
+      Stage 2 (Advancing)  — price above a rising SMA
+      Stage 3 (Topping)    — price hovering near a flat SMA, after an advance
+      Stage 4 (Declining)  — price below a falling SMA
+
+    SMA slope over slope_lookback weeks decides rising/falling/flat (threshold
+    flat_threshold_pct%). Flat/ambiguous weeks are 1-vs-3 by carrying forward
+    the last confirmed trending stage (2 or 4) — the standard resolution for
+    this ambiguity, since basing and topping look identical on MA+price alone.
+
+    Returns:
+      current_signals  -> [{symbol, week, stage, prev_stage, stage_change,
+                             weeks_in_stage, close, sma30}] as of latest week
+      breadth_history  -> [{week, stage1, stage2, stage3, stage4}] full history
+    """
+    current_signals = []
+    breadth = {}  # week_label -> {1:count, 2:count, 3:count, 4:count}
+
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        n_daily = len(dates)
+        if n_daily < 200 or not _check_liquidity(volumes, closes, n_daily):
+            continue
+
+        w_labels, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, "W")
+        n = len(wc)
+        if n < sma_period + slope_lookback + min_weeks:
+            continue
+
+        sma = _calc_sma(wc, sma_period)
+        start = sma_period + slope_lookback
+
+        last_trend = None   # last confirmed 2 or 4
+        stage_seq = [None] * start
+
+        for i in range(start, n):
+            price, s30, s30_prev = wc[i], sma[i], sma[i - slope_lookback]
+            if price is None or s30 is None or s30_prev is None or s30_prev == 0:
+                stage_seq.append(None)
+                continue
+            slope_pct = (s30 - s30_prev) / s30_prev * 100
+
+            if price > s30 and slope_pct > flat_threshold_pct:
+                stage = 2
+            elif price < s30 and slope_pct < -flat_threshold_pct:
+                stage = 4
+            else:
+                stage = 3 if last_trend == 2 else 1   # default Stage 1 if unknown
+
+            if stage in (2, 4):
+                last_trend = stage
+            stage_seq.append(stage)
+
+            breadth.setdefault(w_labels[i], {1: 0, 2: 0, 3: 0, 4: 0})
+            breadth[w_labels[i]][stage] += 1
+
+        if stage_seq and stage_seq[-1] is not None:
+            cur_stage = stage_seq[-1]
+            prev_stage = next((v for v in reversed(stage_seq[:-1]) if v is not None), None)
+            weeks_in_stage = 0
+            for v in reversed(stage_seq):
+                if v == cur_stage: weeks_in_stage += 1
+                else: break
+            i_last = n - 1
+            current_signals.append({
+                "symbol": sym, "week": w_labels[i_last], "stage": cur_stage,
+                "prev_stage": prev_stage,
+                "stage_change": bool(prev_stage is not None and prev_stage != cur_stage),
+                "weeks_in_stage": weeks_in_stage,
+                "close": round(wc[i_last], 2),
+                "sma30": round(sma[i_last], 2) if sma[i_last] is not None else None,
+            })
+
+    breadth_history = [
+        {"week": wk, "stage1": c[1], "stage2": c[2], "stage3": c[3], "stage4": c[4]}
+        for wk, c in sorted(breadth.items())
+    ]
+    return current_signals, breadth_history
+
+
+async def backup_weinstein_history(client, signals):
+    """
+    Accumulating history keyed by the completed WEEK (not the run date) —
+    re-running mid-week overwrites that week's entry instead of duplicating
+    it. {week_date: {symbol: stage, ...}, ...} in weinstein_stage_history.json.
+    """
+    fname = "weinstein_stage_history.json"
+    if not signals:
+        log.info("  🗄  weinstein backup: no signals, skip")
+        return
+    week_key = _isoweek_to_date(signals[0]["week"])
+
+    hist = await r2_download(client, fname)
+    if not isinstance(hist, dict): hist = {}
+    hist[week_key] = {s["symbol"]: s["stage"] for s in signals}
+    await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
+    log.info(f"  🗄  weinstein_stage_history: {week_key} → {fname}  ({len(signals)} stocks, {len(hist)} weeks)")
+
+
+async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
+    """
+    dry_run=True: skip both R2 uploads (weinstein_stage_analysis.json +
+    weinstein_stage_history.json) and instead PRINT the top print_top_n
+    signals per stage (symbol name, weeks_in_stage, close, sma30) to the log
+    — for manually cross-checking real stock names against a chart before
+    trusting the detector on live data.
+    """
+    status = PipelineStatus("run_weinstein_scan")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Weinstein Stage Analysis Scan  {today}{'  [DRY RUN]' if dry_run else ''} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            signals, breadth_history = _detect_weinstein_stages(all_data)
+
+            if not dry_run:
+                # backup keyed on raw week label BEFORE we reformat "week" to a date string below
+                await backup_weinstein_history(client, signals)
+
+            for sig in signals:
+                sig["stage_name"] = STAGE_NAMES[sig["stage"]]
+                sig["week"] = _isoweek_to_date(sig["week"])
+            signals.sort(key=lambda x: (x["stage"], -x["weeks_in_stage"]))
+
+            stage_counts = {STAGE_NAMES[n]: sum(1 for s in signals if s["stage"] == n) for n in (1, 2, 3, 4)}
+            log.info(f"Weinstein stages today: {stage_counts}")
+            if breadth_history:
+                log.info(f"Breadth history: {len(breadth_history)} weeks")
+
+            if dry_run:
+                for n in (1, 2, 3, 4):
+                    stage_syms = [s for s in signals if s["stage"] == n]
+                    log.info(f"\n── Stage {n} ({STAGE_NAMES[n]}) — {len(stage_syms)} stocks, "
+                              f"showing top {min(print_top_n, len(stage_syms))} by weeks_in_stage ──")
+                    for s in stage_syms[:print_top_n]:
+                        log.info(f"  {s['symbol']:<15} weeks_in_stage={s['weeks_in_stage']:<5} "
+                                  f"close={s['close']:<10} sma30={s['sma30']:<10} "
+                                  f"stage_change={s['stage_change']}")
+                log.info("\n[DRY RUN] No R2 files written — copy symbol names above into "
+                          "TradingView/your chart tool to cross-check.")
+            else:
+                await upload_str_with_manifest(client, r2_upload, "weinstein_stage_analysis.json", json.dumps({
+                    "updated": today, "count": len(signals), "stage_counts": stage_counts, "signals": signals,
+                }), schema_v=1, extra_meta={"count": len(signals)})
+        status.success()
+        log.info("━━━ Weinstein Stage Analysis Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
 # ══════════════════════════════════════════════════════════════
 # VCP SCAN
 # ══════════════════════════════════════════════════════════════
@@ -3828,6 +4104,9 @@ if __name__ == "__main__":
         case "pattern_scan":  asyncio.run(run_pattern_scan())
         case "pattern_scan_force": asyncio.run(run_pattern_scan(force=True))
         case "stage2_scan":   asyncio.run(run_stage2_scan())
+        case "minervini_scan": asyncio.run(run_minervini_scan())
+        case "weinstein_scan": asyncio.run(run_weinstein_scan())
+        case "weinstein_scan_dryrun": asyncio.run(run_weinstein_scan(dry_run=True))
         case "vcp_scan":      asyncio.run(run_vcp_scan())
         case _:
             print(__doc__)
