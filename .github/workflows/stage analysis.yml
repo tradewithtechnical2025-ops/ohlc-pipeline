@@ -15,6 +15,10 @@ on:
         description: 'Type YES to actually run weinstein_scan and SAVE to R2 (writes production files — skip this for just testing)'
         required: false
         default: ''
+      debug_symbol:
+        description: 'Symbol to debug (e.g. BBOX) — prints week-by-week close/sma30/slope/stage for just this one stock, no R2 writes. Leave blank for normal dry-run/save behavior above.'
+        required: false
+        default: ''
 
 jobs:
   test:
@@ -33,10 +37,11 @@ jobs:
 
   dry_run_real_data:
     # Only runs when YOU manually click "Run workflow" AND leave run_real_save
-    # blank/anything other than YES — never on push/PR, since this hits real
-    # Upstox/R2 APIs (uses the same repo secrets your production pipeline
-    # already uses). Prints real symbol names, writes NOTHING to R2.
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_real_save != 'YES'
+    # blank/anything other than YES, AND leave debug_symbol blank — never on
+    # push/PR, since this hits real Upstox/R2 APIs (uses the same repo
+    # secrets your production pipeline already uses). Prints real symbol
+    # names, writes NOTHING to R2.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_real_save != 'YES' && github.event.inputs.debug_symbol == ''
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -95,3 +100,35 @@ jobs:
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
         run: python pipeline.py weinstein_scan
+
+  debug_symbol:
+    # Only runs when YOU manually click "Run workflow" AND type a symbol into
+    # debug_symbol — prints that ONE stock's week-by-week close/sma30/slope%/
+    # stage using real data, no R2 writes. Use this to check why a stock's
+    # stage/transition looks wrong compared to its chart.
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.debug_symbol != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install httpx
+          fi
+
+      - name: Run Weinstein debug (real stock data, NO R2 writes)
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+        run: python pipeline.py weinstein_debug "${{ github.event.inputs.debug_symbol }}"
