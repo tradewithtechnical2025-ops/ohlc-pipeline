@@ -1264,93 +1264,175 @@ def _fmt_cr(val):
         return "—"
 
 
+def _shorten_quarter_header(h):
+    """'Mar 2026' -> \"Mar'26\" — compact month+2-digit-year label so the
+    monospace comparison table's column headers stay narrow, matching the
+    abbreviated style financial-data aggregator sites commonly use."""
+    if not h:
+        return None
+    parts = h.split()
+    if len(parts) != 2 or len(parts[1]) < 2:
+        return h
+    mon, yr = parts
+    return f"{mon}'{yr[-2:]}"
+
+
+def _fmt_table_num(val, decimals=1):
+    """Compact number for a monospace table cell — no ₹ symbol (keeps
+    columns narrow enough to line up on a phone screen), '-' for missing."""
+    if val is None:
+        return "-"
+    try:
+        return f"{val:,.{decimals}f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _fmt_table_pct(val, decimals=1):
+    if val is None:
+        return "-"
+    try:
+        return f"{'+' if val >= 0 else ''}{val:.{decimals}f}%"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _fmt_table_pp(val, decimals=1):
+    """Percentage-POINT delta for the OPM row — a margin is already a
+    percentage, so its change should read as '+1.8pp', not a relative %
+    change of the percentage itself."""
+    if val is None:
+        return "-"
+    try:
+        return f"{'+' if val >= 0 else ''}{val:.{decimals}f}pp"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _telegram_fin_table(parsed: dict) -> list:
+    """Builds a compact multi-column comparison table — Metric rows
+    (Sales/PAT/EPS/OPM%) x QoQ/YoY/Current/QoQ-prior/YoY-prior columns —
+    as a Telegram <pre> monospace block. Mirrors the row-x-column layout
+    financial-data aggregator apps (e.g. Earnings Pulse) use; Telegram
+    messages can't render a real HTML table, so this is plain fixed-width
+    text instead. Returns [] if there's no prior-period data to compare
+    against at all (nothing to build a table from)."""
+    q = parsed.get("quarter", {})
+    revenue = q.get("revenue")
+    total_income = q.get("total_income")
+    cur_rev = total_income if total_income is not None else revenue
+    cur_pat = q.get("pat")
+    cur_eps = q.get("eps_basic")
+    cur_opm = round(q["opm"] * 100, 1) if q.get("opm") is not None else None
+    cur_header = _shorten_quarter_header(_quarter_header(q.get("period_end"))) or "Cur"
+
+    qf = parsed.get("qoq_fundamentals") or {}
+    yoy_native = parsed.get("yoy_comparison")
+    yf = parsed.get("yoy_fundamentals") or {}
+
+    def _pick(ti_key, sales_key, source):
+        ti = source.get(ti_key)
+        return ti if ti is not None else source.get(sales_key)
+
+    qoq_rev = _pick("total_income_prior", "sales_prior", qf)
+    qoq_rev_pct = qf.get("total_income_qoq_pct")
+    if qoq_rev_pct is None:
+        qoq_rev_pct = qf.get("sales_qoq_pct")
+    qoq_pat = qf.get("pat_prior")
+    qoq_pat_pct = qf.get("pat_qoq_pct")
+    qoq_eps = qf.get("eps_prior")
+    qoq_opm = qf.get("opm_prior")
+    qoq_opm_pp = qf.get("opm_qoq_pp")
+    qoq_header = _shorten_quarter_header(qf.get("prior_header"))
+
+    if yoy_native:
+        # Native XBRL-tagged prior-year context — doesn't carry a
+        # comparative EPS figure, unlike the AI/fundamentals paths.
+        yoy_rev = yoy_native.get("total_income")
+        if yoy_rev is None:
+            yoy_rev = yoy_native.get("revenue")
+        yoy_pat = yoy_native.get("pat")
+        yoy_opm = round(yoy_native["opm"] * 100, 1) if yoy_native.get("opm") is not None else None
+        yoy_opm_pp = round((cur_opm - yoy_opm), 1) if (cur_opm is not None and yoy_opm is not None) else None
+        yoy_eps = None
+        yoy_rev_pct = yoy_pat_pct = None  # computed generically below from the raw values
+        yoy_header = _shorten_quarter_header(_quarter_header(yoy_native.get("period_end")))
+    else:
+        yoy_rev = _pick("total_income_prior", "sales_prior", yf)
+        yoy_rev_pct = yf.get("total_income_yoy_pct")
+        if yoy_rev_pct is None:
+            yoy_rev_pct = yf.get("sales_yoy_pct")
+        yoy_pat = yf.get("pat_prior")
+        yoy_pat_pct = yf.get("pat_yoy_pct")
+        yoy_eps = yf.get("eps_prior")
+        yoy_opm = yf.get("opm_prior")
+        yoy_opm_pp = yf.get("opm_yoy_pp")
+        yoy_header = _shorten_quarter_header(yf.get("prior_header"))
+
+    if not qf and not yf and not yoy_native:
+        return []  # nothing to compare against — a table would be all dashes
+
+    # Sales/PAT are raw rupees on the `quarter`/fundamentals dicts — scale
+    # to ₹Cr (÷1e7) for the table, same convention _fmt_cr uses everywhere
+    # else. EPS/OPM are already in their natural display units.
+    def _cr(v):
+        return v / 1e7 if v is not None else None
+
+    rows = [
+        ("Sales", _cr(cur_rev), _cr(qoq_rev), qoq_rev_pct, _cr(yoy_rev), yoy_rev_pct, 1, "pct"),
+        ("PAT",   _cr(cur_pat), _cr(qoq_pat), qoq_pat_pct, _cr(yoy_pat), yoy_pat_pct, 1, "pct"),
+        ("EPS",   cur_eps,      qoq_eps,      None,        yoy_eps,      None,        2, "pct"),
+        ("OPM%",  cur_opm,      qoq_opm,      qoq_opm_pp,  yoy_opm,      yoy_opm_pp,  1, "pp"),
+    ]
+
+    hdr_cur = cur_header or "Cur"
+    hdr_qoq = qoq_header or "-"
+    hdr_yoy = yoy_header or "-"
+    header = f"{'Metric':<7}{'QoQ':>8}{'YoY':>8}{hdr_cur:>9}{hdr_qoq:>9}{hdr_yoy:>9}"
+    lines = [f"<pre>{header}"]
+    for label, cur, qprior, qdelta, yprior, ydelta, dec, delta_kind in rows:
+        # Sales/PAT/OPM already have a precomputed delta; EPS doesn't carry
+        # one upstream, so derive a plain % change here from the prior value.
+        if delta_kind == "pct":
+            if qdelta is None and cur is not None and qprior is not None and qprior != 0:
+                qdelta = (cur - qprior) / abs(qprior) * 100
+            if ydelta is None and cur is not None and yprior is not None and yprior != 0:
+                ydelta = (cur - yprior) / abs(yprior) * 100
+            fmt_delta = _fmt_table_pct
+        else:
+            fmt_delta = _fmt_table_pp
+        row = (f"{label:<7}{fmt_delta(qdelta):>8}{fmt_delta(ydelta):>8}"
+               f"{_fmt_table_num(cur, dec):>9}{_fmt_table_num(qprior, dec):>9}{_fmt_table_num(yprior, dec):>9}")
+        lines.append(row)
+    lines.append("</pre>")
+    lines.append("<i>Sales/PAT in ₹Cr</i>")
+    return lines
+
+
 def _telegram_basis_block(parsed: dict) -> list:
-    """Builds the Current Qtr / QoQ / YoY lines for ONE basis (Standalone or
+    """Builds the financial comparison block for ONE basis (Standalone or
     Consolidated). No header/company-name lines — those are built once by
     the caller so two bases for the same company share a single message."""
     q = parsed.get("quarter", {})
     revenue = q.get("revenue")
     total_income = q.get("total_income")
-    # Headline "Rev" shows Total Income (Revenue + Other Income) when
-    # available — some filers (e.g. real-estate, holding companies) have
-    # Other Income that's a material share of the top line, so Total
-    # Income is the more complete current-quarter figure. Falls back to
-    # Revenue from Operations if total_income wasn't extracted.
     rev_display = total_income if total_income is not None else revenue
     pat = q.get("pat")
     pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
     cur_header = _quarter_header(q.get("period_end")) or ""
 
-    lines = [f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>"]
-    lines.append(f"Rev: <b>{_fmt_cr(rev_display)}</b>")
-    lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
-    if q.get("eps_basic") is not None:
-        lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
-
-    def _pct(cur_v, prior_v):
-        if cur_v is None or prior_v is None or prior_v == 0:
-            return None
-        return (cur_v - prior_v) / abs(prior_v) * 100
-
-    def _section(title, prior_header, cur_rev, cur_pat, prior_rev, prior_pat,
-                 rev_pct, pat_pct, opm_current_pct=None, opm_pp=None, prefix=""):
-        sec = ["", f"<b>{title}{' (vs ' + prior_header + ')' if prior_header else ''}</b>"]
-        if cur_rev is not None and rev_pct is not None:
-            prior_txt = f" from {_fmt_cr(prior_rev)}" if prior_rev is not None else ""
-            sec.append(f"Rev: {_fmt_cr(cur_rev)} ({prefix}{'+' if rev_pct >= 0 else ''}{rev_pct:.1f}%{prior_txt})")
-        if cur_pat is not None and pat_pct is not None:
-            prior_txt = f" from {_fmt_cr(prior_pat)}" if prior_pat is not None else ""
-            sec.append(f"PAT: {_fmt_cr(cur_pat)} ({prefix}{'+' if pat_pct >= 0 else ''}{pat_pct:.1f}%{prior_txt})")
-        if opm_current_pct is not None and opm_pp is not None:
-            sec.append(f"OPM: {opm_current_pct}% ({prefix}{'+' if opm_pp >= 0 else ''}{opm_pp:.1f}pp)")
-        return sec if len(sec) > 2 else []
-
-    cur_opm_pct = round(q["opm"] * 100, 2) if q.get("opm") is not None else None
-
-    def _pick_rev_basis(cur_ti, cur_rev, prior_ti, prior_rev, pct_ti, pct_rev):
-        """Prefers Total Income (matches the Current-Qtr headline above) when
-        both current and prior Total Income are available; falls back to
-        Revenue from Operations otherwise (e.g. the XBRL-fundamentals-DB
-        YoY fallback path, which doesn't track Total Income at all)."""
-        if cur_ti is not None and prior_ti is not None and pct_ti is not None:
-            return cur_ti, prior_ti, pct_ti
-        return cur_rev, prior_rev, pct_rev
-
-    qf = parsed.get("qoq_fundamentals")
-    if qf:
-        prefix = "" if qf.get("basis_verified") else "~"
-        cur_r, prior_r, pct_r = _pick_rev_basis(
-            total_income, revenue, qf.get("total_income_prior"), qf.get("sales_prior"),
-            qf.get("total_income_qoq_pct"), qf.get("sales_qoq_pct"),
-        )
-        lines += _section("QoQ", qf.get("prior_header"), cur_r, pat,
-                           prior_r, qf.get("pat_prior"),
-                           pct_r, qf.get("pat_qoq_pct"),
-                           cur_opm_pct, qf.get("opm_qoq_pp"), prefix)
-
-    yoy = parsed.get("yoy_comparison")
-    yf = parsed.get("yoy_fundamentals")
-    if yoy:
-        ti_pct = _pct(total_income, yoy.get("total_income"))
-        cur_r, prior_r, pct_r = _pick_rev_basis(
-            total_income, revenue, yoy.get("total_income"), yoy.get("revenue"),
-            ti_pct, _pct(revenue, yoy.get("revenue")),
-        )
-        pat_pct = _pct(pat, yoy.get("pat"))
-        yoy_header = _quarter_header(yoy.get("period_end"))
-        opm_pp = round((q["opm"] - yoy["opm"]) * 100, 2) if q.get("opm") is not None and yoy.get("opm") is not None else None
-        lines += _section("YoY", yoy_header, cur_r, pat, prior_r, yoy.get("pat"),
-                           pct_r, pat_pct, cur_opm_pct, opm_pp)
-    elif yf:
-        prefix = "" if yf.get("basis_verified") else "~"
-        cur_r, prior_r, pct_r = _pick_rev_basis(
-            total_income, revenue, yf.get("total_income_prior"), yf.get("sales_prior"),
-            yf.get("total_income_yoy_pct"), yf.get("sales_yoy_pct"),
-        )
-        lines += _section("YoY", yf.get("prior_header"), cur_r, pat,
-                           prior_r, yf.get("pat_prior"),
-                           pct_r, yf.get("pat_yoy_pct"),
-                           cur_opm_pct, yf.get("opm_yoy_pp"), prefix)
+    table = _telegram_fin_table(parsed)
+    if table:
+        lines = list(table)
+    else:
+        # No prior-period data at all (e.g. a company's first-ever result,
+        # or fundamentals lookup failed) — fall back to a plain current-
+        # quarter summary rather than sending an empty/dash-only table.
+        lines = [f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>"]
+        lines.append(f"Rev: <b>{_fmt_cr(rev_display)}</b>")
+        lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
+        if q.get("eps_basic") is not None:
+            lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
 
     if q.get("yoy_caution"):
         lines.append("")
@@ -1482,6 +1564,41 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     existing = await r2_get(client, "nse_results_detailed.json")
     existing_items = (existing or {}).get("items", [])
+
+    def _basis_key(it):
+        """(symbol, period_end) — ignores standalone/consolidated nature,
+        used to find the Standalone/Consolidated counterpart of a result."""
+        meta = it.get("meta", {}) or {}
+        quarter = it.get("quarter", {}) or {}
+        return (meta.get("symbol"), quarter.get("period_end"))
+
+    # Consolidated preferred over Standalone: retroactive cleanup. NSE
+    # often files Standalone and Consolidated as two SEPARATE PDF documents
+    # (different filenames/links, sometimes even different runs) rather
+    # than two tables in one PDF, so they can end up stored as two
+    # independent records for the same symbol+quarter. Consolidated is
+    # what's wanted; Standalone should only ever persist as a fallback when
+    # no Consolidated result exists at all for that company+quarter — drop
+    # any Standalone record that already has a Consolidated counterpart
+    # sitting in the existing data, regardless of whether anything new is
+    # being parsed this run.
+    _existing_consolidated_keys = {
+        _basis_key(it) for it in existing_items
+        if (it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "consolidated"
+        and _basis_key(it)[0]
+    }
+    if _existing_consolidated_keys:
+        _before = len(existing_items)
+        existing_items = [
+            it for it in existing_items
+            if not ((it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
+                    and _basis_key(it) in _existing_consolidated_keys)
+        ]
+        _removed = _before - len(existing_items)
+        if _removed:
+            print(f"  🗑 Removed {_removed} previously-stored Standalone record(s) already superseded "
+                  f"by an existing Consolidated result (Consolidated preferred)")
+
     existing_links = {it.get("link") for it in existing_items}
 
     def _result_key(it):
@@ -1694,6 +1811,43 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — updating record, skipping Telegram")
         for r in refiled:
             existing_items[existing_by_key[_result_key(r)]] = r
+
+    # Consolidated preferred over Standalone: forward-looking filter.
+    # Covers both (a) Consolidated already sitting in existing_items while
+    # a new Standalone filing arrives this run, and (b) Standalone and
+    # Consolidated both arriving fresh in the SAME run's batch (the common
+    # case — NSE frequently files both PDFs for the same board meeting
+    # within minutes of each other). Either way, drop the Standalone
+    # record before it can be stored or sent to Telegram — Standalone only
+    # ever survives as a fallback when no Consolidated result exists at
+    # all for that symbol+quarter.
+    consolidated_available = {
+        _basis_key(it) for it in existing_items + parsed_new
+        if (it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "consolidated"
+        and _basis_key(it)[0]
+    }
+    if consolidated_available:
+        before_new = len(parsed_new)
+        parsed_new = [
+            r for r in parsed_new
+            if not ((r.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
+                    and _basis_key(r) in consolidated_available)
+        ]
+        dropped_new_standalone = before_new - len(parsed_new)
+        if dropped_new_standalone:
+            print(f"  ⏸ Dropped {dropped_new_standalone} new Standalone result(s) — Consolidated "
+                  f"already available/arriving for the same symbol+quarter (Consolidated preferred)")
+
+        before_existing = len(existing_items)
+        existing_items = [
+            it for it in existing_items
+            if not ((it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
+                    and _basis_key(it) in consolidated_available)
+        ]
+        dropped_existing_standalone = before_existing - len(existing_items)
+        if dropped_existing_standalone:
+            print(f"  🗑 Removed {dropped_existing_standalone} previously-stored Standalone record(s) "
+                  f"now superseded by a Consolidated result arriving this run")
 
     if parsed_new:
         groups = _group_parsed_results(parsed_new)
