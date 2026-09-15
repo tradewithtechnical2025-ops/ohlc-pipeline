@@ -740,16 +740,28 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
                 # is just a generous safety cap for the rare oversized filing,
                 # not a normal-case truncation point.
                 "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:100000]}]}],
-                # maxOutputTokens raised from 700 -> 3000. 700 was too tight
-                # for this schema once segment_breakup / key_highlights /
-                # management_commentary / qoq_prior / yoy_prior are all
-                # populated — Gemini's response was getting cut off mid-JSON,
-                # which surfaced as JSONDecodeError ("Unterminated string",
-                # "Expecting ',' delimiter", "Extra data") rather than a
-                # clean truncation signal. 3000 gives real headroom.
-                "generationConfig": {"temperature": 0.05, "maxOutputTokens": 3000, "responseMimeType": "application/json"},
+                # maxOutputTokens raised well beyond the visible-JSON size —
+                # on "thinking"-capable flash models, internal reasoning
+                # tokens are drawn from THIS SAME budget before any visible
+                # output is emitted, so a limit sized only for the JSON
+                # itself (e.g. 3000) can be entirely consumed by thinking,
+                # leaving the actual answer truncated after just a couple
+                # hundred characters (seen repeatedly: JSON cut off at
+                # char 200-800 regardless of how high this was raised).
+                # thinkingConfig explicitly caps/disables that reasoning
+                # budget so tokens go to the structured answer instead —
+                # this is a plain extraction task, not something that
+                # benefits from extended chain-of-thought. If the model
+                # doesn't support thinkingConfig, the API should ignore the
+                # unrecognized field rather than error.
+                "generationConfig": {
+                    "temperature": 0.05,
+                    "maxOutputTokens": 8192,
+                    "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingBudget": 0},
+                },
             },
-            timeout=30,
+            timeout=60,
         )
         if r.status_code == 429:
             print(f"    · [{fname_dbg}] AI extraction skipped: Gemini quota/rate limit hit")
@@ -760,17 +772,28 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         if not candidates or "content" not in candidates[0]:
             print(f"    · [{fname_dbg}] AI extraction: unexpected Gemini response shape")
             return None
+        finish_reason = candidates[0].get("finishReason", "")
         parts = candidates[0]["content"].get("parts") or []
         raw_text = "".join(p.get("text", "") for p in parts).strip()
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
-        # strict=False allows literal control characters (unescaped raw
-        # newlines/tabs) inside JSON string values without raising —
-        # Gemini occasionally emits a raw newline inside a multi-line text
-        # field (e.g. management_commentary) instead of the JSON-escaped
-        # \n, which under strict (default) parsing surfaces as a confusing
-        # "Unterminated string starting at..." error even though the
-        # response is otherwise well-formed.
-        parsed = json.loads(cleaned, strict=False)
+        try:
+            # strict=False allows literal control characters (unescaped raw
+            # newlines/tabs) inside JSON string values without raising —
+            # Gemini occasionally emits a raw newline inside a multi-line
+            # text field (e.g. management_commentary) instead of the
+            # JSON-escaped \n, which under strict (default) parsing
+            # surfaces as a confusing "Unterminated string starting at..."
+            # error even though the response is otherwise well-formed.
+            parsed = json.loads(cleaned, strict=False)
+        except json.JSONDecodeError as je:
+            # Surface finishReason on a parse failure — "MAX_TOKENS" here
+            # means the response was genuinely cut off mid-JSON (budget
+            # exhausted, likely by internal thinking tokens), vs "STOP"
+            # meaning the model finished normally but emitted malformed
+            # JSON — the two need different fixes, so don't conflate them.
+            print(f"    · [{fname_dbg}] AI JSON parse failed ({je}); finishReason={finish_reason or 'unknown'}, "
+                  f"response length={len(raw_text)} chars")
+            return None
         return parsed
     except Exception as e:
         print(f"    · [{fname_dbg}] AI extraction failed: {type(e).__name__}: {e}")
