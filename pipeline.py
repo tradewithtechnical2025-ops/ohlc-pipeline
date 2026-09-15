@@ -3262,16 +3262,28 @@ TRANSITION_LABELS = {
 def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
                               flat_threshold_pct=1.0, min_weeks=40,
                               early_breakout_lookback=26, ema_short_period=10,
-                              min_weeks_in_prior_stage=3, confirm_weeks=2):
+                              min_weeks_in_prior_stage=3, confirm_weeks=2,
+                              swing_lookback=10):
     """
     Stan Weinstein's original 4-Stage Analysis (his book "Secrets for Profiting
     in Bull and Bear Markets") — WEEKLY chart, ema_period-week average
     (Weinstein used a 30-week SMA; this uses EMA instead — see EMA NOTE below).
 
       Stage 1 (Basing)     — price hovering near a flat average, after a decline
-      Stage 2 (Advancing)  — price > 10-week EMA > 30-week EMA, slope rising
+      Stage 2 (Advancing)  — price > 10wk EMA > 30wk EMA, slope rising,
+                              AND close > highest weekly HIGH of the prior
+                              swing_lookback weeks (genuine new swing high)
       Stage 3 (Topping)    — price hovering near a flat average, after an advance
-      Stage 4 (Declining)  — price < 10-week EMA < 30-week EMA, slope falling
+      Stage 4 (Declining)  — price < 10wk EMA < 30wk EMA, slope falling,
+                              AND close < lowest weekly LOW of the prior
+                              swing_lookback weeks (genuine new swing low)
+
+    SWING HIGH/LOW CONFIRMATION: on top of the EMA-based conditions, entry
+    into Stage 2/4 also requires the close to actually break the prior
+    swing_lookback weeks' real price extreme (weekly high for Stage 2, weekly
+    low for Stage 4 — wicks, not just closes) — a genuine breakout of recent
+    price structure, not merely an EMA crossover with no new high/low to show
+    for it.
 
     EMA NOTE (why not SMA): Weinstein's original method used a simple 30-week
     SMA, which weighs a week from 6 months ago the same as last week. That
@@ -3368,9 +3380,17 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
                 continue
             slope_pct = (e30 - e30_prev) / e30_prev * 100
 
-            if price > e10 > e30 and slope_pct > flat_threshold_pct:
+            swing_start = max(0, i - swing_lookback)
+            prior_highs = [v for v in wh[swing_start:i] if v is not None]
+            prior_lows = [v for v in wl[swing_start:i] if v is not None]
+            swing_high = max(prior_highs) if prior_highs else None
+            swing_low = min(prior_lows) if prior_lows else None
+
+            if (price > e10 > e30 and slope_pct > flat_threshold_pct
+                    and swing_high is not None and price > swing_high):
                 stage = 2
-            elif price < e10 < e30 and slope_pct < -flat_threshold_pct:
+            elif (price < e10 < e30 and slope_pct < -flat_threshold_pct
+                    and swing_low is not None and price < swing_low):
                 stage = 4
             else:
                 stage = 3 if last_trend == 2 else 1   # default Stage 1 if unknown
@@ -3518,7 +3538,7 @@ async def backup_weinstein_transitions(client, signals):
 
 async def debug_weinstein_symbol(symbol, ema_period=30, slope_lookback=4, flat_threshold_pct=1.0,
                                   ema_short_period=10, min_weeks_in_prior_stage=3, confirm_weeks=2,
-                                  weeks_shown=20) -> None:
+                                  swing_lookback=10, weeks_shown=20) -> None:
     """
     Diagnostic: prints week-by-week close/ema30/ema10/slope%/stage for ONE
     symbol, using the EXACT same math as _detect_weinstein_stages() (duplicated
@@ -3568,7 +3588,7 @@ async def debug_weinstein_symbol(symbol, ema_period=30, slope_lookback=4, flat_t
     candidate_trend = None
     candidate_streak = 0
     stage_seq_full = [None] * start   # for weeks_in_prev_stage / transition_type preview
-    print(f"\n{'Week':<12}{'Close':<10}{'EMA30':<10}{'EMA10':<10}{'Slope%':<10}{'Stage':<20}{'last_trend after'}")
+    print(f"\n{'Week':<12}{'Close':<10}{'EMA30':<10}{'EMA10':<10}{'Slope%':<10}{'SwHigh':<10}{'SwLow':<10}{'Stage':<20}{'last_trend after'}")
     show_from = max(start, n - weeks_shown)
     for i in range(start, n):
         price, e30, e30_prev = wc[i], ema30_arr[i], ema30_arr[i - slope_lookback]
@@ -3577,12 +3597,19 @@ async def debug_weinstein_symbol(symbol, ema_period=30, slope_lookback=4, flat_t
         if price is None or e30 is None or e30_prev is None or e30_prev == 0 or e10 is None:
             stage_seq_full.append(None)
             if i >= show_from:
-                print(f"{row_week:<12}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'None (missing data)':<20}{last_trend}")
+                print(f"{row_week:<12}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'None (missing data)':<20}{last_trend}")
             continue
         slope_pct = (e30 - e30_prev) / e30_prev * 100
-        if price > e10 > e30 and slope_pct > flat_threshold_pct:
+        swing_start = max(0, i - swing_lookback)
+        prior_highs = [v for v in wh[swing_start:i] if v is not None]
+        prior_lows = [v for v in wl[swing_start:i] if v is not None]
+        swing_high = max(prior_highs) if prior_highs else None
+        swing_low = min(prior_lows) if prior_lows else None
+        if (price > e10 > e30 and slope_pct > flat_threshold_pct
+                and swing_high is not None and price > swing_high):
             stage = 2
-        elif price < e10 < e30 and slope_pct < -flat_threshold_pct:
+        elif (price < e10 < e30 and slope_pct < -flat_threshold_pct
+                and swing_low is not None and price < swing_low):
             stage = 4
         else:
             stage = 3 if last_trend == 2 else 1
@@ -3597,7 +3624,9 @@ async def debug_weinstein_symbol(symbol, ema_period=30, slope_lookback=4, flat_t
             candidate_trend, candidate_streak = None, 0
         stage_seq_full.append(stage)
         if i >= show_from:
-            print(f"{row_week:<12}{price:<10.2f}{e30:<10.2f}{e10:<10.2f}{slope_pct:<10.2f}"
+            sh_str = f"{swing_high:.2f}" if swing_high is not None else "—"
+            sl_str = f"{swing_low:.2f}" if swing_low is not None else "—"
+            print(f"{row_week:<12}{price:<10.2f}{e30:<10.2f}{e10:<10.2f}{slope_pct:<10.2f}{sh_str:<10}{sl_str:<10}"
                   f"{STAGE_NAMES[stage]+' ('+str(stage)+')':<20}{last_trend}   (candidate={candidate_trend}x{candidate_streak})")
 
     print(f"\nFinal stage this run: {STAGE_NAMES[stage]} ({stage})")
