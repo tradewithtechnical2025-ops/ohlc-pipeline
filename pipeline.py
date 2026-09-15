@@ -3239,8 +3239,28 @@ async def run_minervini_scan(min_rs_rating=70) -> None:
 STAGE_NAMES = {1: "Basing", 2: "Advancing", 3: "Topping", 4: "Declining"}
 
 
+TRANSITION_LABELS = {
+    # Only 8 of the theoretical 12 (stage, stage) pairs are reachable — the
+    # carry-forward rule (stage = 3 if last_trend==2 else 1) means a "flat"
+    # week ALWAYS resolves to whichever of {1,3} matches the current
+    # last_trend, so (2→1), (4→3), (1→3), (3→1) can never actually happen —
+    # a run coming from 2 or 3 can only flat-resolve to 3, and a run coming
+    # from 4 or 1 can only flat-resolve to 1. Deliberately no entries for
+    # those 4 — .get() just returns None for them (won't happen, but safe).
+    (1, 2): "Base Breakout — Basing to Advancing",
+    (2, 3): "Topping Started — Advancing to Topping",
+    (3, 4): "Breakdown Confirmed — Topping to Declining",
+    (4, 1): "Bottoming — Declining to Basing",
+    (3, 2): "Failed Top — resumed Advancing without breaking down",
+    (1, 4): "Failed Base — resumed Declining without breaking out",
+    (2, 4): "Sharp Reversal — Advancing straight to Declining",
+    (4, 2): "Sharp Reversal — Declining straight to Advancing",
+}
+
+
 def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
-                              flat_threshold_pct=1.0, min_weeks=40):
+                              flat_threshold_pct=1.0, min_weeks=40,
+                              early_breakout_lookback=26):
     """
     Stan Weinstein's original 4-Stage Analysis (his book "Secrets for Profiting
     in Bull and Bear Markets") — WEEKLY chart, sma_period-week SMA (Weinstein
@@ -3255,6 +3275,26 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
     flat_threshold_pct%). Flat/ambiguous weeks are 1-vs-3 by carrying forward
     the last confirmed trending stage (2 or 4) — the standard resolution for
     this ambiguity, since basing and topping look identical on MA+price alone.
+
+    EARLY TRANSITION (fixes the lag): the official `stage` field only flips
+    to 2 once the 30-week SMA's slope confirms — which takes several weeks
+    AFTER a base-high breakout, since a slow 30-week average doesn't move
+    fast. To catch the breakout itself, while stage is still 1 (Basing) we
+    separately check if this week's close broke above the highest close of
+    the prior early_breakout_lookback weeks (the base range) — if so,
+    early_transition=True ("Possible Stage 2 — base breakout, SMA30 slope
+    not yet confirmed"), even though `stage` still correctly reads 1.
+    Symmetric check while stage==3 (Topping) flags a range breakdown as a
+    possible early Stage 4. Use `stage` for the confirmed/reliable read and
+    `early_transition` for a faster (noisier) heads-up.
+
+    NOT SEQUENTIAL: each week's stage is recomputed independently from that
+    week's price/slope — it does NOT require passing through 1→2→3→4 in
+    order. So a "failed top" (Topping reverting straight back to Advancing,
+    3→2, skipping Declining) and a "failed base" (Basing reverting straight
+    back to Declining, 1→4, skipping Advancing) are both real, valid outputs
+    — not bugs. `transition_type` (via TRANSITION_LABELS) names exactly which
+    kind of transition stage_change represents, including these two.
 
     Returns:
       current_signals  -> [{symbol, week, stage, prev_stage, stage_change,
@@ -3310,13 +3350,40 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
                 if v == cur_stage: weeks_in_stage += 1
                 else: break
             i_last = n - 1
+
+            # Early transition check — only meaningful while officially in Basing/Topping
+            early_transition = False
+            early_transition_label = None
+            range_ref = None
+            if cur_stage in (1, 3):
+                lb_start = max(0, i_last - early_breakout_lookback)
+                prior_closes = [v for v in wc[lb_start:i_last] if v is not None]
+                today_close = wc[i_last]
+                if prior_closes and today_close is not None:
+                    if cur_stage == 1:
+                        base_high = max(prior_closes)
+                        range_ref = round(base_high, 2)
+                        if today_close > base_high:
+                            early_transition = True
+                            early_transition_label = "Possible Stage 2 — base breakout, SMA30 slope not yet confirmed"
+                    else:  # cur_stage == 3
+                        range_low = min(prior_closes)
+                        range_ref = round(range_low, 2)
+                        if today_close < range_low:
+                            early_transition = True
+                            early_transition_label = "Possible Stage 4 — range breakdown, SMA30 slope not yet confirmed"
+
             current_signals.append({
                 "symbol": sym, "week": w_labels[i_last], "stage": cur_stage,
                 "prev_stage": prev_stage,
                 "stage_change": bool(prev_stage is not None and prev_stage != cur_stage),
+                "transition_type": TRANSITION_LABELS.get((prev_stage, cur_stage)) if prev_stage is not None and prev_stage != cur_stage else None,
                 "weeks_in_stage": weeks_in_stage,
                 "close": round(wc[i_last], 2),
                 "sma30": round(sma[i_last], 2) if sma[i_last] is not None else None,
+                "early_transition": early_transition,
+                "early_transition_label": early_transition_label,
+                "range_ref": range_ref,
             })
 
     breadth_history = [
@@ -3385,9 +3452,16 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                     log.info(f"\n── Stage {n} ({STAGE_NAMES[n]}) — {len(stage_syms)} stocks, "
                               f"showing top {min(print_top_n, len(stage_syms))} by weeks_in_stage ──")
                     for s in stage_syms[:print_top_n]:
+                        tag = f"  ⚡ {s['early_transition_label']} (range_ref={s['range_ref']})" if s["early_transition"] else ""
+                        chg = f"  🔄 {s['transition_type']}" if s["stage_change"] else ""
                         log.info(f"  {s['symbol']:<15} weeks_in_stage={s['weeks_in_stage']:<5} "
                                   f"close={s['close']:<10} sma30={s['sma30']:<10} "
-                                  f"stage_change={s['stage_change']}")
+                                  f"stage_change={s['stage_change']}{tag}{chg}")
+                early_watch = [s for s in signals if s["early_transition"]]
+                if early_watch:
+                    log.info(f"\n⚡ {len(early_watch)} stocks with early_transition=True "
+                              f"(base breakout / range breakdown ahead of SMA30 confirmation): "
+                              f"{[s['symbol'] for s in early_watch]}")
                 log.info("\n[DRY RUN] No R2 files written — copy symbol names above into "
                           "TradingView/your chart tool to cross-check.")
             else:
