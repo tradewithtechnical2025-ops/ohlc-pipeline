@@ -25,3 +25,34 @@ jobs:
 
       - name: Run Weinstein stage detector test
         run: python test_weinstein_stage.py
+
+  dry_run_real_data:
+    # Only runs when YOU manually click "Run workflow" — never on push/PR,
+    # since this hits real Upstox/R2 APIs (uses the same repo secrets your
+    # production pipeline already uses).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install httpx
+          fi
+
+      - name: Run Weinstein dry-run (real stock data, NO R2 writes)
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+        run: python pipeline.py weinstein_scan_dryrun
