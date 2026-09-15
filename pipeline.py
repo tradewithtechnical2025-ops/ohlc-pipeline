@@ -3262,30 +3262,37 @@ TRANSITION_LABELS = {
 def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
                               flat_threshold_pct=1.0, min_weeks=40,
                               early_breakout_lookback=26, sma_short_period=10,
-                              min_weeks_in_prior_stage=3):
+                              min_weeks_in_prior_stage=3, confirm_weeks=2):
     """
     Stan Weinstein's original 4-Stage Analysis (his book "Secrets for Profiting
     in Bull and Bear Markets") — WEEKLY chart, sma_period-week SMA (Weinstein
     used 30-week, ≈150-day daily).
 
       Stage 1 (Basing)     — price hovering near a flat SMA, after a decline
-      Stage 2 (Advancing)  — price above a rising SMA, AND 10-week SMA > 30-week SMA
+      Stage 2 (Advancing)  — price > 10-week SMA > 30-week SMA, slope rising
       Stage 3 (Topping)    — price hovering near a flat SMA, after an advance
-      Stage 4 (Declining)  — price below a falling SMA, AND 10-week SMA < 30-week SMA
+      Stage 4 (Declining)  — price < 10-week SMA < 30-week SMA, slope falling
 
     SMA slope over slope_lookback weeks decides rising/falling/flat (threshold
     flat_threshold_pct%). Flat/ambiguous weeks are 1-vs-3 by carrying forward
     the last confirmed trending stage (2 or 4) — the standard resolution for
     this ambiguity, since basing and topping look identical on MA+price alone.
 
-    SMA10>SMA30 CONFIRMATION (anti-whipsaw): a single borderline week — price
-    barely above SMA30 with slope just over the flat_threshold — used to be
-    enough to flip Stage 4→2 outright, which then "poisoned" last_trend for
-    months afterward (every later ambiguous week got called Topping instead
-    of Basing, since last_trend was wrongly left at 2). Requiring the faster
-    10-week SMA to also agree with the direction (>30-week SMA for Stage 2,
-    < for Stage 4) makes that single-week trigger much harder to hit on noise
-    alone, so last_trend stays correct through genuine multi-week bases.
+    SMA10>SMA30 CONFIRMATION + 2-WEEK PERSISTENCE (anti-whipsaw / anti-poison):
+    a single borderline week — price barely above SMA30 with slope just over
+    the flat_threshold — used to be enough to flip Stage 4→2 outright, which
+    then "poisoned" last_trend for months afterward (every later ambiguous
+    week got called Topping instead of Basing, since last_trend was wrongly
+    left at 2). Three defenses now: (a) price itself must be above the faster
+    10-week SMA too, not just the 30-week one (price > SMA10 > SMA30 for
+    Stage 2, reversed for Stage 4) — a stronger, stricter entry condition
+    than price vs SMA30 alone, (b) that 10-week SMA must be on the correct
+    side of the 30-week SMA, and (c) even when a week's raw read is 2 or 4,
+    `last_trend` (the value the 1-vs-3 fallback actually uses) only updates
+    once that raw read repeats for confirm_weeks CONSECUTIVE weeks. That
+    single week's `stage` is still shown honestly (it can momentarily read 2
+    or 4), but it can no longer by itself flip the fallback bucket for every
+    later ambiguous week.
 
     MIN 3-WEEK HOLD FOR TRANSITION LABELS (anti-chatter): `stage`/`stage_change`
     still reflect the literal week-by-week math honestly. But `transition_type`
@@ -3337,7 +3344,9 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
         sma_short = _calc_sma(wc, sma_short_period)
         start = sma_period + slope_lookback
 
-        last_trend = None   # last confirmed 2 or 4
+        last_trend = None      # CONFIRMED trend (2 or 4) — only this decides the 1-vs-3 fallback
+        candidate_trend = None
+        candidate_streak = 0
         stage_seq = [None] * start
 
         for i in range(start, n):
@@ -3348,15 +3357,28 @@ def _detect_weinstein_stages(all_data, sma_period=30, slope_lookback=4,
                 continue
             slope_pct = (s30 - s30_prev) / s30_prev * 100
 
-            if price > s30 and slope_pct > flat_threshold_pct and s10 > s30:
+            if price > s10 > s30 and slope_pct > flat_threshold_pct:
                 stage = 2
-            elif price < s30 and slope_pct < -flat_threshold_pct and s10 < s30:
+            elif price < s10 < s30 and slope_pct < -flat_threshold_pct:
                 stage = 4
             else:
                 stage = 3 if last_trend == 2 else 1   # default Stage 1 if unknown
 
+            # last_trend (used above for the 1-vs-3 fallback) only updates once
+            # a raw 2/4 read repeats for confirm_weeks CONSECUTIVE weeks — a
+            # single borderline week is shown honestly as that week's stage,
+            # but can't by itself "poison" every later ambiguous week into
+            # the wrong bucket (see docstring: SMA10 CONFIRMATION section).
             if stage in (2, 4):
-                last_trend = stage
+                if stage == candidate_trend:
+                    candidate_streak += 1
+                else:
+                    candidate_trend, candidate_streak = stage, 1
+                if candidate_streak >= confirm_weeks:
+                    last_trend = stage
+            else:
+                candidate_trend, candidate_streak = None, 0
+
             stage_seq.append(stage)
 
             breadth.setdefault(w_labels[i], {1: 0, 2: 0, 3: 0, 4: 0})
@@ -3484,7 +3506,8 @@ async def backup_weinstein_transitions(client, signals):
 
 
 async def debug_weinstein_symbol(symbol, sma_period=30, slope_lookback=4, flat_threshold_pct=1.0,
-                                  sma_short_period=10, min_weeks_in_prior_stage=3, weeks_shown=20) -> None:
+                                  sma_short_period=10, min_weeks_in_prior_stage=3, confirm_weeks=2,
+                                  weeks_shown=20) -> None:
     """
     Diagnostic: prints week-by-week close/sma30/sma10/slope%/stage for ONE
     symbol, using the EXACT same math as _detect_weinstein_stages() (duplicated
@@ -3531,6 +3554,8 @@ async def debug_weinstein_symbol(symbol, sma_period=30, slope_lookback=4, flat_t
     sma_short = _calc_sma(wc, sma_short_period)
 
     last_trend = None
+    candidate_trend = None
+    candidate_streak = 0
     stage_seq_full = [None] * start   # for weeks_in_prev_stage / transition_type preview
     print(f"\n{'Week':<12}{'Close':<10}{'SMA30':<10}{'SMA10':<10}{'Slope%':<10}{'Stage':<20}{'last_trend after'}")
     show_from = max(start, n - weeks_shown)
@@ -3544,18 +3569,25 @@ async def debug_weinstein_symbol(symbol, sma_period=30, slope_lookback=4, flat_t
                 print(f"{row_week:<12}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'None (missing data)':<20}{last_trend}")
             continue
         slope_pct = (s30 - s30_prev) / s30_prev * 100
-        if price > s30 and slope_pct > flat_threshold_pct and s10 > s30:
+        if price > s10 > s30 and slope_pct > flat_threshold_pct:
             stage = 2
-        elif price < s30 and slope_pct < -flat_threshold_pct and s10 < s30:
+        elif price < s10 < s30 and slope_pct < -flat_threshold_pct:
             stage = 4
         else:
             stage = 3 if last_trend == 2 else 1
         if stage in (2, 4):
-            last_trend = stage
+            if stage == candidate_trend:
+                candidate_streak += 1
+            else:
+                candidate_trend, candidate_streak = stage, 1
+            if candidate_streak >= confirm_weeks:
+                last_trend = stage
+        else:
+            candidate_trend, candidate_streak = None, 0
         stage_seq_full.append(stage)
         if i >= show_from:
             print(f"{row_week:<12}{price:<10.2f}{s30:<10.2f}{s10:<10.2f}{slope_pct:<10.2f}"
-                  f"{STAGE_NAMES[stage]+' ('+str(stage)+')':<20}{last_trend}")
+                  f"{STAGE_NAMES[stage]+' ('+str(stage)+')':<20}{last_trend}   (candidate={candidate_trend}x{candidate_streak})")
 
     print(f"\nFinal stage this run: {STAGE_NAMES[stage]} ({stage})")
 
