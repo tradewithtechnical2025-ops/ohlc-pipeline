@@ -2517,7 +2517,8 @@ def _weekly_pullback_swing_low_candidates(lows, end_idx, lookback, floor=0):
 def _try_build_weekly_pullback_v2(lo, hi, wd, wh, wl, wc, emas, n,
                                    pole_min_weeks, pole_max_weeks, min_gain_pct,
                                    min_pullback_pct, ema_proximity_pct, max_pullback_weeks,
-                                   pole_ema_tolerance_pct, peak_check_min_pullback_pct):
+                                   pole_ema_tolerance_pct, peak_check_min_pullback_pct,
+                                   max_signal_age_weeks=2):
     if lo is None or lo >= hi:
         return None
 
@@ -2583,6 +2584,14 @@ def _try_build_weekly_pullback_v2(lo, hi, wd, wh, wl, wc, emas, n,
             cum_low = l
             cum_low_idx = j
 
+        # ---- FIX: keep walking and OVERWRITE with the LATEST touch, don't
+        # stop at the FIRST one. A stock can sit near its EMA for many
+        # consecutive weeks (or touch it, drift off, then touch again) —
+        # stopping at the earliest touch meant the staleness check below
+        # could reject a pullback that's genuinely still live today just
+        # because it ALSO happened to touch the EMA weeks earlier. What
+        # matters for "is this a live pullback signal" is the MOST RECENT
+        # touch before any breakout, not the first one on this pole.
         for p in sorted(emas.keys()):
             e = emas[p][j]
             if e is None:
@@ -2595,10 +2604,32 @@ def _try_build_weekly_pullback_v2(lo, hi, wd, wh, wl, wc, emas, n,
                 signal_ema = p
                 signal_kind = "Reversal" if reversal else f"Near EMA{p}"
                 break
-        if signal_idx is not None:
-            break
 
     if signal_idx is None:
+        return None
+
+    # ---- FIX: a signal is only a valid "pullback" if it's still CURRENT —
+    # not just something that happened somewhere in the last max_pullback_weeks.
+    # Without this, a stock that touched its EMA once (weeks ago) and has
+    # since broken down further into an outright downtrend still shows up
+    # as "W-Pullback" today, because w_pb_map keeps whichever match has the
+    # latest signal_date with no check that the signal is still live. Real
+    # confirmed example: AAVAS — pole was Feb->Jul (genuine +48% rally),
+    # EMA touch happened early Aug, but by mid-Sep the stock has kept
+    # falling well below both EMAs (RS 28, Mswing -0.83) — a breakdown, not
+    # a live pullback-to-EMA setup. Require the touch to be within the last
+    # max_signal_age_weeks of the most recent bar.
+    if (n - 1 - signal_idx) > max_signal_age_weeks:
+        return None
+
+    # ---- Trend-health gate: as of the LATEST bar (today), the fast EMA
+    # must still be above the slow EMA (e.g. weekly EMA10 > EMA30). A stock
+    # can pass the staleness check above yet still have flipped into a
+    # genuine downtrend structure (fast EMA crossed below slow EMA) — this
+    # catches that independently of how recent the EMA "touch" itself was.
+    slow_ema = max(emas.keys())
+    fast_last, slow_last = emas[fast_ema][n - 1], emas[slow_ema][n - 1]
+    if fast_last is None or slow_last is None or fast_last <= slow_last:
         return None
 
     pullback_pct = (pole_high - wl[signal_idx]) / pole_high * 100.0
@@ -2621,13 +2652,21 @@ def _detect_weekly_pullback_v2(all_data, min_gain_pct=30.0, pole_min_weeks=3, po
                                 ema_periods=(10, 30), ema_proximity_pct=5.0,
                                 max_pullback_weeks=12, min_pullback_pct=5.0,
                                 pole_ema_tolerance_pct=0.0, peak_check_min_pullback_pct=10.0,
-                                lookback_weeks=104):
+                                lookback_weeks=104, max_signal_age_weeks=2):
     """
     Chain-based weekly rally + pullback-to-EMA signal detector (HTF-style):
     pole must be a strictly clean rally (no real EMA10 close-violations
     during formation), peak-check is pullback-aware, and each pole's own
     pullback-low chains directly into the next pole's base. No entry/SL —
     just the signal, for boolean-flagging in screener_feed.json.
+
+    The EMA-touch signal must be RECENT (within max_signal_age_weeks of the
+    latest bar) — not just anywhere within max_pullback_weeks of the pole's
+    own high. Without this, a stock that touched its EMA once weeks ago and
+    has since broken down further into an outright downtrend (e.g. AAVAS:
+    genuine Feb->Jul pole, EMA touch early Aug, but still falling through
+    mid-Sep with RS 28 and negative Mswing) kept showing as "W-Pullback"
+    long after the setup stopped being live.
     """
     all_signals = []
     for sym, s in all_data.items():
@@ -2665,7 +2704,8 @@ def _detect_weekly_pullback_v2(all_data, min_gain_pct=30.0, pole_min_weeks=3, po
                     lo, hi, wd, wh, wl, wc, emas, n,
                     pole_min_weeks, pole_max_weeks, min_gain_pct,
                     min_pullback_pct, ema_proximity_pct, max_pullback_weeks,
-                    pole_ema_tolerance_pct, peak_check_min_pullback_pct)
+                    pole_ema_tolerance_pct, peak_check_min_pullback_pct,
+                    max_signal_age_weeks)
                 if match is not None:
                     break
 
@@ -3807,6 +3847,19 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
 
 from statistics import mean as _mean
 
+def _vcp_atr(highs, lows, closes, period=14):
+    """Average True Range over the trailing `period` bars."""
+    n = len(highs)
+    if n < period + 1: return 0.0
+    trs = []
+    for i in range(1, n):
+        h, l, c_prev = highs[i], lows[i], closes[i - 1]
+        if h is None or l is None or c_prev is None: continue
+        trs.append(max(h - l, abs(h - c_prev), abs(l - c_prev)))
+    if len(trs) < period: return 0.0
+    return sum(trs[-period:]) / period
+
+
 def _vcp_sma(arr, period, end=None):
     end = len(arr) if end is None else end
     if end < period: return None
@@ -3814,88 +3867,64 @@ def _vcp_sma(arr, period, end=None):
     if not seg or any(v is None for v in seg): return None
     return sum(seg) / period
 
-def _vcp_zigzag_pct(highs, lows, pct_threshold=0.04):
+
+def _vcp_zigzag_abs(highs, lows, atr_threshold):
     """
-    Percentage-based ZigZag — a pivot (H or L) is only confirmed once
-    price has reversed by at least pct_threshold from the running
-    extreme tracked since the last confirmed pivot. Amplitude-based,
-    not time-based, so small noisy wiggles get filtered regardless of
-    how many bars they span, while genuine reversals are always caught
-    no matter how long they take to form.
-    Returns [(idx, price, 'H'/'L', confirm_idx), ...] in chronological
-    order — confirm_idx is the index where the reversal was actually
-    DETECTED (which can be a day or more after the pivot's own idx),
-    needed by callers that want to scan the true price extreme over
-    the whole up/down swing, not just up to the pivot's own bar.
+    ATR-based ZigZag — a pivot (H or L) is only confirmed once price has
+    reversed by at least atr_threshold (an absolute price amount, derived
+    from ATR so it auto-scales to each stock's own volatility) from the
+    running extreme. Replaces the older fixed-percentage ZigZag, which used
+    the same % threshold for a ₹50 penny stock and a ₹5,000 large-cap.
     """
     n = len(highs)
     if n < 2: return []
-
     piv = []
     ext_high = highs[0]; ext_high_idx = 0
     ext_low  = lows[0];  ext_low_idx  = 0
     direction = None
-
     for i in range(1, n):
         h, l = highs[i], lows[i]
         if h is None or l is None: continue
         if ext_high is None or h > ext_high: ext_high, ext_high_idx = h, i
         if ext_low  is None or l < ext_low:  ext_low,  ext_low_idx  = l, i
-
         if direction is None:
-            if ext_high is not None and l <= ext_high * (1 - pct_threshold):
+            if ext_high is not None and l <= ext_high - atr_threshold:
                 piv.append((ext_high_idx, ext_high, "H", i))
                 direction = "down"; ext_low, ext_low_idx = l, i
-            elif ext_low is not None and h >= ext_low * (1 + pct_threshold):
+            elif ext_low is not None and h >= ext_low + atr_threshold:
                 piv.append((ext_low_idx, ext_low, "L", i))
                 direction = "up"; ext_high, ext_high_idx = h, i
         elif direction == "up":
-            if l <= ext_high * (1 - pct_threshold):
+            if l <= ext_high - atr_threshold:
                 piv.append((ext_high_idx, ext_high, "H", i))
                 direction = "down"; ext_low, ext_low_idx = l, i
-        else:  # direction == "down"
-            if h >= ext_low * (1 + pct_threshold):
+        else:
+            if h >= ext_low + atr_threshold:
                 piv.append((ext_low_idx, ext_low, "L", i))
                 direction = "up"; ext_high, ext_high_idx = h, i
-
     return piv
 
-def _vcp_zigzag_close_pct(highs, lows, closes, pct_threshold=0.04):
+
+def _vcp_zigzag_close_atr(highs, lows, closes, atr_threshold):
     """
-    Same idea as _vcp_zigzag_pct, but uses CLOSING prices to decide WHEN
-    a swing reverses (far less noisy than using intrabar highs/lows — a
-    single wide-range wick can otherwise trigger a spurious pivot on its
-    own). Once a swing's direction change is confirmed via closes, the
-    pivot's reported price is the TRUE extreme (highest high for 'H',
-    lowest low for 'L') reached anywhere within that swing's span —
-    scanned through confirm_idx (the day the reversal was detected),
-    not just through the pivot's own close-based day. This matters
-    because the single highest intrabar high of a swing can land on the
-    very day price starts reversing (a day that already closes lower,
-    but still prints a higher wick than the prior "peak" day).
+    Same idea as _vcp_zigzag_abs, but uses CLOSING prices to decide WHEN a
+    reversal is confirmed (noise-resistant against intraday wick spikes),
+    then looks back to find the TRUE high/low within that confirmed span.
     """
     n = len(closes)
     if n < 2: return []
-    close_piv = _vcp_zigzag_pct(closes, closes, pct_threshold)
+    close_piv = _vcp_zigzag_abs(closes, closes, atr_threshold)
     if not close_piv: return []
-
     piv = []
     span_start = 0
     for idx, _price, kind, confirm_idx in close_piv:
-        scan_end = confirm_idx  # not idx — extend through the confirmation day
+        scan_end = confirm_idx
         seg = highs[span_start:scan_end+1] if kind == "H" else lows[span_start:scan_end+1]
         vals = [(span_start + off, v) for off, v in enumerate(seg) if v is not None]
         if vals:
             true_idx, true_price = (max(vals, key=lambda x: x[1]) if kind == "H"
                                      else min(vals, key=lambda x: x[1]))
             piv.append((true_idx, true_price, kind))
-            # FIX: advance from true_idx (the actual reported pivot day),
-            # not idx (the close-based anchor day) — using idx here let
-            # the next pivot's scan window overlap backward and re-include
-            # the day just used as this pivot, which on an extreme-range
-            # single candle (huge high AND huge low the same day) could
-            # get double-counted as both an H pivot and the very next L
-            # pivot's low.
             span_start = true_idx + 1
         else:
             span_start = idx + 1
@@ -3903,23 +3932,6 @@ def _vcp_zigzag_close_pct(highs, lows, closes, pct_threshold=0.04):
 
 
 def _vcp_filter_nested(piv, max_nested_ratio=0.65):
-    """
-    Removes an interior H/L pivot pair when BOTH:
-      (a) it is fully "nested" inside the surrounding bigger swing — its
-          high does not exceed the NEXT pivot high and its low does not
-          undercut the PREVIOUS pivot low (or the mirror L-then-H case), and
-      (b) its own range is meaningfully smaller than its immediate
-          neighboring legs (at most max_nested_ratio of the smaller one).
-    Condition (b) is essential — without it, condition (a) alone cascades
-    and collapses comparably-sized, genuinely separate contraction legs
-    into one, since removing one nested pair changes what counts as the
-    next pair's immediate neighbor and can trigger a runaway chain
-    reaction. Only a SINGLE forward pass is made (no cascading re-scan
-    from the start), so removal stays bounded to genuinely small nested
-    wiggles — e.g. a brief 2-3 day pullback-and-bounce riding inside a
-    much bigger multi-week decline/rally, which shouldn't count as its
-    own separate VCP contraction.
-    """
     if len(piv) < 5: return piv
     out = list(piv)
     i = 1
@@ -3943,31 +3955,46 @@ def _vcp_filter_nested(piv, max_nested_ratio=0.65):
     return out
 
 
-def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_contractions=6,
+def _detect_vcp(hist, lookback=150, atr_multiplier=1.5, atr_period=14,
+                min_contractions=3, max_contractions=6,
                 max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.03,
-                max_ceiling_jump=0.05, max_dist_from_pivot=0.08, min_prior_move=0.20,
+                max_ceiling_jump=0.025, max_dist_from_pivot=0.08, min_prior_move=0.20,
                 max_52wh_dist=0.20, max_post_breakout_run=0.03,
-                live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15):
+                live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15,
+                ceiling_band_tol=0.04, min_leg_span_bars=5, max_depth_ratio=0.75,
+                min_pattern_days=15, max_pattern_days=325, debug=False):
     """
-    VCP (Volatility Contraction Pattern) detector.
+    VCP (Volatility Contraction Pattern) detector — resistance/pivot-chain
+    based, ATR-scaled ZigZag on closes (auto-adjusts to each stock's own
+    volatility, unlike a fixed-percentage threshold), with nested-swing
+    filtering and an asymmetric ceiling check for flat/descending
+    resistance bases.
 
-    Chains consecutive swing-high -> swing-low legs (via a closing-price
-    percentage ZigZag, so pivot timing is amplitude-based and noise-
-    resistant) into the longest run of progressively tightening
-    contractions ending at the most recent leg.
+    Chains consecutive swing-high -> swing-low legs into the longest run
+    of progressively tightening contractions ending at the most recent
+    leg, and scores each candidate base via TWO independent methods,
+    keeping whichever is valid (Method B preferred when both are):
 
-    Handles BOTH common VCP shapes:
-      - Flat/horizontal resistance — successive highs stay roughly level
-        while lows rise (the "textbook" cup-after-cup base).
-      - Descending resistance — a converging/symmetrical-triangle base
-        where each successive high is itself LOWER than the one before,
-        while lows still rise, narrowing the range from both sides.
-    The chaining rule only blocks a leg from joining the current base
-    when its high jumps *UP* by more than max_ceiling_jump versus the
-    next leg — that signals a genuine breakout past the old base's
-    ceiling into an unrelated, freshly-forming higher base. A high that
-    is level OR LOWER than the next leg's is always allowed to chain,
-    since that's completely normal for both base shapes above.
+      METHOD A (zigzag_chain) — walks the raw pivot chain backward,
+      stopping the run the moment a leg's depth stops tightening OR its
+      high jumps up more than max_ceiling_jump versus its own immediate
+      neighbor. Handles descending-resistance (converging/symmetrical-
+      triangle) bases where each successive high is itself lower than the
+      one before.
+
+      METHOD B (ceiling_cluster) — only the highs that actually touch the
+      base's own ceiling (within ceiling_band_tol) count as contraction
+      boundaries; smaller internal highs that never approach the ceiling
+      are noise inside the base, not separate contractions. Same
+      immediate-neighbor jump rule as Method A applies to ceiling-touching
+      nodes. Handles flat-top, multi-touch cup-with-handle shapes.
+
+    Both methods require the FIRST contraction to be meaningfully deeper
+    than the base leg (max_depth_ratio), and every later leg to be no
+    deeper than the one before it by more than tighten_tol (additive).
+    A live/still-forming final leg (not yet confirmed by a ZigZag reversal)
+    is included if it already meets live_min_bars/live_min_depth, so a
+    base can be caught mid-formation, not just after it closes.
     """
     highs  = hist.get("h") or []
     lows   = hist.get("l") or []
@@ -3978,29 +4005,22 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
 
     if n < 60: return None
     if any(x is None for x in (closes[-1], highs[-1], lows[-1])): return None
-
     last_close = closes[-1]
 
-    # ---- 0. Trend filter (Stage 2 uptrend) ----
     sma50 = _vcp_sma(closes, 50)
     sma150 = _vcp_sma(closes, 150) if n >= 150 else _vcp_sma(closes, min(n, 100))
     if sma50 is None or sma150 is None: return None
     if not (last_close > sma50 > sma150): return None
 
-    # ---- 1. Pivots within lookback ----
-    # (NOTE: an early global-52W-high proximity gate used to sit here, but
-    # it compared last_close against the single highest point anywhere in
-    # the last 252 days — for a descending-resistance VCP, that stale peak
-    # was set BEFORE the base even started narrowing, and is well above
-    # the base is current, relevant ceiling. That wrongly rejected valid
-    # descending-triangle setups. The correct, per-candidate distance
-    # check already happens in step 7 below (dist_from_pivot, measured
-    # against the ACTUAL pivot of the base being evaluated) — no separate
-    # blanket 52W check is needed on top of that.)
     lb = min(lookback, n)
     start = n - lb
     h_w = highs[start:]; l_w = lows[start:]; c_w = closes[start:]
-    piv = _vcp_zigzag_close_pct(h_w, l_w, c_w, zigzag_pct)
+
+    atr_val = _vcp_atr(h_w, l_w, c_w, atr_period)
+    if atr_val <= 0: return None
+    atr_threshold = atr_val * atr_multiplier
+
+    piv = _vcp_zigzag_close_atr(h_w, l_w, c_w, atr_threshold)
     piv = [(i + start, p, k) for (i, p, k) in piv]
     piv = _vcp_filter_nested(piv)
     if len(piv) < 3: return None
@@ -4008,11 +4028,10 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
     h_pivots = [p for p in piv if p[2] == "H"]
     if not h_pivots: return None
 
-    def _try_base(base_high):
+    def _try_base(base_high, dbg=False):
         seq = [p for p in piv if p[0] >= base_high[0]]
         if not seq or seq[0][2] != "H": return None
 
-        # ---- 3. Prior move — from lowest point before base to base_high ----
         search_start = max(0, base_high[0] - 252)
         prior_lows = [lows[i] for i in range(search_start, base_high[0]) if lows[i] is not None]
         if not prior_lows: return None
@@ -4020,7 +4039,6 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
         prior_move = (base_high[1] - prior_low) / prior_low
         if prior_move < min_prior_move: return None
 
-        # ---- 4. Build contractions (H -> next L), true min-low over the span ----
         contractions = []
         i = 0
         while i < len(seq) - 1:
@@ -4033,35 +4051,12 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                 else:
                     li, lp = seq[i+1][0], seq[i+1][1]
                 n_bars = li - hi
-                if hp > 0 and n_bars >= 2:
+                if hp > 0 and n_bars >= min_leg_span_bars:
                     contractions.append((hi, hp, li, lp, (hp - lp) / hp))
                 i += 2
             else:
                 i += 1
 
-        # ---- 4b. Live/in-progress final leg — the tightest leg in a real
-        # VCP is often the MOST RECENT one, and can genuinely be smaller
-        # than zigzag_pct — which means the pivot detector's own threshold
-        # could never "confirm" it as a discrete pivot on its own. Build a
-        # live final leg from whatever's happened since the last CONFIRMED
-        # pivot, using true intrabar highs/lows through TODAY rather than
-        # waiting for a full threshold-confirmed reversal on either side:
-        #   - if the chain currently ends on an H, extend that H's low
-        #     using the true minimum low seen since, through today;
-        #   - if it ends on an L, price may have already rallied to a
-        #     fresh (unconfirmed) peak since then and be pulling back
-        #     again — find that live peak's true high, then the true
-        #     minimum low since THAT peak, through today.
-        # Only replaces/extends an existing contraction when today's true
-        # low is genuinely DEEPER than what's already recorded — this
-        # never shrinks or removes an already-valid confirmed leg.
-        # The pullback itself can be quick (even just 1-2 days, or the
-        # low can be today) — what's gated is live_min_bars of AGE on
-        # the HIGH itself, through today. That confirms the peak has
-        # genuinely rolled over (no new high made in that many days),
-        # rather than being a still-forming top that could easily go
-        # higher tomorrow. Also requires a minimum depth (live_min_depth)
-        # so a trivially shallow wiggle doesn't count either.
         last_piv = seq[-1]
         live_leg = None
         if last_piv[2] == "H":
@@ -4072,7 +4067,7 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
                 depth = (hp - lp) / hp if hp > 0 else 0
                 if hp > 0 and (n - 1 - hi) >= live_min_bars and depth >= live_min_depth:
                     live_leg = (hi, hp, li, lp, depth)
-        else:  # last_piv[2] == "L"
+        else:
             after = [(idx, highs[idx]) for idx in range(last_piv[0] + 1, n) if highs[idx] is not None]
             if after:
                 hi, hp = max(after, key=lambda x: x[1])
@@ -4092,140 +4087,162 @@ def _detect_vcp(hist, lookback=150, zigzag_pct=0.04, min_contractions=3, max_con
 
         if len(contractions) < min_contractions: return None
 
-        # ---- 5. Longest tightening run ending at most recent contraction ----
-        # Chain rule: depths must (roughly) tighten going forward, AND the
-        # ceiling must not jump UP significantly between legs (a big rise
-        # in the high from one leg to the next means a breakout happened
-        # in between — that's an unrelated, newer base, not a continuation).
-        # A ceiling that stays flat OR declines is always fine — that's
-        # completely normal for both flat-resistance and descending-
-        # resistance (converging triangle) VCP shapes.
-        # NOTE: the ceiling check compares each new leg's high against the
-        # RUNNING MAX of every high already included in the chain so far —
-        # not just its immediate previous neighbor. Pairwise-only comparison
-        # wrongly broke the chain when an interior leg dipped deep and then
-        # simply re-tested the base's own already-established ceiling (not
-        # a fresh breakout into an unrelated new base). Comparing against
-        # the running ceiling still correctly blocks a leg whose high truly
-        # exceeds everything seen so far by more than max_ceiling_jump — a
-        # genuine breakout — while continuing to allow legitimate descending-
-        # resistance legs (each high already below the running ceiling by
-        # construction) and legitimate ceiling revisits.
+        # ---- METHOD A: two-pass zigzag-chain walk. Ceiling check is
+        # IMMEDIATE-NEIGHBOR only -- no high may jump up more than
+        # max_ceiling_jump versus the leg right before it, anywhere in the
+        # chain (not just the final/pivot leg). Legitimate revisits of an
+        # OLDER, higher ceiling (like ABB's case) are handled separately by
+        # METHOD B (ceiling-cluster) below, so Method A no longer needs to
+        # reach back through unconfirmed earlier legs to excuse a jump --
+        # that was what let CRISIL's chain through with a 9.7% jump on its
+        # final leg versus its immediate neighbor, which is exactly the
+        # pattern that shouldn't be excused.
         depths = [c[4] for c in contractions]
         run_end = len(depths) - 1
         j = run_end - 1
         while j >= 0:
             if depths[j] < depths[j+1] - tighten_tol:
                 break
-            hi_this = contractions[j+1][1]
-            earlier_ceiling = max(c[1] for c in contractions[:j+1])
-            if hi_this > earlier_ceiling * (1 + max_ceiling_jump):
+            hi_a, hi_b = contractions[j][1], contractions[j+1][1]
+            if hi_b > hi_a * (1 + max_ceiling_jump):
                 break
             j -= 1
-        run = contractions[j+1:]
-        run_depths = [c[4] for c in run]
-        if not (min_contractions <= len(run) <= max_contractions): return None
+        run_a = contractions[j+1:]
 
-        # ---- 5a. First contraction must span a meaningful minimum
-        # duration, measured H-to-NEXT-H (the full down-and-recovery
-        # cycle) — a short 2-4 day whip can produce a deep-looking %
-        # depth without representing a genuine base-forming move. ----
-        if len(run) >= 2 and (run[1][0] - run[0][0]) < min_first_leg_bars: return None
+        # ---- METHOD B: ceiling-cluster (handles flat-top, multi-touch
+        # cup-with-handle shapes -- only the H's that actually touch the
+        # base's own ceiling count as contraction boundaries; smaller
+        # internal highs that never approach the ceiling are treated as
+        # noise inside the base, not separate contractions) ----
+        ceiling = max(c[1] for c in contractions)
+        node_idxs = [idx for idx, c in enumerate(contractions) if c[1] >= ceiling * (1 - ceiling_band_tol)]
+        # Same immediate-neighbor rule as Method A: no ceiling-touching
+        # node's high may jump up more than max_ceiling_jump versus the
+        # node right before it -- being within the overall ceiling band is
+        # not enough on its own (that let a leg jump ~4% versus its own
+        # immediate predecessor slip through, e.g. MAHSCOOTER's 26-May ->
+        # 04-Aug node pair, even though both happened to sit within 4% of
+        # the much-older Feb high). Walk backward and keep only the
+        # longest trailing run of nodes satisfying this.
+        if len(node_idxs) >= 2:
+            k = len(node_idxs) - 1
+            while k >= 1:
+                hi_prev = contractions[node_idxs[k-1]][1]
+                hi_cur  = contractions[node_idxs[k]][1]
+                if hi_cur > hi_prev * (1 + max_ceiling_jump):
+                    break
+                k -= 1
+            node_idxs = node_idxs[k:]
+        run_b = None
+        if len(node_idxs) >= 2:
+            run_b = []
+            for a_i, b_i in zip(node_idxs, node_idxs[1:]):
+                hi, hp = contractions[a_i][0], contractions[a_i][1]
+                span_end = contractions[b_i][0]
+                span = [(idx, lows[idx]) for idx in range(hi+1, span_end+1) if lows[idx] is not None]
+                if not span: continue
+                li, lp = min(span, key=lambda x: x[1])
+                run_b.append((hi, hp, li, lp, (hp-lp)/hp if hp>0 else 0))
+            last_idx = node_idxs[-1]
+            last_c = contractions[last_idx]
+            if last_c[0] == contractions[-1][0]:
+                run_b.append(contractions[-1])
 
-        # ---- 5b. No contraction low must be broken by subsequent price ----
-        for k in range(len(run)):
-            low_k = run[k][3]
-            check_from = run[k][2]
-            for idx in range(check_from + 1, n):
-                if lows[idx] is not None and lows[idx] < low_k:
+        def _validate_and_score(run):
+            if run is None: return None
+            run_depths = [c[4] for c in run]
+            if not (min_contractions <= len(run) <= max_contractions): return None
+            for k in range(1, len(run)):
+                if run[k][3] < run[k-1][3]: return None
+            if len(run) >= 2 and (run[1][0] - run[0][0]) < min_first_leg_bars: return None
+            for k in range(len(run)):
+                low_k = run[k][3]; check_from = run[k][2]
+                for idx in range(check_from + 1, n):
+                    if lows[idx] is not None and lows[idx] < low_k: return None
+            for k in range(1, len(run_depths)):
+                if run_depths[k] >= run_depths[k-1] + tighten_tol: return None
+            # ---- The FIRST contraction must be meaningfully tighter than
+            # the base leg -- at most max_depth_ratio (75%) of its size --
+            # since the base leg's initial pullback should be dramatically
+            # deeper than the next one for a base to be credibly starting
+            # to tighten. Later legs only need the milder additive
+            # tighten_tol check above; requiring every single later pair
+            # to also clear 75% was rejecting valid patterns where the
+            # tail-end legs are already both quite tight (e.g. 6.3% ->
+            # 5.9%), which is a fine, still-valid final approach to the
+            # pivot -- not a sign the base isn't tightening.
+            if len(run_depths) >= 2 and run_depths[1] >= run_depths[0] * max_depth_ratio:
+                return None
+            base_depth  = run_depths[0]
+            final_depth = run_depths[-1]
+            if base_depth > max_base_depth: return None
+            if final_depth > max_final_depth: return None
+            pivot_price = run[-1][1]
+            if pivot_price <= 0: return None
+            dist = (pivot_price - last_close) / pivot_price
+            if dist > max_dist_from_pivot or dist < -0.02: return None
+            post_base_start = run[-1][2] + 1
+            if post_base_start < n:
+                highs_since = [highs[idx] for idx in range(post_base_start, n) if highs[idx] is not None]
+                if highs_since and max(highs_since) > pivot_price * (1 + max_post_breakout_run):
                     return None
+            def _leg_vol(c):
+                a, b = c[0], c[2]
+                seg = [v for v in vols[a:b+1] if v]
+                return sum(seg) / len(seg) if seg else 0
+            first_vol = _leg_vol(run[0])
+            last_vol  = _leg_vol(run[-1])
+            vol_dryup = last_vol < first_vol * 0.75 if first_vol else False
+            base_start = run[0][0]; base_end = run[-1][2]
+            base_len = base_end - base_start
+            if base_len < min_pattern_days: return None
+            if base_len > max_pattern_days: return None
+            score = 0
+            score += min(len(run), 4) * 10
+            score += max(0, (max_final_depth - final_depth) / max_final_depth) * 25
+            score += max(0, (0.25 - (last_vol / first_vol if first_vol else 1)) / 0.25) * 20
+            score += max(0, (max_dist_from_pivot - abs(dist)) / max_dist_from_pivot) * 15
+            score += min(prior_move / 1.0, 1.0) * 10
+            score = round(min(score, 100), 1)
+            return {
+                "is_vcp": True, "contractions": len(run),
+                "depths_pct": [round(d * 100, 1) for d in run_depths],
+                "base_depth_pct": round(base_depth * 100, 1),
+                "final_depth_pct": round(final_depth * 100, 1),
+                "pivot": round(pivot_price, 2),
+                "pivot_date": dates[run[-1][0]] if dates else None,
+                "base_start_date": dates[run[0][0]] if dates else None,
+                "base_end_date": dates[run[-1][2]] if dates else None,
+                "resistance_shape": "descending" if run[0][1] > run[-1][1] * 1.01 else "flat",
+                "contraction_dates": [
+                    {"h_date": dates[c[0]], "h_price": round(c[1], 2),
+                     "l_date": dates[c[2]], "l_price": round(c[3], 2)}
+                    for c in run if dates
+                ],
+                "dist_from_pivot_pct": round(dist * 100, 2),
+                "vol_dryup": vol_dryup,
+                "prior_move_pct": round(prior_move * 100, 1),
+                "base_len": base_len,
+                "score": score,
+                "method": "zigzag_chain",
+            }
 
-        # ---- 6. Strictly decreasing depths (same tighten_tol as Step 5's
-        # chain walk, so both use one consistent definition of "tightening") ----
-        for k in range(1, len(run_depths)):
-            if run_depths[k] >= run_depths[k-1] + tighten_tol:
-                return None
+        res_a = _validate_and_score(run_a)
+        res_b = _validate_and_score(run_b)
+        if res_b is not None:
+            res_b["method"] = "ceiling_cluster"
+        candidates = [r for r in (res_a, res_b) if r is not None]
+        if not candidates: return None
+        # Ceiling-cluster preferred whenever valid -- it represents the
+        # cleaner, textbook "flat-top, multiple ceiling touches" shape.
+        # zigzag_chain (which can carry extra internal-noise legs) is only
+        # used as a fallback when ceiling_cluster itself isn't valid, e.g.
+        # genuine descending-resistance bases where highs never cluster.
+        return res_b if res_b is not None else res_a
 
-        base_depth  = run_depths[0]
-        final_depth = run_depths[-1]
-        if base_depth > max_base_depth: return None
-        if final_depth > max_final_depth: return None
-
-        # ---- 7. Pivot (buy point) ----
-        pivot_price = run[-1][1]
-        if pivot_price <= 0: return None
-        dist = (pivot_price - last_close) / pivot_price
-        if dist > max_dist_from_pivot or dist < -0.02: return None
-
-        # ---- 7b. Reject if this is a POST-BREAKOUT RETEST, not a fresh
-        # pre-breakout setup. dist alone can't tell these apart: a stock
-        # that broke out weeks ago, rallied well past the pivot, and has
-        # now pulled back down near/below it again will show the same
-        # small "dist" as a stock that's genuinely still approaching the
-        # pivot for the first time. Check whether price ever closed
-        # meaningfully above the pivot at any point since the base's
-        # final low — if so, the breakout already happened. ----
-        post_base_start = run[-1][2] + 1
-        if post_base_start < n:
-            highs_since = [highs[idx] for idx in range(post_base_start, n) if highs[idx] is not None]
-            if highs_since and max(highs_since) > pivot_price * (1 + max_post_breakout_run):
-                return None
-
-        # ---- 8. Volume dry-up — informational / scoring only ----
-        def _leg_vol(c):
-            a, b = c[0], c[2]
-            seg = [v for v in vols[a:b+1] if v]
-            return sum(seg) / len(seg) if seg else 0
-        first_vol = _leg_vol(run[0])
-        last_vol  = _leg_vol(run[-1])
-        vol_dryup = last_vol < first_vol * 0.75 if first_vol else False
-
-        # ---- 9. Base length check ----
-        base_start = run[0][0]; base_end = run[-1][2]
-        base_len = base_end - base_start
-        if base_len < 10: return None
-
-        # ---- 10. Score ----
-        score = 0
-        score += min(len(run), 4) * 10
-        score += max(0, (max_final_depth - final_depth) / max_final_depth) * 25
-        score += max(0, (0.25 - (last_vol / first_vol if first_vol else 1)) / 0.25) * 20
-        score += max(0, (max_dist_from_pivot - abs(dist)) / max_dist_from_pivot) * 15
-        score += min(prior_move / 1.0, 1.0) * 10
-        score = round(min(score, 100), 1)
-
-        return {
-            "is_vcp"             : True,
-            "contractions"       : len(run),
-            "depths_pct"         : [round(d * 100, 1) for d in run_depths],
-            "base_depth_pct"     : round(base_depth * 100, 1),
-            "final_depth_pct"    : round(final_depth * 100, 1),
-            "pivot"              : round(pivot_price, 2),
-            "pivot_date"         : dates[run[-1][0]] if dates else None,
-            "base_start_date"    : dates[run[0][0]]  if dates else None,
-            "base_end_date"      : dates[run[-1][2]] if dates else None,
-            "resistance_shape"   : "descending" if run[0][1] > run[-1][1] * 1.01 else "flat",
-            "contraction_dates"  : [
-                {"h_date": dates[c[0]], "h_price": round(c[1], 2),
-                 "l_date": dates[c[2]], "l_price": round(c[3], 2)}
-                for c in run if dates
-            ],
-            "dist_from_pivot_pct": round(dist * 100, 2),
-            "vol_dryup"          : vol_dryup,
-            "prior_move_pct"     : round(prior_move * 100, 1),
-            "base_len"           : base_len,
-            "score"              : score,
-        }
-
-    # Try every candidate base and keep the best-scoring valid result —
-    # returning on the FIRST success (most-recent-first) meant an older
-    # candidate producing a longer, more complete tightening chain (e.g.
-    # after nested-pair merging exposes a earlier valid base_high) never
-    # even got tried once a more recent, shorter-chain candidate already
-    # succeeded on its own.
     best = None
     for base_high in sorted(h_pivots, key=lambda x: -x[0]):
-        result = _try_base(base_high)
+        result = _try_base(base_high, dbg=debug)
         if result and (best is None or result["score"] > best["score"]):
             best = result
     return best
