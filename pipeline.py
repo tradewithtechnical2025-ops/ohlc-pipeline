@@ -522,7 +522,7 @@ ATH_BACKFILL_FROM_DATE = "2000-01-01"  # generously early; NSE electronic
 # a small daily delta fetch, not a one-time 25-year backfill across 1800
 # symbols. If you see 429 (rate-limit) errors climbing in the log, lower
 # this back down; if it's clean, you can likely push it even higher.
-ATH_BACKFILL_CONCURRENCY = 20
+ATH_BACKFILL_CONCURRENCY = 10  # was 20 -- caused 429s at that level; 10 is 2x the daily job's CONCURRENCY=5, a safer step up
 
 async def r2_download_ath(client) -> dict:
     data = await r2_download(client, "ath_data.json")
