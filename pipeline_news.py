@@ -343,6 +343,8 @@ _XBRL_FIELD_MAP = {
     "OtherIncome":                                                        "other_income",
     "Income":                                                             "total_income",
     "Expenses":                                                           "total_expenses",
+    "FinanceCosts":                                                       "finance_costs",
+    "DepreciationDepletionAndAmortisationExpense":                        "depreciation",
     "ProfitBeforeExceptionalItemsAndTax":                                 "pbt_before_exceptional",
     "ExceptionalItemsBeforeTax":                                          "exceptional_items",
     "ProfitBeforeTax":                                                    "pbt",
@@ -468,18 +470,56 @@ def _process_notes(period_dict: dict, max_notes_chars: int = 600) -> None:
         period_dict["notes"] = cleaned[:max_notes_chars] + ("…" if len(cleaned) > max_notes_chars else "")
 
 
-def _compute_opm(period_dict: dict) -> None:
+def _compute_op(period_dict: dict) -> None:
     """
-    Mutates period_dict in place, adding 'opm' as a decimal fraction (e.g.
-    0.241 = 24.1%) using the same formula pipeline_fundamentals_prod.py's
-    _compute_opm() uses for fundamentals_summary.json ((sales-expenses)/
-    sales) — matching methodology is what makes the QoQ/YoY OPM comparison
-    against fundamentals data meaningful rather than comparing two
-    differently-defined margins.
+    Mutates period_dict in place, adding 'op' (Operating Profit) using the
+    convention every Indian equity data provider (Screener, Moneycontrol,
+    Trendlyne, earningspulse.ai, etc.) actually uses:
+        OP = Revenue − (Total Expenses − Finance Costs − Depreciation)
+           = Revenue − core operating expenses (materials/employee/other,
+             i.e. Total Expenses with Finance Costs and Depreciation
+             excluded back out)
+    This is DELIBERATELY NOT "PBT + Finance Costs + Depreciation" — PBT is
+    computed from Total Income (Revenue + Other Income), so that formula
+    silently folds Other Income into "Operating" Profit, overstating it.
+    Verified against Tempsens Instruments Q1 FY27 XBRL: this formula gives
+    ₹23.76 Cr / 20.0% OPM, matching earningspulse.ai's ₹24 Cr / 20.1% to
+    within rounding; the old (revenue − total_expenses) formula gave
+    ₹18.55 Cr / 15.6% — short by exactly Finance Costs + Depreciation.
+    Only computed when the filing's table broke out both line items
+    separately (not every source does).
     """
     revenue = period_dict.get("revenue")
     expenses = period_dict.get("total_expenses")
-    if revenue and expenses is not None and revenue != 0:
+    fc = period_dict.get("finance_costs")
+    dep = period_dict.get("depreciation")
+    if revenue is not None and expenses is not None and fc is not None and dep is not None:
+        period_dict["op"] = revenue - expenses + fc + dep
+
+
+def _compute_opm(period_dict: dict) -> None:
+    """
+    Mutates period_dict in place, adding 'opm' as a decimal fraction (e.g.
+    0.241 = 24.1%). Prefers the proper Operating Profit (see _compute_op)
+    over Revenue; only falls back to the old (revenue-total_expenses)/
+    revenue approximation — which is really EBIT-margin, not OPM, since it
+    still has Finance Costs and Depreciation baked into the subtraction —
+    when finance_costs/depreciation genuinely aren't available for this
+    period. pipeline_fundamentals_prod.py's _compute_opm() needs the same
+    fix applied for QoQ/YoY OPM comparisons against fundamentals data to
+    stay meaningful — keep both in sync.
+    """
+    revenue = period_dict.get("revenue")
+    if not revenue:
+        return
+    if period_dict.get("op") is None:
+        _compute_op(period_dict)
+    op = period_dict.get("op")
+    if op is not None:
+        period_dict["opm"] = round(op / revenue, 4)
+        return
+    expenses = period_dict.get("total_expenses")
+    if expenses is not None:
         period_dict["opm"] = round((revenue - expenses) / revenue, 4)
 
 
@@ -836,12 +876,6 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     eps_basic = cur.get("eps_basic")      # per-share rupee amount — never scaled
     eps_diluted = cur.get("eps_diluted")
 
-    # EBITDA = PBT + Finance Costs + Depreciation (no Other Income subtraction,
-    # matching the convention validated against several real filings' own stated
-    # EBITDA — not company-defined "Adjusted EBITDA", which can differ). Only
-    # computed when the filing's table actually broke out both line items.
-    ebitda = (pbt + finance_costs + depreciation) if (pbt is not None and finance_costs is not None and depreciation is not None) else None
-
     if revenue is None and pat is None:
         print(f"    · [{fname_dbg}] AI returned is_results_table=true but no revenue/PAT — treating as invalid")
         return None
@@ -886,10 +920,15 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     quarter = {
         "revenue": revenue, "other_income": other_income, "total_income": total_income,
         "total_expenses": total_expenses, "finance_costs": finance_costs, "depreciation": depreciation,
-        "pbt": pbt, "tax_expense": tax_expense, "pat": pat, "ebitda": ebitda,
+        "pbt": pbt, "tax_expense": tax_expense, "pat": pat,
         "comprehensive_income": comprehensive, "eps_basic": eps_basic, "eps_diluted": eps_diluted,
         "period_end": period_end,
     }
+    # 'op' (Operating Profit) is computed by _compute_opm -> _compute_op
+    # below using Revenue − core operating expenses (Finance Costs and
+    # Depreciation excluded back out) — NOT PBT + Finance Costs +
+    # Depreciation, which would silently fold Other Income into it (PBT is
+    # derived from Total Income = Revenue + Other Income).
     _compute_opm(quarter)
 
     result = {
@@ -934,11 +973,13 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         "revenue": scale(qoq.get("revenue")), "total_income": scale(qoq.get("total_income")),
         "pat": scale(qoq.get("pat")), "eps_basic": qoq.get("eps_basic"),
         "total_expenses": scale(qoq.get("total_expenses")),
+        "finance_costs": scale(qoq.get("finance_costs")), "depreciation": scale(qoq.get("depreciation")),
     }
     yoy_prior = {
         "revenue": scale(yoy.get("revenue")), "total_income": scale(yoy.get("total_income")),
         "pat": scale(yoy.get("pat")), "eps_basic": yoy.get("eps_basic"),
         "total_expenses": scale(yoy.get("total_expenses")),
+        "finance_costs": scale(yoy.get("finance_costs")), "depreciation": scale(yoy.get("depreciation")),
     }
     qoq_header = _quarter_header(qoq.get("period_end")) if qoq.get("period_end") else None
     yoy_header = _quarter_header(yoy.get("period_end")) if yoy.get("period_end") else None
@@ -970,8 +1011,19 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
             out[f"{out_field}_prior"] = prior_v
             out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
             got_any = True
-    prior_rev, prior_exp = prior.get("revenue"), prior.get("total_expenses")
-    prior_opm = (prior_rev - prior_exp) / prior_rev if (prior_rev and prior_exp is not None and prior_rev != 0) else None
+    prior_rev = prior.get("revenue")
+    prior_exp = prior.get("total_expenses")
+    prior_fc = prior.get("finance_costs")
+    prior_dep = prior.get("depreciation")
+    if prior_rev and prior_exp is not None and prior_fc is not None and prior_dep is not None:
+        prior_opm = (prior_rev - prior_exp + prior_fc + prior_dep) / prior_rev
+    elif prior_rev and prior_exp is not None:
+        # Finance costs/depreciation weren't broken out for this prior
+        # column — falls back to the EBIT-margin approximation rather than
+        # dropping the comparison entirely.
+        prior_opm = (prior_rev - prior_exp) / prior_rev
+    else:
+        prior_opm = None
     cur_opm = cur.get("opm")
     if cur_opm is not None and prior_opm is not None:
         out["opm_prior"] = round(prior_opm * 100, 2)
@@ -1665,6 +1717,11 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 return True  # no real NSE-listed company's quarterly EPS is in the thousands
         if "extraction_method" not in meta:
             return True  # pre-dates this tracking — provenance/quality unknown, worth a fresh attempt
+        if "op" not in q:
+            return True  # pre-dates the OP/OPM formula fix (old formula double-
+                         # subtracted Finance Costs+Depreciation, understating
+                         # Operating Profit) — needs a fresh parse to pick up
+                         # 'op' via the corrected _compute_op
         return False
 
     incomplete_pdf_links = {it.get("link") for it in existing_items if _looks_stale_or_wrong(it)}
@@ -1786,13 +1843,52 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                   f"attempts — giving up on them going forward (nse_xbrl_failures.json)")
         await r2_put(client, "nse_xbrl_failures.json", {"updated_at": now_iso, "links": failures})
 
+    def _merge_refiled(old: dict, new: dict) -> dict:
+        """
+        Merges a newer parse of an already-seen result (same symbol+quarter+
+        nature) into the older one instead of blindly picking one and
+        discarding the other. A re-filing (correction, resubmission, or
+        NSE re-publishing the same "Outcome of Board Meeting" under a
+        second link) is NOT guaranteed to be more complete than the other
+        copy — a thin cover-letter PDF parsed after the full annexures were
+        already extracted can silently wipe out QoQ/YoY comparisons, key
+        highlights, and management commentary (confirmed: happened to a CMI
+        record this way). Field-by-field: the new value wins when present,
+        the old value survives when the new parse is missing/blank for that
+        field. Numeric 0 is a real value and is kept as-is; only None,
+        missing keys, and empty lists/strings fall back to old.
+        """
+        def merge_dict(o, n):
+            out = dict(o or {})
+            for k, v in (n or {}).items():
+                if v is None:
+                    continue
+                if isinstance(v, (list, str)) and len(v) == 0:
+                    continue
+                if isinstance(v, dict) and isinstance(out.get(k), dict):
+                    out[k] = merge_dict(out.get(k), v)
+                else:
+                    out[k] = v
+            return out
+
+        merged = merge_dict(old, new)
+        # link/title/published should always reflect the LATEST filing that
+        # triggered this merge, even when its own content was thinner and
+        # got backfilled from old above — otherwise re-filing detection on
+        # a future run (existing_links) would point at the stale link.
+        for k in ("link", "title", "published", "published_ts"):
+            if k in new:
+                merged[k] = new[k]
+        return merged
+
     # Intra-batch dedup: NSE sometimes files the same symbol+quarter+nature
     # twice within minutes (correction/resubmission) — both can land as
     # "new" in the SAME run, so the cross-run existing_by_key check below
     # (built before this run started) can't catch them against each other.
-    # Keep only the latest per key, using the XBRL filename's embedded
+    # Merge into whichever copy has the later XBRL/filename-embedded
     # submission timestamp (published_ts has been observed as unreliable/0
-    # for this feed).
+    # for this feed) — that copy's own fields win, but anything it's
+    # missing gets backfilled from the earlier copy rather than lost.
     latest_by_key = {}
     unkeyed = []
     for r in parsed_all:
@@ -1801,12 +1897,16 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             unkeyed.append(r)
             continue
         prior = latest_by_key.get(key)
-        if prior is None or _filing_ts(r.get("link", "")) >= _filing_ts(prior.get("link", "")):
+        if prior is None:
             latest_by_key[key] = r
+        elif _filing_ts(r.get("link", "")) >= _filing_ts(prior.get("link", "")):
+            latest_by_key[key] = _merge_refiled(prior, r)
+        else:
+            latest_by_key[key] = _merge_refiled(r, prior)
     superseded_count = len(parsed_all) - len(latest_by_key) - len(unkeyed)
     parsed_all = list(latest_by_key.values()) + unkeyed
     if superseded_count > 0:
-        print(f"  ↺ {superseded_count} superseded within this batch (same-run resubmission) — kept latest only")
+        print(f"  ↺ {superseded_count} superseded within this batch (same-run resubmission) — merged into latest")
 
     # Split out re-filed results (same symbol+quarter+nature already notified
     # under a different link) — refresh their data but don't spam Telegram again.
@@ -1819,9 +1919,10 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         else:
             parsed_new.append(r)
     if refiled:
-        print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — updating record, skipping Telegram")
+        print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — merging into existing record, skipping Telegram")
         for r in refiled:
-            existing_items[existing_by_key[_result_key(r)]] = r
+            idx = existing_by_key[_result_key(r)]
+            existing_items[idx] = _merge_refiled(existing_items[idx], r)
 
     # Consolidated preferred over Standalone: forward-looking filter.
     # Covers both (a) Consolidated already sitting in existing_items while
