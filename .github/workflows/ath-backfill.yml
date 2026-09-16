@@ -1,0 +1,28 @@
+name: ATH Backfill
+
+on:
+  workflow_dispatch:   # manual trigger from Actions tab
+
+jobs:
+  ath-backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340  # full-history fetch for 1000+ symbols takes a while
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run ATH backfill pipeline
+        run: python pipeline.py ath_backfill
+        env:
+          UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:    ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
