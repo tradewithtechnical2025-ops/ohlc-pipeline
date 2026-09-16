@@ -23,6 +23,7 @@ Usage:
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
   python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
+  python pipeline.py ath_backfill   # one-time All-Time-High full-history backfill (see ATH section)
 """
 
 import asyncio
@@ -510,6 +511,115 @@ async def upload_all_chunks(client, all_data, today):
 
 
 # ══════════════════════════════════════════════════════════════
+# ATH (All-Time High) — separate from rolling ohlc_*.json window
+# ══════════════════════════════════════════════════════════════
+
+ATH_BACKFILL_FROM_DATE = "2000-01-01"  # generously early; NSE electronic
+                                        # records don't go back further for
+                                        # virtually any currently-listed stock
+
+async def r2_download_ath(client) -> dict:
+    data = await r2_download(client, "ath_data.json")
+    if isinstance(data, dict) and "stocks" in data:
+        return data["stocks"]
+    return data if isinstance(data, dict) else {}
+
+async def r2_upload_ath(client, ath_data: dict, today: str) -> None:
+    payload = json.dumps({"updated": today, "count": len(ath_data), "stocks": ath_data})
+    await r2_upload(client, "ath_data.json", payload)
+
+def _update_ath_from_delta(ath_data: dict, delta: dict, today: str) -> int:
+    """
+    Cheap incremental ATH maintenance — NO extra Upstox calls. `delta` is
+    the {symbol: candle} dict run_daily()/run_today() already compute for
+    today's session; just compares each candle's high against the stored
+    ATH and bumps it if today set a new record.
+
+    New symbols (not yet in ath_data — e.g. a very recent listing that
+    hasn't been through run_ath_backfill yet) get seeded here with today's
+    high; run_ath_backfill will correct this to the true ATH next time it
+    runs for that symbol.
+    """
+    updated = 0
+    for sym, candle in delta.items():
+        h = candle.get("h")
+        if h is None: continue
+        existing = ath_data.get(sym)
+        if existing is None:
+            ath_data[sym] = {"ath": round(h, 2), "ath_date": candle["d"]}
+            updated += 1
+        elif h > existing["ath"]:
+            ath_data[sym] = {"ath": round(h, 2), "ath_date": candle["d"]}
+            updated += 1
+    return updated
+
+
+async def run_ath_backfill() -> None:
+    """
+    ONE-TIME (or occasional, for newly-listed symbols) job: fetches each
+    stock's FULL history from Upstox — from ATH_BACKFILL_FROM_DATE, NOT the
+    rolling ROLLING_DAYS window used by run_daily/run_full — and computes
+    its All-Time High. Stored separately in its own small ath_data.json,
+    not merged into ohlc_*.json — keeping full 25-year history for every
+    stock just for one number would bloat the main OHLC store many times
+    over for no benefit.
+
+    Resumable: symbols already present in ath_data.json are skipped, so a
+    re-run only fetches what's missing (new listings, or ones that failed
+    last time). Re-run this periodically as new symbols get added to
+    classification.json — daily maintenance after that is free (folded
+    into run_daily/run_today via _update_ath_from_delta, no extra calls).
+    """
+    status = PipelineStatus("run_ath_backfill")
+    try:
+        today = today_ist()
+        log.info(f"━━━ ATH Backfill  (from {ATH_BACKFILL_FROM_DATE}) ━━━")
+        sem = asyncio.Semaphore(CONCURRENCY)
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
+
+            ath_data = await r2_download_ath(client)
+            missing = [sym for sym in all_ikeys if sym not in ath_data]
+            log.info(f"Universe: {len(all_ikeys)}  Already have: {len(ath_data)}  Missing: {len(missing)}")
+            if not missing:
+                log.info("✅ All symbols already backfilled!")
+                status.success(); return
+
+            done = 0; failed = []
+            for i in range(0, len(missing), 50):
+                batch = missing[i:i+50]
+                results = await asyncio.gather(*[
+                    fetch_ohlc(client, sem, sym, all_ikeys[sym], ATH_BACKFILL_FROM_DATE, today)
+                    for sym in batch
+                ])
+                for sym, candles in results:
+                    if not candles:
+                        failed.append(sym); continue
+                    valid = [c for c in candles if c.get("h") is not None]
+                    if not valid:
+                        failed.append(sym); continue
+                    best = max(valid, key=lambda c: c["h"])
+                    ath_data[sym] = {"ath": round(best["h"], 2), "ath_date": best["d"]}
+                    done += 1
+                pct = min(i+50, len(missing))
+                log.info(f"  {pct}/{len(missing)}  ✓{done}  ✗{len(failed)}")
+                if pct % 200 == 0 or pct == len(missing):
+                    await r2_upload_ath(client, ath_data, today)   # checkpoint
+
+            await r2_upload_ath(client, ath_data, today)
+            log.info(f"✓ {done} backfilled  ✗ {len(failed)} failed")
+            if failed:
+                sample = failed[:20]
+                log.info(f"  Failed (re-run to retry): {sample}{'…' if len(failed) > 20 else ''}")
+        status.success()
+        log.info("━━━ ATH Backfill complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
 # DATA HELPERS
 # ══════════════════════════════════════════════════════════════
 
@@ -606,11 +716,17 @@ async def run_daily() -> None:
             log.info(f"Merged: {total_new} new  Delta: {len(delta)}")
             dropped = apply_rolling_window(all_data, cutoff)
             log.info(f"Rolling: dropped {dropped} old candles")
+
+            ath_data = await r2_download_ath(client)
+            ath_updated = _update_ath_from_delta(ath_data, delta, today)
+            log.info(f"ATH: {ath_updated} new record(s) today")
+
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
                 upload_str_with_manifest(client, r2_upload, "ohlc_delta.json",
                                           json.dumps({"date": today, "stocks": delta}),
                                           schema_v=1, extra_meta={"stock_count": len(delta)}),
+                r2_upload_ath(client, ath_data, today),
             )
         status.success()
         log.info("━━━ Daily complete ━━━")
@@ -646,11 +762,17 @@ async def run_today() -> None:
                 upsert_candle(all_data, sym, c)
 
             delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
+
+            ath_data = await r2_download_ath(client)
+            ath_updated = _update_ath_from_delta(ath_data, delta, today)
+            log.info(f"ATH: {ath_updated} new record(s) today")
+
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
                 upload_str_with_manifest(client, r2_upload, "ohlc_delta.json",
                                           json.dumps({"date": today, "stocks": delta}),
                                           schema_v=1, extra_meta={"stock_count": len(delta)}),
+                r2_upload_ath(client, ath_data, today),
             )
             log.info(f"✅ delta: {len(delta)} stocks")
         status.success()
@@ -4528,6 +4650,7 @@ if __name__ == "__main__":
                 sys.exit(1)
             asyncio.run(debug_weinstein_symbol(sys.argv[2]))
         case "vcp_scan":      asyncio.run(run_vcp_scan())
+        case "ath_backfill":  asyncio.run(run_ath_backfill())
         case _:
             print(__doc__)
             sys.exit(1)
