@@ -24,6 +24,7 @@ Usage:
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
   python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
   python pipeline.py ath_backfill   # one-time All-Time-High full-history backfill (see ATH section)
+  python pipeline.py ath_reset      # wipes ath_data.json -- use once to recover from pre-fix seeding, then re-run ath_backfill
 """
 
 import asyncio
@@ -541,10 +542,16 @@ def _update_ath_from_delta(ath_data: dict, delta: dict, today: str) -> int:
     today's session; just compares each candle's high against the stored
     ATH and bumps it if today set a new record.
 
-    New symbols (not yet in ath_data — e.g. a very recent listing that
-    hasn't been through run_ath_backfill yet) get seeded here with today's
-    high; run_ath_backfill will correct this to the true ATH next time it
-    runs for that symbol.
+    New symbols (not yet in ath_data — e.g. run_ath_backfill hasn't reached
+    this symbol yet, or hasn't been run at all) get seeded here with
+    today's high, tagged "source": "seed" so run_ath_backfill knows this
+    is NOT a real backfilled value and must still fetch full history for
+    it — without this tag, a seeded entry looks identical to a properly
+    backfilled one, and run_ath_backfill's "already have it" resumability
+    check would skip it forever, permanently stuck on a too-low ATH.
+    The tag is preserved (not wiped) on later incremental bumps to an
+    already-seeded entry, until run_ath_backfill actually processes it
+    and overwrites it with a real value (which carries no "source" key).
     """
     updated = 0
     for sym, candle in delta.items():
@@ -552,12 +559,37 @@ def _update_ath_from_delta(ath_data: dict, delta: dict, today: str) -> int:
         if h is None: continue
         existing = ath_data.get(sym)
         if existing is None:
-            ath_data[sym] = {"ath": round(h, 2), "ath_date": candle["d"]}
+            ath_data[sym] = {"ath": round(h, 2), "ath_date": candle["d"], "source": "seed"}
             updated += 1
         elif h > existing["ath"]:
-            ath_data[sym] = {"ath": round(h, 2), "ath_date": candle["d"]}
+            existing["ath"] = round(h, 2)
+            existing["ath_date"] = candle["d"]
+            # NOTE: mutate in place, don't replace the dict -- replacing it
+            # would silently drop an existing "source": "seed" tag.
             updated += 1
     return updated
+
+
+async def run_ath_reset() -> None:
+    """
+    One-off recovery tool: wipes ath_data.json back to empty, so the next
+    run_ath_backfill() treats EVERY symbol as missing and recomputes from
+    full history. Needed once, to clean up any symbols that were seeded
+    by _update_ath_from_delta() BEFORE the "source": "seed" tagging fix
+    existed (those entries have no tag to distinguish them from a real
+    backfilled value, so run_ath_backfill can't tell they need a retry —
+    resetting is the only fully-safe way to guarantee no wrong value
+    survives). Safe to run even mid-backfill: everything already correctly
+    backfilled just gets recomputed to the same correct value next run.
+    """
+    status = PipelineStatus("run_ath_reset")
+    try:
+        async with httpx.AsyncClient() as client:
+            await r2_upload_ath(client, {}, today_ist())
+        log.info("✓ ath_data.json reset to empty — run 'ath_backfill' next to rebuild from scratch")
+        status.success()
+    except Exception as e:
+        status.failure(e)
 
 
 async def run_ath_backfill() -> None:
@@ -587,8 +619,12 @@ async def run_ath_backfill() -> None:
             all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
 
             ath_data = await r2_download_ath(client)
-            missing = [sym for sym in all_ikeys if sym not in ath_data]
-            log.info(f"Universe: {len(all_ikeys)}  Already have: {len(ath_data)}  Missing: {len(missing)}")
+            missing = [
+                sym for sym in all_ikeys
+                if sym not in ath_data or ath_data[sym].get("source") == "seed"
+            ]
+            already_real = len(ath_data) - sum(1 for v in ath_data.values() if v.get("source") == "seed")
+            log.info(f"Universe: {len(all_ikeys)}  Already have (real): {already_real}  Missing/seed-only: {len(missing)}")
             if not missing:
                 log.info("✅ All symbols already backfilled!")
                 status.success(); return
@@ -4657,6 +4693,7 @@ if __name__ == "__main__":
             asyncio.run(debug_weinstein_symbol(sys.argv[2]))
         case "vcp_scan":      asyncio.run(run_vcp_scan())
         case "ath_backfill":  asyncio.run(run_ath_backfill())
+        case "ath_reset":     asyncio.run(run_ath_reset())
         case _:
             print(__doc__)
             sys.exit(1)
