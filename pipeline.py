@@ -518,6 +518,12 @@ ATH_BACKFILL_FROM_DATE = "2000-01-01"  # generously early; NSE electronic
                                         # records don't go back further for
                                         # virtually any currently-listed stock
 
+# Much higher than the daily job's CONCURRENCY=5 -- that value is tuned for
+# a small daily delta fetch, not a one-time 25-year backfill across 1800
+# symbols. If you see 429 (rate-limit) errors climbing in the log, lower
+# this back down; if it's clean, you can likely push it even higher.
+ATH_BACKFILL_CONCURRENCY = 20
+
 async def r2_download_ath(client) -> dict:
     data = await r2_download(client, "ath_data.json")
     if isinstance(data, dict) and "stocks" in data:
@@ -574,7 +580,7 @@ async def run_ath_backfill() -> None:
     try:
         today = today_ist()
         log.info(f"━━━ ATH Backfill  (from {ATH_BACKFILL_FROM_DATE}) ━━━")
-        sem = asyncio.Semaphore(CONCURRENCY)
+        sem = asyncio.Semaphore(ATH_BACKFILL_CONCURRENCY)
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
