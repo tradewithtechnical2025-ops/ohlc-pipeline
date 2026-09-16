@@ -57,6 +57,7 @@ FEEDS = [
     # Market News
     ("et_markets",   "Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
     ("mint_markets", "LiveMint Markets",        "https://www.livemint.com/rss/markets"),
+    ("bs_finance",   "Business Standard Finance", "https://www.business-standard.com/rss/finance-103.rss"),
 ]
 
 # source_key(s) -> R2 output file
@@ -66,7 +67,7 @@ OUTPUT_MAP = {
     "nse_announcements.json":  ["nse_announcements"],
     "nse_board_meetings.json": ["nse_board"],
     "nse_corp_actions.json":   ["nse_corp_actions"],
-    "market_news.json":        ["et_markets", "mint_markets"],
+    "market_news.json":        ["et_markets", "mint_markets", "bs_finance"],
 }
 
 
@@ -192,6 +193,14 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                         "published":    entry.get("published", ""),
                         "published_ts": ts,
                         "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
+                        # Optional richer fields — only Business Standard's
+                        # feed populates these right now (media:content for
+                        # an article thumbnail, bs:source for the wire/
+                        # agency attribution e.g. "Press Trust of India" or
+                        # "Bloomberg"). Other sources simply leave these
+                        # blank; the frontend treats them as optional.
+                        "image":        (entry.get("media_content") or [{}])[0].get("url", ""),
+                        "author":       entry.get("bs_source", "") or entry.get("author", ""),
                     })
 
                 # NSE occasionally serves a transient empty-but-200 response
