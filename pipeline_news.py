@@ -1626,9 +1626,11 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # in place instead of appending a lookalike duplicate
     existing_by_key = {_result_key(it): idx for idx, it in enumerate(existing_items) if _result_key(it)[0]}
 
-    # ⚠️ TEMPORARY: XBRL processing disabled to isolate-test the PDF fast-path.
-    # Set back to False (or remove this block) once PDF testing is done.
-    DISABLE_XBRL_FOR_TESTING = True
+    # XBRL processing re-enabled — was left disabled for PDF fast-path
+    # isolation testing, which silently skipped every XBRL-only filing
+    # (e.g. Integrated Filing results with no separate "Outcome of Board
+    # Meeting" PDF, like Tempsens) instead of parsing them.
+    DISABLE_XBRL_FOR_TESTING = False
     if DISABLE_XBRL_FOR_TESTING:
         print("  ⚠ XBRL processing disabled for testing — PDF-only this run")
         xbrl_items = []
