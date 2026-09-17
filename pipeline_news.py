@@ -1613,6 +1613,49 @@ def _group_parsed_results(parsed_new: list) -> list:
     return [groups[k] for k in order]
 
 
+async def _update_results_by_symbol(client: httpx.AsyncClient, parsed_all: list, quarters_to_keep: int = 8):
+    """Maintains a per-symbol store of each company's most recent quarters
+    of parsed results (Standalone and Consolidated tracked separately),
+    independent of nse_results_detailed.json's global 1000-item rolling
+    cap. That cap is shared across EVERY company combined — during a busy
+    results season, a company's own 2nd/3rd/4th-most-recent quarter can
+    get evicted by the sheer volume of OTHER companies filing, well before
+    4 quarters have actually passed for that company. This file keeps at
+    least `quarters_to_keep` quarters per symbol+nature no matter how much
+    unrelated filing volume happens elsewhere, so a stock's own quarterly
+    history/AI-summary stays reliably available (e.g. for a per-stock
+    "past 4 quarters" view on the frontend)."""
+    if not parsed_all:
+        return
+    existing = await r2_get(client, "nse_results_by_symbol.json")
+    store = (existing or {}).get("symbols", {})
+
+    touched = set()
+    for r in parsed_all:
+        meta = r.get("meta", {}) or {}
+        symbol = meta.get("symbol")
+        nature = meta.get("standalone_consolidated") or "Standalone"
+        period_end = (r.get("quarter") or {}).get("period_end")
+        if not symbol or not period_end:
+            continue
+        touched.add(symbol)
+        sym_entry = store.setdefault(symbol, {})
+        nature_list = sym_entry.setdefault(nature, [])
+        # Replace any existing entry for the same quarter (a refiled/
+        # updated result) rather than duplicating it, then keep only the
+        # most recent `quarters_to_keep` by period_end.
+        nature_list[:] = [q for q in nature_list if (q.get("quarter") or {}).get("period_end") != period_end]
+        nature_list.append(r)
+        nature_list.sort(key=lambda q: (q.get("quarter") or {}).get("period_end") or "", reverse=True)
+        sym_entry[nature] = nature_list[:quarters_to_keep]
+
+    if touched:
+        payload = {"updated_at": datetime.now(timezone.utc).isoformat(), "symbols": store}
+        await r2_put(client, "nse_results_by_symbol.json", payload)
+        print(f"  ✓ nse_results_by_symbol.json: updated {len(touched)} symbol(s), "
+              f"keeping up to {quarters_to_keep} quarters each")
+
+
 async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict], fundamentals: dict | None) -> dict | None:
     """
     Builds/updates nse_results_detailed.json from two sources:
@@ -1985,6 +2028,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     merged = existing_items + parsed_new
     merged.sort(key=_effective_ts, reverse=True)
     merged = merged[:1000]  # cap file size — keep most recent 1000 filings
+
+    await _update_results_by_symbol(client, parsed_all)
 
     return make_payload(merged)
 
