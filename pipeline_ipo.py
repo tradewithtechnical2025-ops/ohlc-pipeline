@@ -71,6 +71,28 @@ async def r2_upload(client, filename, data):
     log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
 
 
+async def r2_download(client, filename):
+    """Fetch existing R2 file so this run can merge into it instead of clobbering it.
+    Returns None if the file doesn't exist yet or can't be parsed — caller treats that as 'no prior data'."""
+    url = f"{WORKER_URL}?file={filename}"
+    try:
+        r = await client.get(url, headers=WORKER_HEADERS, timeout=30)
+    except httpx.RequestError as e:
+        log.warning(f"  ↓ {filename}: fetch failed ({e}) — proceeding without merge")
+        return None
+    if r.status_code == 404:
+        log.info(f"  ↓ {filename}: not found yet (first run)")
+        return None
+    if r.status_code != 200:
+        log.warning(f"  ↓ {filename}: HTTP {r.status_code} — proceeding without merge")
+        return None
+    try:
+        return r.json()
+    except Exception as e:
+        log.warning(f"  ↓ {filename}: bad JSON ({e}) — proceeding without merge")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════
 # LIST  (paginated)
 # ══════════════════════════════════════════════════════════════
@@ -267,6 +289,29 @@ async def run_ipo_scan():
             normalized.append(obj)
 
         log.info(f"Skipped {skipped_old} old listed IPOs (before {cutoff})")
+
+        # Step 3.5: merge with existing R2 data instead of clobbering it.
+        # Fresh Upstox data wins on id conflict; anything only present in the old
+        # file (manually added rows, or ids Upstox stopped returning) is retained,
+        # subject to the same listed-lookback cutoff so stale entries still age out.
+        fresh_ids = {o["id"] for o in normalized}
+        existing = await r2_download(client, "ipo_data.json")
+        carried_over = 0
+        if existing and isinstance(existing.get("ipos"), list):
+            for old in existing["ipos"]:
+                old_id = old.get("id")
+                if not old_id or old_id in fresh_ids:
+                    continue  # fresh API data takes priority
+                if old.get("status") == "listed":
+                    ld = old.get("listing_date") or (old.get("timeline") or {}).get("listing") or ""
+                    if ld and ld < cutoff:
+                        continue  # aged out
+                normalized.append(old)
+                fresh_ids.add(old_id)
+                carried_over += 1
+            log.info(f"Carried over {carried_over} IPOs from existing ipo_data.json not in this run's fetch")
+        else:
+            log.info("No existing ipo_data.json to merge (or unreadable) — writing fresh-only data")
 
         # Step 4: sort — active first, then by bidding_start desc
         STATUS_ORDER = {"open": 0, "upcoming": 1, "closed": 2, "listed": 3}
