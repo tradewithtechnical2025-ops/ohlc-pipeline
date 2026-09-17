@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import calendar
 import json
 import os
@@ -767,53 +768,57 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
 All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
 
 
-async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str):
-    """Calls Gemini to extract structured financial data directly from
-    the raw extracted PDF text. Returns the parsed JSON dict, or None if the
-    API isn't configured, the call fails, or the response doesn't parse as
-    valid JSON. Caller is responsible for unit-scaling and sanity checks.
+async def _gemini_generate_json(client: httpx.AsyncClient, parts: list, fname_dbg: str, label: str = ""):
+    """Shared Gemini call + response-parsing core used by both the text-based
+    and PDF-native (multimodal) extraction paths below. `parts` is the
+    Gemini `contents[0].parts` list already assembled by the caller (a text
+    part, optionally plus an inline_data part). `label` is prepended to log
+    lines so the two callers' output stays distinguishable (e.g.
+    "PDF-native fallback: "). Returns the parsed JSON dict, or None on any
+    failure — callers are responsible for unit-scaling and sanity checks.
 
-    Same _AI_EXTRACT_SYSTEM_PROMPT and same output schema as the old
-    Claude-based version — _build_result_from_ai() downstream needs no
-    changes. Gemini has no separate system-prompt slot in this endpoint,
-    so the instructions are prepended to the single user turn instead."""
+    Split out of the original single-function text-only version so the new
+    PDF-native fallback (added for scanned/image-only pages — see
+    _ai_extract_financials_from_pdf) doesn't have to duplicate the
+    response-shape handling, JSON-cleanup and error logging."""
     if not GEMINI_API_KEY:
         return None
+    tag = f"[{fname_dbg}] {label}".strip()
     try:
         r = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
             json={
                 # Matches the known-working browser-based RHP extractor's
-                # request shape exactly (same model, same generationConfig,
-                # same 60000-char text cap) — that tool reliably gets clean
-                # JSON back from this model. An earlier attempt here added
-                # a "thinkingConfig": {"thinkingBudget": 0} field that
-                # isn't present in the working reference at all; every
-                # response after adding it came back truncated a few
-                # hundred characters into the JSON regardless of how high
-                # maxOutputTokens was raised, so that field (not the token
-                # budget) was almost certainly the actual cause — removed.
-                "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:60000]}]}],
+                # request shape exactly (same model, same generationConfig)
+                # — that tool reliably gets clean JSON back from this model.
+                # An earlier attempt here added a "thinkingConfig":
+                # {"thinkingBudget": 0} field that isn't present in the
+                # working reference at all; every response after adding it
+                # came back truncated a few hundred characters into the
+                # JSON regardless of how high maxOutputTokens was raised,
+                # so that field (not the token budget) was almost certainly
+                # the actual cause — removed.
+                "contents": [{"parts": parts}],
                 "generationConfig": {
                     "temperature": 0.05,
                     "maxOutputTokens": 8192,
                     "responseMimeType": "application/json",
                 },
             },
-            timeout=60,
+            timeout=90,
         )
         if r.status_code == 429:
-            print(f"    · [{fname_dbg}] AI extraction skipped: Gemini quota/rate limit hit")
+            print(f"    · {tag} AI extraction skipped: Gemini quota/rate limit hit")
             return None
         r.raise_for_status()
         data = r.json()
         candidates = data.get("candidates") or []
         if not candidates or "content" not in candidates[0]:
-            print(f"    · [{fname_dbg}] AI extraction: unexpected Gemini response shape")
+            print(f"    · {tag} AI extraction: unexpected Gemini response shape")
             return None
         finish_reason = candidates[0].get("finishReason", "")
-        parts = candidates[0]["content"].get("parts") or []
-        raw_text = "".join(p.get("text", "") for p in parts).strip()
+        resp_parts = candidates[0]["content"].get("parts") or []
+        raw_text = "".join(p.get("text", "") for p in resp_parts).strip()
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
         try:
             # strict=False allows literal control characters (unescaped raw
@@ -830,13 +835,77 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
             # exhausted, likely by internal thinking tokens), vs "STOP"
             # meaning the model finished normally but emitted malformed
             # JSON — the two need different fixes, so don't conflate them.
-            print(f"    · [{fname_dbg}] AI JSON parse failed ({je}); finishReason={finish_reason or 'unknown'}, "
+            print(f"    · {tag} AI JSON parse failed ({je}); finishReason={finish_reason or 'unknown'}, "
                   f"response length={len(raw_text)} chars")
             return None
         return parsed
     except Exception as e:
-        print(f"    · [{fname_dbg}] AI extraction failed: {type(e).__name__}: {e}")
+        print(f"    · {tag} AI extraction failed: {type(e).__name__}: {e}")
         return None
+
+
+async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str):
+    """Calls Gemini to extract structured financial data directly from
+    the raw extracted PDF text. Returns the parsed JSON dict, or None if the
+    API isn't configured, the call fails, or the response doesn't parse as
+    valid JSON. Caller is responsible for unit-scaling and sanity checks.
+
+    Same _AI_EXTRACT_SYSTEM_PROMPT and same output schema as the old
+    Claude-based version — _build_result_from_ai() downstream needs no
+    changes. Gemini has no separate system-prompt slot in this endpoint,
+    so the instructions are prepended to the single user turn instead.
+    Same 60000-char text cap as before (kept here rather than in the shared
+    helper, since it's specific to the text-only payload)."""
+    parts = [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:60000]}]
+    return await _gemini_generate_json(client, parts, fname_dbg)
+
+
+# Wording swap for the PDF-native prompt below — the base system prompt
+# opens by describing its input as "already OCR'd/extracted to plain
+# text", which is wrong for this path (no extraction happened at all, the
+# model is reading the PDF's pages, including any scanned/image ones,
+# directly).
+_AI_EXTRACT_SYSTEM_PROMPT_PDF_NATIVE = _AI_EXTRACT_SYSTEM_PROMPT.replace(
+    "already OCR'd/extracted to plain text",
+    "given to you as the raw PDF file itself — some pages may be scanned/"
+    "photographed images with no text layer at all, so read every page "
+    "visually rather than assuming a text layer exists",
+)
+
+# Keep the inline base64 payload well under Gemini's inline-request size
+# ceiling. Filings needing this fallback are almost always a handful of
+# pages, so this should essentially never trigger in practice.
+_PDF_NATIVE_MAX_BYTES = 15 * 1024 * 1024
+
+
+async def _ai_extract_financials_from_pdf(client: httpx.AsyncClient, pdf_bytes: bytes, fname_dbg: str):
+    """Fallback extraction path for PDFs where pdfplumber's text layer is
+    missing on some or all pages (e.g. a results table filed as a scanned/
+    photographed printout rather than a digitally-generated PDF — the
+    NSE/BSE outcome cover letter is often real text while the actual
+    results table pages that follow are pure images).
+
+    Sends the PDF file itself to Gemini as inline multimodal data instead
+    of pre-extracted text, so the model can read scanned pages visually
+    (OCR-style) rather than relying on a text layer that isn't there.
+    Same system prompt/schema/validation as _ai_extract_financials —
+    _build_result_from_ai() needs no changes either way.
+
+    Only called when the cheaper text-based path can't find (or can't
+    confirm) a results table AND at least one page looks scanned — see the
+    call sites in parse_financial_results_pdf for the exact trigger
+    conditions. Costs one extra Gemini call on the rare filings that need
+    it; never runs on ordinary text-only PDFs."""
+    if len(pdf_bytes) > _PDF_NATIVE_MAX_BYTES:
+        print(f"    · [{fname_dbg}] PDF too large for inline multimodal fallback "
+              f"({len(pdf_bytes) / 1e6:.1f} MB) — skipping")
+        return None
+    b64 = base64.b64encode(pdf_bytes).decode("ascii")
+    parts = [
+        {"text": _AI_EXTRACT_SYSTEM_PROMPT_PDF_NATIVE},
+        {"inline_data": {"mime_type": "application/pdf", "data": b64}},
+    ]
+    return await _gemini_generate_json(client, parts, fname_dbg, label="PDF-native fallback:")
 
 
 def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = ""):
@@ -1055,6 +1124,23 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     instead of guessing from the PDF's first line, which was confirmed
     unreliable (grabbed dates, website URLs, reference numbers, or
     name+address as if they were the company name).
+
+    SCANNED-PAGE FALLBACK: some filers submit the cover letter/board
+    outcome as real text but the actual results table as a scanned/
+    photographed image with no text layer at all (confirmed on a live
+    filing — ORISSAMINE's Sept 2026 outcome PDF: pages 1-3 had real text,
+    pages 4-6 with the actual "Statement of Standalone Audited Financial
+    Results" table extracted to 0 chars each via pdfplumber). Since the
+    heading pre-check and the text-based AI call both only ever see
+    pdfplumber's extracted text, a PDF like that either fails the heading
+    pre-check outright (if the heading itself is only visible on a scanned
+    page) or — as happened here — passes the pre-check on cover-letter
+    boilerplate text alone, then the AI correctly reports
+    is_results_table=false because the table it's supposed to find simply
+    isn't in the text it was given. Either way the actual table goes
+    unparsed even though the PDF genuinely has one.
+    _ai_extract_financials_from_pdf() (PDF-native, multimodal) is the
+    fallback for exactly this case — see the two call sites below.
     """
     import pdfplumber
     import io as _io
@@ -1063,38 +1149,72 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
 
     try:
         with pdfplumber.open(_io.BytesIO(content)) as pdf:
-            text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
+            page_texts = [(p.extract_text(layout=True) or "") for p in pdf.pages]
     except Exception as e:
         print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
         return None
-    if not text.strip():
-        print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
-        return None
+    text = "\n".join(page_texts)
 
-    # ── Cheap pre-check BEFORE spending an AI call ──
-    # Most "Outcome of Board Meeting" PDFs are governance/KMP-only (no
-    # results table) — no point burning a Gemini call on those.
-    if not _pdf_find_heading_candidates(text):
-        print(f"    · [{fname_dbg}] no 'Financial Results' heading found — not a results PDF, skipping AI call")
-        return None
+    # A page is "scanned-looking" if pdfplumber pulled next to nothing off
+    # it. On its own that's not conclusive (a short real page also scores
+    # low) — it's only a meaningful signal alongside at least one other
+    # page in the same PDF that clearly does have a real text layer, which
+    # is why has_scanned_page below requires both conditions together.
+    page_lens = [len(t.strip()) for t in page_texts]
+    has_text_page = any(l > 500 for l in page_lens)
+    has_scanned_page = any(l < 50 for l in page_lens)
+    fully_scanned = len(text.strip()) < 50
 
-    # ── AI extraction (sole extraction path — no regex fallback) ──
-    # Send the FULL extracted PDF text (not a truncated head-of-document
-    # slice) — Gemini flash's context window comfortably fits an entire
-    # results PDF, and truncating to a fixed prefix was clipping the actual
-    # table on filings with a long cover letter/auditor's report ahead of
-    # it. _ai_extract_financials still applies its own generous safety cap
-    # for the rare pathologically long document.
-    ai = await _ai_extract_financials(client, text, fname_dbg)
-    if not ai:
-        if not GEMINI_API_KEY:
-            print(f"    · [{fname_dbg}] skipping — GEMINI_API_KEY not set")
-        else:
-            print(f"    · [{fname_dbg}] AI extraction failed or returned unparseable data — skipping")
-        return None
-    if not ai.get("is_results_table"):
-        print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
-        return None
+    if fully_scanned:
+        print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF) "
+              f"— trying PDF-native fallback")
+        ai = await _ai_extract_financials_from_pdf(client, content, fname_dbg)
+        if not ai or not ai.get("is_results_table"):
+            print(f"    · [{fname_dbg}] PDF-native fallback found no results table either — skipping")
+            return None
+    else:
+        # ── Cheap pre-check BEFORE spending an AI call ──
+        # Most "Outcome of Board Meeting" PDFs are governance/KMP-only (no
+        # results table) — no point burning a Gemini call on those. Only
+        # bypass this on a mixed text+scanned-page PDF, where the heading
+        # itself could legitimately be sitting on a page the regex can't
+        # see at all.
+        heading_found = bool(_pdf_find_heading_candidates(text))
+        if not heading_found and not (has_text_page and has_scanned_page):
+            print(f"    · [{fname_dbg}] no 'Financial Results' heading found — not a results PDF, skipping AI call")
+            return None
+
+        # ── AI extraction (sole extraction path — no regex fallback) ──
+        # Send the FULL extracted PDF text (not a truncated head-of-document
+        # slice) — Gemini flash's context window comfortably fits an entire
+        # results PDF, and truncating to a fixed prefix was clipping the actual
+        # table on filings with a long cover letter/auditor's report ahead of
+        # it. _ai_extract_financials still applies its own generous safety cap
+        # for the rare pathologically long document.
+        ai = await _ai_extract_financials(client, text, fname_dbg) if heading_found else None
+        if not ai or not ai.get("is_results_table"):
+            if not GEMINI_API_KEY:
+                print(f"    · [{fname_dbg}] skipping — GEMINI_API_KEY not set")
+                return None
+            # Text-based path found nothing usable. If some pages look
+            # scanned, the real table may simply be invisible to the text
+            # path (either the heading pre-check missed it, or the AI saw
+            # only cover-letter text) — worth one PDF-native retry before
+            # giving up for good.
+            if has_text_page and has_scanned_page:
+                reason = "AI says this isn't a results table" if ai else "AI extraction failed or returned unparseable data"
+                print(f"    · [{fname_dbg}] {reason} (text path) — retrying with PDF-native fallback "
+                      f"(scanned page detected)")
+                ai = await _ai_extract_financials_from_pdf(client, content, fname_dbg)
+                if not ai or not ai.get("is_results_table"):
+                    print(f"    · [{fname_dbg}] PDF-native fallback found no results table either — skipping")
+                    return None
+            else:
+                if not ai:
+                    print(f"    · [{fname_dbg}] AI extraction failed or returned unparseable data — skipping")
+                else:
+                    print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
+                return None
 
     result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title)
     if not result:
