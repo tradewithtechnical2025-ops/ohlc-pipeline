@@ -1929,7 +1929,7 @@ def _today_gap_events(gaps_by_sym, today):
 # ══════════════════════════════════════════════════════════════
 
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
-    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None, vcp_map=None):
+    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None, vcp_map=None, ath_map=None):
     cls_map={}
     for x in (classification or []):
         sym=x.get("symbol") or x.get("nse_code")
@@ -2083,6 +2083,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             rs_idx[f"rs_nh50_{short}"]=rs_info.get(f"rs_nh_50_{ikey}"); rs_idx[f"rs_nl50_{short}"]=rs_info.get(f"rs_nl_50_{ikey}")
             rs_idx[f"rs_div50_{short}"]=rs_info.get(f"rs_div_50_{ikey}")
         result_date=result_map.get(sym)
+        ath_info=(ath_map or {}).get(sym,{})
+        ath_val=ath_info.get("ath")
+        ath_off_pct=round((ltp-ath_val)/ath_val*100,2) if ath_val else None
         row={"symbol":sym,"name":cls_info.get("name",""),"tv_code":sh_info.get("tv_code",f"NSE:{sym},"),
             "sector":cls_info.get("sector_group",""),"industry":cls_info.get("display_industry",""),
             "mcap":cls_info.get("market_cap_cr"),"themes":cls_info.get("themes",[]),
@@ -2090,6 +2093,7 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             "high":highs[-1],"low":lows[-1],
             "avg_vol20":round(avg_vol20) if avg_vol20 else None,"avg_vol50":round(avg_vol50) if avg_vol50 else None,
             "high52":high52,"low52":low52,"52whd":whd52,"52wld":wld52,"new_52wh":new_52wh,"new_52wl":new_52wl,
+            "ath":ath_val,"ath_date":ath_info.get("ath_date"),"ath_off_pct":ath_off_pct,
             "pct_atr":pct_atr,"pct_bbw":pct_bbw,"ema10":ema10,"ema21":ema21,"ema50":ema50,"ema200":ema200,
             "emad10":emad10,"emad21":emad21,"emad50":emad50,"above_21":above_21,"above_50":above_50,"above_200":above_200,
             "gt_50_200":gt_50_200,"gt_21_50":gt_21_50,"1mg":mg1,"3mg":mg3,"6mg":mg6,"9mg":mg9,"12mg":mg12,
@@ -2200,7 +2204,7 @@ async def run_ep_scan() -> None:
             ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
             (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
              idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
-             hlr_raw,pb_raw,pat_raw,w_pb_raw,w_hlr_raw,m_pb_raw,ema_shakeout_raw,htf_raw,vcp_raw)=await asyncio.gather(
+             hlr_raw,pb_raw,pat_raw,w_pb_raw,w_hlr_raw,m_pb_raw,ema_shakeout_raw,htf_raw,vcp_raw,ath_raw)=await asyncio.gather(
                 asyncio.gather(*ohlc_tasks,return_exceptions=True),
                 r2_download(client,"screener.json"),
                 r2_download(client,"fundamentals_summary.json"),   # ← CHANGED (was r2_download_fund(client))
@@ -2215,6 +2219,7 @@ async def run_ep_scan() -> None:
                 r2_download(client,"shakeout_signals.json"),   # ← NEW: shakeout_scanner.py's EMA-breakdown+recovery signals
                 r2_download(client,"htf_test_results.json"),   # ← NEW: htf_test_scan.py's HTF / Mini-HTF flag-pole signals
                 r2_download(client,"vcp_signals.json"),   # ← NEW: run_vcp_scan()'s VCP (Volatility Contraction Pattern) signals
+                r2_download(client,"ath_data.json"),   # ← NEW: All-Time-High per symbol, merged into screener_feed below
             )
             all_data={}
             for i,res in enumerate(ohlc_results):
@@ -2257,6 +2262,7 @@ async def run_ep_scan() -> None:
                     sym=row.get("symbol") or row.get("Stocks","")
                     if sym: sheet_data[sym]={"circuit":row.get("Circuit") or row.get("circuit"),"tv_code":row.get("TV CODE") or row.get("tv_code",""),"hpbc":row.get("HPBC") or row.get("hpbc",""),"tl_hl_bo":row.get("TL/HL BO") or row.get("tl_hl_bo","")}
             elif isinstance(sheet_raw,dict): sheet_data=sheet_raw
+            ath_map=ath_raw.get("stocks",{}) if isinstance(ath_raw,dict) else {}
             hlr_map={}
             if isinstance(hlr_raw,dict):
                 for sig in (hlr_raw.get("signals") or []):
@@ -2425,7 +2431,7 @@ async def run_ep_scan() -> None:
             gaps_by_sym=await update_gap_tracker(client,all_data,today)
             gap_state=_build_gap_state(all_data,gaps_by_sym,today)
             gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
-            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map,vcp_map=vcp_map)
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map,vcp_map=vcp_map,ath_map=ath_map)
             mtf_ma_map=_calc_multi_tf_ma(all_data)
             log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
             for row in screener_feed:
