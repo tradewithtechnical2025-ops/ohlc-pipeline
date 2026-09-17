@@ -675,6 +675,42 @@ _PDF_NON_RESULT_PATTERNS = [
 _PDF_NON_RESULT_RE = re.compile("|".join(_PDF_NON_RESULT_PATTERNS), re.IGNORECASE)
 
 
+def _extract_filename_symbol(link: str) -> str:
+    """Best-effort NSE symbol/scrip-code guess from a filing's own filename
+    prefix (e.g. 'SKYWAYS_17092026...pdf' -> 'SKYWAYS') — used to cross-
+    check a candidate announcement against result_calendar.json without
+    needing to download and parse the PDF itself just to find out."""
+    fname = link.rsplit("/", 1)[-1]
+    m = _PDF_FILENAME_TS_RE.match(fname)
+    if m:
+        return m.group(1).upper()
+    return ""
+
+
+def _in_result_calendar(symbol: str, calendar: dict, item_link: str) -> bool:
+    """True if `symbol` appears in result_calendar.json for the filing's
+    own embedded date, or the day before/after (NSE's predicted calendar
+    date and the actual filing date can be a day off). Fails OPEN — if the
+    calendar is empty/unavailable, or we can't confidently extract a
+    symbol or date from this item, the item is allowed through rather than
+    silently hidden, since a broken filter is worse than an occasional
+    false positive."""
+    if not calendar or not symbol:
+        return True
+    fts = _filing_ts(item_link)
+    if not fts:
+        return True
+    try:
+        d = datetime.strptime(fts, "%d%m%Y%H%M%S").date()
+    except ValueError:
+        return True
+    for delta in (-1, 0, 1):
+        day = (d + timedelta(days=delta)).isoformat()
+        if symbol in (calendar.get(day) or []):
+            return True
+    return False
+
+
 def _is_board_outcome_pdf(it: dict) -> bool:
     link = it.get("link", "")
     if not link.lower().endswith(".pdf"):
@@ -1765,8 +1801,18 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 if not content:
                     return None
                 parsed = parse_financial_results_xbrl(content)
-                if not parsed.get("quarter") and not parsed.get("year"):
-                    return None  # not a financial-results XBRL (or empty) — skip silently
+                # Require an actual "quarter" bucket — our whole system
+                # (dedup, QoQ/YoY comparisons, the Results tab's card
+                # layout) is built around quarterly figures. A filing that
+                # only has "year" data (some non-Ind-AS taxonomies report
+                # annually with no quarter context) can't be meaningfully
+                # displayed or compared, and previously slipped through as
+                # a symbol-less, quarter-less junk record (seen directly:
+                # Synoptics Technologies' NONINDAS filing).
+                if not parsed.get("quarter"):
+                    return None  # no quarterly data — not useful for this feed, skip silently
+                if not parsed.get("meta", {}).get("symbol"):
+                    return None  # can't be identified/deduped without a symbol — skip
                 parsed["link"] = it["link"]
                 parsed["title"] = it.get("title", "")
                 parsed["published"] = it.get("published", "")
@@ -2041,9 +2087,39 @@ async def run():
                 continue
             seen_pdf_links.add(link)
             pdf_candidates_now.append(it)
+
+        # Cross-check against result_calendar.json — NSE's own schedule of
+        # which symbols are actually due to declare results on which date.
+        # Many "Outcome of Board Meeting" PDFs are about something other
+        # than quarterly results (NCD issuance, KMP changes, etc.) with a
+        # generic boilerplate summary giving no textual clue either way
+        # (confirmed directly: Anupam Rasayan/Shalibhadra/Shivalic Power/
+        # Pelatro all showed up as bare "RESULT" cards with no financial
+        # data — none of their symbols were actually on the calendar for
+        # that date). This filter is ground-truth rather than a text
+        # heuristic, so it catches cases the earlier NCD/debenture wording
+        # filter can't. Applied to the FULL candidate set (new + already-
+        # stored) so previously-admitted non-results self-heal out on each
+        # run, not just prevented going forward.
+        calendar_payload = await r2_get(client, "result_calendar.json")
+        if not calendar_payload:
+            print("  ⚠ result_calendar.json unavailable — skipping calendar cross-check this run")
         existing_pdf_feed = await r2_get(client, "nse_results_pdf_feed.json")
         existing_pdf_items = (existing_pdf_feed or {}).get("items", [])
-        merged_pdf_feed = dedup_items(pdf_candidates_now + existing_pdf_items)
+        all_pdf_candidates = dedup_items(pdf_candidates_now + existing_pdf_items)
+
+        before_cal = len(all_pdf_candidates)
+        if calendar_payload:
+            all_pdf_candidates = [
+                it for it in all_pdf_candidates
+                if _in_result_calendar(_extract_filename_symbol(it.get("link", "")), calendar_payload, it.get("link", ""))
+            ]
+            dropped_cal = before_cal - len(all_pdf_candidates)
+            if dropped_cal:
+                print(f"  🗑 {dropped_cal} announcement(s) dropped — symbol not on result_calendar.json for that date "
+                      f"(likely not an actual results filing despite the 'Outcome of Board Meeting' subject)")
+
+        merged_pdf_feed = all_pdf_candidates
         merged_pdf_feed.sort(key=_effective_ts, reverse=True)
         merged_pdf_feed = merged_pdf_feed[:500]
         print(f"  nse_results_pdf_feed.json: {len(existing_pdf_items)} existing + "
