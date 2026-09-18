@@ -2026,13 +2026,6 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         key = _result_key(r)
         r_is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"  # XBRL path never sets meta.source
         matched = key[0] and key in existing_by_key
-        # TEMP DIAGNOSTIC — pinpointing why some XBRL results keep getting
-        # re-treated as "new" across runs despite an existing record with
-        # the same symbol/quarter/nature. Remove once root-caused.
-        if r_is_xbrl:
-            existing_keys_same_symbol = [k for k in existing_by_key if k[0] == key[0]]
-            print(f"    [diag] {key[0]}: computed_key={key!r} matched={bool(matched)} "
-                  f"existing_keys_for_this_symbol={existing_keys_same_symbol!r}")
         if matched:
             idx = existing_by_key[key]
             existing_rec = existing_items[idx]
@@ -2059,29 +2052,6 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         for r in refiled:
             existing_items[existing_by_key[_result_key(r)]] = r
 
-    # XBRL-sourced NEW results (no PDF record existed at all for this
-    # symbol+quarter — the sole scenario XBRL is meant to fill in) still
-    # get a recency guard before Telegram: re-enabling XBRL after it was
-    # off for a while means whatever backlog of old, never-covered XBRL
-    # filings accumulated in the meantime would otherwise all fire at
-    # once, flooding the channel with results that are old news by now.
-    # Genuinely fresh XBRL-only results (published in roughly the last
-    # couple of days) still notify normally.
-    XBRL_TELEGRAM_MAX_AGE_SECONDS = 3 * 24 * 60 * 60  # 3 days
-    now_ts = datetime.now(timezone.utc).timestamp()
-    xbrl_backlog_silenced = []
-    still_notify = []
-    for r in parsed_new:
-        is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"
-        if is_xbrl and (now_ts - _effective_ts(r)) > XBRL_TELEGRAM_MAX_AGE_SECONDS:
-            xbrl_backlog_silenced.append((r.get("meta", {}) or {}).get("symbol") or "?")
-            continue
-        still_notify.append(r)
-    if xbrl_backlog_silenced:
-        print(f"  🔇 {len(xbrl_backlog_silenced)} XBRL-only result(s) older than 3 days — storing data, "
-              f"skipping Telegram (backlog, not fresh news): {', '.join(xbrl_backlog_silenced)}")
-    parsed_new_for_telegram = still_notify
-
     # Consolidated preferred over Standalone: forward-looking filter.
     # Covers both (a) Consolidated already sitting in existing_items while
     # a new Standalone filing arrives this run, and (b) Standalone and
@@ -2091,6 +2061,20 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # record before it can be stored or sent to Telegram — Standalone only
     # ever survives as a fallback when no Consolidated result exists at
     # all for that symbol+quarter.
+    #
+    # IMPORTANT: this must run BEFORE the XBRL recency-guard block below,
+    # not after. It used to run after, which meant parsed_new_for_telegram
+    # got built from the pre-filter parsed_new — so a Standalone entry
+    # correctly got dropped from parsed_new/storage here, but the ALREADY-
+    # built parsed_new_for_telegram snapshot still had it, and it kept
+    # getting sent to Telegram on every single run (NSE re-files the same
+    # Standalone XBRL fresh each day, so it never matched an existing key
+    # and never aged out of the 3-day recency guard either) even though it
+    # was being correctly dropped from storage. Confirmed directly via
+    # diagnostic logging: SKYWAYS/ESSARSHPNG/INDLMETER/TEMPSENS all showed
+    # computed_key=(...,'Standalone') with only a 'Consolidated' key on
+    # file — genuinely new-by-key every run, correctly dropped by this
+    # filter, yet still Telegram-sent because of the stale snapshot.
     consolidated_available = {
         _basis_key(it) for it in existing_items + parsed_new
         if (it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "consolidated"
@@ -2131,6 +2115,31 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         if dropped_existing_standalone:
             print(f"  🗑 Removed {dropped_existing_standalone} previously-stored Standalone record(s) "
                   f"now superseded by a Consolidated result arriving this run: {', '.join(removed_syms)}")
+
+    # XBRL-sourced NEW results (no PDF record existed at all for this
+    # symbol+quarter — the sole scenario XBRL is meant to fill in) still
+    # get a recency guard before Telegram: re-enabling XBRL after it was
+    # off for a while means whatever backlog of old, never-covered XBRL
+    # filings accumulated in the meantime would otherwise all fire at
+    # once, flooding the channel with results that are old news by now.
+    # Genuinely fresh XBRL-only results (published in roughly the last
+    # couple of days) still notify normally. Runs on the ALREADY
+    # Consolidated-preference-filtered parsed_new (see above) so a
+    # dropped Standalone duplicate can never sneak into this snapshot.
+    XBRL_TELEGRAM_MAX_AGE_SECONDS = 3 * 24 * 60 * 60  # 3 days
+    now_ts = datetime.now(timezone.utc).timestamp()
+    xbrl_backlog_silenced = []
+    still_notify = []
+    for r in parsed_new:
+        is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"
+        if is_xbrl and (now_ts - _effective_ts(r)) > XBRL_TELEGRAM_MAX_AGE_SECONDS:
+            xbrl_backlog_silenced.append((r.get("meta", {}) or {}).get("symbol") or "?")
+            continue
+        still_notify.append(r)
+    if xbrl_backlog_silenced:
+        print(f"  🔇 {len(xbrl_backlog_silenced)} XBRL-only result(s) older than 3 days — storing data, "
+              f"skipping Telegram (backlog, not fresh news): {', '.join(xbrl_backlog_silenced)}")
+    parsed_new_for_telegram = still_notify
 
     if parsed_new_for_telegram:
         groups = _group_parsed_results(parsed_new_for_telegram)
