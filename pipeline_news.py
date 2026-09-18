@@ -33,12 +33,19 @@ AI_PDF_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 
-# XBRL processing — when enabled, this is the authoritative/official path
-# (SEBI-mandated structured filing, no AI needed, parsed directly via
-# parse_financial_results_xbrl). It also matters as a FALLBACK: some
-# companies never file an "Outcome of Board Meeting" PDF at all for a
-# given result (only the XBRL submission), so relying on the PDF fast-
-# path alone silently misses those results entirely.
+# XBRL processing — enabled, but ONLY as a fallback for results that have
+# NO PDF-sourced record at all (see the refiled/parsed_new split below).
+# Re-enabling this outright once caused two real problems: (1) XBRL
+# OVERWRITES a PDF/AI-parsed record for the same symbol+quarter with a
+# plain XBRL-only one — XBRL never carries key_highlights/management_
+# commentary/segment_breakup (AI-only concepts), so the richer card
+# silently lost that content whenever XBRL "caught up" to a result
+# already covered by the PDF fast-path; (2) a backlog of previously-
+# unparsed XBRL announcements got treated as "new" the moment this flag
+# flipped on, flooding Telegram with already-covered results at once.
+# The fallback-only logic below (never overwrite an existing PDF record;
+# only fill in results the PDF path never covered at all) plus a recency
+# guard on Telegram sends fixes both without losing XBRL-only coverage.
 DISABLE_XBRL_FOR_TESTING = False
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 UP_HEADERS = {
@@ -1600,6 +1607,72 @@ def _telegram_result_message(group) -> str:
     return msg
 
 
+def _merge_xbrl_into_pdf_record(existing: dict, xbrl_parsed: dict) -> dict:
+    """When XBRL data arrives for a result the PDF fast-path already
+    covered, update just the NUMERIC fields with XBRL's officially-tagged
+    figures (more authoritative than an AI read of the PDF), while
+    preserving every narrative field the PDF/AI extraction found
+    (key_highlights, management_commentary, segment_breakup,
+    board_meeting_outcome) — XBRL parsing never produces those at all, so
+    a blanket overwrite (the earlier design) would silently delete them.
+    No Telegram notification follows this: the person was already
+    notified when the PDF-based result first came in — this just quietly
+    corrects/confirms the numbers in place."""
+    merged = dict(existing)
+    merged_quarter = dict(existing.get("quarter") or {})
+    xbrl_quarter = xbrl_parsed.get("quarter") or {}
+
+    NUMERIC_FIELDS = ("revenue", "other_income", "total_income", "total_expenses",
+                       "pbt", "tax_expense", "pat", "comprehensive_income",
+                       "eps_basic", "eps_diluted")
+    changed_fields = []
+    for f in NUMERIC_FIELDS:
+        xv = xbrl_quarter.get(f)
+        if xv is not None and xv != merged_quarter.get(f):
+            changed_fields.append(f)
+            merged_quarter[f] = xv
+
+    if changed_fields:
+        _compute_opm(merged_quarter)  # keep opm consistent with any updated revenue/expenses
+    merged["quarter"] = merged_quarter
+
+    # If XBRL tagged its own prior-year context, refresh yoy_fundamentals'
+    # absolute figures from it (more authoritative than the AI's read of
+    # the PDF's own comparative column) — never touches qoq_fundamentals
+    # (XBRL essentially never tags QoQ) or any narrative field.
+    yoy_native = xbrl_parsed.get("yoy_comparison")
+    if yoy_native:
+        yf = dict(existing.get("yoy_fundamentals") or {})
+        cur = merged_quarter
+        prior_ti = yoy_native.get("total_income")
+        if prior_ti is not None:
+            yf["total_income_prior"] = prior_ti
+            if cur.get("total_income") is not None and prior_ti != 0:
+                yf["total_income_yoy_pct"] = round((cur["total_income"] - prior_ti) / abs(prior_ti) * 100, 2)
+        prior_pat = yoy_native.get("pat")
+        if prior_pat is not None:
+            yf["pat_prior"] = prior_pat
+            if cur.get("pat") is not None and prior_pat != 0:
+                yf["pat_yoy_pct"] = round((cur["pat"] - prior_pat) / abs(prior_pat) * 100, 2)
+        prior_eps = yoy_native.get("eps_basic")
+        if prior_eps is not None:
+            yf["eps_prior"] = prior_eps
+            if cur.get("eps_basic") is not None and prior_eps != 0:
+                yf["eps_yoy_pct"] = round((cur["eps_basic"] - prior_eps) / abs(prior_eps) * 100, 2)
+        if yoy_native.get("opm") is not None and cur.get("opm") is not None:
+            yf["opm_prior"] = round(yoy_native["opm"] * 100, 2)
+            yf["opm_yoy_pp"] = round((cur["opm"] - yoy_native["opm"]) * 100, 2)
+        yf["basis"] = "xbrl_tagged"
+        yf["basis_verified"] = True
+        merged["yoy_fundamentals"] = yf
+
+    if changed_fields:
+        sym = (existing.get("meta", {}) or {}).get("symbol")
+        print(f"    · XBRL confirmed/updated {len(changed_fields)} field(s) for {sym}: "
+              f"{', '.join(changed_fields)} (narrative preserved, no Telegram resend)")
+    return merged
+
+
 def _group_parsed_results(parsed_new: list) -> list:
     """
     Groups newly-parsed results by company+quarter (scrip_code +
@@ -1948,16 +2021,56 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # under a different link) — refresh their data but don't spam Telegram again.
     parsed_new = []
     refiled = []
+    xbrl_merged_records = []
     for r in parsed_all:
         key = _result_key(r)
+        r_is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"  # XBRL path never sets meta.source
         if key[0] and key in existing_by_key:
+            idx = existing_by_key[key]
+            existing_rec = existing_items[idx]
+            existing_is_pdf = (existing_rec.get("meta", {}) or {}).get("source") == "pdf"
+            if r_is_xbrl and existing_is_pdf:
+                # XBRL "catching up" to a result the PDF fast-path already
+                # covered — selectively merge just the numeric fields in
+                # place (see _merge_xbrl_into_pdf_record) rather than a
+                # blanket overwrite, so the AI-extracted narrative content
+                # survives. No Telegram resend — the person was already
+                # notified when the PDF result first came in.
+                merged_rec = _merge_xbrl_into_pdf_record(existing_rec, r)
+                existing_items[idx] = merged_rec
+                xbrl_merged_records.append(merged_rec)
+                continue
             refiled.append(r)
         else:
             parsed_new.append(r)
+    if xbrl_merged_records:
+        print(f"  🔗 {len(xbrl_merged_records)} XBRL result(s) merged into existing PDF record(s) — numbers refreshed, narrative kept, no Telegram resend")
     if refiled:
         print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — updating record, skipping Telegram")
         for r in refiled:
             existing_items[existing_by_key[_result_key(r)]] = r
+
+    # XBRL-sourced NEW results (no PDF record existed at all for this
+    # symbol+quarter — the sole scenario XBRL is meant to fill in) still
+    # get a recency guard before Telegram: re-enabling XBRL after it was
+    # off for a while means whatever backlog of old, never-covered XBRL
+    # filings accumulated in the meantime would otherwise all fire at
+    # once, flooding the channel with results that are old news by now.
+    # Genuinely fresh XBRL-only results (published in roughly the last
+    # couple of days) still notify normally.
+    XBRL_TELEGRAM_MAX_AGE_SECONDS = 3 * 24 * 60 * 60  # 3 days
+    now_ts = datetime.now(timezone.utc).timestamp()
+    xbrl_backlog_silenced = 0
+    still_notify = []
+    for r in parsed_new:
+        is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"
+        if is_xbrl and (now_ts - _effective_ts(r)) > XBRL_TELEGRAM_MAX_AGE_SECONDS:
+            xbrl_backlog_silenced += 1
+            continue
+        still_notify.append(r)
+    if xbrl_backlog_silenced:
+        print(f"  🔇 {xbrl_backlog_silenced} XBRL-only result(s) older than 3 days — storing data, skipping Telegram (backlog, not fresh news)")
+    parsed_new_for_telegram = still_notify
 
     # Consolidated preferred over Standalone: forward-looking filter.
     # Covers both (a) Consolidated already sitting in existing_items while
@@ -1996,9 +2109,9 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             print(f"  🗑 Removed {dropped_existing_standalone} previously-stored Standalone record(s) "
                   f"now superseded by a Consolidated result arriving this run")
 
-    if parsed_new:
-        groups = _group_parsed_results(parsed_new)
-        print(f"  Sending {len(groups)} Telegram message(s) ({len(parsed_new)} filings grouped)...")
+    if parsed_new_for_telegram:
+        groups = _group_parsed_results(parsed_new_for_telegram)
+        print(f"  Sending {len(groups)} Telegram message(s) ({len(parsed_new_for_telegram)} filings grouped)...")
         if not TELEGRAM_RESULTS_CHAT_ID:
             print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
                   "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
@@ -2036,7 +2149,10 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     merged.sort(key=_effective_ts, reverse=True)
     merged = merged[:1000]  # cap file size — keep most recent 1000 filings
 
-    await _update_results_by_symbol(client, parsed_all)
+    # Include the freshly XBRL-merged records too, so the per-symbol
+    # store's copy of this quarter also gets the corrected numbers rather
+    # than staying stale.
+    await _update_results_by_symbol(client, refiled + parsed_new + xbrl_merged_records)
 
     return make_payload(merged)
 
