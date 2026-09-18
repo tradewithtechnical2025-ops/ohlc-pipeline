@@ -73,19 +73,19 @@
       "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (8172 bytes)"
     },
     "ebixcash-ipo": {
-      "status": "download_failed",
-      "at": "2026-09-13 15:06",
-      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+      "status": "done",
+      "at": "2026-09-18 09:43",
+      "attempts": 1
     },
     "boat-ipo": {
-      "status": "download_failed",
-      "at": "2026-09-13 15:06",
-      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+      "status": "done",
+      "at": "2026-09-18 09:45",
+      "attempts": 1
     },
     "navi-technologies-ipo": {
-      "status": "download_failed",
-      "at": "2026-09-13 15:07",
-      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
+      "status": "done",
+      "at": "2026-09-18 09:47",
+      "attempts": 1
     },
     "armee-infotech-limited": {
       "status": "done",
@@ -95,6 +95,31 @@
     "varmora-granito-limited-ipo": {
       "status": "done",
       "at": "2026-09-18 09:12",
+      "attempts": 1
+    },
+    "sonaselection-india-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-18 09:34",
+      "attempts": 1
+    },
+    "reliance-jio-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-18 09:36",
+      "attempts": 1
+    },
+    "biba-fashions-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-18 09:36",
+      "attempts": 1
+    },
+    "droom-technology-limited-ipo": {
+      "status": "done",
+      "at": "2026-09-18 09:39",
+      "attempts": 1
+    },
+    "oyo-ipo": {
+      "status": "done",
+      "at": "2026-09-18 09:40",
       "attempts": 1
     }
   }
