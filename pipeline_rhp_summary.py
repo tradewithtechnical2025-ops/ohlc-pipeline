@@ -386,12 +386,27 @@ async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, _is_retry: bool =
                 # viewer-wrapped one — it's the real, full document; a plain
                 # .pdf href is frequently just the abridged summary, which
                 # is far too thin for meaningful risk/financials extraction.
+                #
+                # BUG FOUND (Jio Platforms DRHP, confirmed via live pipeline
+                # log): the full-DRHP /web/?file=... reference on some SEBI
+                # pages is NOT inside a real <a href="..."> tag — it's bare
+                # text elsewhere on the page. href-only extraction never saw
+                # it, silently fell through to the abridged .pdf href, and
+                # fetched a 13-page summary with none of the real content.
+                # Now searches the WHOLE page text for a /web/?file=...
+                # reference first — href attribute or not — before falling
+                # back to href-only .pdf matching.
                 all_hrefs = re.findall(r'href\s*=\s*["\']([^"\']+)["\']', html_text, re.I)
                 pdf_url = None
-                for h in all_hrefs:
-                    if "/web/?file=" in h or "/web/?file=" in h.replace("../", ""):
-                        pdf_url = h
-                        break
+
+                viewer_match = re.search(r'(?:\.\./)*(?:https?://[^\s"\'<>]+)?/web/\?file=[^\s"\'<>]+', html_text)
+                if viewer_match:
+                    pdf_url = viewer_match.group(0)
+                if not pdf_url:
+                    for h in all_hrefs:
+                        if "/web/?file=" in h or "/web/?file=" in h.replace("../", ""):
+                            pdf_url = h
+                            break
                 if not pdf_url:
                     for h in all_hrefs:
                         if ".pdf" in h.lower():
