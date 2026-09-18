@@ -32,6 +32,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_PDF_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
+
+# XBRL processing — when enabled, this is the authoritative/official path
+# (SEBI-mandated structured filing, no AI needed, parsed directly via
+# parse_financial_results_xbrl). It also matters as a FALLBACK: some
+# companies never file an "Outcome of Board Meeting" PDF at all for a
+# given result (only the XBRL submission), so relying on the PDF fast-
+# path alone silently misses those results entirely.
+DISABLE_XBRL_FOR_TESTING = False
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 UP_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
@@ -750,7 +758,7 @@ Your job:
 4. Use the CURRENT quarter column only (the most recent quarter, i.e. the first/leftmost data column — NOT a prior-year or prior-quarter comparative column) for the "current" object.
 5. Report the unit the table itself states (look for "₹ in Crore", "Rs in Crores", "₹ in Million", "₹ in Lakh"/"₹ in Lakhs"/"Rs. in Lacs"/"Rs. in Lac" — "Lac"/"Lacs" is a very common alternate spelling of Lakh in Indian filings, treat it identically — or similar near the table header) — if genuinely no unit statement exists anywhere, use "Crore" as the default (NSE's most common convention).
 6. Ignore any numbers inside formula references like "(3+4)" or "[3-4]" next to line-item labels — those are row-number citations, not data.
-7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, total_income, PAT, EPS, finance_costs and depreciation if visible as separate columns in the same main table, plus each comparison column's period-end date. Revenue and total_income comparative columns get missed more often than PAT/EPS — the standard NSE quarterly table always has ALL FOUR columns (current quarter, immediately-preceding quarter, same quarter last year, full year) on the SAME row as the current-quarter revenue figure, so if you found a current-quarter revenue value, actively look at that same row's other columns for the comparative revenue figures too rather than only checking for PAT/EPS comparatives.
+7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, total_income, total_expenses, PAT, EPS, finance_costs and depreciation if visible as separate columns in the same main table, plus each comparison column's period-end date. Revenue, total_income and total_expenses comparative columns get missed more often than PAT/EPS — the standard NSE quarterly table always has ALL FOUR columns (current quarter, immediately-preceding quarter, same quarter last year, full year) on the SAME rows as the current-quarter figures, so for EVERY row where you found a current-quarter value, actively look at that same row's other columns for the comparative figures too rather than only checking for PAT/EPS comparatives. total_expenses specifically matters even though it isn't shown in the final display on its own — it's what the operating-profit and operating-margin comparisons are computed from downstream, so a missing prior-period total_expenses silently blanks out those comparisons even when revenue/PAT/EPS comparatives are otherwise complete.
 8. Extract the quarter-end date (the date this result is FOR, e.g. "quarter ended June 30, 2026" -> "2026-06-30").
 9. "pat" MUST be the figure the filing's own reported EPS is actually derived from (usually "Profit attributable to Owners/Shareholders of the Company" — NOT a larger "total" figure that also includes non-controlling/minority interest, if the filing distinguishes between the two). Cross-check: PAT divided by shares outstanding should roughly reconcile to the reported EPS.
 10. finance_costs and depreciation are separate P&L line items (usually "Finance Costs" and "Depreciation and Amortisation Expense") — extract them if the table shows them; the caller computes EBITDA from these, don't compute it yourself.
@@ -1733,8 +1741,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     existing_by_key = {_result_key(it): idx for idx, it in enumerate(existing_items) if _result_key(it)[0]}
 
     # ⚠️ TEMPORARY: XBRL processing disabled to isolate-test the PDF fast-path.
-    # Set back to False (or remove this block) once PDF testing is done.
-    DISABLE_XBRL_FOR_TESTING = True
+    # (module-level DISABLE_XBRL_FOR_TESTING — see top of file)
     if DISABLE_XBRL_FOR_TESTING:
         print("  ⚠ XBRL processing disabled for testing — PDF-only this run")
         xbrl_items = []
@@ -2055,6 +2062,20 @@ async def run():
             if failed_sources:
                 print(f"  ⚠ {filename}: skipping upload — fetch failed for {failed_sources}, "
                       f"keeping existing R2 data untouched")
+                continue
+
+            # While XBRL processing is disabled, nse_results_feed.json's
+            # accumulated XBRL announcements can never get an AI/XBRL-
+            # parsed detail record (build_results_detailed skips XBRL
+            # entirely), and the frontend has separately been told to hide
+            # this feed from the Results tab too — nothing reads or
+            # benefits from it right now. Skip fetching/accumulating/
+            # uploading it entirely rather than doing that work for a file
+            # nothing consumes. Existing R2 data is left untouched (not
+            # deleted) so re-enabling XBRL later picks up right where it
+            # left off.
+            if filename == "nse_results_feed.json" and DISABLE_XBRL_FOR_TESTING:
+                print(f"  ⏭ {filename}: skipping fetch/accumulate — XBRL processing disabled, nothing consumes this file right now")
                 continue
 
             items = []
