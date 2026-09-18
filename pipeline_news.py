@@ -2025,7 +2025,15 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     for r in parsed_all:
         key = _result_key(r)
         r_is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"  # XBRL path never sets meta.source
-        if key[0] and key in existing_by_key:
+        matched = key[0] and key in existing_by_key
+        # TEMP DIAGNOSTIC — pinpointing why some XBRL results keep getting
+        # re-treated as "new" across runs despite an existing record with
+        # the same symbol/quarter/nature. Remove once root-caused.
+        if r_is_xbrl:
+            existing_keys_same_symbol = [k for k in existing_by_key if k[0] == key[0]]
+            print(f"    [diag] {key[0]}: computed_key={key!r} matched={bool(matched)} "
+                  f"existing_keys_for_this_symbol={existing_keys_same_symbol!r}")
+        if matched:
             idx = existing_by_key[key]
             existing_rec = existing_items[idx]
             existing_is_pdf = (existing_rec.get("meta", {}) or {}).get("source") == "pdf"
