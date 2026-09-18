@@ -2145,9 +2145,19 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                     await asyncio.sleep(wait)
             await asyncio.sleep(2)
 
-    merged = existing_items + parsed_new
+    # Guarantee every item actually parsed/notified THIS run survives the
+    # cap, regardless of its timestamp quality — a bad or zero
+    # published_ts (a known issue, especially for XBRL items) could
+    # otherwise sort a freshly-added record to the bottom and truncate it
+    # out before it's ever persisted, making it look "new" again next run
+    # and re-notifying Telegram forever. Only the OLDER, already-persisted
+    # portion gets trimmed to make room, never this run's new items.
+    new_links = {it.get("link") for it in parsed_new}
+    older_existing = [it for it in existing_items if it.get("link") not in new_links]
+    older_existing.sort(key=_effective_ts, reverse=True)
+    keep_older = max(0, 1000 - len(parsed_new))
+    merged = parsed_new + older_existing[:keep_older]
     merged.sort(key=_effective_ts, reverse=True)
-    merged = merged[:1000]  # cap file size — keep most recent 1000 filings
 
     # Include the freshly XBRL-merged records too, so the per-symbol
     # store's copy of this quarter also gets the corrected numbers rather
