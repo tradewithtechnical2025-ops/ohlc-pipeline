@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import calendar
 import json
 import os
@@ -756,7 +757,9 @@ def _pdf_quarter_label(period_end_iso: str):
     return f"Q{q} FY{str(fy_end)[-2:]}"
 
 
-_AI_EXTRACT_SYSTEM_PROMPT = """You extract structured financial data from the text of an NSE-listed Indian company's quarterly results outcome PDF (already OCR'd/extracted to plain text — it may include a cover letter, an auditor's review report, notes, and segment/subsidiary disclosures in addition to the actual results table, or it may not be a results table at all).
+_AI_EXTRACT_SYSTEM_PROMPT = """You extract structured financial data from an NSE-listed Indian company's quarterly results outcome PDF. You are given the extracted plain text of the document AND, usually, the actual PDF document itself.
+
+The extracted text can be genuinely UNRELIABLE for the numbers table specifically — for scanned or lower-quality PDFs, text extraction has been observed to corrupt digits outright (e.g. "406.95" extracted as "40695" with the decimal point silently dropped, or "436.33" garbled into an unrelated "13635"), not just misalign columns. When the PDF document itself is provided, treat it as the authoritative source for every number in the main results table — read the table directly from the PDF the way a person would, rather than trusting the extracted text's digits. Use the extracted text mainly for things that are awkward to re-derive from the PDF alone (confirming labels, locating which page has the table) and as a fallback only when no PDF is provided at all.
 
 Your job:
 1. Determine if this document contains an actual quarterly financial results TABLE (the "Statement of Standalone/Consolidated Financial Results" with line items like Revenue, Expenses, Profit, EPS). If it's only a cover letter, merger intimation, KMP change notice, AGM notice, or similar with no such table, set is_results_table to false and leave other fields null.
@@ -805,11 +808,26 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
 All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
 
 
-async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str):
-    """Calls Gemini to extract structured financial data directly from
-    the raw extracted PDF text. Returns the parsed JSON dict, or None if the
-    API isn't configured, the call fails, or the response doesn't parse as
-    valid JSON. Caller is responsible for unit-scaling and sanity checks.
+async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str, pdf_bytes: bytes = None):
+    """Calls Gemini to extract structured financial data from the PDF's
+    extracted text AND (when provided) the raw PDF itself, sent as a
+    native document part — Gemini reads PDFs directly (including
+    rendering each page internally), so there's no need to pre-render
+    pages to images ourselves; the raw bytes are simpler and, for a
+    normal-sized results PDF, a smaller payload too. Returns the parsed
+    JSON dict, or None if the API isn't configured, the call fails, or
+    the response doesn't parse as valid JSON. Caller is responsible for
+    unit-scaling and sanity checks.
+
+    The PDF matters because pdfplumber's text extraction can come out
+    genuinely GARBLED for scanned/image-quality filings — not just
+    misaligned columns, but wrong digits entirely (confirmed directly:
+    one filing's "406.95" extracted as "40695" with the decimal point
+    gone, "436.33" as "13635", "Unaudited" as "Cnaudited"). No amount of
+    prompt tuning fixes an AI reading from already-corrupted input text —
+    giving it the actual PDF lets it read the table visually, the same
+    way a person would, sidestepping that text-layer corruption entirely
+    for the numbers that actually matter.
 
     Same _AI_EXTRACT_SYSTEM_PROMPT and same output schema as the old
     Claude-based version — _build_result_from_ai() downstream needs no
@@ -818,6 +836,11 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
     if not GEMINI_API_KEY:
         return None
     try:
+        parts = [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:60000]}]
+        if pdf_bytes:
+            parts.append({"inline_data": {"mime_type": "application/pdf",
+                                           "data": base64.b64encode(pdf_bytes).decode()}})
+
         r = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
             json={
@@ -831,14 +854,14 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
                 # hundred characters into the JSON regardless of how high
                 # maxOutputTokens was raised, so that field (not the token
                 # budget) was almost certainly the actual cause — removed.
-                "contents": [{"parts": [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:60000]}]}],
+                "contents": [{"parts": parts}],
                 "generationConfig": {
                     "temperature": 0.05,
                     "maxOutputTokens": 8192,
                     "responseMimeType": "application/json",
                 },
             },
-            timeout=60,
+            timeout=90,
         )
         if r.status_code == 429:
             print(f"    · [{fname_dbg}] AI extraction skipped: Gemini quota/rate limit hit")
@@ -1110,8 +1133,11 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     # results PDF, and truncating to a fixed prefix was clipping the actual
     # table on filings with a long cover letter/auditor's report ahead of
     # it. _ai_extract_financials still applies its own generous safety cap
-    # for the rare pathologically long document.
-    ai = await _ai_extract_financials(client, text, fname_dbg)
+    # for the rare pathologically long document. The raw PDF (`content`,
+    # already in memory from the fetch) is sent alongside the text and
+    # takes priority for the actual numbers — Gemini reads PDFs natively,
+    # so there's no need to pre-render pages to images ourselves.
+    ai = await _ai_extract_financials(client, text, fname_dbg, content)
     if not ai:
         if not GEMINI_API_KEY:
             print(f"    · [{fname_dbg}] skipping — GEMINI_API_KEY not set")
