@@ -51,29 +51,9 @@
       "status": "done",
       "at": "2026-09-13 15:02"
     },
-    "sonaselection-india-limited-ipo": {
-      "status": "done",
-      "at": "2026-09-18 08:29",
-      "attempts": 1
-    },
-    "reliance-jio-limited-ipo": {
-      "status": "done",
-      "at": "2026-09-18 08:36",
-      "attempts": 1
-    },
     "deltatech-gaming-ipo": {
       "status": "done",
       "at": "2026-09-18 08:37",
-      "attempts": 1
-    },
-    "biba-fashions-limited-ipo": {
-      "status": "done",
-      "at": "2026-09-18 08:38",
-      "attempts": 1
-    },
-    "droom-technology-limited-ipo": {
-      "status": "done",
-      "at": "2026-09-18 08:40",
       "attempts": 1
     },
     "puranik-builders-limited-ipo": {
@@ -110,11 +90,6 @@
       "status": "download_failed",
       "at": "2026-09-13 15:07",
       "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (21726 bytes)"
-    },
-    "varmora-granito-limited-ipo": {
-      "status": "done",
-      "at": "2026-09-18 08:32",
-      "attempts": 1
     },
     "armee-infotech-limited": {
       "status": "done",
