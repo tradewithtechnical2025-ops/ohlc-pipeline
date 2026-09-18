@@ -625,8 +625,60 @@ async def rebuild_combined_index(client: httpx.AsyncClient):
     log.info(f"━━━ Rebuild complete: {found} summaries in {COMBINED_SUMMARIES_FILE} ━━━")
 
 
+async def audit_and_requeue_incomplete(client: httpx.AsyncClient):
+    """One-off maintenance mode: scans the combined summaries index
+    (ipo_summaries_all.json) for entries whose financials are incomplete —
+    missing revenue_from_operations or pat, or a note admitting the figures
+    "could not be computed". This is exactly the symptom of the page-window
+    bug fixed alongside this function: for companies with a long Independent
+    Auditor's Examination Report before the actual P&L table (Jio Platforms'
+    ran ~9 pages), the old 10-page/20000-char window ended before reaching
+    real numbers. Confirmed live on ss-retail-limited-ipo (has revenue, no
+    PAT/EBITDA/OCF) — there are likely others.
+
+    Doesn't touch R2 or re-run Gemini itself — just removes the affected
+    ids from rhp_manifest.json's "processed" map so the next normal
+    pipeline run treats them as never-attempted and reprocesses them with
+    the fixed extraction window. The existing "Commit updated RHP manifest"
+    workflow step picks up and commits the change as usual."""
+    log.info("━━━ Auditing combined summaries for incomplete financials ━━━")
+    combined = await load_combined_summaries(client)
+    summaries = combined.get("summaries", {})
+
+    incomplete_ids = []
+    for ipo_id, data in summaries.items():
+        fin = data.get("financials_lakhs") or {}
+        missing_core = not fin.get("revenue_from_operations") or not fin.get("pat")
+        note_flags_issue = "could not be computed" in (fin.get("note") or "").lower()
+        if missing_core or note_flags_issue:
+            incomplete_ids.append(ipo_id)
+
+    log.info(f"Checked {len(summaries)} summaries — {len(incomplete_ids)} look incomplete:")
+    for iid in incomplete_ids:
+        log.info(f"  ⚠ {iid}")
+
+    if not incomplete_ids:
+        log.info("━━━ Nothing to requeue ━━━")
+        return
+
+    manifest = load_manifest()
+    processed = manifest["processed"]
+    requeued = 0
+    for iid in incomplete_ids:
+        if iid in processed:
+            del processed[iid]
+            requeued += 1
+    save_manifest(manifest)
+    log.info(f"━━━ Requeued {requeued} ids (removed from manifest) — next normal run will reprocess them ━━━")
+
+
 if __name__ == "__main__":
-    if os.environ.get("REBUILD_INDEX_ONLY", "false").lower() == "true":
+    if os.environ.get("AUDIT_AND_REQUEUE", "false").lower() == "true":
+        async def _audit():
+            async with httpx.AsyncClient() as client:
+                await audit_and_requeue_incomplete(client)
+        asyncio.run(_audit())
+    elif os.environ.get("REBUILD_INDEX_ONLY", "false").lower() == "true":
         async def _rebuild():
             async with httpx.AsyncClient() as client:
                 await rebuild_combined_index(client)
