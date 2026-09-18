@@ -193,7 +193,12 @@ def extract_pdf_sections(pdf_bytes: bytes) -> dict:
     needed_ranges = []
     if idx["risk"] >= 0: needed_ranges.append((idx["risk"], idx["risk"] + 18))
     if idx["objects"] >= 0: needed_ranges.append((idx["objects"], idx["objects"] + 4))
-    if idx["financials"] >= 0: needed_ranges.append((idx["financials"], idx["financials"] + 10))
+    # 25 pages (not 10) — large companies' "Restated Financial Information"
+    # section can open with a long Independent Auditor's Examination Report
+    # (Jio Platforms' ran ~9 pages) before the actual P&L/Balance Sheet/Cash
+    # Flow tables with real numbers even begin; 10 pages was cutting off
+    # right at that boundary and missing the numbers entirely.
+    if idx["financials"] >= 0: needed_ranges.append((idx["financials"], idx["financials"] + 25))
     if idx["business"] >= 0: needed_ranges.append((idx["business"], idx["business"] + 3))
     needed_ranges.append((0, 4))  # cover pages / offer details
 
@@ -216,7 +221,7 @@ def extract_pdf_sections(pdf_bytes: bytes) -> dict:
     return {
         "risk_factors": render(idx["risk"], 18),
         "objects": render(idx["objects"], 4),
-        "financials": render(idx["financials"], 10),
+        "financials": render(idx["financials"], 25),
         "business": render(idx["business"], 3),
         "offer_details": render(0, 4),
     }
@@ -272,7 +277,7 @@ Company name (if known): {company_name or '(not provided — extract from the do
 {sections['objects'][:6000]}
 
 === EXCERPT: FINANCIAL SUMMARY / RESTATED FINANCIALS ===
-{sections['financials'][:20000]}
+{sections['financials'][:75000]}
 
 === EXCERPT: BUSINESS OVERVIEW ===
 {sections['business'][:4000]}
