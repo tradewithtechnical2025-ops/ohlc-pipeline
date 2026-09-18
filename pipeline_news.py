@@ -2046,7 +2046,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     if xbrl_merged_records:
         print(f"  🔗 {len(xbrl_merged_records)} XBRL result(s) merged into existing PDF record(s) — numbers refreshed, narrative kept, no Telegram resend")
     if refiled:
-        print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — updating record, skipping Telegram")
+        print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — updating record, skipping Telegram: "
+              f"{', '.join((r.get('meta', {}) or {}).get('symbol') or '?' for r in refiled)}")
         for r in refiled:
             existing_items[existing_by_key[_result_key(r)]] = r
 
@@ -2060,16 +2061,17 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # couple of days) still notify normally.
     XBRL_TELEGRAM_MAX_AGE_SECONDS = 3 * 24 * 60 * 60  # 3 days
     now_ts = datetime.now(timezone.utc).timestamp()
-    xbrl_backlog_silenced = 0
+    xbrl_backlog_silenced = []
     still_notify = []
     for r in parsed_new:
         is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"
         if is_xbrl and (now_ts - _effective_ts(r)) > XBRL_TELEGRAM_MAX_AGE_SECONDS:
-            xbrl_backlog_silenced += 1
+            xbrl_backlog_silenced.append((r.get("meta", {}) or {}).get("symbol") or "?")
             continue
         still_notify.append(r)
     if xbrl_backlog_silenced:
-        print(f"  🔇 {xbrl_backlog_silenced} XBRL-only result(s) older than 3 days — storing data, skipping Telegram (backlog, not fresh news)")
+        print(f"  🔇 {len(xbrl_backlog_silenced)} XBRL-only result(s) older than 3 days — storing data, "
+              f"skipping Telegram (backlog, not fresh news): {', '.join(xbrl_backlog_silenced)}")
     parsed_new_for_telegram = still_notify
 
     # Consolidated preferred over Standalone: forward-looking filter.
@@ -2088,6 +2090,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     }
     if consolidated_available:
         before_new = len(parsed_new)
+        dropped_syms = [
+            (r.get("meta", {}) or {}).get("symbol")
+            for r in parsed_new
+            if (r.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
+            and _basis_key(r) in consolidated_available
+        ]
         parsed_new = [
             r for r in parsed_new
             if not ((r.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
@@ -2096,9 +2104,16 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         dropped_new_standalone = before_new - len(parsed_new)
         if dropped_new_standalone:
             print(f"  ⏸ Dropped {dropped_new_standalone} new Standalone result(s) — Consolidated "
-                  f"already available/arriving for the same symbol+quarter (Consolidated preferred)")
+                  f"already available/arriving for the same symbol+quarter (Consolidated preferred): "
+                  f"{', '.join(dropped_syms)}")
 
         before_existing = len(existing_items)
+        removed_syms = [
+            (it.get("meta", {}) or {}).get("symbol")
+            for it in existing_items
+            if (it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
+            and _basis_key(it) in consolidated_available
+        ]
         existing_items = [
             it for it in existing_items
             if not ((it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
@@ -2107,11 +2122,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         dropped_existing_standalone = before_existing - len(existing_items)
         if dropped_existing_standalone:
             print(f"  🗑 Removed {dropped_existing_standalone} previously-stored Standalone record(s) "
-                  f"now superseded by a Consolidated result arriving this run")
+                  f"now superseded by a Consolidated result arriving this run: {', '.join(removed_syms)}")
 
     if parsed_new_for_telegram:
         groups = _group_parsed_results(parsed_new_for_telegram)
         print(f"  Sending {len(groups)} Telegram message(s) ({len(parsed_new_for_telegram)} filings grouped)...")
+        telegram_syms = [(g[0].get("meta", {}) or {}).get("symbol") for g in groups if g]
+        print(f"    symbols: {', '.join(s for s in telegram_syms if s)}")
         if not TELEGRAM_RESULTS_CHAT_ID:
             print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
                   "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
