@@ -9,6 +9,11 @@ on:
         required: false
         type: boolean
         default: false
+      audit_requeue:
+        description: 'Audit ipo_summaries_all.json for incomplete financials (missing revenue/PAT — the page-window bug) and requeue those ids for reprocessing on the next normal run. No new PDFs processed this run.'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   ipo-scan:
@@ -25,7 +30,7 @@ jobs:
       - run: pip install httpx pdfplumber
 
       - name: Run IPO scan
-        if: ${{ !inputs.rebuild_summary_index }}
+        if: ${{ !inputs.rebuild_summary_index && !inputs.audit_requeue }}
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           WORKER_URL:   ${{ secrets.WORKER_URL }}
@@ -38,6 +43,7 @@ jobs:
           WORKER_URL:           ${{ secrets.WORKER_URL }}
           WORKER_TOKEN:         ${{ secrets.WORKER_TOKEN }}
           REBUILD_INDEX_ONLY:   ${{ inputs.rebuild_summary_index }}
+          AUDIT_AND_REQUEUE:    ${{ inputs.audit_requeue }}
         run: python pipeline_rhp_summary.py
 
       - name: Commit updated RHP manifest
