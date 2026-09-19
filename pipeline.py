@@ -474,7 +474,7 @@ async def r2_upload_fund(client, data: dict) -> None:
     if r.status_code != 200: raise RuntimeError(f"Upload failed: HTTP {r.status_code}")
     log.info(f"  ↑ fundamentals.json ({len(payload)/1024:.1f} KB)")
 
-async def save_result_calendar(client, by_date: dict, keep_days=60):
+async def save_result_calendar(client, by_date: dict, keep_days=365):
     """Merges a {date_str: [symbols]} batch into the persisted result_calendar.json."""
     try: existing = await r2_download(client, "result_calendar.json"); cal = existing if isinstance(existing, dict) else {}
     except: cal = {}
@@ -2589,7 +2589,7 @@ async def run_ep_scan() -> None:
                         "ltp":round(fresh_ltp,2) if fresh_ltp is not None else sc.get("ltp",""),
                         "q_name":q_name,
                     })
-            rs_data=_calculate_rs(all_data,history_days=90)
+            rs_data=_calculate_rs(all_data,history_days=180)
             rs_history_list=_build_rs_history_json(all_data,rs_data)
             for sig in signals:
                 rc=rs_data.get(sig["symbol"],{}).get("rs")
