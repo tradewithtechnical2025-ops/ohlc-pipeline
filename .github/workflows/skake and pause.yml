@@ -1,0 +1,49 @@
+name: Shakeout & Pause Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_pause_days:
+        description: "Min consecutive tight-pause days after reclaim"
+        required: false
+        default: "2"
+      pause_only:
+        description: "Only keep signals where a valid pause/base formed (true/false)"
+        required: false
+        default: "true"
+  schedule:
+    # 16:05 IST daily (10:35 UTC), after NSE close ~15:30 IST. Adjust/remove as needed.
+    - cron: "35 10 * * 1-5"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run shakeout + pause scan
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: |
+          ARGS="--min-pause-days ${{ github.event.inputs.min_pause_days || '2' }} --save results.json"
+          if [ "${{ github.event.inputs.pause_only || 'true' }}" = "true" ]; then
+            ARGS="$ARGS --pause-only"
+          fi
+          python shakeout_scanner.py $ARGS
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shakeout-pause-results
+          path: results.json
+          retention-days: 14
