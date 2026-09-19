@@ -1,0 +1,72 @@
+name: TradeWithTech Holiday Sync & Backfill
+on:
+  workflow_dispatch:
+    inputs:
+      backfill_symbols:
+        description: "Comma-separated symbols to backfill (leave blank to auto-detect missing/short-history symbols, or to use failed_stocks.txt if present)"
+        required: false
+        default: ""
+  schedule:
+    # 08:00 IST daily (02:30 UTC), well before market open — keeps the
+    # holiday calendar fresh so is_trading_day() never runs stale.
+    - cron: "30 2 * * *"
+concurrency:
+  group: twt-pipeline
+  cancel-in-progress: false
+env:
+  PYTHON_VERSION: "3.11"
+  UPSTOX_TOKEN:       ${{ secrets.UPSTOX_TOKEN }}
+  WORKER_URL:         ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN:       ${{ secrets.WORKER_TOKEN }}
+  FINEDGE_TOKEN:      ${{ secrets.FINEDGE_TOKEN }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+jobs:
+  holiday-and-backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install Dependencies
+        run: |
+          pip install httpx requests
+
+      - name: Update NSE Holiday Calendar
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py update_holidays
+
+      - name: Commit updated nse_holidays.json
+        run: |
+          if ! git diff --quiet -- nse_holidays.json; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add nse_holidays.json
+            git commit -m "chore: sync nse_holidays.json from Finedge [skip ci]"
+            git push
+          else
+            echo "nse_holidays.json unchanged — nothing to commit"
+          fi
+
+      - name: Backfill Missing OHLC
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py backfill_missing "${{ github.event.inputs.backfill_symbols }}"
+
+      - name: Telegram fallback on workflow failure
+        if: failure()
+        run: |
+          MSG="❌ <b>📊 TradeWithTech Holiday Sync &amp; Backfill</b>%0AStatus : <code>WORKFLOW FAILURE</code>%0ATime : $(TZ='Asia/Kolkata' date '+%d %b %Y, %I:%M %p IST')%0A🔗 ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d "parse_mode=HTML" \
+            -d "text=${MSG}"
