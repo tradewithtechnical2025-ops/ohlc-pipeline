@@ -59,13 +59,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py hlr_scan
-      - name: Pattern Scan
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 10
-          max_attempts: 3
-          retry_wait_seconds: 15
-          command: python pipeline.py pattern_scan
       - name: HTF Scan
         uses: nick-fields/retry@v3
         with:
@@ -80,6 +73,18 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python shakeout_scanner.py --r2-key shakeout_signals.json
+      # ─── Pattern Scan moved AFTER Shakeout Scan (and HTF Scan) so that
+      # screener_feed.json's ema_shakeout_map / shakeout_pause_* fields and
+      # htf_map are built from TODAY's signals, not yesterday's. Pattern
+      # Scan is what builds screener_feed.json — everything it reads from
+      # R2 needs to already be fresh by the time it runs. ───
+      - name: Pattern Scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py pattern_scan
       - name: VCP Scan
         uses: nick-fields/retry@v3
         with:
