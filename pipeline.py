@@ -2298,8 +2298,23 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             _es_today=[cat for cat,rec in _es_cats.items() if rec.get("recovery_date")==today]
             row["ema_shakeout"]=bool(_es_today)
             row["ema_shakeout_cats"]=_es_today or list(_es_cats.keys())
+            # ─── NEW: shakeout PAUSE fields — shakeout_scanner.py now tags each
+            # signal with pause_days/pause_valid/pause_clean (whether the base
+            # right after the reclaim day stayed tight — see shakeout_scanner.py's
+            # _detect_pause). Surface that here so the frontend can build a
+            # "Shakeout + Pause" filter without re-fetching shakeout_signals.json
+            # itself. ───
+            _pause_cats=[cat for cat,rec in _es_cats.items() if rec.get("pause_valid")]
+            _pause_clean_cats=[cat for cat,rec in _es_cats.items() if rec.get("pause_clean")]
+            _pause_days_vals=[rec.get("pause_days") for rec in _es_cats.values() if rec.get("pause_days") is not None]
+            row["shakeout_pause"]=bool(_pause_cats)
+            row["shakeout_pause_clean"]=bool(_pause_clean_cats)
+            row["shakeout_pause_cats"]=_pause_cats
+            row["shakeout_pause_days"]=max(_pause_days_vals) if _pause_days_vals else None
         else:
             row["ema_shakeout"]=False; row["ema_shakeout_cats"]=[]
+            row["shakeout_pause"]=False; row["shakeout_pause_clean"]=False
+            row["shakeout_pause_cats"]=[]; row["shakeout_pause_days"]=None
         _htf_rec=(htf_map or {}).get(sym,{}).get("HTF")
         _mhtf_rec=(htf_map or {}).get(sym,{}).get("MiniHTF")
         row["htf_status"]=_htf_rec.get("status") if _htf_rec else None
