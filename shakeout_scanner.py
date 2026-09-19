@@ -51,6 +51,32 @@ def _calc_ema(closes, period):
     return ema
 
 
+def _calc_atr(highs, lows, closes, period=14):
+    """Simple (SMA-based) ATR, aligned by index. atr[i] uses True Range of
+    days up to and including i, averaged over the trailing `period` days.
+    Returns None where there isn't enough history yet."""
+    n = len(closes)
+    atr = [None] * n
+    tr = [None] * n
+    for i in range(n):
+        h, l, c = highs[i], lows[i], closes[i]
+        if h is None or l is None:
+            continue
+        if i == 0 or closes[i - 1] is None:
+            tr[i] = h - l
+        else:
+            pc = closes[i - 1]
+            tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+    for i in range(n):
+        if i < period - 1:
+            continue
+        window = [v for v in tr[i - period + 1:i + 1] if v is not None]
+        if len(window) < period:
+            continue
+        atr[i] = sum(window) / len(window)
+    return atr
+
+
 def _check_liquidity(volumes, closes, n, min_turnover=3_00_00_000):
     lookback = min(50, n)
     if lookback < 20:
@@ -91,16 +117,22 @@ def _merge_compound_shakeouts(raw_signals, dates, closes):
         periods = sorted(set(g["ema_period"] for g in group))
         breakdown_idx = min(g["breakdown_idx"] for g in group)
         recovery_idx = max(g["recovery_idx"] for g in group)
+        best_pause_days = max(g["pause_days"] for g in group)
         entry = {
             "ema_periods": periods,
             "compound": len(group) > 1,
             "breakdown_date": dates[breakdown_idx],
             "recovery_date": dates[recovery_idx],
             "days_to_recover": recovery_idx - breakdown_idx,
+            "pause_days": best_pause_days,
+            "pause_valid": any(g["pause_valid"] for g in group),
             "details": [
                 {"ema_period": g["ema_period"], "breakdown_date": g["breakdown_date"],
                  "breakdown_close": g["breakdown_close"], "ema_value": g["ema_value"],
-                 "recovery_date": g["recovery_date"], "recovery_close": g["recovery_close"]}
+                 "recovery_date": g["recovery_date"], "recovery_close": g["recovery_close"],
+                 "pause_days": g["pause_days"], "pause_valid": g["pause_valid"],
+                 "pause_band_low": g["pause_band_low"], "pause_band_high": g["pause_band_high"],
+                 "pause_end_date": g["pause_end_date"]}
                 for g in sorted(group, key=lambda x: x["ema_period"])
             ],
             "as_of_date": as_of_date, "as_of_close": as_of_close,
@@ -109,8 +141,65 @@ def _merge_compound_shakeouts(raw_signals, dates, closes):
     return merged
 
 
+def _detect_pause(closes, ema, atr, recovery_idx, breakdown_idx, n,
+                   min_pause_days=2, max_pause_days=15):
+    """Checks the days AFTER the reclaim/recovery day for a tight pause/base.
+
+    Rule (finalized in conversation):
+      - Anchor = reclaim_close (Close on recovery_idx).
+      - ATR = 1x the 14-day ATR as of the breakdown day (pre-breakdown,
+        so the shakeout's own volatility doesn't distort the band).
+      - A day qualifies as a valid pause day if BOTH:
+          reclaim_close - ATR <= close[j] <= reclaim_close + ATR
+          close[j] > ema[j]   (still respecting the reclaimed EMA)
+      - pause_days = length of the CONSECUTIVE run of valid days starting
+        right after recovery_idx. First failing day ends the run.
+
+    Returns a dict: pause_days, pause_valid, band_low, band_high,
+    pause_end_date_idx (last valid pause index, or None).
+    """
+    reclaim_close = closes[recovery_idx]
+    # ATR as of the breakdown day (pre-breakdown data only). Falls back to
+    # the recovery day's ATR if that's unavailable (e.g. early in history).
+    atr_ref = None
+    if breakdown_idx - 1 >= 0 and atr[breakdown_idx - 1] is not None:
+        atr_ref = atr[breakdown_idx - 1]
+    elif atr[breakdown_idx] is not None:
+        atr_ref = atr[breakdown_idx]
+    elif atr[recovery_idx] is not None:
+        atr_ref = atr[recovery_idx]
+
+    if reclaim_close is None or atr_ref is None:
+        return {"pause_days": 0, "pause_valid": False, "band_low": None,
+                "band_high": None, "pause_end_idx": None}
+
+    band_low = round(reclaim_close - atr_ref, 2)
+    band_high = round(reclaim_close + atr_ref, 2)
+
+    pause_days = 0
+    last_valid_idx = None
+    for j in range(recovery_idx + 1, min(n, recovery_idx + 1 + max_pause_days)):
+        c, e = closes[j], ema[j]
+        if c is None or e is None:
+            break
+        if not (band_low <= c <= band_high):
+            break
+        if not (c > e):
+            break
+        pause_days += 1
+        last_valid_idx = j
+
+    return {
+        "pause_days": pause_days,
+        "pause_valid": pause_days >= min_pause_days,
+        "band_low": band_low,
+        "band_high": band_high,
+        "pause_end_idx": last_valid_idx,
+    }
+
+
 def detect_shakeout(s, ema_periods=(10, 21, 50), min_days_above=None, max_recovery_days=5,
-                     lookback_days=260):
+                     lookback_days=260, min_pause_days=2, max_pause_days=15, atr_period=14):
     """Returns a list of shakeout signals for this stock (most recent first).
     When breakdown+recovery windows for DIFFERENT EMAs overlap (e.g. EMA10
     breaks down, then EMA21 also breaks down before EMA10 recovers, then
@@ -135,6 +224,7 @@ def detect_shakeout(s, ema_periods=(10, 21, 50), min_days_above=None, max_recove
     ema21 = _calc_ema(closes, 21)
     ema50 = _calc_ema(closes, 50)
     emas = {10: ema10, 21: ema21, 50: ema50}
+    atr = _calc_atr(highs, lows, closes, period=atr_period)
 
     max_min_days = max(min_days_above.get(p, 3) for p in ema_periods)
     scan_start = max(max_min_days + 1, n - lookback_days)
@@ -172,6 +262,10 @@ def detect_shakeout(s, ema_periods=(10, 21, 50), min_days_above=None, max_recove
             if recovery_idx is None:
                 continue
 
+            pause = _detect_pause(closes, ema, atr, recovery_idx, i, n,
+                                   min_pause_days=min_pause_days,
+                                   max_pause_days=max_pause_days)
+
             raw_signals.append({
                 "ema_period": period,
                 "breakdown_idx": i, "recovery_idx": recovery_idx,
@@ -181,6 +275,11 @@ def detect_shakeout(s, ema_periods=(10, 21, 50), min_days_above=None, max_recove
                 "recovery_date": dates[recovery_idx],
                 "recovery_close": round(closes[recovery_idx], 2),
                 "days_to_recover": recovery_idx - i,
+                "pause_days": pause["pause_days"],
+                "pause_valid": pause["pause_valid"],
+                "pause_band_low": pause["band_low"],
+                "pause_band_high": pause["band_high"],
+                "pause_end_date": dates[pause["pause_end_idx"]] if pause["pause_end_idx"] is not None else None,
             })
 
     signals = _merge_compound_shakeouts(raw_signals, dates, closes)
@@ -230,6 +329,13 @@ def main():
     ap.add_argument("--min-days-above", type=int, default=None,
                      help="override for ALL EMAs (default: EMA10=5, EMA21/50=3)")
     ap.add_argument("--max-recovery-days", type=int, default=5)
+    ap.add_argument("--min-pause-days", type=int, default=2,
+                     help="min consecutive tight-pause days after reclaim (default 2)")
+    ap.add_argument("--max-pause-days", type=int, default=15,
+                     help="how many days after reclaim to scan for the pause window")
+    ap.add_argument("--atr-period", type=int, default=14)
+    ap.add_argument("--pause-only", action="store_true",
+                     help="only keep signals where a valid pause/base formed")
     ap.add_argument("--save", help="optional path to save results as JSON")
     ap.add_argument("--r2-key", help="optional R2 filename to push results to")
     args = ap.parse_args()
@@ -247,20 +353,28 @@ def main():
             skipped_illiquid += 1
             continue
         for sig in detect_shakeout(s, min_days_above=args.min_days_above,
-                                    max_recovery_days=args.max_recovery_days):
+                                    max_recovery_days=args.max_recovery_days,
+                                    min_pause_days=args.min_pause_days,
+                                    max_pause_days=args.max_pause_days,
+                                    atr_period=args.atr_period):
             signals.append({"symbol": sym, **sig})
 
     print(f"Skipped (illiquid): {skipped_illiquid}")
+    if args.pause_only:
+        signals = [x for x in signals if x["pause_valid"]]
     signals.sort(key=lambda x: x["breakdown_date"], reverse=True)
-    print(f"Shakeout signals found: {len(signals)}\n")
+    label = "Shakeout+Pause signals found" if args.pause_only else "Shakeout signals found"
+    print(f"{label}: {len(signals)}\n")
     for x in signals:
         emas_str = "+".join(f"EMA{p}" for p in x["ema_periods"])
         tag = " [COMPOUND]" if x["compound"] else ""
-        print(f"  {x['symbol']:<15} {emas_str:<15}{tag} "
+        pause_tag = f" [PAUSE OK: {x['pause_days']}d]" if x["pause_valid"] else f" [pause: {x['pause_days']}d, not enough]"
+        print(f"  {x['symbol']:<15} {emas_str:<15}{tag}{pause_tag} "
               f"breakdown {x['breakdown_date']}  recovered {x['recovery_date']} (+{x['days_to_recover']}d)")
         for d in x["details"]:
             print(f"      EMA{d['ema_period']}: {d['breakdown_date']} @ {d['breakdown_close']} "
-                  f"(EMA {d['ema_value']}) -> recovered {d['recovery_date']} @ {d['recovery_close']}")
+                  f"(EMA {d['ema_value']}) -> recovered {d['recovery_date']} @ {d['recovery_close']}  "
+                  f"band [{d['pause_band_low']}, {d['pause_band_high']}]")
 
     result = {
         "updated": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
