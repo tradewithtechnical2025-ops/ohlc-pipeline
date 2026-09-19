@@ -861,6 +861,85 @@ async def run_full() -> None:
         status.failure(e)
 
 
+async def run_backfill_missing(symbols_arg: str | None = None) -> None:
+    """Targeted repair for the 'many stocks missing OHLC after the last run'
+    situation — refetches ONLY the affected symbols and merges them into the
+    existing R2 chunks, instead of re-running the whole run_full() (slow,
+    and briefly blanks every symbol's data while it rebuilds).
+
+    Symbol source, in priority order:
+      1. symbols_arg — a comma-separated list passed on the command line
+      2. failed_stocks.txt in HERE, if present (written by run_full() on failure)
+      3. any symbol in the ISIN map that's either absent from the current
+         R2 data entirely, or has fewer than MIN_HISTORY_DAYS candles
+         (a common sign of a partial/interrupted fetch)
+
+    Duplicate-candle safety: this reuses merge_candles_into(), the same
+    function run_daily() uses for its own gap-fill. It merges by date —
+    for each symbol it builds a set of dates already on file and only
+    appends candles whose date isn't already in that set — so re-running
+    this command (even repeatedly, even overlapping date ranges) can only
+    ever fill gaps or leave things unchanged, never duplicate a candle."""
+    status = PipelineStatus("run_backfill_missing")
+    try:
+        today = last_trading_day()
+        start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
+        cutoff = start
+        sem = asyncio.Semaphore(CONCURRENCY)
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            ikey_map = {**ISIN_MAP, **BSE_ISIN_MAP}
+
+            all_data = await download_all_chunks(client)
+
+            if symbols_arg:
+                targets = [s.strip() for s in symbols_arg.split(",") if s.strip()]
+            elif (HERE / "failed_stocks.txt").exists():
+                targets = [s.strip() for s in (HERE / "failed_stocks.txt").read_text().splitlines() if s.strip()]
+                log.info(f"Using failed_stocks.txt: {len(targets)} symbols")
+            else:
+                targets = [sym for sym in ikey_map
+                           if sym not in all_data or len(all_data[sym].get("d", [])) < MIN_HISTORY_DAYS]
+                log.info(f"Auto-detected {len(targets)} symbols missing or under {MIN_HISTORY_DAYS} candles")
+
+            targets = [s for s in targets if s in ikey_map]
+            if not targets:
+                log.info("Nothing to backfill — all target symbols already have full history")
+                status.success(); return
+
+            log.info(f"━━━ Backfill  {start} → {today}  ({len(targets)} symbols) ━━━")
+            ok = 0; failed = []
+            for i in range(0, len(targets), 50):
+                chunk = targets[i:i+50]
+                results = await asyncio.gather(*[
+                    fetch_ohlc(client, sem, sym, ikey_map[sym], start, today) for sym in chunk
+                ])
+                for sym, candles in results:
+                    if candles:
+                        added = merge_candles_into(all_data, sym, candles, cutoff)
+                        ok += 1
+                        log.info(f"  {sym}: +{added} candle(s)")
+                    else:
+                        failed.append(sym)
+                pct = min(i+50, len(targets))
+                log.info(f"  {pct}/{len(targets)}  OK:{ok}  Failed:{len(failed)}")
+
+            apply_rolling_window(all_data, cutoff)
+            await upload_all_chunks(client, all_data, today)
+
+            if failed:
+                (HERE / "failed_stocks.txt").write_text("\n".join(failed))
+                log.warning(f"  {len(failed)} still failed — rewritten to failed_stocks.txt for the next run")
+            elif (HERE / "failed_stocks.txt").exists():
+                (HERE / "failed_stocks.txt").unlink()  # everything backfilled — clear the retry list
+
+        status.success()
+        log.info(f"━━━ Backfill complete — {ok} symbols updated, {len(failed)} still failing ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
 async def run_status() -> None:
     async with httpx.AsyncClient() as client:
         results = await asyncio.gather(*[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)], return_exceptions=True)
@@ -1241,6 +1320,102 @@ async def run_finedge_daily() -> None:
             )
         status.success()
         log.info("━━━ Finedge Daily complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# NSE HOLIDAY CALENDAR — sync nse_holidays.json from Finedge
+# ══════════════════════════════════════════════════════════════
+
+def _extract_holiday_dates(payload) -> set[str]:
+    """Pulls a flat set of ISO date strings ('YYYY-MM-DD') out of the Finedge
+    /holidays-calendar response. Confirmed schema: a bare JSON list of
+    {"description": ..., "trading_date": "26-Jan-2026", "week_day": "Monday"}
+    objects — 'trading_date' is 'DD-Mon-YYYY'. Also tolerates a few
+    alternate shapes (dict-wrapped list, ISO-format dates, other common key
+    names) in case Finedge changes the response later. Non-parseable entries
+    are skipped, not fatal — the caller decides if zero results is acceptable."""
+    def _as_date_str(v) -> str | None:
+        if not v: return None
+        s = str(v).strip()
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":  # 'YYYY-MM-DD'
+            try: date.fromisoformat(s); return s
+            except ValueError: return None
+        try:  # 'DD-Mon-YYYY', e.g. '26-Jan-2026' — Finedge's actual format
+            return datetime.strptime(s, "%d-%b-%Y").date().isoformat()
+        except ValueError:
+            return None
+
+    rows = payload
+    if isinstance(payload, dict):
+        for key in ("holidays", "data", "results", "holiday_list", "calendar"):
+            if isinstance(payload.get(key), list):
+                rows = payload[key]; break
+        else:
+            rows = list(payload.values()) if all(isinstance(v, (dict, str)) for v in payload.values()) else []
+
+    out: set[str] = set()
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if isinstance(row, str):
+            d = _as_date_str(row)
+            if d: out.add(d)
+            continue
+        if not isinstance(row, dict):
+            continue
+        segment = str(row.get("segment") or row.get("exchange") or row.get("category") or "").lower()
+        if segment and not any(tag in segment for tag in ("nse", "equity", "cash", "cm")) and \
+           any(tag in segment for tag in ("commodity", "currency", "mcx", "fo_only", "derivative")):
+            continue  # skip clearly non-cash-equity segments when the field disambiguates
+        for key in ("trading_date", "date", "holiday_date", "holidayDate"):
+            d = _as_date_str(row.get(key))
+            if d: out.add(d); break
+    return out
+
+
+async def run_update_holidays() -> None:
+    """Fetches the NSE holiday calendar from Finedge and merges any new dates
+    into nse_holidays.json (union with what's already there — never removes
+    dates). This is the fix for is_trading_day() silently treating an actual
+    exchange holiday as a trading day because the static JSON file had gone
+    stale (e.g. missing 2026-09-16)."""
+    status = PipelineStatus("run_update_holidays")
+    try:
+        log.info("━━━ NSE Holiday Calendar Sync ━━━")
+        sem = asyncio.Semaphore(1)
+        async with httpx.AsyncClient() as client:
+            payload = await _finedge_get(client, sem, "holidays-calendar", {})
+
+        if payload is None:
+            log.error("❌ Finedge holidays-calendar returned nothing — leaving nse_holidays.json untouched")
+            status.failure(RuntimeError("empty holidays-calendar response"))
+            return
+
+        fetched = _extract_holiday_dates(payload)
+        if not fetched:
+            log.error(f"❌ Could not parse any dates out of the Finedge response — "
+                      f"raw payload shape: {type(payload).__name__}, "
+                      f"keys={list(payload.keys()) if isinstance(payload, dict) else 'n/a'}. "
+                      f"Update _extract_holiday_dates() to match the real schema.")
+            status.failure(RuntimeError("unparseable holidays-calendar response"))
+            return
+
+        existing = set(NSE_HOLIDAYS)
+        merged = existing | fetched
+        new_dates = sorted(merged - existing)
+
+        if new_dates:
+            with open(HERE / "nse_holidays.json", "w") as f:
+                json.dump(sorted(merged), f, indent=2)
+            log.info(f"✅ nse_holidays.json updated: {len(new_dates)} new date(s) added: {new_dates}")
+        else:
+            log.info(f"✅ nse_holidays.json already up to date ({len(existing)} dates, "
+                      f"{len(fetched)} confirmed from Finedge)")
+
+        status.success()
+        log.info("━━━ Holiday Calendar Sync complete ━━━")
     except Exception as e:
         status.failure(e)
 
@@ -4670,6 +4845,8 @@ if __name__ == "__main__":
         case "daily":         asyncio.run(run_daily())
         case "today":         asyncio.run(run_today())
         case "full":          asyncio.run(run_full())
+        case "backfill_missing":
+            asyncio.run(run_backfill_missing(sys.argv[2] if len(sys.argv) > 2 else None))
         case "status":        asyncio.run(run_status())
         case "fund_daily":    asyncio.run(run_fund_daily())
         case "fund_full":     asyncio.run(run_fund_full(0))
@@ -4684,6 +4861,7 @@ if __name__ == "__main__":
         case "fund_full_9":   asyncio.run(run_fund_full(9))
         case "fund_full_10":  asyncio.run(run_fund_full(10))
         case "finedge_daily": asyncio.run(run_finedge_daily())
+        case "update_holidays": asyncio.run(run_update_holidays())
         case "ep_scan":       asyncio.run(run_ep_scan())
         case "hlr_scan":      asyncio.run(run_hlr_scan())
         case "pattern_scan":  asyncio.run(run_pattern_scan())
