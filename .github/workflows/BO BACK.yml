@@ -1,0 +1,45 @@
+name: Backtest Pause Breakout
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_clean_days:
+        description: "Min consecutive clean pause days required before breakout entry"
+        required: false
+        default: "3"
+      sl_pct:
+        description: "Stop-loss %% below entry (as a decimal, e.g. 0.04 = 4%%)"
+        required: false
+        default: "0.04"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run backtest
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: |
+          python backtest_pause_breakout.py \
+            --min-clean-days "${{ github.event.inputs.min_clean_days || '3' }}" \
+            --sl-pct "${{ github.event.inputs.sl_pct || '0.04' }}" \
+            --save backtest_results.json
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: backtest_results.json
+          retention-days: 14
