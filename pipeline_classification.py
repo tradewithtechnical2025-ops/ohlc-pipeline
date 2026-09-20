@@ -18,6 +18,14 @@ OUTPUT_FILE          = "classification.json"
 FUNDAMENTAL_FILE     = "fundamental.json"
 IPO_DATA_FILE        = "ipo_data.json"   # same tracker file the master pipeline reads
 
+# bse.json is produced by pipeline_master.py's build_bse_master() with
+# BSE_ONLY_EXCLUSIVE=True — it already contains ONLY stocks that have no
+# nse_code (i.e. genuinely BSE-only, not dual-listed). Folding it in here
+# means classification.json becomes the single combined output, so a
+# separate bse_classification.json (which never pruned stale entries and
+# caused the same company to show twice on the site) is no longer needed.
+BSE_INPUT_FILE       = "bse.json"
+
 CONCURRENCY = 4
 BATCH_SIZE  = 25
 RATE_DELAY  = 0.25
@@ -1114,6 +1122,36 @@ async def main():
         master = await r2_download(client, "master.json")
         print(f"Loaded {len(master)} stocks")
 
+        print("\nDownloading bse.json (BSE-exclusive stocks)...")
+        bse_only = await r2_download(client, BSE_INPUT_FILE)
+        if not isinstance(bse_only, list):
+            print("  ⚠️  bse.json missing/empty — proceeding with NSE-only universe this run")
+            bse_only = []
+        else:
+            print(f"Loaded {len(bse_only)} BSE-exclusive stocks")
+
+        # Combine both universes into one input list. process_stock() already
+        # works generically off whatever fields a stock dict has (symbol,
+        # name, exchange, market_cap_cr, consolidated_ind, optional source/
+        # isin), so BSE-exclusive entries flow through the exact same
+        # profile-fetch + classify() path as NSE ones — no separate code path
+        # needed. Safety de-dupe by symbol (NSE first) in case a stock ever
+        # shows up in both, even though bse.json is built to exclude anything
+        # with an nse_code.
+        combined_input = list(master)
+        seen_symbols   = {s.get("symbol") for s in master}
+        skipped_dupe   = 0
+        for s in bse_only:
+            sym = s.get("symbol")
+            if sym in seen_symbols:
+                skipped_dupe += 1
+                continue
+            combined_input.append(s)
+            seen_symbols.add(sym)
+        if skipped_dupe:
+            print(f"  ⚠️  Skipped {skipped_dupe} BSE-exclusive symbol(s) already present in master.json")
+        print(f"Combined universe: {len(combined_input)} stocks ({len(master)} NSE + {len(combined_input) - len(master)} BSE-exclusive)")
+
         print("\nDownloading ipo_data.json (fallback classification for fresh IPOs)...")
         ipo_industry_map: dict = {}
         try:
@@ -1131,10 +1169,10 @@ async def main():
             print(f"  ⚠️  Could not load ipo_data.json: {e} — IPO fallback classification unavailable this run")
 
         results = []
-        total   = len(master)
+        total   = len(combined_input)
 
         for i in range(0, total, BATCH_SIZE):
-            batch = master[i:i + BATCH_SIZE]
+            batch = combined_input[i:i + BATCH_SIZE]
             tasks = [
                 process_stock(client, stock, semaphore, fundamentals, ipo_industry_map)
                 for stock in batch
@@ -1147,9 +1185,12 @@ async def main():
         classification = [x for x in results if x]
         classification.sort(key=lambda x: x["market_cap_cr"], reverse=True)
 
+        nse_final = sum(1 for x in classification if x.get("exchange") == "NSE")
+        bse_final = sum(1 for x in classification if x.get("exchange") == "BSE")
+
         print("\n=== SUMMARY ===")
-        print(f"✓ Final Stocks : {len(classification)}")
-        print(f"✗ Removed      : {len(master) - len(classification)}")
+        print(f"✓ Final Stocks : {len(classification)}  (NSE: {nse_final}, BSE-exclusive: {bse_final})")
+        print(f"✗ Removed      : {len(combined_input) - len(classification)}")
 
         # Upload both files
         await r2_upload(client, OUTPUT_FILE, classification)
