@@ -173,18 +173,32 @@ async def r2_upload_pending(client, pending):
     await r2_upload(client, PENDING_FILE, payload)
 
 
-async def get_nse_universe(client):
+async def get_nse_universe(client, exchange_filter=None):
+    # NOTE (Sep 2026): classification.json now carries BSE stocks too (merged
+    # NSE+BSE universe). For a BSE-exclusive stock, "symbol" is the numeric
+    # BSE scrip code (e.g. "544467") — Finedge itself uses this numeric code
+    # as the query symbol for BSE stocks, so "symbol" as-is is already the
+    # right thing to both query Finedge with AND use as the storage key
+    # (fundamentals_full/{sym}.json, summary dict) matching the "stock"
+    # field used elsewhere on the platform. No trading_symbol substitution
+    # needed — this was previously restricted to exchange == "NSE" only,
+    # which is the actual bug: BSE-exclusive stocks never entered the
+    # universe at all.
+    #
+    # exchange_filter: None = NSE+BSE both (default). Pass "NSE" or "BSE" to
+    # restrict to just that exchange (used by the "bse" CLI mode below).
+    allowed = {"NSE", "BSE"} if exchange_filter is None else {exchange_filter.strip().upper()}
     classification = await r2_download(client, "classification.json")
     if not classification or not isinstance(classification, list):
         raise RuntimeError("classification.json missing or invalid in R2!")
     symbols = []
     for s in classification:
         sym = str(s.get("symbol", "")).strip().upper()
-        exch = str(s.get("exchange", "")).strip()
-        if sym and exch == "NSE" and not _is_etf(sym):
+        exch = str(s.get("exchange", "")).strip().upper()
+        if sym and exch in allowed and not _is_etf(sym):
             symbols.append(sym)
     symbols = sorted(set(symbols))
-    log.info(f"Universe: {len(symbols)} NSE equity symbols (ETFs excluded)")
+    log.info(f"Universe: {len(symbols)} {'/'.join(sorted(allowed))} equity symbols (ETFs excluded)")
     return symbols
 
 
@@ -201,6 +215,7 @@ async def get_classification_lookup(client):
         out[sym] = {
             "sector_group": s.get("sector_group"),
             "display_industry": s.get("display_industry"),
+            "exchange": str(s.get("exchange", "")).strip().upper(),
         }
     return out
 
@@ -781,6 +796,11 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf=None, classi
 # ══════════════════════════════════════════════════════════════
 
 async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
+    # "sym" is both the Finedge query symbol AND the storage/output key —
+    # for a BSE-exclusive stock this is the numeric BSE code, which is what
+    # Finedge itself expects (confirmed — no trading_symbol substitution).
+    classification = (classification_lookup or {}).get(sym)
+
     profile = await _fetch_profile_raw(client, sem, sym)
     company_type = _classify_company(profile)
 
@@ -809,7 +829,6 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
         "annual_price_ratios": price_ratios,
         "segment_revenue": segment_revenue,
     }
-    classification = (classification_lookup or {}).get(sym)
     summary_entry = _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf, classification)
     return sym, obj, summary_entry
 
@@ -818,17 +837,18 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
 # MODE: full / full_1..10
 # ══════════════════════════════════════════════════════════════
 
-async def run_full(part=0):
+async def run_full(part=0, exchange_filter=None):
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient() as client:
-        symbols = await get_nse_universe(client)
+        symbols = await get_nse_universe(client, exchange_filter=exchange_filter)
         classification_lookup = await get_classification_lookup(client)
+        label_prefix = exchange_filter.strip().upper() + " " if exchange_filter else ""
         if part == 0:
-            chunk, label = symbols, "Full"
+            chunk, label = symbols, f"{label_prefix}Full"
         else:
             part_size = (len(symbols) + TOTAL_PARTS - 1) // TOTAL_PARTS
             start, end = (part - 1) * part_size, part * part_size
-            chunk, label = symbols[start:end], f"Part {part}/{TOTAL_PARTS}"
+            chunk, label = symbols[start:end], f"{label_prefix}Part {part}/{TOTAL_PARTS}"
         log.info(f"━━━ Fundamentals Full {label}  ({len(chunk)} stocks) ━━━")
 
         summary = await r2_download_summary(client)
@@ -1046,6 +1066,8 @@ if __name__ == "__main__":
         asyncio.run(run_full(0))
     elif mode.startswith("full_") and mode.split("_")[1].isdigit():
         asyncio.run(run_full(int(mode.split("_")[1])))
+    elif mode == "bse":
+        asyncio.run(run_full(0, exchange_filter="BSE"))
     elif mode == "daily":
         asyncio.run(run_daily())
     elif mode == "backfill_summary":
