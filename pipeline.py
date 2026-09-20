@@ -2273,7 +2273,18 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         ath_info=(ath_map or {}).get(sym,{})
         ath_val=ath_info.get("ath")
         ath_off_pct=round((ltp-ath_val)/ath_val*100,2) if ath_val else None
-        row={"symbol":sym,"name":cls_info.get("name",""),"tv_code":sh_info.get("tv_code",f"NSE:{sym},"),
+        # tv_code fallback: sheet_data.json (sh_info) is NSE-only legacy data,
+        # so it has no entry for BSE stocks — falling back to a hardcoded
+        # "NSE:{sym}," put an "NSE:" prefix on BSE numeric scrip codes
+        # (e.g. "NSE:500012,"), which isn't a real TradingView symbol and
+        # breaks the chart for every BSE stock. Build the fallback from
+        # classification.json's own exchange + trading_symbol instead — the
+        # real readable BSE trading symbol, correctly exchange-prefixed.
+        _cls_exch=cls_info.get("exchange") or "NSE"
+        _cls_tv_sym=cls_info.get("trading_symbol") or sym
+        row={"symbol":sym,"name":cls_info.get("name",""),
+            "tv_code":sh_info.get("tv_code") or f"{_cls_exch}:{_cls_tv_sym},",
+            "trading_symbol":cls_info.get("trading_symbol"),
             "sector":cls_info.get("sector_group",""),"industry":cls_info.get("display_industry",""),
             "mcap":cls_info.get("market_cap_cr"),"themes":cls_info.get("themes",[]),
             "ltp":ltp,"pct_ch":pct_ch,"volume":vol,"rvol":rvol,"rvol50":rvol50,
