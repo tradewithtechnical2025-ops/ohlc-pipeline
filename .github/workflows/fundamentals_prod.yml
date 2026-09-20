@@ -10,6 +10,7 @@ on:
         options:
           - sync
           - backfill_summary
+          - bse
           - full
           - full_1
           - full_2
