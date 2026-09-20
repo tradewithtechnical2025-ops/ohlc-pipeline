@@ -1,0 +1,47 @@
+name: OHLC Pipeline Scans (Manual)
+
+# Manual trigger only — runs any of pipeline.py's scan/report modes on
+# demand (VCP, Minervini Trend Template, Weinstein, EP, HLR, status, etc.)
+# without needing a separate .yml per mode.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'pipeline.py mode to run'
+        required: true
+        default: 'status'
+        type: choice
+        options:
+          - status
+          - vcp_scan
+          - minervini_scan
+          - stage2_scan
+          - weinstein_scan
+          - weinstein_scan_dryrun
+          - ep_scan
+          - hlr_scan
+          - pattern_scan
+          - pattern_scan_force
+
+jobs:
+  pipeline-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run pipeline.py (${{ inputs.mode }})
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+        run: python pipeline.py ${{ inputs.mode }}
