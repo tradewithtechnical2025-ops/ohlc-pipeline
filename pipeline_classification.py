@@ -1037,6 +1037,13 @@ async def process_stock(client, stock, semaphore, fundamentals: dict, ipo_indust
                 "symbol":           symbol,
                 "name":             stock.get("name"),
                 "exchange":         stock.get("exchange"),
+                # BSE-exclusive stocks (from bse.json) carry a "trading_symbol"
+                # from Upstox when Finedge's own "symbol" was blank and fell
+                # back to the numeric bse_code — without this, the frontend
+                # has nothing but that numeric code to display. None for NSE
+                # stocks (master.json doesn't carry this field), which is
+                # fine since the frontend should fall back to "symbol" then.
+                "trading_symbol":   stock.get("trading_symbol"),
                 "market_cap_cr":    market_cap,
                 "macro_sector":     (profile or {}).get("macro_sector"),
                 "sector_group":     sector_group,
@@ -1095,6 +1102,10 @@ async def process_stock(client, stock, semaphore, fundamentals: dict, ipo_indust
         "symbol":           symbol,
         "name":             stock.get("name"),
         "exchange":         stock.get("exchange"),
+        # See comment on the IPO-fallback return above — carries the real
+        # BSE trading symbol through for display when "symbol" itself is a
+        # numeric bse_code fallback. None for NSE stocks.
+        "trading_symbol":   stock.get("trading_symbol"),
         "market_cap_cr":    market_cap,
         "macro_sector":     profile.get("macro_sector"),
         "sector_group":     sector_group,
