@@ -197,7 +197,19 @@ async def build_isin_map(client):
             else: nse_miss.append(sym)
         elif exchange == "BSE":
             bse_meta_raw[sym] = {"name": name}
-            ikey = bse_bod.get(sym)
+            # BSE-exclusive stocks from classification.json almost always
+            # have a numeric "symbol" (Finedge's stock-symbols master leaves
+            # BSE-only companies' symbol blank, so it falls back to the
+            # numeric bse_code — see pipeline_classification.py). bse_bod
+            # is keyed by real alphabetic trading symbols from the BOD file,
+            # so a numeric symbol never matches there. Try "symbol" first
+            # (covers any BSE stock that DOES have a real Finedge symbol),
+            # then fall back to "trading_symbol" (the Upstox-sourced real
+            # trading symbol classification.json also carries) so these
+            # stocks actually resolve to an instrument_key instead of all
+            # landing in bse_miss and silently never getting OHLC.
+            trading_sym = str(stock.get("trading_symbol") or "").strip().upper()
+            ikey = bse_bod.get(sym) or (bse_bod.get(trading_sym) if trading_sym else None)
             if ikey: bse_map[sym] = ikey
             else: bse_miss.append(sym)
 
