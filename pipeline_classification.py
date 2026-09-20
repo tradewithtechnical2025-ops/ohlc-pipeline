@@ -96,6 +96,8 @@ SECTOR_GROUP_MAP = {
     "Tyres & Rubber Products":                  "Automobiles",
     "Tractors":                                 "Automobiles",
     "Auto -Dealer":                              "Automobiles",
+    "Auto Dealer":                               "Automobiles",
+    "Auto Dealers":                              "Automobiles",
     "Trading - Auto Components":                "Automobiles",
     "Construction Vehicles":                    "Automobiles",
     "Dealers-Commercial Vehicles, Tractors, Construction Vehicles": "Automobiles",
@@ -319,6 +321,11 @@ INDUSTRY_MAP = {
     "Commercial Vehicles": "Commercial Vehicles",
     "Tractors": "Commercial Vehicles",
     "Auto -Dealer": "Auto Dealers",
+    # NOTE: Finedge sometimes returns "Auto Dealer" (no hyphen, singular) as
+    # the raw sub_industry instead of "Auto -Dealer" (seen on BIKEWO). Both
+    # variants are mapped here so they land in the same display_industry
+    # bucket instead of BIKEWO falling through to its own raw-string group.
+    "Auto Dealer": "Auto Dealers",
     "Trading - Auto Components": "Auto Components",
     "Dealers-Commercial Vehicles, Tractors, Construction Vehicles": "Commercial Vehicles",
     "Private Sector Bank": "Private Banks",
@@ -326,12 +333,17 @@ INDUSTRY_MAP = {
     "Other Bank": "Other Banks",
     "Stockbroking & Allied": "Stockbroking",
     "Asset Management Company": "Asset Management",
-    "Exchange and Data Platform": "Exchanges",
+    # Capital-markets infrastructure sub_industries (exchanges, depositories,
+    # ratings agencies, other cap-market services) are consolidated into one
+    # "Capital Mkt Infra" bucket — each was previously its own 1-3 stock
+    # display_industry group (Exchanges, Depositories, Ratings, Other Cap
+    # Markets), which is too thin a sample to rank meaningfully on its own.
+    "Exchange and Data Platform": "Capital Mkt Infra",
     "Financial Products Distributor": "Wealth Mgmt",
-    "Depositories, Clearing Houses and Other Intermediaries": "Depositories",
-    "Depositories Clearing Houses and Other Intermediaries": "Depositories",
-    "Other Capital Market related Services": "Other Cap Markets",
-    "Ratings": "Ratings",
+    "Depositories, Clearing Houses and Other Intermediaries": "Capital Mkt Infra",
+    "Depositories Clearing Houses and Other Intermediaries": "Capital Mkt Infra",
+    "Other Capital Market related Services": "Capital Mkt Infra",
+    "Ratings": "Capital Mkt Infra",
     "Financial Technology (Fintech)": "Fintech",
     "Non Banking Financial Company (NBFC)": "NBFC",
     "Other Financial Services": "Other Financials",
@@ -345,7 +357,10 @@ INDUSTRY_MAP = {
     "Insurance Distributors": "Insurance Broking",
     "Diversified Commercial Services": "Commercial Services",
     "Trading & Distributors": "Trading & Distribution",
-    "Consulting Services": "Consulting",
+    # Consulting folded into the "Other Services" bucket (alongside Other
+    # Consumer Services / Data Processing Services below) rather than
+    # standing alone as a single-stock group.
+    "Consulting Services": "Other Services",
     "Business Process Outsourcing (BPO)/ Knowledge Process Outsourcing (KPO)": "BPO/KPO",
     "Other Consumer Services": "Other Services",
     "Data Processing Services": "Other Services",
@@ -400,7 +415,9 @@ INDUSTRY_MAP = {
     "Film Production, Distribution & Exhibition": "Film & OTT",
     "Film Production Distribution & Exhibition": "Film & OTT",
     "TV Broadcasting & Software Production": "Broadcasting",
-    "Advertising & Media Agencies": "Advertising",
+    # Advertising folded into Print Media (both small, Entertainment-adjacent
+    # media businesses) instead of standing alone as a single-stock group.
+    "Advertising & Media Agencies": "Print Media",
     "Print Media": "Print Media",
     "Printing & Publication": "Print Media",
     "Web based media and service": "Digital Media",
@@ -472,8 +489,11 @@ INDUSTRY_MAP = {
     "Pharmaceuticals": "Pharmaceuticals",
     "Power Generation": "Power Generation",
     "Integrated Power Utilities": "Integrated Power",
-    "Power Distribution": "Power Distribution",
-    "Power - Transmission": "Power Transmission",
+    # Power Distribution and Power Transmission merged into one "Power T&D"
+    # bucket — each was a single-stock display_industry group on its own
+    # (ADANIENSOL / POWERGRID respectively).
+    "Power Distribution": "Power T&D",
+    "Power - Transmission": "Power T&D",
     "Power Trading": "Power Generation",
     "Multi Utilities": "Utilities",
     "Other Utilities": "Utilities",
