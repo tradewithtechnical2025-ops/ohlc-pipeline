@@ -2285,6 +2285,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         row={"symbol":sym,"name":cls_info.get("name",""),
             "tv_code":sh_info.get("tv_code") or f"{_cls_exch}:{_cls_tv_sym},",
             "trading_symbol":cls_info.get("trading_symbol"),
+            # Explicit field for the frontend's All/NSE/BSE filter — safer
+            # than parsing the "NSE:"/"BSE:" prefix back out of tv_code.
+            "exchange":_cls_exch,
             "sector":cls_info.get("sector_group",""),"industry":cls_info.get("display_industry",""),
             "mcap":cls_info.get("market_cap_cr"),"themes":cls_info.get("themes",[]),
             "ltp":ltp,"pct_ch":pct_ch,"volume":vol,"rvol":rvol,"rvol50":rvol50,
