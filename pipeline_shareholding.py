@@ -281,7 +281,7 @@ async def main():
         symbols = [
             x["symbol"]
             for x in master
-            if x.get("exchange") == "NSE"
+            if x.get("exchange") in ("NSE", "BSE")
         ]
 
         BAD_KEYWORDS = [
