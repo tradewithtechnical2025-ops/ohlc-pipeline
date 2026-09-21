@@ -213,11 +213,30 @@ async def main():
             "master.json"
         )
 
+        # NOTE (Sep 2026): master.json is NSE-only — pipeline_master.py builds
+        # it purely from Finedge's NSE-keyed quotes and never puts a BSE
+        # entry in it. BSE-exclusive stocks live in a SEPARATE file,
+        # bse.json (built by build_bse_master() there). "symbol" in bse.json
+        # is Finedge's own symbol (numeric BSE code for BSE-exclusive
+        # stocks) — same convention used everywhere else in this pipeline.
+        try:
+            bse = await r2_download(client, "bse.json")
+        except Exception:
+            bse = []
+        if not isinstance(bse, list):
+            bse = []
+
         symbols = [
             x["symbol"]
             for x in master
-            if x.get("exchange") == "NSE"
+            if x.get("exchange") in ("NSE", "BSE")
+        ] + [
+            x["symbol"]
+            for x in bse
+            if x.get("symbol")
         ]
+        symbols = sorted(set(symbols))
+        print(f"master.json: {len(master)} | bse.json: {len(bse)} | combined unique: {len(symbols)}")
 
         # Remove ETF / Index Symbols
         BAD_KEYWORDS = [
@@ -278,6 +297,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
