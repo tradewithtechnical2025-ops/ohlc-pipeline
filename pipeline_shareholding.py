@@ -276,13 +276,35 @@ async def main():
     async with httpx.AsyncClient() as client:
 
         # ── Download master list ──────────────
+        # NOTE (Sep 2026): master.json is NSE-only — pipeline_master.py builds
+        # it purely from Finedge's NSE-keyed quotes and never puts a BSE
+        # entry in it. BSE-exclusive stocks live in a SEPARATE file,
+        # bse.json (built by build_bse_master() there). Widening the
+        # exchange filter on master.json alone does nothing since it has no
+        # "BSE" rows to begin with — bse.json has to be fetched and merged
+        # in too. "symbol" in bse.json is Finedge's own symbol (numeric BSE
+        # code for BSE-exclusive stocks), same convention used everywhere
+        # else in this pipeline.
         master = await r2_download(client, "master.json")
+
+        try:
+            bse = await r2_download(client, "bse.json")
+        except Exception:
+            bse = []
+        if not isinstance(bse, list):
+            bse = []
 
         symbols = [
             x["symbol"]
             for x in master
             if x.get("exchange") in ("NSE", "BSE")
+        ] + [
+            x["symbol"]
+            for x in bse
+            if x.get("symbol")
         ]
+        symbols = sorted(set(symbols))
+        print(f"  📋 master.json : {len(master)} | bse.json : {len(bse)} | combined unique : {len(symbols)}")
 
         BAD_KEYWORDS = [
             "ETF", "LIQUID", "NIFTY", "GOLD",
