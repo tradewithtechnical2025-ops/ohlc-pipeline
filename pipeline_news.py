@@ -839,6 +839,30 @@ def _bse_fallback_date(published: str):
         return None
 
 
+def _dedup_bse_by_link(items: list[dict]) -> list[dict]:
+    """BSE cross-posts the exact SAME filing (identical PDF link) once per
+    scrip code a company has listed on the exchange — a company with many
+    debt instruments gets the announcement repeated once per NCD, not just
+    once for its equity (confirmed directly: Infrastructure Leasing &
+    Financial Services' single revised-FY19 filing appeared under 21
+    different scrip codes in one feed poll). dedup_items()'s (link, title,
+    summary) key can't catch this since BSE's <title> embeds the scrip
+    code (e.g. "...Ltd (958047)" vs "...Ltd (957962)"), so every copy
+    looks like a distinct item and — left unfiltered — becomes 21 separate
+    AI-parsed "results" and 21 Telegram messages for one document. Expects
+    items already sorted newest-first (same convention as dedup_items);
+    collapses to the first (most recent) occurrence per link."""
+    seen_links = set()
+    out = []
+    for it in items:
+        link = it.get("link", "")
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+        out.append(it)
+    return out
+
+
 def _pdf_quarter_label(period_end_iso: str):
     try:
         d = datetime.strptime(period_end_iso, "%Y-%m-%d")
@@ -2102,8 +2126,32 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         if not sym or not bucket:
             continue  # can't group without both — left alone, processed normally
         pdf_groups.setdefault((sym, bucket), []).append(it)
-    pdf_groups = {k: sorted(v, key=lambda x: x.get("published_ts", 0))
-                  for k, v in pdf_groups.items() if len(v) >= 2}
+
+    # Only a genuine cross-exchange duplicate — same symbol, same day, and
+    # at most ONE item per exchange — gets the "try one, skip the rest"
+    # treatment below. A bucket with 2+ items from the SAME exchange
+    # (confirmed directly: SYMBIOTEC's Q1 FY27 filed Standalone AND
+    # Consolidated as two separate NSE PDFs the same day, landing in the
+    # same (symbol, date) bucket alongside its one BSE copy) is a sign of
+    # genuinely distinct filings, not one result on two feeds — collapsing
+    # that bucket would silently keep whichever nature happened to parse
+    # first and permanently discard the other (in this exact run, that
+    # meant losing the Consolidated result — worse than doing nothing).
+    # Those buckets are left to normal independent parsing instead, same
+    # as before this feature existed, so the existing "Consolidated
+    # preferred over Standalone" cleanup (elsewhere in this function)
+    # still gets a Consolidated record to prefer.
+    clean_groups = {}
+    for key, items in pdf_groups.items():
+        if len(items) < 2:
+            continue
+        exchanges = [it.get("_exchange", "NSE") for it in items]
+        if len(exchanges) == len(set(exchanges)):
+            clean_groups[key] = sorted(items, key=lambda x: x.get("published_ts", 0))
+        # else: mixed same-exchange filings in this bucket — leave every
+        # item in it out of clean_groups so they fall through to
+        # singleton_pdf below and get parsed independently, as before.
+    pdf_groups = clean_groups
     grouped_links = {it["link"] for group in pdf_groups.values() for it in group}
     singleton_pdf = [it for it in new_pdf if it["link"] not in grouped_links]
 
@@ -2609,10 +2657,15 @@ async def run():
         # filename anyway (_in_result_calendar fails open on an empty
         # symbol, so BSE items would just pass through untouched — the
         # check would cost a filter pass for nothing).
-        bse_candidates_now = [it for it in result_map.get("bse_announcements", []) if _is_bse_results_pdf(it)]
+        bse_candidates_now = [
+            it for it in _dedup_bse_by_link(
+                sorted(result_map.get("bse_announcements", []), key=lambda x: x.get("published_ts", 0), reverse=True)
+            )
+            if _is_bse_results_pdf(it)
+        ]
         existing_bse_feed = await r2_get(client, "bse_results_pdf_feed.json")
         existing_bse_items = (existing_bse_feed or {}).get("items", [])
-        merged_bse_feed = dedup_items(bse_candidates_now + existing_bse_items)
+        merged_bse_feed = _dedup_bse_by_link(dedup_items(bse_candidates_now + existing_bse_items))
         merged_bse_feed.sort(key=_effective_ts, reverse=True)
         merged_bse_feed = merged_bse_feed[:500]
         print(f"  bse_results_pdf_feed.json: {len(existing_bse_items)} existing + "
