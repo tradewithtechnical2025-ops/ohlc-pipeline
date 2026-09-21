@@ -34,20 +34,23 @@ AI_PDF_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 
-# XBRL processing — enabled, but ONLY as a fallback for results that have
-# NO PDF-sourced record at all (see the refiled/parsed_new split below).
-# Re-enabling this outright once caused two real problems: (1) XBRL
-# OVERWRITES a PDF/AI-parsed record for the same symbol+quarter with a
-# plain XBRL-only one — XBRL never carries key_highlights/management_
-# commentary/segment_breakup (AI-only concepts), so the richer card
-# silently lost that content whenever XBRL "caught up" to a result
-# already covered by the PDF fast-path; (2) a backlog of previously-
-# unparsed XBRL announcements got treated as "new" the moment this flag
-# flipped on, flooding Telegram with already-covered results at once.
-# The fallback-only logic below (never overwrite an existing PDF record;
-# only fill in results the PDF path never covered at all) plus a recency
-# guard on Telegram sends fixes both without losing XBRL-only coverage.
-DISABLE_XBRL_FOR_TESTING = False
+# XBRL processing — permanently OFF. This pipeline now runs PDF/AI-extraction
+# only (see parse_financial_results_pdf / _ai_extract_financials). XBRL used
+# to serve two purposes — (1) confirming/correcting PDF-sourced numbers in
+# place, and (2) a fallback for results with no PDF record at all — but both
+# are now redundant: the site's main data API re-pulls and corrects every
+# stock's fundamentals the next day regardless, so XBRL's same-day accuracy
+# bump isn't worth the extra fetch/parse work or the added latency (XBRL
+# filings routinely land well after the board-outcome PDF). This also means
+# BSE, which has no XBRL feed at all in this pipeline, is handled by the
+# exact same PDF path as NSE — one extraction path instead of two.
+# (Earlier note, kept for context: naively re-enabling full XBRL once
+# caused it to silently overwrite PDF/AI records — losing key_highlights/
+# management_commentary/segment_breakup, which XBRL never carries — and to
+# re-flood Telegram with a backlog of "new" XBRL items. If XBRL is ever
+# revisited, reintroduce it as fallback-only + confirm-in-place, not a
+# blanket overwrite.)
+PDF_ONLY_MODE = True
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 UP_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
@@ -74,6 +77,15 @@ FEEDS = [
     ("et_markets",   "Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
     ("mint_markets", "LiveMint Markets",        "https://www.livemint.com/rss/markets"),
     ("bs_finance",   "Business Standard Finance", "https://www.business-standard.com/rss/finance-103.rss"),
+    # BSE Official — general corporate-announcements feed, NOT the dedicated
+    # "Latest FINANCIAL RESULTS" feed (Comp_Resultsnew.aspx). Deliberate
+    # choice: the dedicated feed is BSE's XBRL-backed feed and lands
+    # noticeably later (confirmed directly: AUGMONT's results PDF hit this
+    # general feed at 19:52 IST vs 20:21 IST on the XBRL feed) — same
+    # speed-over-confirmation tradeoff already made for NSE (PDF_ONLY_MODE),
+    # so only this faster, noisier feed is polled; the XBRL feed is skipped
+    # entirely rather than used as a fallback/confirmation source.
+    ("bse_announcements", "BSE Corporate Announcements", "https://beta.bseindia.com/data/xml/announcements.xml"),
 ]
 
 # source_key(s) -> R2 output file
@@ -84,6 +96,7 @@ OUTPUT_MAP = {
     "nse_board_meetings.json": ["nse_board"],
     "nse_corp_actions.json":   ["nse_corp_actions"],
     "market_news.json":        ["et_markets", "mint_markets", "bs_finance"],
+    "bse_announcements.json":  ["bse_announcements"],
 }
 
 
@@ -217,6 +230,12 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                         # blank; the frontend treats them as optional.
                         "image":        (entry.get("media_content") or [{}])[0].get("url", ""),
                         "author":       entry.get("bs_source", "") or entry.get("author", ""),
+                        # BSE's announcements feed tags each item with its
+                        # numeric scrip code via a non-standard <scripcode>
+                        # element; feedparser exposes unrecognized flat tags
+                        # as plain entry attributes. Empty for every other
+                        # feed (NSE, news) since they don't have this tag.
+                        "scripcode":    (entry.get("scripcode") or "").strip(),
                     })
 
                 # NSE occasionally serves a transient empty-but-200 response
@@ -271,6 +290,24 @@ async def r2_get(client: httpx.AsyncClient, filename: str):
     except Exception as e:
         print(f"  ⚠ r2_get({filename}) failed: {e}")
         return None
+
+
+async def _load_bse_symbol_map(client: httpx.AsyncClient) -> dict:
+    """bse_code -> canonical `symbol` (classification.json's own field —
+    an NSE ticker like 'AUGMONT' for dual-listed stocks, or the numeric
+    bse_code itself for BSE-only stocks, matching that file's existing
+    convention). First entry wins on the rare duplicate bse_code (4 seen
+    in a 2,391-row sample) rather than erroring the whole map build."""
+    payload = await r2_get(client, "classification.json")
+    rows = payload if isinstance(payload, list) else (payload or {}).get("items") or []
+    m = {}
+    for row in rows:
+        code = (row.get("bse_code") or "").strip()
+        sym = row.get("symbol")
+        if code and sym and code not in m:
+            m[code] = sym
+    print(f"  ✓ classification.json: {len(m)} bse_code -> symbol mapping(s) loaded")
+    return m
 
 
 async def r2_put(client: httpx.AsyncClient, filename: str, data: dict):
@@ -703,6 +740,30 @@ def _extract_filename_symbol(link: str) -> str:
     return ""
 
 
+def _pdf_probable_symbol(it: dict, bse_symbol_map: dict | None) -> str:
+    """Best-effort symbol for a PDF candidate WITHOUT downloading/AI-parsing
+    it — NSE's filename embeds it directly; BSE's <scripcode> resolves via
+    classification.json. Used only to spot "the same result filed on both
+    exchanges" before spending an AI call on both copies (see the
+    cross-exchange dedup block in build_results_detailed) — a miss here
+    just means no dedup for that item, not a correctness problem, so this
+    stays best-effort rather than failing loudly."""
+    if it.get("_exchange") == "BSE":
+        code = it.get("scripcode", "")
+        return ((bse_symbol_map or {}).get(code, code) or "").upper()
+    return _extract_filename_symbol(it.get("link", ""))
+
+
+def _pdf_date_bucket(it: dict):
+    """Coarse same-IST-day bucket from published_ts, for grouping same-day
+    cross-exchange filings of the same result. None if published_ts is
+    unavailable (item is simply left out of that grouping, not dropped)."""
+    ts = it.get("published_ts", 0)
+    if not ts:
+        return None
+    return datetime.fromtimestamp(ts, tz=_IST).date().isoformat()
+
+
 def _in_result_calendar(symbol: str, calendar: dict, item_link: str) -> bool:
     """True if `symbol` appears in result_calendar.json for the filing's
     own embedded date, or the day before/after (NSE's predicted calendar
@@ -739,6 +800,43 @@ def _is_board_outcome_pdf(it: dict) -> bool:
     if _PDF_NON_RESULT_RE.search(free_text):
         return False
     return True
+
+
+# BSE's announcements feed has no |SUBJECT: tag (that's an NSE-only
+# convention) — its <description> is a single free-text sentence, so
+# detection has to work off that text directly. Matched against real
+# examples: "Unaudited standalone and consolidated financial results of
+# the Company for the quarter ended 30th June 2026." (results PDF) vs.
+# "Outcome of the Board Meeting held on today... is enclosed herewith."
+# (board-outcome PDF with no numbers) and "Announcement under Regulation
+# 30 (LODR) - Press Release" / "- Investor Presentation" (no numbers) —
+# only the first pattern should pass.
+_BSE_RESULT_DESC_RE = re.compile(
+    r"(unaudited|audited)\s+(standalone|consolidated|standalone\s+and\s+consolidated).{0,100}?"
+    r"financial\s+results.{0,100}?(quarter|year|half[\s-]?year)\s+ended",
+    re.IGNORECASE,
+)
+
+
+def _is_bse_results_pdf(it: dict) -> bool:
+    link = it.get("link", "")
+    if not link.lower().endswith(".pdf"):
+        return False
+    if not it.get("scripcode"):
+        return False  # can't be identified without a scrip code
+    return bool(_BSE_RESULT_DESC_RE.search(it.get("summary", "") or ""))
+
+
+def _bse_fallback_date(published: str):
+    """BSE's own pubDate ('21-Sep-2026 19:52:08', IST, no filename
+    timestamp to fall back on) converted to the 'YYYY-MM-DD' board_meeting_date
+    shape _build_result_from_ai expects. Returns None on any parse failure
+    (caller treats that as 'can't build a dedup key', same as NSE's missing-
+    filename-timestamp case)."""
+    try:
+        return datetime.strptime((published or "").strip(), "%d-%b-%Y %H:%M:%S").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def _pdf_quarter_label(period_end_iso: str):
@@ -900,7 +998,9 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         return None
 
 
-def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = ""):
+def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = "",
+                           scrip_code: str = None, fallback_board_meeting_date: str = None,
+                           symbol_override: str = None, exchange: str = "NSE"):
     """Converts the AI extraction's JSON into the {meta, quarter,
     qoq_fundamentals, yoy_fundamentals} shape used throughout the pipeline —
     plus segment_breakup / management_commentary / key_highlights /
@@ -910,7 +1010,15 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     keys — no other function needs to change).
     Applies unit scaling and a total_income reconciliation sanity check.
     Returns None if the AI result fails basic validation (missing
-    revenue+PAT, bad date, unmatched filename)."""
+    revenue+PAT, bad date, unmatched filename).
+
+    scrip_code / fallback_board_meeting_date / symbol_override / exchange
+    exist for BSE: unlike NSE, a BSE filing's own filename is a random GUID
+    with no embedded symbol or timestamp, and its PDF text won't contain
+    "NSE Symbol: ...". Passing these lets the caller supply, from the RSS
+    item itself, what NSE filings otherwise let this function derive from
+    the filename alone. All four are no-ops for NSE (left as None/"NSE"),
+    so NSE's existing filename-derived behavior is unchanged."""
     cur = ai.get("current") or {}
     nature = ai.get("basis") or "Standalone"
     unit_word = (ai.get("unit") or "Crore").lower()
@@ -969,13 +1077,26 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
 
     fname = link.rsplit("/", 1)[-1]
     m_fn = _PDF_FILENAME_TS_RE.match(fname)
-    if not m_fn:
-        print(f"    · [{fname_dbg}] AI result parsed but filename doesn't match expected timestamp pattern")
+    if m_fn:
+        board_meeting_date = f"{m_fn.group(4)}-{m_fn.group(3)}-{m_fn.group(2)}"
+        fname_symbol = m_fn.group(1)
+    elif fallback_board_meeting_date:
+        board_meeting_date = fallback_board_meeting_date
+        fname_symbol = None
+    else:
+        print(f"    · [{fname_dbg}] no filename timestamp and no fallback date supplied — can't build dedup key")
         return None
-    board_meeting_date = f"{m_fn.group(4)}-{m_fn.group(3)}-{m_fn.group(2)}"
 
     m_sym = re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&]+)", text, re.IGNORECASE)
-    symbol = m_sym.group(1).upper() if m_sym else m_fn.group(1)
+    if symbol_override:
+        symbol = symbol_override
+    elif m_sym:
+        symbol = m_sym.group(1).upper()
+    elif fname_symbol:
+        symbol = fname_symbol
+    else:
+        print(f"    · [{fname_dbg}] no symbol in filing text, filename, or override — skipping")
+        return None
 
     m_aud = re.search(r"\((Unaudited|Audited)\)", text, re.IGNORECASE)
     audited = m_aud.group(1).capitalize() if m_aud else None
@@ -1001,7 +1122,8 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
             "standalone_consolidated": nature,
             "audited": audited,
             "quarter_label": _pdf_quarter_label(period_end),
-            "scrip_code": None,
+            "scrip_code": scrip_code,
+            "exchange": exchange,
             "source": "pdf",
             "extraction_method": "ai",
         },
@@ -1081,7 +1203,9 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
     return out if got_any else None
 
 
-async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = ""):
+async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = "",
+                                       scrip_code: str = None, fallback_board_meeting_date: str = None,
+                                       symbol_override: str = None, exchange: str = "NSE"):
     """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
     {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
     flow through the same grouping/dedup/Telegram code.
@@ -1148,7 +1272,9 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
         return None
 
-    result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title)
+    result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title,
+                                    scrip_code=scrip_code, fallback_board_meeting_date=fallback_board_meeting_date,
+                                    symbol_override=symbol_override, exchange=exchange)
     if not result:
         print(f"    · [{fname_dbg}] AI result failed validation (missing revenue/PAT, bad date, or filename mismatch) — skipping")
     return result
@@ -1763,23 +1889,38 @@ async def _update_results_by_symbol(client: httpx.AsyncClient, parsed_all: list,
               f"keeping up to {quarters_to_keep} quarters each")
 
 
-async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict], fundamentals: dict | None) -> dict | None:
+async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict],
+                                  fundamentals: dict | None, bse_pdf_items: list[dict] | None = None,
+                                  bse_symbol_map: dict | None = None) -> dict | None:
     """
-    Builds/updates nse_results_detailed.json from two sources:
-      - XBRL filings (results_items, nse_results_feed.json) — authoritative,
-        full-detail, but often published well after the board meeting.
-      - "Outcome of Board Meeting" PDFs (board_items, nse_board_meetings.json)
-        — a fast-path: usually available immediately, core numbers only,
-        AI-extracted (see parse_financial_results_pdf).
-    Both feed the same symbol+quarter+nature dedup key, so if a PDF result
-    was already notified, the later XBRL for the same result just updates
-    the record silently (see the "refiled" handling below) instead of
-    sending a second Telegram message.
+    Builds/updates nse_results_detailed.json from a single source:
+      - "Outcome of Board Meeting" / financial-results PDFs (board_items,
+        nse_board_meetings.json) — usually available immediately, AI-extracted
+        (see parse_financial_results_pdf). XBRL is permanently off (see
+        PDF_ONLY_MODE at top of file); results_items is accepted for
+        signature compatibility but yields no items while that flag is on.
+    Same symbol+quarter+nature dedup key as before, so a re-filed PDF for
+    the same result updates the existing record in place (see the "refiled"
+    handling below) instead of creating a duplicate.
     Only processes links not already present (idempotent across runs —
     avoids re-fetching ~150+ files every poll).
     """
     xbrl_items = [it for it in results_items if XBRL_LINK_RE.search(it.get("link", ""))]
     pdf_items = [it for it in board_items if _is_board_outcome_pdf(it)]
+
+    # BSE candidates (already pre-filtered by _is_bse_results_pdf before
+    # this function is called) are tagged _exchange="BSE" so process_pdf
+    # below knows to pass scrip_code/date/symbol overrides instead of
+    # relying on NSE's filename convention. bse_symbol_map resolves each
+    # scrip_code to the platform's canonical symbol (see
+    # _load_bse_symbol_map); a code with no mapping entry falls back to
+    # using the scrip_code itself as the symbol — same convention
+    # classification.json already uses for BSE-only stocks — rather than
+    # silently dropping the result.
+    for it in (bse_pdf_items or []):
+        it["_exchange"] = "BSE"
+    pdf_items = pdf_items + list(bse_pdf_items or [])
+
     if not xbrl_items and not pdf_items:
         print("  ⚠ No XBRL or board-outcome-PDF results items — skipping detail parse")
         return None
@@ -1839,10 +1980,10 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # in place instead of appending a lookalike duplicate
     existing_by_key = {_result_key(it): idx for idx, it in enumerate(existing_items) if _result_key(it)[0]}
 
-    # ⚠️ TEMPORARY: XBRL processing disabled to isolate-test the PDF fast-path.
-    # (module-level DISABLE_XBRL_FOR_TESTING — see top of file)
-    if DISABLE_XBRL_FOR_TESTING:
-        print("  ⚠ XBRL processing disabled for testing — PDF-only this run")
+    # XBRL processing is permanently off (module-level PDF_ONLY_MODE — see
+    # top of file). Next-day fundamentals API corrects anything the PDF
+    # fast-path gets wrong, so XBRL confirmation isn't needed.
+    if PDF_ONLY_MODE:
         xbrl_items = []
 
     # Existing PDF-sourced records are treated as reprocess-eligible (even
@@ -1925,7 +2066,53 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print("  ✓ nse_results_detailed: no new filings to parse")
         return None
 
-    print(f"  Parsing {len(new_xbrl)} new XBRL + {len(new_pdf)} new PDF result filing(s)...")
+    # Cross-exchange dedup: the same result is very often filed on BOTH NSE
+    # and BSE the same day (confirmed directly: AUGMONT's board-outcome PDF
+    # hit NSE and BSE within ~30 min of each other). Without this, both
+    # copies would independently reach process_pdf() and each burn a
+    # separate Gemini call on what is, functionally, the same numbers —
+    # wasted API spend, and pure luck which one's extraction quality wins.
+    # Grouped by (probable_symbol, same-IST-day) using ONLY pre-parse info
+    # (NSE's filename, BSE's scrip_code -> classification.json) — cheap,
+    # no download needed.
+    #
+    # Groups are NOT resolved into a blind "keep earliest, skip the rest"
+    # split here — that would permanently discard the other exchange's
+    # copy even if the earliest one turns out to fail AI extraction
+    # (a bad scan, an unusual layout, etc.), losing the result entirely
+    # until the WAF-style give-up window or a manual look. Instead each
+    # group is walked in published-time order by process_pdf_group()
+    # below: try the earliest copy; only if it actually parses do the
+    # remaining copies get skipped (and only THEN persisted into
+    # bse_nse_duplicate_links.json, so future runs don't re-fetch them
+    # either). If it fails, the next-earliest copy is tried immediately,
+    # same run — no result is dropped as long as at least one exchange's
+    # copy is extractable.
+    dupe_payload = await r2_get(client, "bse_nse_duplicate_links.json")
+    known_dupe_links = set((dupe_payload or {}).get("links", []))
+    before_dupe = len(new_pdf)
+    new_pdf = [it for it in new_pdf if it["link"] not in known_dupe_links]
+    if before_dupe != len(new_pdf):
+        print(f"  ⏭ Skipping {before_dupe - len(new_pdf)} PDF(s) already known cross-exchange duplicates")
+
+    pdf_groups = {}
+    for it in new_pdf:
+        sym = _pdf_probable_symbol(it, bse_symbol_map)
+        bucket = _pdf_date_bucket(it)
+        if not sym or not bucket:
+            continue  # can't group without both — left alone, processed normally
+        pdf_groups.setdefault((sym, bucket), []).append(it)
+    pdf_groups = {k: sorted(v, key=lambda x: x.get("published_ts", 0))
+                  for k, v in pdf_groups.items() if len(v) >= 2}
+    grouped_links = {it["link"] for group in pdf_groups.values() for it in group}
+    singleton_pdf = [it for it in new_pdf if it["link"] not in grouped_links]
+
+    if not new_xbrl and not new_pdf:
+        print("  ✓ nse_results_detailed: no new filings to parse")
+        return None
+
+    print(f"  Parsing {len(new_xbrl)} new XBRL + {len(new_pdf)} new PDF result filing(s) "
+          f"({len(pdf_groups)} cross-exchange group(s), {len(singleton_pdf)} single-exchange)...")
     sem = asyncio.Semaphore(3)  # be polite to nsearchives.nseindia.com
     failed_links = []
 
@@ -1982,7 +2169,17 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                     print(f"  ⚠ PDF fetch returned empty for {fname}")
                     failed_links.append(it["link"])
                     return None
-                parsed = await parse_financial_results_pdf(client, content, it["link"], it.get("title", ""))
+                if it.get("_exchange") == "BSE":
+                    code = it.get("scripcode", "")
+                    parsed = await parse_financial_results_pdf(
+                        client, content, it["link"], it.get("title", ""),
+                        scrip_code=code,
+                        fallback_board_meeting_date=_bse_fallback_date(it.get("published", "")),
+                        symbol_override=(bse_symbol_map or {}).get(code, code),
+                        exchange="BSE",
+                    )
+                else:
+                    parsed = await parse_financial_results_pdf(client, content, it["link"], it.get("title", ""))
                 if not parsed:
                     print(f"  ⚠ PDF parse returned None for {fname} "
                           f"(no results heading / AI unavailable / AI said not a results table / "
@@ -2000,12 +2197,38 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 failed_links.append(it["link"])
                 return None
 
-    xbrl_results, pdf_results = await asyncio.gather(
+    new_dupe_links = []  # populated only once a group's winner actually parses OK
+
+    async def process_pdf_group(sym: str, bucket: str, group_items: list[dict]):
+        for idx, it in enumerate(group_items):
+            ex = it.get("_exchange", "NSE")
+            result = await process_pdf(it)
+            if result:
+                remaining = group_items[idx + 1:]
+                if remaining:
+                    skipped_exs = ", ".join(sorted({r.get("_exchange", "NSE") for r in remaining}))
+                    print(f"  ⏭ {sym} ({bucket}): {ex}'s copy parsed OK — skipping {len(remaining)} "
+                          f"same-result copy/copies from {skipped_exs} (no AI call spent on them)")
+                    new_dupe_links.extend(r["link"] for r in remaining)
+                return result
+            is_last = idx == len(group_items) - 1
+            print(f"  ⚠ {sym} ({bucket}): {ex}'s copy failed to parse — "
+                  f"{'no more copies to try this run' if is_last else 'trying the next exchange copy now'}")
+        return None  # every copy in the group failed this run — none marked duplicate, all retried next run
+
+    xbrl_results, group_results, singleton_results = await asyncio.gather(
         asyncio.gather(*(process_xbrl(it) for it in new_xbrl)),
-        asyncio.gather(*(process_pdf(it) for it in new_pdf)),
+        asyncio.gather(*(process_pdf_group(sym, bucket, items) for (sym, bucket), items in pdf_groups.items())),
+        asyncio.gather(*(process_pdf(it) for it in singleton_pdf)),
     )
+    pdf_results = list(group_results) + list(singleton_results)
     parsed_all = [r for r in xbrl_results if r] + [r for r in pdf_results if r]
     print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf)} successfully")
+
+    if new_dupe_links:
+        all_dupe_links = list(known_dupe_links | set(new_dupe_links))[-5000:]  # cap growth
+        await r2_put(client, "bse_nse_duplicate_links.json",
+                     {"updated_at": datetime.now(timezone.utc).isoformat(), "links": all_dupe_links})
 
     if failed_links:
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -2250,18 +2473,17 @@ async def run():
                       f"keeping existing R2 data untouched")
                 continue
 
-            # While XBRL processing is disabled, nse_results_feed.json's
-            # accumulated XBRL announcements can never get an AI/XBRL-
-            # parsed detail record (build_results_detailed skips XBRL
-            # entirely), and the frontend has separately been told to hide
-            # this feed from the Results tab too — nothing reads or
-            # benefits from it right now. Skip fetching/accumulating/
-            # uploading it entirely rather than doing that work for a file
-            # nothing consumes. Existing R2 data is left untouched (not
-            # deleted) so re-enabling XBRL later picks up right where it
-            # left off.
-            if filename == "nse_results_feed.json" and DISABLE_XBRL_FOR_TESTING:
-                print(f"  ⏭ {filename}: skipping fetch/accumulate — XBRL processing disabled, nothing consumes this file right now")
+            # XBRL is permanently off (PDF_ONLY_MODE), so nse_results_feed.json's
+            # accumulated XBRL announcements can never get a parsed detail
+            # record (build_results_detailed skips XBRL entirely), and the
+            # frontend has separately been told to hide this feed from the
+            # Results tab too — nothing reads or benefits from it. Skip
+            # fetching/accumulating/uploading it entirely rather than doing
+            # that work for a file nothing consumes. Existing R2 data is
+            # left untouched (not deleted) so re-enabling XBRL later, if
+            # ever, picks up right where it left off.
+            if filename == "nse_results_feed.json" and PDF_ONLY_MODE:
+                print(f"  ⏭ {filename}: skipping fetch/accumulate — PDF-only mode, nothing consumes this file right now")
                 continue
 
             items = []
@@ -2378,13 +2600,34 @@ async def run():
               f"{max(len(merged_pdf_feed) - len(existing_pdf_items), 0)} new = {len(merged_pdf_feed)} (capped at 500)")
         await r2_put(client, "nse_results_pdf_feed.json", make_payload(merged_pdf_feed))
 
+        # ── BSE results-PDF candidates ──
+        # Same rolling-accumulator pattern as nse_results_pdf_feed.json
+        # above (BSE's feed only ever shows its latest snapshot too), but
+        # simpler: no result_calendar.json cross-check, since that
+        # calendar's symbol keys are NSE-derived and
+        # _extract_filename_symbol can't read anything out of a BSE GUID
+        # filename anyway (_in_result_calendar fails open on an empty
+        # symbol, so BSE items would just pass through untouched — the
+        # check would cost a filter pass for nothing).
+        bse_candidates_now = [it for it in result_map.get("bse_announcements", []) if _is_bse_results_pdf(it)]
+        existing_bse_feed = await r2_get(client, "bse_results_pdf_feed.json")
+        existing_bse_items = (existing_bse_feed or {}).get("items", [])
+        merged_bse_feed = dedup_items(bse_candidates_now + existing_bse_items)
+        merged_bse_feed.sort(key=_effective_ts, reverse=True)
+        merged_bse_feed = merged_bse_feed[:500]
+        print(f"  bse_results_pdf_feed.json: {len(existing_bse_items)} existing + "
+              f"{max(len(merged_bse_feed) - len(existing_bse_items), 0)} new = {len(merged_bse_feed)} (capped at 500)")
+        await r2_put(client, "bse_results_pdf_feed.json", make_payload(merged_bse_feed))
+
         # ── Financial results detail (P&L from XBRL / AI-extracted PDF) ──
-        print("\nParsing financial results XBRL...")
+        print("\nParsing financial results (PDF-only)...")
         fundamentals = await r2_get(client, FUNDAMENTALS_FILE)
         fundamentals_stocks = (fundamentals or {}).get("stocks")
         if not fundamentals_stocks:
             print(f"  ⚠ {FUNDAMENTALS_FILE} unavailable — YoY fallback via fundamentals disabled this run")
-        detailed_payload = await build_results_detailed(client, results_feed_items, merged_pdf_feed, fundamentals_stocks)
+        bse_symbol_map = await _load_bse_symbol_map(client)
+        detailed_payload = await build_results_detailed(client, results_feed_items, merged_pdf_feed, fundamentals_stocks,
+                                                          bse_pdf_items=merged_bse_feed, bse_symbol_map=bse_symbol_map)
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
 
