@@ -1,0 +1,38 @@
+name: Backfill (market session + gap/price reaction)
+
+# ⚠ PLACEHOLDER TIME — adjust the cron below to run comfortably AFTER
+# pipeline.py's own daily OHLC job finishes (its `daily` mode). Check
+# that workflow's schedule and set this at least 30-45 min later, so
+# ohlc_1..8.json has definitely finished uploading before this reads it.
+# Cron is in UTC; IST = UTC+5:30. Example: "30 11 * * 1-5" = 17:00 IST,
+# Mon-Fri (skips weekends since Indian markets are closed then).
+#
+# Both parts inside backfill.py are safe to run on this same daily
+# schedule — the market-session part is idempotent (only fills records
+# still missing it, costs nothing once the initial backlog is caught
+# up), so there's no separate one-off job to maintain.
+on:
+  schedule:
+    - cron: "30 11 * * 1-5"   # ← set this to match your OHLC job's timing
+  workflow_dispatch: {}        # lets you trigger it manually to test/re-run
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run backfill
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python backfill.py
