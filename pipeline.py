@@ -455,19 +455,48 @@ async def fetch_ohlc_bulk(client, ikey_map: dict[str, str], batch_size=500) -> d
 # ══════════════════════════════════════════════════════════════
 
 async def r2_upload(client, filename, data):
+    # FIX: this had zero retry logic — a single dropped/reset connection to
+    # the Worker (httpx.ReadError etc., which does happen on GitHub Actions
+    # runners) crashed the entire pipeline run immediately. Every other
+    # network call in this file (Upstox, Finedge, BOD) already retries with
+    # exponential backoff via the RETRY constant — this brings r2_upload in
+    # line with that same pattern instead of being the one exception.
     if isinstance(data, str): data = data.encode()
     url = f"{WORKER_URL}?file={filename}"
-    r = await client.post(url, headers={**WORKER_HEADERS,"Content-Type":"application/json"}, content=data, timeout=90)
-    if r.status_code != 200: raise RuntimeError(f"Upload failed {filename}: HTTP {r.status_code}")
-    log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
+    last_err=None
+    for attempt in range(RETRY):
+        try:
+            r = await client.post(url, headers={**WORKER_HEADERS,"Content-Type":"application/json"}, content=data, timeout=90)
+        except httpx.RequestError as e:
+            last_err=e; log.warning(f"  Upload {filename}: network error ({e}), retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        if r.status_code == 200:
+            log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
+            return
+        last_err=RuntimeError(f"Upload failed {filename}: HTTP {r.status_code}")
+        log.warning(f"  Upload {filename}: HTTP {r.status_code}, retry {attempt+1}")
+        await asyncio.sleep(2 ** attempt)
+    raise last_err
 
 async def r2_download(client, filename):
+    # Same retry fix as r2_upload — was a single-shot GET with no
+    # resilience to a dropped connection.
     url = f"{WORKER_URL}/{filename}"
-    r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
-    if r.status_code == 404: return None
-    if r.status_code != 200: raise RuntimeError(f"Download failed {filename}: HTTP {r.status_code}")
-    log.info(f"  ↓ {filename} ({len(r.content)/1024:.0f} KB)")
-    return r.json()
+    last_err=None
+    for attempt in range(RETRY):
+        try:
+            r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
+        except httpx.RequestError as e:
+            last_err=e; log.warning(f"  Download {filename}: network error ({e}), retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        if r.status_code == 404: return None
+        if r.status_code == 200:
+            log.info(f"  ↓ {filename} ({len(r.content)/1024:.0f} KB)")
+            return r.json()
+        last_err=RuntimeError(f"Download failed {filename}: HTTP {r.status_code}")
+        log.warning(f"  Download {filename}: HTTP {r.status_code}, retry {attempt+1}")
+        await asyncio.sleep(2 ** attempt)
+    raise last_err
 
 async def r2_download_fund(client) -> dict:
     url = f"{WORKER_URL}/fundamentals.json"
