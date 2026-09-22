@@ -1756,6 +1756,201 @@ def _build_mswing_json(all_data, mswing_data):
         rows.append(row)
     return rows
 
+# ══════════════════════════════════════════════════════════════
+# NEW — Sector/industry group history for MSwing, mirroring
+# _build_group_rs_history() exactly (same shape: {"date":..,"groups":{group:{...}}}),
+# just with MSwing-appropriate buckets instead of RS's 60/70/80/90 percentile
+# breakpoints. MSwing is a raw momentum value (not a 0-99 percentile), so the
+# buckets here are ">=0" (bullish), ">=1", ">=2", ">=3" (strengthening
+# momentum) — adjust these threshold numbers freely if a different cutoff
+# reads better once you see real data.
+# ══════════════════════════════════════════════════════════════
+def _build_group_mswing_history(classification, mswing_history_json, field_name):
+    if not classification or not isinstance(classification, list): return []
+    group_map={}
+    for s in classification:
+        sym=s.get("symbol"); group=s.get(field_name)
+        if not sym or not group: continue
+        group_map.setdefault(group,[]).append(sym)
+    if not mswing_history_json: return []
+    sample=max(mswing_history_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_mswing_history({field_name}): no date columns found — empty output")
+        return []
+    output=[]
+    for dtc in date_cols:
+        stocks={}
+        for row in mswing_history_json:
+            sym=row.get("Stock Name"); val=row.get(dtc)
+            if sym and val is not None: stocks[sym]=val
+        groups={}
+        for group,syms in group_map.items():
+            valid=pos=ge1=ge2=ge3=0; val_sum=0
+            for sym in syms:
+                val=stocks.get(sym)
+                if val is None: continue
+                valid+=1; val_sum+=val
+                if val>=0: pos+=1
+                if val>=1: ge1+=1
+                if val>=2: ge2+=1
+                if val>=3: ge3+=1
+            if valid<5: continue
+            groups[group]={"stocks":valid,"mswing_pos":round(pos/valid*100,1),"mswing_ge1":round(ge1/valid*100,1),
+                "mswing_ge2":round(ge2/valid*100,1),"mswing_ge3":round(ge3/valid*100,1),"avg_mswing":round(val_sum/valid,4)}
+        output.append({"date":dtc,"groups":groups})
+    return output
+
+# ══════════════════════════════════════════════════════════════
+# NEW — Same treatment for MA. Since there's no existing day-by-day
+# "close vs MA" history array (mtf_ma_map only holds *today's* snapshot),
+# this computes one from scratch using the full EMA/SMA series (_calc_ema /
+# _calc_sma already return the whole array, so this is a single pass per
+# stock, not per-day recomputation). Defaulted to Daily EMA50 — the most
+# commonly referenced trend-health MA elsewhere in this file (screener_feed's
+# 'above_50' field). Swap ma_type="sma" for SMA, or change `period` for a
+# different length (e.g. period=200 for the long-term trend gate).
+# ══════════════════════════════════════════════════════════════
+def _calculate_ma_above_history(all_data, period=50, ma_type="ema", history_days=180):
+    ma_fn=_calc_ema if ma_type=="ema" else _calc_sma
+    result={}
+    for sym, s in all_data.items():
+        closes=s["c"]; n=len(closes)
+        ma_arr=ma_fn(closes, period)
+        history=[]
+        for day_offset in range(history_days,-1,-1):
+            idx=n-1-day_offset
+            if idx<0 or idx>=len(ma_arr): history.append(None); continue
+            c_now=closes[idx]; ma_val=ma_arr[idx]
+            if c_now is None or ma_val is None: history.append(None)
+            else: history.append(1 if c_now>ma_val else 0)
+        result[sym]={"above_ma":history[-1] if history else None,"history":history}
+    return result
+
+def _build_ma_history_json(all_data, ma_data):
+    from datetime import date as dt
+    sample_sym=max(all_data.keys(), key=lambda s:len(all_data[s].get("d",[])))
+    dates=all_data[sample_sym]["d"]; n=len(dates)
+    history_len=len(next(iter(ma_data.values()))["history"]); start_idx=n-history_len
+    def fmt_date(d_str): return dt.fromisoformat(d_str).strftime("%-d-%b-%y")
+    date_labels=[(i,fmt_date(dates[start_idx+i])) for i in range(history_len) if 0<=start_idx+i<n]
+    rows=[]
+    for sym, v in ma_data.items():
+        row={"Stock Name":sym}
+        for i,label in date_labels:
+            if v["history"][i] is not None: row[label]=v["history"][i]
+        rows.append(row)
+    return rows
+
+def _build_group_ma_history(classification, ma_history_json, field_name, label="pct_above_ema50"):
+    if not classification or not isinstance(classification, list): return []
+    group_map={}
+    for s in classification:
+        sym=s.get("symbol"); group=s.get(field_name)
+        if not sym or not group: continue
+        group_map.setdefault(group,[]).append(sym)
+    if not ma_history_json: return []
+    sample=max(ma_history_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_ma_history({field_name}): no date columns found — empty output")
+        return []
+    output=[]
+    for dtc in date_cols:
+        stocks={}
+        for row in ma_history_json:
+            sym=row.get("Stock Name"); val=row.get(dtc)
+            if sym and val is not None: stocks[sym]=val
+        groups={}
+        for group,syms in group_map.items():
+            valid=above=0
+            for sym in syms:
+                val=stocks.get(sym)
+                if val is None: continue
+                valid+=1
+                if val==1: above+=1
+            if valid<5: continue
+            groups[group]={"stocks":valid, label:round(above/valid*100,1)}
+        output.append({"date":dtc,"groups":groups})
+    return output
+
+# ══════════════════════════════════════════════════════════════
+# NEW — Multi-period/type version of the MA group history.
+# Instead of a single MA (e.g. just EMA50), this covers periods 10, 21, 50,
+# 200 for BOTH EMA and SMA (8 combinations total), merged into ONE group
+# entry per date so the frontend gets a single record per sector/industry
+# per date with all 8 percentages side by side:
+#   { "stocks":223, "pct_above_ema10":61.2, "pct_above_sma10":58.4,
+#     "pct_above_ema21":..., "pct_above_sma21":..., "pct_above_ema50":...,
+#     "pct_above_sma50":..., "pct_above_ema200":..., "pct_above_sma200":... }
+# Reuses _calculate_ma_above_history() + _build_ma_history_json() per
+# combination — no duplicate calculation logic, just called 8x.
+# ══════════════════════════════════════════════════════════════
+MA_GROUP_PERIODS=(10, 21, 50, 200)
+MA_GROUP_TYPES=("ema", "sma")
+
+def _build_ma_history_all_combos(all_data, periods=MA_GROUP_PERIODS, types=MA_GROUP_TYPES, history_days=180):
+    """Returns {"ema10": ma_history_json, "sma10": ma_history_json, ...} for every period x type combo."""
+    combos={}
+    for ma_type in types:
+        for period in periods:
+            label=f"{ma_type}{period}"
+            ma_data=_calculate_ma_above_history(all_data, period=period, ma_type=ma_type, history_days=history_days)
+            combos[label]=_build_ma_history_json(all_data, ma_data)
+    return combos
+
+def _build_group_ma_history_multi(classification, ma_history_by_label, field_name):
+    if not classification or not isinstance(classification, list): return []
+    group_map={}
+    for s in classification:
+        sym=s.get("symbol"); group=s.get(field_name)
+        if not sym or not group: continue
+        group_map.setdefault(group,[]).append(sym)
+    if not ma_history_by_label: return []
+
+    # Date columns: derive from whichever combo's fullest row has the most
+    # date keys (same defensive pattern as _build_group_rs_history — the
+    # first combo/row might belong to a short-history stock).
+    any_json=next((j for j in ma_history_by_label.values() if j), None)
+    if not any_json: return []
+    sample=max(any_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_ma_history_multi({field_name}): no date columns found — empty output")
+        return []
+
+    # Pre-index each combo as {date: {symbol: 0/1}} for fast lookups below.
+    combo_by_date={}
+    for label, hist_json in ma_history_by_label.items():
+        per_date={dtc:{} for dtc in date_cols}
+        for row in hist_json:
+            sym=row.get("Stock Name")
+            if not sym: continue
+            for dtc in date_cols:
+                val=row.get(dtc)
+                if val is not None: per_date[dtc][sym]=val
+        combo_by_date[label]=per_date
+
+    output=[]
+    for dtc in date_cols:
+        groups={}
+        for group,syms in group_map.items():
+            entry=None
+            for label, per_date in combo_by_date.items():
+                stocks=per_date[dtc]
+                valid=above=0
+                for sym in syms:
+                    val=stocks.get(sym)
+                    if val is None: continue
+                    valid+=1
+                    if val==1: above+=1
+                if valid<5: continue
+                if entry is None: entry={"stocks":valid}
+                entry[f"pct_above_{label}"]=round(above/valid*100,1)
+            if entry: groups[group]=entry
+        output.append({"date":dtc,"groups":groups})
+    return output
+
 
 PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo"]
 HLR_STATE_KEYS={"BO":"hlr_bo","Near HLR":"hlr_near","Consolidating near HLR":"hlr_consol"}
@@ -2640,6 +2835,14 @@ async def run_ep_scan() -> None:
             industry_rs_history=_build_group_rs_history(classification,rs_history_list,"display_industry")
             mswing_data=_calculate_mswing(all_data,history_days=ROLLING_DAYS-50)
             mswing_list=_build_mswing_json(all_data,mswing_data)
+            sector_group_mswing_history=_build_group_mswing_history(classification,mswing_list,"sector_group")
+            industry_mswing_history=_build_group_mswing_history(classification,mswing_list,"display_industry")
+            # MA group history — Daily EMA10/21/50/200 AND SMA10/21/50/200
+            # "close above/below" per stock, rolled up to % of stocks above
+            # each MA per sector/industry per date (8 percentages per group).
+            ma_history_combos=_build_ma_history_all_combos(all_data,history_days=180)
+            sector_group_ma_history=_build_group_ma_history_multi(classification,ma_history_combos,"sector_group")
+            industry_ma_history=_build_group_ma_history_multi(classification,ma_history_combos,"display_industry")
             for sig in signals:
                 sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
             for sig in pr_signals:
@@ -2720,6 +2923,18 @@ async def run_ep_scan() -> None:
                                           schema_v=1),
                 upload_str_with_manifest(client, r2_upload, "industry_rs_history.json",
                                           json.dumps(industry_rs_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "sector_group_mswing_history.json",
+                                          json.dumps(sector_group_mswing_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "industry_mswing_history.json",
+                                          json.dumps(industry_mswing_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "sector_group_ma_history.json",
+                                          json.dumps(sector_group_ma_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "industry_ma_history.json",
+                                          json.dumps(industry_ma_history),
                                           schema_v=1),
                 upload_str_with_manifest(client, r2_upload, "screener_feed.json", json.dumps(screener_feed),
                                           schema_v=1, extra_meta={"stock_count": len(screener_feed)}),
