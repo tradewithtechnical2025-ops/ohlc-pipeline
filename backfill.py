@@ -16,16 +16,19 @@ into one script, one run, one upload:
      separately from the gap backfill below.
 
   2. GAP / PRICE-REACTION BACKFILL. For every result within
-     MAX_RESULT_AGE_DAYS, computes (1) result-day move + volume spike,
-     (2) next-trading-day move + volume spike, (3) next-trading-day gap
-     %/direction, (4) return from result date to today — using
-     pipeline.py's OHLC chunks (ohlc_1..8.json). Needs the CURRENT day's
-     EOD OHLC update to have already landed, so this script should run
-     on a schedule AFTER pipeline.py's daily OHLC job finishes (see the
+     MAX_RESULT_AGE_DAYS, computes (1) result-day move + volume spike —
+     fillable the same evening the result's own EOD candle lands, no
+     need to wait a day; (2) next-trading-day move + volume spike and
+     (3) next-trading-day gap %/direction — these genuinely do wait for
+     T+1; and (4) return from result date to today. Uses pipeline.py's
+     OHLC chunks (ohlc_1..8.json), so this script should run on a
+     schedule AFTER pipeline.py's daily OHLC job finishes (see the
      matching GitHub Actions workflow's cron comment).
-     (1)-(3) are frozen once computed (never recomputed); (4) is a moving
-     target and is re-evaluated every run for any record still in the
-     retention window.
+     (1) and (2)/(3) are each frozen once computed, independently of one
+     another — a missing T+1 no longer holds back (1), which used to be
+     bundled with (2)/(3) behind the same "wait for T+1" gate even
+     though it never needed T+1 at all. (4) is a moving target and is
+     re-evaluated every run for any record still in the retention window.
 
 Both parts read nse_results_detailed.json once at the top and write it
 back once at the bottom (if anything changed) — not two separate
@@ -140,9 +143,45 @@ async def load_ohlc_all(client: httpx.AsyncClient) -> dict:
     return all_data
 
 
-def compute_t1_reaction(sym: str, board_meeting_date: str, all_data: dict):
-    """(1) result_day_ch/vol_x, (2) t1_ch_pct/vol_x, (3) gap_pct/direction.
-    Frozen once T+1 exists — computed only once per result. Mirrors
+def compute_result_day(sym: str, board_meeting_date: str, all_data: dict):
+    """(1) result_day_ch / result_day_vol_x — needs ONLY the result day's
+    own OHLC (T), not T+1. Fillable the very same evening the result's
+    EOD candle lands, no need to wait a day. Kept as its own function
+    (not bundled with compute_t1_fields below) specifically so a missing
+    T+1 never blocks this from being computed — that bundling was a bug:
+    the result day's own move was being held back for a day it never
+    needed to wait for."""
+    s = all_data.get(sym)
+    if not s:
+        return None
+    dates, closes, volumes = s.get("d"), s.get("c"), s.get("v")
+    if not dates or not closes:
+        return None
+    ri_list = [i for i, d in enumerate(dates) if d == board_meeting_date]
+    if not ri_list:
+        return None  # today's own EOD candle isn't in OHLC yet
+    ri = ri_list[-1]
+    if ri == 0 or not closes[ri - 1]:
+        return None  # no prior close to compare against (first day in series)
+    t_close = closes[ri]
+    if not t_close:
+        return None
+    result_day_ch = round((t_close - closes[ri - 1]) / closes[ri - 1] * 100, 2)
+
+    result_day_vol_x = None
+    if volumes and ri < len(volumes) and volumes[ri] is not None:
+        lookback = min(VOLUME_LOOKBACK, ri)
+        if lookback > 0:
+            avg_vol = sum(volumes[ri - lookback:ri]) / lookback
+            if avg_vol:
+                result_day_vol_x = round(volumes[ri] / avg_vol, 2)
+
+    return {"result_day_ch": result_day_ch, "result_day_vol_x": result_day_vol_x}
+
+
+def compute_t1_fields(sym: str, board_meeting_date: str, all_data: dict):
+    """(2) t1_ch_pct/vol_x, (3) gap_pct/direction — needs T+1, so this
+    genuinely waits a day (unlike compute_result_day above). Mirrors
     pipeline.py's _detect_post_result_thrust ri/ti indexing, but
     unconditional — no move-size/volume/close-position filtering."""
     s = all_data.get(sym)
@@ -166,19 +205,15 @@ def compute_t1_reaction(sym: str, board_meeting_date: str, all_data: dict):
         return None
 
     gap_pct = round((t1_open - t_close) / t_close * 100, 2)
-    result_day_ch = round((t_close - closes[ri - 1]) / closes[ri - 1] * 100, 2) if ri > 0 and closes[ri - 1] else None
     t1_ch_pct = round((t1_close - t_close) / t_close * 100, 2) if t1_close else None
 
-    result_day_vol_x = t1_vol_x = None
-    if volumes and ti < len(volumes):
+    t1_vol_x = None
+    if volumes and ti < len(volumes) and volumes[ti] is not None:
         lookback = min(VOLUME_LOOKBACK, ri)
         if lookback > 0:
             avg_vol = sum(volumes[ri - lookback:ri]) / lookback
             if avg_vol:
-                if volumes[ri] is not None:
-                    result_day_vol_x = round(volumes[ri] / avg_vol, 2)
-                if volumes[ti] is not None:
-                    t1_vol_x = round(volumes[ti] / avg_vol, 2)
+                t1_vol_x = round(volumes[ti] / avg_vol, 2)
 
     return {
         "next_trading_date": t1_date,
@@ -187,8 +222,6 @@ def compute_t1_reaction(sym: str, board_meeting_date: str, all_data: dict):
         "t1_high": round(t1_high, 2) if t1_high is not None else None,
         "t1_low": round(t1_low, 2) if t1_low is not None else None,
         "t1_close": round(t1_close, 2) if t1_close is not None else None,
-        "result_day_ch": result_day_ch,
-        "result_day_vol_x": result_day_vol_x,
         "t1_ch_pct": t1_ch_pct,
         "t1_vol_x": t1_vol_x,
         "gap_pct": gap_pct,
@@ -230,6 +263,7 @@ async def run_gap_backfill(client: httpx.AsyncClient, items: list) -> int:
         return 0
 
     cutoff = (date.today() - timedelta(days=MAX_RESULT_AGE_DAYS)).isoformat()
+    filled_rd, already_had_rd, waiting_on_rd = 0, 0, 0
     filled_t1, already_had_t1, waiting_on_t1 = 0, 0, 0
     updated_ret, no_ret_data = 0, 0
     no_match, too_old, changed = 0, 0, 0
@@ -247,10 +281,21 @@ async def run_gap_backfill(client: httpx.AsyncClient, items: list) -> int:
         pr = it.get("price_reaction") or {}
         item_changed = False
 
+        if "result_day_ch" in pr:
+            already_had_rd += 1
+        else:
+            rd = compute_result_day(sym, bmd, all_data)
+            if rd:
+                pr.update(rd)
+                filled_rd += 1
+                item_changed = True
+            else:
+                waiting_on_rd += 1
+
         if "gap_pct" in pr:
             already_had_t1 += 1
         else:
-            t1 = compute_t1_reaction(sym, bmd, all_data)
+            t1 = compute_t1_fields(sym, bmd, all_data)
             if t1:
                 pr.update(t1)
                 filled_t1 += 1
@@ -272,7 +317,8 @@ async def run_gap_backfill(client: httpx.AsyncClient, items: list) -> int:
         if item_changed:
             changed += 1
 
-    print(f"  ✓ (1)(2)(3) one-time: {filled_t1} newly filled | {already_had_t1} already had it | {waiting_on_t1} waiting on T+1 data")
+    print(f"  ✓ (1) result day: {filled_rd} newly filled | {already_had_rd} already had it | {waiting_on_rd} waiting on today's own EOD candle")
+    print(f"  ✓ (2)(3) next day: {filled_t1} newly filled | {already_had_t1} already had it | {waiting_on_t1} waiting on T+1 data")
     print(f"  ✓ (4) return-since-result: {updated_ret} updated this run | {no_ret_data} no OHLC match")
     print(f"    {no_match} unmatched (no symbol/date) | {too_old} beyond {MAX_RESULT_AGE_DAYS}d cutoff")
     return changed
