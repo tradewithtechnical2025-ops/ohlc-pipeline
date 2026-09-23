@@ -51,14 +51,21 @@ REQUEST_DELAY_SEC = 3.0  # be polite to Tiingo, avoid hourly limit issues on fre
 CONCURRENCY = 1          # sequential — free plan is only 50 requests/hour
 TIINGO_429_WAIT_SEC = 90 # Tiingo free plan resets roughly on a rolling basis; back off and retry
 
-# Starter list of 50 popular US stocks — edit as needed
+# TEST list — 10 stocks only, to stay well under Tiingo free plan's 50 req/hour limit
+# (10 symbols x 2 calls [meta+historical] = 20 calls per backfill run)
+# Once ready to scale up, swap back to the full 50-symbol list.
 US_SYMBOLS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRKB", "AVGO", "JPM",
-    "LLY", "V", "UNH", "XOM", "MA", "COST", "HD", "PG", "JNJ", "NFLX",
-    "BAC", "ABBV", "CRM", "WMT", "KO", "AMD", "PEP", "MRK", "ADBE", "TMO",
-    "CSCO", "ORCL", "ACN", "MCD", "LIN", "ABT", "DHR", "WFC", "TXN", "CAT",
-    "PM", "INTU", "IBM", "GE", "QCOM", "AMGN", "NOW", "SPGI", "UBER", "BA",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "AVGO", "JPM", "LLY",
 ]
+
+# Full 50-symbol list — kept here for later use
+# US_SYMBOLS = [
+#     "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRKB", "AVGO", "JPM",
+#     "LLY", "V", "UNH", "XOM", "MA", "COST", "HD", "PG", "JNJ", "NFLX",
+#     "BAC", "ABBV", "CRM", "WMT", "KO", "AMD", "PEP", "MRK", "ADBE", "TMO",
+#     "CSCO", "ORCL", "ACN", "MCD", "LIN", "ABT", "DHR", "WFC", "TXN", "CAT",
+#     "PM", "INTU", "IBM", "GE", "QCOM", "AMGN", "NOW", "SPGI", "UBER", "BA",
+# ]
 
 
 def r2_filename(symbol: str) -> str:
@@ -168,7 +175,55 @@ def normalize_bar(bar):
 # Modes
 # ---------------------------------------------------------------------------
 
-async def backfill_one(sem, tiingo_client, r2_client, symbol, start_str, end_str, stats):
+# ---------------------------------------------------------------------------
+# Screener feed — lightweight, single-file summary for ALL symbols
+# (price/change/volume + sector/industry/mcap), same idea as production's
+# screener_feed.json. This is what us_stocks.html should fetch once,
+# instead of looping N individual us_ohlc_<SYMBOL>.json fetches — the
+# per-symbol files stay purely for the chart page (one fetch per click).
+# ---------------------------------------------------------------------------
+async def generate_screener_feed(r2_client, latest_bars):
+    if not latest_bars:
+        log.warning("  screener feed: no bars collected, skipping")
+        return
+    try:
+        meta = await r2_download(r2_client, "us_company_meta.json")
+    except Exception as e:
+        log.warning(f"  screener feed: couldn't load us_company_meta.json ({e}), sector/industry/mcap will be blank")
+        meta = None
+    meta_stocks = (meta or {}).get("stocks", {})
+
+    rows = []
+    for symbol, info in latest_bars.items():
+        last = info["last"]
+        prev = info["prev"]
+        price = last["c"] if last else None
+        change_pct = None
+        if last and prev and prev.get("c"):
+            change_pct = ((last["c"] - prev["c"]) / prev["c"]) * 100
+
+        m = meta_stocks.get(symbol, {})
+        rows.append({
+            "symbol": symbol,
+            "name": m.get("name") or info.get("name") or symbol,
+            "sector": m.get("sector"),
+            "industry": m.get("industry"),
+            "mcap": m.get("marketCap"),
+            "ltp": price,
+            "pct_ch": change_pct,
+            "volume": last.get("v") if last else None,
+        })
+
+    payload = {
+        "updated": datetime.utcnow().isoformat() + "Z",
+        "count": len(rows),
+        "stocks": rows,
+    }
+    await r2_upload(r2_client, "us_screener_feed.json", payload)
+    log.info(f"  screener feed: uploaded us_screener_feed.json ({len(rows)} symbols)")
+
+
+async def backfill_one(sem, tiingo_client, r2_client, symbol, start_str, end_str, stats, latest_bars):
     async with sem:
         try:
             raw = await fetch_historical(tiingo_client, symbol, start_str, end_str)
@@ -194,6 +249,12 @@ async def backfill_one(sem, tiingo_client, r2_client, symbol, start_str, end_str
             await r2_upload(r2_client, r2_filename(symbol), payload)
             log.info(f"  {symbol}: {len(bars)} bars uploaded (meta: {'ok' if meta else 'missing'})")
             stats["ok"] += 1
+            if len(bars) >= 1:
+                latest_bars[symbol] = {
+                    "name": company.get("name"),
+                    "last": bars[-1],
+                    "prev": bars[-2] if len(bars) >= 2 else None,
+                }
         except Exception as e:
             log.error(f"  {symbol}: {e}")
             stats["failed"].append(symbol)
@@ -207,18 +268,20 @@ async def run_backfill():
 
     log.info(f"Backfill: {start_str} to {end_str} for {len(US_SYMBOLS)} symbols")
     stats = {"ok": 0, "failed": []}
+    latest_bars = {}
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient() as tiingo_client, httpx.AsyncClient() as r2_client:
-        tasks = [backfill_one(sem, tiingo_client, r2_client, sym, start_str, end_str, stats) for sym in US_SYMBOLS]
+        tasks = [backfill_one(sem, tiingo_client, r2_client, sym, start_str, end_str, stats, latest_bars) for sym in US_SYMBOLS]
         await asyncio.gather(*tasks)
+        await generate_screener_feed(r2_client, latest_bars)
 
     log.info(f"Backfill done: {stats['ok']} ok, {len(stats['failed'])} failed")
     if stats["failed"]:
         log.info("Failed symbols: " + ", ".join(stats["failed"]))
 
 
-async def daily_one(sem, tiingo_client, r2_client, symbol, stats):
+async def daily_one(sem, tiingo_client, r2_client, symbol, stats, latest_bars):
     async with sem:
         try:
             latest = await fetch_latest(tiingo_client, symbol)
@@ -245,6 +308,12 @@ async def daily_one(sem, tiingo_client, r2_client, symbol, stats):
             await r2_upload(r2_client, filename, existing)
             log.info(f"  {symbol}: appended {new_bar['date']}")
             stats["ok"] += 1
+            if len(bars) >= 1:
+                latest_bars[symbol] = {
+                    "name": (existing.get("company") or {}).get("name"),
+                    "last": bars[-1],
+                    "prev": bars[-2] if len(bars) >= 2 else None,
+                }
         except Exception as e:
             log.error(f"  {symbol}: {e}")
             stats["failed"].append(symbol)
@@ -254,11 +323,13 @@ async def daily_one(sem, tiingo_client, r2_client, symbol, stats):
 async def run_daily():
     log.info(f"Daily update for {len(US_SYMBOLS)} symbols")
     stats = {"ok": 0, "failed": []}
+    latest_bars = {}
     sem = asyncio.Semaphore(CONCURRENCY)
 
     async with httpx.AsyncClient() as tiingo_client, httpx.AsyncClient() as r2_client:
-        tasks = [daily_one(sem, tiingo_client, r2_client, sym, stats) for sym in US_SYMBOLS]
+        tasks = [daily_one(sem, tiingo_client, r2_client, sym, stats, latest_bars) for sym in US_SYMBOLS]
         await asyncio.gather(*tasks)
+        await generate_screener_feed(r2_client, latest_bars)
 
     log.info(f"Daily update done: {stats['ok']} ok, {len(stats['failed'])} failed")
     if stats["failed"]:
