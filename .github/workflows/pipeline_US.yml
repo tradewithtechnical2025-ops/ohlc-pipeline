@@ -1,21 +1,20 @@
-name: US Stocks OHLC Pipeline (Tiingo)
+name: US Stocks Pipeline (Tiingo OHLC + NASDAQ Meta)
 
 on:
-  # Run daily update automatically after US market close
-  # 21:30 UTC = 3:00 AM IST (next day) — well after NYSE/NASDAQ close (20:00 UTC / 4:00 PM ET)
   schedule:
-    - cron: "30 21 * * 1-5"   # Mon-Fri only
-  # Allow manual trigger for both backfill and daily runs
+    - cron: "30 21 * * 1-5"   # 3:00 AM IST — daily OHLC update (Tiingo)
+    - cron: "45 21 * * 1-5"   # 3:15 AM IST — daily sector/industry/market cap (NASDAQ)
   workflow_dispatch:
     inputs:
       mode:
-        description: "Pipeline mode"
+        description: "Which function to run"
         required: true
         default: "daily"
         type: choice
         options:
-          - daily
-          - backfill
+          - backfill   # pipeline_us.py --mode backfill (Tiingo, last 3 years OHLC)
+          - daily      # pipeline_us.py --mode daily (Tiingo, latest bar append)
+          - meta       # pipeline_us_meta.py (NASDAQ sector/industry/market cap)
 
 jobs:
   run-pipeline:
@@ -32,18 +31,28 @@ jobs:
       - name: Install dependencies
         run: pip install httpx
 
-      - name: Run pipeline (scheduled = daily)
-        if: github.event_name == 'schedule'
-        env:
-          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
-          WORKER_URL: ${{ secrets.WORKER_URL }}
-          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-        run: python pipeline_us.py --mode daily
+      - name: Determine mode
+        id: pick
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "30 21 * * 1-5" ]; then
+            echo "mode=daily" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event.schedule }}" = "45 21 * * 1-5" ]; then
+            echo "mode=meta" >> "$GITHUB_OUTPUT"
+          fi
 
-      - name: Run pipeline (manual dispatch)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Run Tiingo OHLC pipeline (backfill or daily)
+        if: steps.pick.outputs.mode == 'backfill' || steps.pick.outputs.mode == 'daily'
         env:
           TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-        run: python pipeline_us.py --mode ${{ github.event.inputs.mode }}
+        run: python pipeline_us.py --mode ${{ steps.pick.outputs.mode }}
+
+      - name: Run NASDAQ meta pipeline (sector/industry/market cap)
+        if: steps.pick.outputs.mode == 'meta'
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline_us_meta.py
