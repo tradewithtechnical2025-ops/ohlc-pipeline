@@ -52,7 +52,7 @@ CONCURRENCY = 5          # parallel symbols in flight at once
 
 # Starter list of 50 popular US stocks — edit as needed
 US_SYMBOLS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRK.B", "AVGO", "JPM",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "BRKB", "AVGO", "JPM",
     "LLY", "V", "UNH", "XOM", "MA", "COST", "HD", "PG", "JNJ", "NFLX",
     "BAC", "ABBV", "CRM", "WMT", "KO", "AMD", "PEP", "MRK", "ADBE", "TMO",
     "CSCO", "ORCL", "ACN", "MCD", "LIN", "ABT", "DHR", "WFC", "TXN", "CAT",
@@ -117,6 +117,17 @@ async def r2_download(client: httpx.AsyncClient, filename: str):
 # Tiingo calls
 # ---------------------------------------------------------------------------
 
+async def fetch_meta(client: httpx.AsyncClient, symbol: str):
+    url = f"{TIINGO_BASE}/{symbol}"
+    params = {"token": TIINGO_API_KEY}
+    r = await client.get(url, params=params, timeout=30)
+    if r.status_code == 404:
+        log.warning(f"  {symbol}: meta not found on Tiingo")
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
 async def fetch_historical(client: httpx.AsyncClient, symbol: str, start_date: str, end_date: str):
     url = f"{TIINGO_BASE}/{symbol}/prices"
     params = {"startDate": start_date, "endDate": end_date, "token": TIINGO_API_KEY, "format": "json"}
@@ -163,9 +174,23 @@ async def backfill_one(sem, tiingo_client, r2_client, symbol, start_str, end_str
                 stats["failed"].append(symbol)
                 return
             bars = [normalize_bar(b) for b in raw]
-            payload = {"symbol": symbol, "updated": datetime.utcnow().isoformat() + "Z", "bars": bars}
+
+            meta = await fetch_meta(tiingo_client, symbol)
+            company = {
+                "name": meta.get("name") if meta else None,
+                "exchangeCode": meta.get("exchangeCode") if meta else None,
+                "description": meta.get("description") if meta else None,
+                "startDate": meta.get("startDate") if meta else None,
+            } if meta else {}
+
+            payload = {
+                "symbol": symbol,
+                "updated": datetime.utcnow().isoformat() + "Z",
+                "company": company,
+                "bars": bars,
+            }
             await r2_upload(r2_client, r2_filename(symbol), payload)
-            log.info(f"  {symbol}: {len(bars)} bars uploaded")
+            log.info(f"  {symbol}: {len(bars)} bars uploaded (meta: {'ok' if meta else 'missing'})")
             stats["ok"] += 1
         except Exception as e:
             log.error(f"  {symbol}: {e}")
