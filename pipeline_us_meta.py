@@ -55,6 +55,20 @@ async def fetch_screener(client: httpx.AsyncClient, limit: int = 10000):
     return r.json()
 
 
+def clean_name(raw_name):
+    """NASDAQ screener returns names like 'Apple Inc. Common Stock' or
+    'Meta Platforms Inc. Class A Common Stock' — strip the redundant
+    trailing 'Common Stock', but keep meaningful suffixes like
+    'Class A' (dual-class shares) or 'Warrant'/'Rights' (different
+    instrument, not the underlying common stock)."""
+    if not raw_name:
+        return raw_name
+    name = raw_name.strip()
+    if name.endswith(" Common Stock"):
+        name = name[: -len(" Common Stock")].strip()
+    return name
+
+
 def parse_market_cap(raw):
     try:
         val = float(raw)
@@ -102,7 +116,7 @@ async def main():
                 skipped += 1
                 continue
             meta[symbol] = {
-                "name": row.get("name"),
+                "name": clean_name(row.get("name")),
                 "sector": row.get("sector") or None,
                 "industry": row.get("industry") or None,
                 "marketCap": parse_market_cap(row.get("marketCap")),
