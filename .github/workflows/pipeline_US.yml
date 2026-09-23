@@ -1,0 +1,49 @@
+name: US Stocks OHLC Pipeline (Tiingo)
+
+on:
+  # Run daily update automatically after US market close
+  # 21:30 UTC = 3:00 AM IST (next day) — well after NYSE/NASDAQ close (20:00 UTC / 4:00 PM ET)
+  schedule:
+    - cron: "30 21 * * 1-5"   # Mon-Fri only
+  # Allow manual trigger for both backfill and daily runs
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Pipeline mode"
+        required: true
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - backfill
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run pipeline (scheduled = daily)
+        if: github.event_name == 'schedule'
+        env:
+          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline_us.py --mode daily
+
+      - name: Run pipeline (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        run: python pipeline_us.py --mode ${{ github.event.inputs.mode }}
