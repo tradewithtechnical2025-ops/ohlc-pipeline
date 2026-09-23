@@ -47,8 +47,9 @@ WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 TIINGO_BASE = "https://api.tiingo.com/tiingo/daily"
 BACKFILL_YEARS = 3
 RETRY = 5
-REQUEST_DELAY_SEC = 1.0  # be polite to Tiingo, avoid hourly limit issues on free plan
-CONCURRENCY = 5          # parallel symbols in flight at once
+REQUEST_DELAY_SEC = 3.0  # be polite to Tiingo, avoid hourly limit issues on free plan
+CONCURRENCY = 1          # sequential — free plan is only 50 requests/hour
+TIINGO_429_WAIT_SEC = 90 # Tiingo free plan resets roughly on a rolling basis; back off and retry
 
 # Starter list of 50 popular US stocks — edit as needed
 US_SYMBOLS = [
@@ -117,37 +118,38 @@ async def r2_download(client: httpx.AsyncClient, filename: str):
 # Tiingo calls
 # ---------------------------------------------------------------------------
 
+async def _tiingo_get(client: httpx.AsyncClient, url: str, params: dict, label: str):
+    """GET with 404->None and 429-aware backoff/retry (Tiingo hourly rate limit)."""
+    for attempt in range(RETRY):
+        r = await client.get(url, params=params, timeout=30)
+        if r.status_code == 404:
+            log.warning(f"  {label}: not found on Tiingo, skipping")
+            return None
+        if r.status_code == 429:
+            log.warning(f"  {label}: 429 rate limited, waiting {TIINGO_429_WAIT_SEC}s (attempt {attempt + 1}/{RETRY})")
+            await asyncio.sleep(TIINGO_429_WAIT_SEC)
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError(f"{label}: still rate limited after {RETRY} retries")
+
+
 async def fetch_meta(client: httpx.AsyncClient, symbol: str):
     url = f"{TIINGO_BASE}/{symbol}"
     params = {"token": TIINGO_API_KEY}
-    r = await client.get(url, params=params, timeout=30)
-    if r.status_code == 404:
-        log.warning(f"  {symbol}: meta not found on Tiingo")
-        return None
-    r.raise_for_status()
-    return r.json()
+    return await _tiingo_get(client, url, params, f"{symbol} meta")
 
 
 async def fetch_historical(client: httpx.AsyncClient, symbol: str, start_date: str, end_date: str):
     url = f"{TIINGO_BASE}/{symbol}/prices"
     params = {"startDate": start_date, "endDate": end_date, "token": TIINGO_API_KEY, "format": "json"}
-    r = await client.get(url, params=params, timeout=30)
-    if r.status_code == 404:
-        log.warning(f"  {symbol}: not found on Tiingo, skipping")
-        return None
-    r.raise_for_status()
-    return r.json()
+    return await _tiingo_get(client, url, params, symbol)
 
 
 async def fetch_latest(client: httpx.AsyncClient, symbol: str):
     url = f"{TIINGO_BASE}/{symbol}/prices"
     params = {"token": TIINGO_API_KEY, "format": "json"}
-    r = await client.get(url, params=params, timeout=30)
-    if r.status_code == 404:
-        log.warning(f"  {symbol}: not found on Tiingo, skipping")
-        return None
-    r.raise_for_status()
-    data = r.json()
+    data = await _tiingo_get(client, url, params, symbol)
     return data[-1] if data else None
 
 
