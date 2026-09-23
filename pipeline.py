@@ -3373,7 +3373,7 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
         if not swing_highs: continue
         swing_highs.sort(key=lambda x:x[0],reverse=True); used=[False]*len(swing_highs); levels=[]
         for i,(h,d,tag) in enumerate(swing_highs):
-            if used[i]: continue
+            if used[i] or not h or h<=0: continue
             cluster=[(h,d,tag)]
             for j in range(i+1,len(swing_highs)):
                 if not used[j] and abs(swing_highs[j][0]-h)/h*100<=cluster_pct: cluster.append(swing_highs[j]); used[j]=True
@@ -3383,13 +3383,14 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
             touch_pts=sorted([{"date":c[1],"price":round(c[0],2)} for c in cluster],key=lambda x:x["date"])
             levels.append((level,zone_low,len(cluster),len(cluster)>=2,touch_pts,cluster_tag))
         curr_close=closes[-1]
-        if curr_close is None: continue
+        if curr_close is None or curr_close<=0: continue   # bad candle (c=0) guard
         curr_date=dates[-1]
         if n>=consol_days:
             rh=[v for v in highs[-consol_days:] if v is not None]; rl=[v for v in lows[-consol_days:] if v is not None]
             range_pct=(max(rh)-min(rl))/curr_close*100 if rh and rl else 0; is_consol=range_pct<consol_pct
         else: range_pct=0; is_consol=False
         for (level,zone_low,touches,is_zone,touch_pts,cluster_tag) in levels:
+            if not level or level<=0: continue
             dist_pct=(level-curr_close)/level*100
             if cluster_tag=="BO":
                 state="BO"
@@ -3427,7 +3428,7 @@ def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, near_pct=5.0, c
         if not swing_highs: continue
         swing_highs.sort(key=lambda x: x[0], reverse=True); used = [False] * len(swing_highs); levels = []
         for i, (h, d, tag) in enumerate(swing_highs):
-            if used[i]: continue
+            if used[i] or not h or h <= 0: continue
             cluster = [(h, d, tag)]
             for j in range(i + 1, len(swing_highs)):
                 if not used[j] and abs(swing_highs[j][0] - h) / h * 100 <= cluster_pct:
@@ -3439,7 +3440,7 @@ def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, near_pct=5.0, c
             levels.append((level, zone_low, len(cluster), len(cluster) >= 2, touch_pts, cluster_tag))
 
         curr_close = wc[-1]
-        if curr_close is None: continue
+        if curr_close is None or curr_close <= 0: continue   # bad candle (c=0) → ZeroDivisionError guard
         curr_date = wd[-1]
         if n >= consol_days:
             rh = [v for v in wh[-consol_days:] if v is not None]; rl = [v for v in wl[-consol_days:] if v is not None]
@@ -3447,6 +3448,7 @@ def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, near_pct=5.0, c
         else: range_pct = 0; is_consol = False
 
         for (level, zone_low, touches, is_zone, touch_pts, cluster_tag) in levels:
+            if not level or level <= 0: continue
             dist_pct = (level - curr_close) / level * 100
             if cluster_tag == "BO": state = "BO"
             elif 0 <= dist_pct <= near_pct: state = "Consolidating near HLR" if is_consol else "Near HLR"
@@ -3466,6 +3468,8 @@ async def run_hlr_scan() -> None:
             ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
             all_data=await download_all_chunks(client)
             log.info(f"Loaded {len(all_data)} stocks")
+            _zero=[(sym,s_["d"][i]) for sym,s_ in all_data.items() for i,c in enumerate(s_.get("c") or []) if c is not None and c<=0]
+            if _zero: log.warning(f"⚠ Zero/negative closes: {len(_zero)} → {_zero[:20]}")
             hlr_signals=_detect_hlr(all_data)
             order={"BO":0,"Consolidating near HLR":1,"Near HLR":2}
             hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
