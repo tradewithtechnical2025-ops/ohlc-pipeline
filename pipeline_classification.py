@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+from datetime import date
 
 import httpx
 
@@ -32,6 +33,33 @@ RATE_DELAY  = 0.25
 RETRY       = 3
 
 MIN_MARKET_CAP_CR = 10
+
+# ── Profile cache ──
+# company-profile data (sector / sub_industry / description) almost never
+# changes, so it is fetched ONCE per symbol and reused from R2 on later runs.
+# Only these get (re)fetched from Finedge on a normal daily run:
+#   • symbols not in the cache yet (new listings / new BSE-exclusive rows)
+#   • symbols whose cached profile has no sector/industry/sub_industry yet
+#     (fresh IPOs where Finedge hasn't populated the profile) — daily
+#   • IPO-sourced symbols with no profile at all — daily
+#   • non-IPO symbols with no profile at all — every MISSING_RETRY_DAYS
+#   • entries older than PROFILE_MAX_AGE_DAYS (periodic refresh; 0 = never)
+# FORCE_REFRESH=1 env → refetch every profile this run.
+PROFILE_CACHE_FILE   = "profile_cache.json"
+FORCE_REFRESH        = os.environ.get("FORCE_REFRESH", "").strip() in ("1", "true", "yes")
+PROFILE_MAX_AGE_DAYS = int(os.environ.get("PROFILE_MAX_AGE_DAYS", "30"))
+MISSING_RETRY_DAYS   = 3
+
+# Only these profile fields are cached (market_cap intentionally dropped —
+# it is stale in company-profile; live mcap now comes from the quote API).
+PROFILE_CACHE_FIELDS = (
+    "name", "description", "website", "bse_code", "nse_code",
+    "macro_sector", "sector", "industry", "sub_industry",
+)
+
+# ── Live market cap (quote API) ──
+# ONE call with no symbol param returns the full universe, keyed by symbol:
+# {"ITC": {"market_cap": 335789.75, ...}, ...} — market_cap already in ₹ Crore.
 
 # =========================================================
 # SECTOR GROUP MAP
@@ -917,6 +945,7 @@ WORKER_HEADERS = {
 }
 
 PROFILE_URL = "https://data.finedgeapi.com/api/v1/company-profile"
+QUOTE_URL   = "https://data.finedgeapi.com/api/v2/quote"
 
 # =========================================================
 # R2 HELPERS
@@ -947,6 +976,13 @@ async def r2_upload(client, filename, data):
 # =========================================================
 
 async def fetch_profile(client, symbol, semaphore):
+    """
+    Returns (profile_or_None, definitive).
+    definitive=True  → Finedge gave a real answer (200, or a hard non-200
+                       like 404) — safe to cache the result.
+    definitive=False → retries exhausted on network / 429 / 5xx — transient,
+                       do NOT overwrite the existing cache entry.
+    """
     async with semaphore:
         for attempt in range(RETRY):
             await asyncio.sleep(RATE_DELAY)
@@ -973,36 +1009,127 @@ async def fetch_profile(client, symbol, semaphore):
                 continue
             if r.status_code != 200:
                 print(f"{symbol} -> HTTP {r.status_code}")
-                return None
+                return None, True
             try:
-                return r.json()
+                data = r.json()
             except Exception:
-                return None
-    return None
+                return None, True
+            return (data if isinstance(data, dict) and data else None), True
+    return None, False
 
 # =========================================================
-# PROCESS STOCK
+# LIVE MARKET CAP (quote API)
 # =========================================================
 
-async def process_stock(client, stock, semaphore, fundamentals: dict, ipo_industry_map: dict):
-    symbol = stock["symbol"]
-    is_ipo_source = stock.get("source") == "ipo"
+async def fetch_live_market_caps(client) -> dict[str, float]:
+    """
+    symbol → market cap (₹ Cr) for the full universe in ONE quote call.
+    Symbols missing from the response or with market_cap <= 0 are simply
+    absent — process_stock() then falls back to master.json's market_cap_cr.
+    Any failure → {} (whole run falls back to master.json, never crashes).
+    """
+    data = {}
+    for attempt in range(RETRY):
+        try:
+            r = await client.get(QUOTE_URL, params={"token": FINEDGE_TOKEN}, timeout=180)
+        except Exception as e:
+            print(f"  quote Network Error: {e}")
+            await asyncio.sleep(2 ** attempt)
+            continue
+        if r.status_code == 429:
+            print("  quote -> 429")
+            await asyncio.sleep(15)
+            continue
+        if r.status_code in (502, 503, 504):
+            print(f"  quote -> {r.status_code} (retrying, attempt {attempt + 1}/{RETRY})")
+            await asyncio.sleep(5 * (attempt + 1))
+            continue
+        if r.status_code != 200:
+            print(f"  quote -> HTTP {r.status_code}")
+            break
+        try:
+            data = r.json()
+        except Exception:
+            print("  quote -> invalid JSON")
+        break
 
-    profile = await fetch_profile(client, symbol, semaphore)
+    if not isinstance(data, dict):
+        data = {}
 
-    master_mcap = stock.get("market_cap_cr")
+    mcaps: dict[str, float] = {}
+    for sym, q in data.items():
+        if not isinstance(q, dict):
+            continue
+        try:
+            mc = float(q.get("market_cap") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mc > 0:
+            mcaps[sym] = mc
+    return mcaps
 
-    # Does the profile actually carry usable classification data? Finedge
-    # sometimes returns a profile shell for freshly-listed stocks with
-    # sector/industry/sub_industry all blank (not just market_cap = 0 —
-    # that part alone doesn't block classify() below).
-    profile_has_classification = bool(
+# =========================================================
+# PROFILE CACHE HELPERS
+# =========================================================
+
+def has_classification(profile) -> bool:
+    return bool(
         profile and (
             (profile.get("sector") or "").strip()
             or (profile.get("industry") or "").strip()
             or (profile.get("sub_industry") or "").strip()
         )
     )
+
+
+def slim_profile(profile: dict) -> dict:
+    return {k: profile.get(k) for k in PROFILE_CACHE_FIELDS}
+
+
+def _age_days(entry: dict, today: date) -> int:
+    try:
+        return (today - date.fromisoformat(entry.get("fetched_at", ""))).days
+    except (TypeError, ValueError):
+        return 10**6   # unknown date → treat as very old
+
+
+def needs_fetch(entry, is_ipo: bool, today: date) -> bool:
+    if FORCE_REFRESH or not entry:
+        return True
+    profile = entry.get("profile")
+    age     = _age_days(entry, today)
+    if profile is None:
+        # Finedge had no profile last time. IPOs get retried daily (their
+        # profile usually appears within days); others every few days.
+        return is_ipo or age >= MISSING_RETRY_DAYS
+    if not has_classification(profile):
+        return True
+    if PROFILE_MAX_AGE_DAYS > 0 and age >= PROFILE_MAX_AGE_DAYS:
+        return True
+    return False
+
+# =========================================================
+# PROCESS STOCK
+# =========================================================
+
+def process_stock(stock, profile, live_mcap, fundamentals: dict, ipo_industry_map: dict):
+    """
+    profile   : cached (or just-fetched) Finedge company-profile, or None
+    live_mcap : market cap in ₹ Cr from the quote API, or None
+    """
+    symbol = stock["symbol"]
+    is_ipo_source = stock.get("source") == "ipo"
+
+    master_mcap = stock.get("market_cap_cr")
+
+    # Market cap priority: live quote API → master.json. Profile's own
+    # market_cap is NOT used any more (stale, and no longer cached).
+    market_cap = float(live_mcap) if live_mcap else float(master_mcap or 0)
+
+    # Does the profile actually carry usable classification data? Finedge
+    # sometimes returns a profile shell for freshly-listed stocks with
+    # sector/industry/sub_industry all blank.
+    profile_has_classification = has_classification(profile)
 
     # ── IPO-sourced stocks: never filter on market cap ──
     # market_cap_cr sits at 0 in master.json for freshly-injected IPO rows
@@ -1021,8 +1148,6 @@ async def process_stock(client, stock, semaphore, fundamentals: dict, ipo_indust
             # no reason when we actually know its industry.
             ipo_industry = ipo_industry_map.get(stock.get("isin") or "", "")
             mapped = IPO_TRACKER_INDUSTRY_MAP.get(ipo_industry)
-
-            market_cap = float(master_mcap) if master_mcap else float((profile or {}).get("market_cap") or 0)
 
             if mapped:
                 sector_group, display_industry = mapped
@@ -1065,15 +1190,6 @@ async def process_stock(client, stock, semaphore, fundamentals: dict, ipo_indust
         # is" case, not a freshly-listed-stock data lag.
         print(f"✗ {symbol} | profile fail")
         return None
-
-    # ── FIX: market cap mismatch ──
-    # company-profile endpoint's market_cap can be stale (fundamentals-type
-    # data, refreshed less often). master.json's market_cap_cr comes from
-    # the live quote endpoint and is fresher — prefer that when present.
-    # Fall back to profile's value only when master doesn't have one yet
-    # (e.g. a stock freshly injected via Upstox with no Finedge quote).
-    profile_mcap = float(profile.get("market_cap") or 0)
-    market_cap   = float(master_mcap) if master_mcap else profile_mcap
 
     if not is_ipo_source and market_cap < MIN_MARKET_CAP_CR:
         print(f"✗ {symbol} | market cap < {MIN_MARKET_CAP_CR}cr")
@@ -1179,19 +1295,80 @@ async def main():
         except Exception as e:
             print(f"  ⚠️  Could not load ipo_data.json: {e} — IPO fallback classification unavailable this run")
 
-        results = []
-        total   = len(combined_input)
+        # ── Profile cache ──
+        print(f"\nDownloading {PROFILE_CACHE_FILE}...")
+        try:
+            profile_cache = await r2_download(client, PROFILE_CACHE_FILE)
+            if not isinstance(profile_cache, dict):
+                profile_cache = {}
+        except Exception as e:
+            print(f"  ⚠️  No usable profile cache ({e}) — first run, fetching all profiles")
+            profile_cache = {}
+        print(f"  📦 Cached profiles: {len(profile_cache)}")
 
-        for i in range(0, total, BATCH_SIZE):
-            batch = combined_input[i:i + BATCH_SIZE]
-            tasks = [
-                process_stock(client, stock, semaphore, fundamentals, ipo_industry_map)
-                for stock in batch
-            ]
-            batch_results = await asyncio.gather(*tasks)
-            results.extend(batch_results)
-            print(f"\nProcessed {min(i + BATCH_SIZE, total)}/{total}")
+        # Prune delisted / dropped-from-universe symbols
+        universe_syms = {s["symbol"] for s in combined_input}
+        pruned = len(profile_cache)
+        profile_cache = {k: v for k, v in profile_cache.items() if k in universe_syms}
+        pruned -= len(profile_cache)
+        if pruned:
+            print(f"  🧹 Pruned {pruned} symbol(s) no longer in universe")
+
+        today    = date.today()
+        to_fetch = [
+            s for s in combined_input
+            if needs_fetch(profile_cache.get(s["symbol"]), s.get("source") == "ipo", today)
+        ]
+        if FORCE_REFRESH:
+            print("  🔁 FORCE_REFRESH=1 — refetching every profile")
+        print(f"  🌐 Profiles to fetch from Finedge: {len(to_fetch)} / {len(combined_input)}")
+
+        # ── Fetch only the profiles that need it ──
+        fetched_ok = fetched_missing = fetched_transient = 0
+        for i in range(0, len(to_fetch), BATCH_SIZE):
+            batch = to_fetch[i:i + BATCH_SIZE]
+            outs  = await asyncio.gather(*(fetch_profile(client, s["symbol"], semaphore) for s in batch))
+            for s, (profile, definitive) in zip(batch, outs):
+                sym = s["symbol"]
+                if profile:
+                    profile_cache[sym] = {"profile": slim_profile(profile), "fetched_at": today.isoformat()}
+                    fetched_ok += 1
+                elif definitive:
+                    # Finedge genuinely has no profile. Don't clobber an older
+                    # good profile (e.g. periodic refresh hit a one-off 404).
+                    old = profile_cache.get(sym)
+                    if old and old.get("profile"):
+                        old["fetched_at"] = today.isoformat()
+                    else:
+                        profile_cache[sym] = {"profile": None, "fetched_at": today.isoformat()}
+                    fetched_missing += 1
+                else:
+                    fetched_transient += 1   # keep existing entry as-is, retry next run
+            print(f"  Fetched {min(i + BATCH_SIZE, len(to_fetch))}/{len(to_fetch)}")
             await asyncio.sleep(2)
+        if to_fetch:
+            print(f"  ✓ ok: {fetched_ok} | ✗ no profile: {fetched_missing} | ⚠ transient fail: {fetched_transient}")
+
+        # ── Live market caps (quote API) ──
+        print("\nFetching live market caps (quote API)...")
+        live_mcaps = await fetch_live_market_caps(client)
+        if not live_mcaps:
+            print("  ⚠️  Quote API gave no market caps — using master.json market_cap_cr for all")
+        matched = sum(1 for s in combined_input if s["symbol"] in live_mcaps)
+        print(f"  💹 Live mcap for {matched} / {len(combined_input)} symbols "
+              f"(rest fall back to master.json)")
+
+        # ── Classify (no network — all from cache) ──
+        results = [
+            process_stock(
+                stock,
+                (profile_cache.get(stock["symbol"]) or {}).get("profile"),
+                live_mcaps.get(stock["symbol"]),
+                fundamentals,
+                ipo_industry_map,
+            )
+            for stock in combined_input
+        ]
 
         classification = [x for x in results if x]
         classification.sort(key=lambda x: x["market_cap_cr"], reverse=True)
@@ -1206,8 +1383,9 @@ async def main():
         # Upload both files
         await r2_upload(client, OUTPUT_FILE, classification)
         await r2_upload(client, FUNDAMENTAL_FILE, list(fundamentals.values()))
+        await r2_upload(client, PROFILE_CACHE_FILE, profile_cache)
 
-        print("\n🎉 Done! classification.json + fundamental.json uploaded")
+        print(f"\n🎉 Done! classification.json + fundamental.json + {PROFILE_CACHE_FILE} uploaded")
 
 
 if __name__ == "__main__":
