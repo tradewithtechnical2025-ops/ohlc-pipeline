@@ -521,19 +521,35 @@ def _process_notes(period_dict: dict, max_notes_chars: int = 600) -> None:
         period_dict["notes"] = cleaned[:max_notes_chars] + ("…" if len(cleaned) > max_notes_chars else "")
 
 
+def _opm_value(revenue, total_expenses, finance_costs=None, depreciation=None):
+    """
+    Operating margin as a decimal fraction, EBITDA-style:
+    (Revenue from Ops - (Total Expenses - Finance Costs - Depreciation)) / Revenue.
+    The filing's "Total expenses" line INCLUDES finance costs and D&A, so
+    (revenue - total_expenses) alone is an EBIT-style margin and understates
+    OPM heavily for capex-heavy companies (e.g. ESDS Q1 FY27: 26.2% vs the
+    correct 41.9%). Returns (opm, basis) where basis is "ebitda" when both
+    add-backs were available, else "ebit" (fallback, old formula) so callers
+    never compare margins computed on different bases.
+    """
+    if not revenue or total_expenses is None:
+        return None, None
+    if finance_costs is not None and depreciation is not None:
+        op_exp = total_expenses - finance_costs - depreciation
+        return round((revenue - op_exp) / revenue, 4), "ebitda"
+    return round((revenue - total_expenses) / revenue, 4), "ebit"
+
+
 def _compute_opm(period_dict: dict) -> None:
     """
     Mutates period_dict in place, adding 'opm' as a decimal fraction (e.g.
-    0.241 = 24.1%) using the same formula pipeline_fundamentals_prod.py's
-    _compute_opm() uses for fundamentals_summary.json ((sales-expenses)/
-    sales) — matching methodology is what makes the QoQ/YoY OPM comparison
-    against fundamentals data meaningful rather than comparing two
-    differently-defined margins.
+    0.241 = 24.1%) plus 'opm_basis' ("ebitda" or "ebit") — see _opm_value().
     """
-    revenue = period_dict.get("revenue")
-    expenses = period_dict.get("total_expenses")
-    if revenue and expenses is not None and revenue != 0:
-        period_dict["opm"] = round((revenue - expenses) / revenue, 4)
+    opm, basis = _opm_value(period_dict.get("revenue"), period_dict.get("total_expenses"),
+                            period_dict.get("finance_costs"), period_dict.get("depreciation"))
+    if opm is not None:
+        period_dict["opm"] = opm
+        period_dict["opm_basis"] = basis
 
 
 def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
@@ -1193,11 +1209,13 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         "revenue": scale(qoq.get("revenue")), "total_income": scale(qoq.get("total_income")),
         "pat": scale(qoq.get("pat")), "eps_basic": qoq.get("eps_basic"),
         "total_expenses": scale(qoq.get("total_expenses")),
+        "finance_costs": scale(qoq.get("finance_costs")), "depreciation": scale(qoq.get("depreciation")),
     }
     yoy_prior = {
         "revenue": scale(yoy.get("revenue")), "total_income": scale(yoy.get("total_income")),
         "pat": scale(yoy.get("pat")), "eps_basic": yoy.get("eps_basic"),
         "total_expenses": scale(yoy.get("total_expenses")),
+        "finance_costs": scale(yoy.get("finance_costs")), "depreciation": scale(yoy.get("depreciation")),
     }
     qoq_header = _quarter_header(qoq.get("period_end")) if qoq.get("period_end") else None
     yoy_header = _quarter_header(yoy.get("period_end")) if yoy.get("period_end") else None
@@ -1229,9 +1247,13 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
             out[f"{out_field}_prior"] = prior_v
             out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
             got_any = True
-    prior_rev, prior_exp = prior.get("revenue"), prior.get("total_expenses")
-    prior_opm = (prior_rev - prior_exp) / prior_rev if (prior_rev and prior_exp is not None and prior_rev != 0) else None
-    cur_opm = cur.get("opm")
+    # Compute both sides on the SAME basis: if either period is missing its
+    # finance_costs/depreciation add-backs, fall back to the EBIT-style
+    # formula for both, so the pp delta never mixes two margin definitions.
+    both_ebitda = all(d.get(k) is not None for d in (cur, prior) for k in ("finance_costs", "depreciation"))
+    fc_dep = lambda d: (d.get("finance_costs"), d.get("depreciation")) if both_ebitda else (None, None)
+    prior_opm, _ = _opm_value(prior.get("revenue"), prior.get("total_expenses"), *fc_dep(prior))
+    cur_opm, _ = _opm_value(cur.get("revenue"), cur.get("total_expenses"), *fc_dep(cur))
     if cur_opm is not None and prior_opm is not None:
         out["opm_prior"] = round(prior_opm * 100, 2)
         out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
@@ -1595,7 +1617,9 @@ def _telegram_fin_table(parsed: dict) -> list:
     q = parsed.get("quarter", {})
     revenue = q.get("revenue")
     total_income = q.get("total_income")
-    cur_rev = total_income if total_income is not None else revenue
+    # "Sales" = Revenue from Operations (excludes Other Income), matching
+    # screener/aggregator convention. Total Income only as a fallback.
+    cur_rev = revenue if revenue is not None else total_income
     cur_pat = q.get("pat")
     cur_eps = q.get("eps_basic")
     cur_opm = round(q["opm"] * 100, 1) if q.get("opm") is not None else None
@@ -1606,13 +1630,13 @@ def _telegram_fin_table(parsed: dict) -> list:
     yf = parsed.get("yoy_fundamentals") or {}
 
     def _pick(ti_key, sales_key, source):
-        ti = source.get(ti_key)
-        return ti if ti is not None else source.get(sales_key)
+        sv = source.get(sales_key)
+        return sv if sv is not None else source.get(ti_key)
 
     qoq_rev = _pick("total_income_prior", "sales_prior", qf)
-    qoq_rev_pct = qf.get("total_income_qoq_pct")
+    qoq_rev_pct = qf.get("sales_qoq_pct")
     if qoq_rev_pct is None:
-        qoq_rev_pct = qf.get("sales_qoq_pct")
+        qoq_rev_pct = qf.get("total_income_qoq_pct")
     qoq_pat = qf.get("pat_prior")
     qoq_pat_pct = qf.get("pat_qoq_pct")
     qoq_eps = qf.get("eps_prior")
@@ -1623,9 +1647,9 @@ def _telegram_fin_table(parsed: dict) -> list:
     if yoy_native:
         # Native XBRL-tagged prior-year context — doesn't carry a
         # comparative EPS figure, unlike the AI/fundamentals paths.
-        yoy_rev = yoy_native.get("total_income")
+        yoy_rev = yoy_native.get("revenue")
         if yoy_rev is None:
-            yoy_rev = yoy_native.get("revenue")
+            yoy_rev = yoy_native.get("total_income")
         yoy_pat = yoy_native.get("pat")
         yoy_opm = round(yoy_native["opm"] * 100, 1) if yoy_native.get("opm") is not None else None
         yoy_opm_pp = round((cur_opm - yoy_opm), 1) if (cur_opm is not None and yoy_opm is not None) else None
@@ -1634,9 +1658,9 @@ def _telegram_fin_table(parsed: dict) -> list:
         yoy_header = _shorten_quarter_header(_quarter_header(yoy_native.get("period_end")))
     else:
         yoy_rev = _pick("total_income_prior", "sales_prior", yf)
-        yoy_rev_pct = yf.get("total_income_yoy_pct")
+        yoy_rev_pct = yf.get("sales_yoy_pct")
         if yoy_rev_pct is None:
-            yoy_rev_pct = yf.get("sales_yoy_pct")
+            yoy_rev_pct = yf.get("total_income_yoy_pct")
         yoy_pat = yf.get("pat_prior")
         yoy_pat_pct = yf.get("pat_yoy_pct")
         yoy_eps = yf.get("eps_prior")
@@ -1691,7 +1715,7 @@ def _telegram_basis_block(parsed: dict) -> list:
     q = parsed.get("quarter", {})
     revenue = q.get("revenue")
     total_income = q.get("total_income")
-    rev_display = total_income if total_income is not None else revenue
+    rev_display = revenue if revenue is not None else total_income
     pat = q.get("pat")
     pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
     cur_header = _quarter_header(q.get("period_end")) or ""
