@@ -655,7 +655,14 @@ def _compute_opm(row):
         return None
     exp = row.get("expenses")
     if exp is not None:
-        return round((sales - exp) / sales, 4)
+        # FIX (Sep 2026): FinEdge "expenses" is the filing's Total Expenses,
+        # which INCLUDES depreciation and finance costs (verified on
+        # 3BBLACKBIO: materials+inventory chg+employee+other+D&A+finance ==
+        # expenses, all 12 quarters). Add both back so OPM is EBITDA-style
+        # and matches Screener's OPM exactly (e.g. 3BBLACKBIO Mar'26: 24.0%,
+        # was showing 12.7%).
+        op_exp = exp - (row.get("depreciation") or 0) - (row.get("finance_costs") or 0)
+        return round((sales - op_exp) / sales, 4)
     pbt  = row.get("pbt")
     dep  = row.get("depreciation")
     fin  = row.get("finance_costs")
@@ -680,7 +687,8 @@ def _compute_ebitda_abs(row):
         return None
     exp = row.get("expenses")
     if exp is not None:
-        return sales - exp
+        # Same D&A + finance-cost add-back as _compute_opm() (see FIX note there).
+        return sales - (exp - (row.get("depreciation") or 0) - (row.get("finance_costs") or 0))
     pbt = row.get("pbt")
     dep = row.get("depreciation")
     fin = row.get("finance_costs")
