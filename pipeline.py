@@ -19,6 +19,7 @@ Usage:
   python pipeline.py pattern_scan_force   # bypass trading-day gate (use after holiday-list fixes)
   python pipeline.py candle_scan          # candlestick patterns -> candle_patterns.json + candle_pattern_stats.json
   python pipeline.py candle_scan_force    # same, bypassing the trading-day gate
+  python pipeline.py home_ticker          # home page ticker -> home_ticker.json (run after all scans)
   python pipeline.py vcp_scan
   python pipeline.py stage2_scan
   python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
@@ -3920,6 +3921,121 @@ async def run_candle_scan(force: bool = False) -> None:
     except Exception as e:
         status.failure(e)
 
+# ══════════════════════════════════════════════════════════════
+# HOME PAGE TICKER  (home_ticker)
+#   Reads today's scan outputs from R2 and writes a tiny public file,
+#   home_ticker.json, for the scrolling ticker on the home page.
+#   Run it AFTER all scans (it only reads their outputs + OHLC for breadth).
+# ══════════════════════════════════════════════════════════════
+
+TICKER_PER_TYPE = 3   # stocks per signal type (highest RS first)
+
+
+def _ticker_pick(symbols, rs_map, n=TICKER_PER_TYPE):
+    """Top-n symbols by RS rating; skips BSE numeric codes (not readable on a ticker) and duplicates."""
+    seen, clean = set(), []
+    for s in symbols:
+        if not s or s in seen or str(s).isdigit(): continue
+        seen.add(s); clean.append(s)
+    clean.sort(key=lambda s: -(rs_map.get(s) or 0))
+    return clean[:n]
+
+
+def _ticker_latest(signals):
+    """Only the signals from the most recent date in a list (lists can carry older days)."""
+    dates = [s.get("date") for s in signals if s.get("date")]
+    if not dates: return signals
+    last = max(dates)
+    return [s for s in signals if s.get("date") == last]
+
+
+def _ticker_breadth_50sma(all_data):
+    """% of stocks (with >= 50 closes) whose last close is above their 50-day SMA."""
+    above = total = 0
+    for s in all_data.values():
+        closes = [c for c in (s.get("c") or []) if c is not None and c > 0]
+        if len(closes) < 50: continue
+        total += 1
+        if closes[-1] > sum(closes[-50:]) / 50: above += 1
+    return round(above / total * 100) if total else None
+
+
+async def run_home_ticker() -> None:
+    status = PipelineStatus("run_home_ticker")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Home Ticker  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            names = ["rs_ratings.json", "pattern_signals.json", "hlr_signals.json", "pullback_signals.json",
+                     "candle_patterns.json", "minervini_trend_template.json"]
+            res = await asyncio.gather(*[r2_download(client, n) for n in names], return_exceptions=True)
+            data = {}
+            for n, r in zip(names, res):
+                if isinstance(r, Exception) or not r:
+                    log.warning(f"  {n} unavailable — skipped"); data[n] = {}
+                else:
+                    data[n] = r
+            rs_map = {sym: (v or {}).get("rs") for sym, v in (data["rs_ratings.json"].get("stocks") or {}).items()}
+
+            items = []
+            def add(label, syms, tone):
+                for s in _ticker_pick(syms, rs_map):
+                    items.append({"label": label, "symbol": s, "tone": tone})
+
+            # HLR breakouts
+            hlr = data["hlr_signals.json"].get("signals") or []
+            add("HLR BREAKOUT", [s["symbol"] for s in hlr if s.get("state") == "BO"], "green")
+            # Pullbacks (latest session only)
+            pb = _ticker_latest(data["pullback_signals.json"].get("signals") or [])
+            add("PULLBACK", [s["symbol"] for s in pb], "green")
+            # MCP / coil still coiling
+            pat = data["pattern_signals.json"].get("signals") or []
+            add("MCP COILING", [s["symbol"] for s in pat
+                                if ("MCP" in str(s.get("pattern")) or s.get("pattern") == "Mini Coil")
+                                and s.get("coil_state", "Coiling") == "Coiling"], "cyan")
+            # Stage 2 leaders — prefer stocks that entered the Trend Template today
+            mv = data["minervini_trend_template.json"]
+            new_today = [s for s in (mv.get("new_today") or [])]
+            stage2 = new_today if new_today else [s["symbol"] for s in (mv.get("signals") or [])]
+            add("NEW STAGE 2" if new_today else "STAGE 2 LEADER", stage2, "green")
+            # Candlestick patterns (latest session): 2 bullish + 1 bearish
+            cs = [s for s in (data["candle_patterns.json"].get("signals") or [])
+                  if s.get("date") == data["candle_patterns.json"].get("latest")]
+            for bias, tone, n in (("bullish", "green", 2), ("bearish", "red", 1)):
+                picked = _ticker_pick([s["symbol"] for s in cs if s.get("bias") == bias], rs_map, n)
+                for sym in picked:
+                    pat_name = next(s["pattern"] for s in cs if s["symbol"] == sym and s.get("bias") == bias)
+                    items.append({"label": pat_name.upper(), "symbol": sym, "tone": tone})
+
+            # Market breadth line
+            all_data = await download_all_chunks(client)
+            pct50 = _ticker_breadth_50sma(all_data)
+            breadth = None
+            if pct50 is not None:
+                breadth = {"label": "% ABOVE 50 SMA", "value": f"{pct50}%", "tone": "green" if pct50 >= 50 else "red"}
+
+            # Interleave types so the ticker doesn't show 3 of the same in a row
+            by_label = {}
+            for it in items: by_label.setdefault(it["label"], []).append(it)
+            mixed, queues = [], list(by_label.values())
+            while any(queues):
+                for q in queues:
+                    if q: mixed.append(q.pop(0))
+            if breadth: mixed.insert(0, breadth)
+
+            last_session = max([d for d in [data["candle_patterns.json"].get("latest"),
+                                            data["hlr_signals.json"].get("updated")] if d] or [today])
+            log.info(f"Ticker items: {len(mixed)} (session {last_session})")
+            for it in mixed: log.info(f"  {it['label']} · {it.get('symbol', it.get('value'))}")
+
+            await upload_str_with_manifest(client, r2_upload, "home_ticker.json", json.dumps({
+                "updated": today, "date": last_session, "items": mixed,
+            }), schema_v=1, extra_meta={"count": len(mixed)})
+        status.success()
+        log.info("━━━ Home Ticker complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
 #-----------------
 def _calc_sma(closes, period):
     n = len(closes)
@@ -5446,6 +5562,7 @@ if __name__ == "__main__":
         case "pattern_scan_force": asyncio.run(run_pattern_scan(force=True))
         case "candle_scan":   asyncio.run(run_candle_scan())
         case "candle_scan_force": asyncio.run(run_candle_scan(force=True))
+        case "home_ticker":   asyncio.run(run_home_ticker())
         case "stage2_scan":   asyncio.run(run_stage2_scan())
         case "minervini_scan": asyncio.run(run_minervini_scan())
         case "weinstein_scan": asyncio.run(run_weinstein_scan())
