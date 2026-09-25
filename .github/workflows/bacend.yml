@@ -22,6 +22,7 @@ on:
           - hlr_scan
           - pattern_scan
           - pattern_scan_force
+          - candle_scan
 
 jobs:
   pipeline-scan:
