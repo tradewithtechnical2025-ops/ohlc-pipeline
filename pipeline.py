@@ -17,6 +17,8 @@ Usage:
   python pipeline.py hlr_scan
   python pipeline.py pattern_scan
   python pipeline.py pattern_scan_force   # bypass trading-day gate (use after holiday-list fixes)
+  python pipeline.py candle_scan          # candlestick patterns -> candle_patterns.json + candle_pattern_stats.json
+  python pipeline.py candle_scan_force    # same, bypassing the trading-day gate
   python pipeline.py vcp_scan
   python pipeline.py stage2_scan
   python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
@@ -3631,6 +3633,270 @@ async def run_pattern_scan(force: bool = False) -> None:
         log.info("━━━ Pattern Scan complete ━━━")
     except Exception as e:
         status.failure(e)
+# ══════════════════════════════════════════════════════════════
+# CANDLESTICK PATTERN SCAN  (candle_scan)
+#   Outputs:
+#     candle_patterns.json      — signals from the last CANDLE_SIGNAL_SESSIONS sessions
+#     candle_pattern_stats.json — per-pattern backtest over the full OHLC history
+#                                 (forward returns after 5 / 10 / 20 sessions)
+#   Does not touch pattern_scan (Inside Bar / NR7 / MCP stay there).
+# ══════════════════════════════════════════════════════════════
+
+CANDLE_SIGNAL_SESSIONS = 10          # sessions of signals kept in candle_patterns.json
+CANDLE_FWD_BARS        = (5, 10, 20) # forward-return horizons for the backtest
+CANDLE_AVG_LOOKBACK    = 10          # bars used for "average body / range" references
+CANDLE_TREND_LOOKBACK  = 5           # bars used to judge the trend before a pattern
+
+# pattern name -> bias ("bullish" / "bearish" / "neutral"), in display order
+CANDLE_PATTERNS = {
+    "Bullish Engulfing": "bullish", "Bearish Engulfing": "bearish",
+    "Hammer": "bullish", "Shooting Star": "bearish",
+    "Morning Star": "bullish", "Evening Star": "bearish",
+    "Piercing Line": "bullish", "Dark Cloud Cover": "bearish",
+    "Bullish Harami": "bullish", "Bearish Harami": "bearish",
+    "Tweezer Bottom": "bullish", "Tweezer Top": "bearish",
+    "Bullish Marubozu": "bullish", "Bearish Marubozu": "bearish",
+    "Three White Soldiers": "bullish", "Three Black Crows": "bearish",
+    "Doji": "neutral", "Dragonfly Doji": "bullish", "Gravestone Doji": "bearish",
+}
+
+
+def _candle_prep(s):
+    """Per-stock arrays used by the detector. Bars with a missing O/H/L/C are marked invalid."""
+    o, h, l, c = s["o"], s["h"], s["l"], s["c"]
+    n = len(c)
+    ok = [all(x is not None and x > 0 for x in (o[i], h[i], l[i], c[i])) and h[i] >= l[i] for i in range(n)]
+    body = [abs(c[i] - o[i]) if ok[i] else None for i in range(n)]
+    rng = [h[i] - l[i] if ok[i] else None for i in range(n)]
+    # Average body / range of the CANDLE_AVG_LOOKBACK bars BEFORE bar i (never includes bar i)
+    avg_body = [None] * n
+    avg_rng = [None] * n
+    lb = CANDLE_AVG_LOOKBACK
+    for i in range(lb, n):
+        bs = [body[j] for j in range(i - lb, i) if body[j] is not None]
+        rs = [rng[j] for j in range(i - lb, i) if rng[j] is not None]
+        if len(bs) >= lb // 2: avg_body[i] = sum(bs) / len(bs)
+        if len(rs) >= lb // 2: avg_rng[i] = sum(rs) / len(rs)
+    return {"o": o, "h": h, "l": l, "c": c, "ok": ok, "body": body, "rng": rng,
+            "avg_body": avg_body, "avg_rng": avg_rng, "n": n}
+
+
+def _candle_trend(p, start):
+    """Trend over the CANDLE_TREND_LOOKBACK bars before the pattern's first bar `start`.
+    'down' = close fell over the window and sits below the window's average close; 'up' mirrors it."""
+    k = CANDLE_TREND_LOOKBACK
+    a, b = start - 1 - k, start - 1
+    if a < 0: return None
+    c = p["c"]
+    if not (p["ok"][a] and p["ok"][b]): return None
+    win = [c[j] for j in range(a, b + 1) if p["ok"][j]]
+    if len(win) < k: return None
+    avg = sum(win) / len(win)
+    if c[b] < c[a] and c[b] < avg: return "down"
+    if c[b] > c[a] and c[b] > avg: return "up"
+    return None
+
+
+def _candle_patterns_at(p, i):
+    """Candlestick patterns that complete on bar i. Returns [(name, candles_in_pattern), ...]."""
+    out = []
+    if i < 3 or not p["ok"][i]: return out
+    o, h, l, c, body, rng = p["o"], p["h"], p["l"], p["c"], p["body"], p["rng"]
+    ab, ar = p["avg_body"][i], p["avg_rng"][i]
+    if not ab or not ar or rng[i] <= 0: return out
+
+    O, H, L, C, B, R = o[i], h[i], l[i], c[i], body[i], rng[i]
+    UW = H - max(O, C)          # upper wick
+    LW = min(O, C) - L          # lower wick
+    bull, bear = C > O, C < O
+    t1 = _candle_trend(p, i)    # trend before a 1-bar pattern
+
+    # ── Single-candle ──
+    # Doji: tiny body on a normal-sized range, only at the end of a trend
+    if B <= 0.1 * R and R >= 0.5 * ar and t1:
+        if UW <= 0.1 * R and LW >= 0.6 * R: out.append(("Dragonfly Doji", 1))
+        elif LW <= 0.1 * R and UW >= 0.6 * R: out.append(("Gravestone Doji", 1))
+        else: out.append(("Doji", 1))
+    # Hammer: after a decline, long lower wick (>= 2x body), little upper wick, body in the top part
+    if t1 == "down" and B > 0.1 * R and LW >= 2 * B and UW <= 0.15 * R and min(O, C) >= L + 0.6 * R:
+        out.append(("Hammer", 1))
+    # Shooting Star: after a rise, long upper wick (>= 2x body), little lower wick, body in the bottom part
+    if t1 == "up" and B > 0.1 * R and UW >= 2 * B and LW <= 0.15 * R and max(O, C) <= L + 0.4 * R:
+        out.append(("Shooting Star", 1))
+    # Marubozu: long body (>= 1.5x average) with almost no wicks
+    if B >= 1.5 * ab and B >= 0.9 * R:
+        out.append(("Bullish Marubozu" if bull else "Bearish Marubozu", 1))
+
+    # ── Two-candle ──
+    j = i - 1
+    if p["ok"][j] and rng[j] > 0:
+        O1, H1, L1, C1, B1 = o[j], h[j], l[j], c[j], body[j]
+        bull1, bear1 = C1 > O1, C1 < O1
+        t2 = _candle_trend(p, j)  # trend before a 2-bar pattern
+        # Engulfing: today's body fully covers yesterday's opposite-colour body
+        if t2 == "down" and bear1 and bull and O <= C1 and C >= O1 and B > B1:
+            out.append(("Bullish Engulfing", 2))
+        if t2 == "up" and bull1 and bear and O >= C1 and C <= O1 and B > B1:
+            out.append(("Bearish Engulfing", 2))
+        # Piercing Line: long red, then green opens at/below its close and closes above its midpoint
+        if t2 == "down" and bear1 and B1 >= ab and bull and O <= C1 and (O1 + C1) / 2 < C < O1:
+            out.append(("Piercing Line", 2))
+        # Dark Cloud Cover: long green, then red opens at/above its close and closes below its midpoint
+        if t2 == "up" and bull1 and B1 >= ab and bear and O >= C1 and O1 < C < (O1 + C1) / 2:
+            out.append(("Dark Cloud Cover", 2))
+        # Harami: long body, then a small (<= half) opposite body inside it
+        if t2 == "down" and bear1 and B1 >= ab and bull and B <= 0.5 * B1 and O >= C1 and C <= O1:
+            out.append(("Bullish Harami", 2))
+        if t2 == "up" and bull1 and B1 >= ab and bear and B <= 0.5 * B1 and O <= C1 and C >= O1:
+            out.append(("Bearish Harami", 2))
+        # Tweezers: matching lows (highs) within 10% of the average range, colours flip
+        tol = 0.1 * ar
+        if t2 == "down" and bear1 and bull and abs(L - L1) <= tol:
+            out.append(("Tweezer Bottom", 2))
+        if t2 == "up" and bull1 and bear and abs(H - H1) <= tol:
+            out.append(("Tweezer Top", 2))
+
+    # ── Three-candle ──
+    k = i - 2
+    if p["ok"][k] and p["ok"][j]:
+        O2, C2, B2 = o[k], c[k], body[k]
+        O1, C1, B1 = o[j], c[j], body[j]
+        t3 = _candle_trend(p, k)  # trend before a 3-bar pattern
+        mid2 = (O2 + C2) / 2
+        # Morning Star: long red, small body at/below its close, then green closing above its midpoint
+        if (t3 == "down" and C2 < O2 and B2 >= ab and B1 <= 0.3 * B2 and max(O1, C1) <= C2 + 0.1 * B2
+                and bull and B >= 0.5 * ab and C > mid2):
+            out.append(("Morning Star", 3))
+        # Evening Star: long green, small body at/above its close, then red closing below its midpoint
+        if (t3 == "up" and C2 > O2 and B2 >= ab and B1 <= 0.3 * B2 and min(O1, C1) >= C2 - 0.1 * B2
+                and bear and B >= 0.5 * ab and C < mid2):
+            out.append(("Evening Star", 3))
+        # Three White Soldiers: 3 solid green bars, higher closes, each opening inside the previous body
+        bars = [(O2, C2, B2, h[k]), (O1, C1, B1, h[j]), (O, C, B, H)]
+        if (all(cc > oo and bb >= 0.6 * ab and (hh - cc) <= 0.3 * bb for oo, cc, bb, hh in bars)
+                and C1 > C2 and C > C1 and O2 <= O1 <= C2 and O1 <= O <= C1):
+            out.append(("Three White Soldiers", 3))
+        # Three Black Crows: 3 solid red bars, lower closes, each opening inside the previous body
+        lows3 = [(O2, C2, B2, l[k]), (O1, C1, B1, l[j]), (O, C, B, L)]
+        if (all(cc < oo and bb >= 0.6 * ab and (cc - ll) <= 0.3 * bb for oo, cc, bb, ll in lows3)
+                and C1 < C2 and C < C1 and C2 <= O1 <= O2 and C1 <= O <= O1):
+            out.append(("Three Black Crows", 3))
+    return out
+
+
+def _candle_liquid_flags(s):
+    """Per-bar liquidity (same rule as _check_liquidity, but using only data up to that bar)."""
+    v, c = s["v"], s["c"]
+    n = len(c)
+    flags = [False] * n
+    for i in range(n):
+        lb = min(50, i + 1)
+        if lb < 20: continue
+        vols = [x for x in v[i + 1 - lb:i + 1] if x is not None]
+        prices = [x for x in c[i + 1 - lb:i + 1] if x is not None and x > 0]
+        if len(vols) < 20 or len(prices) < 20: continue
+        flags[i] = (sum(vols) / len(vols) * sum(prices) / len(prices)) >= 3_00_00_000
+    return flags
+
+
+def _detect_candle_patterns(all_data, sessions=CANDLE_SIGNAL_SESSIONS):
+    """Returns (recent_signals, stats). Signals: last `sessions` bars of each liquid stock.
+    Stats: every historical occurrence (liquid at that bar) with forward returns."""
+    signals = []
+    agg = {name: {"n": 0, **{f"sum_{f}": 0.0 for f in CANDLE_FWD_BARS},
+                  **{f"cnt_{f}": 0 for f in CANDLE_FWD_BARS}, **{f"win_{f}": 0 for f in CANDLE_FWD_BARS}}
+           for name in CANDLE_PATTERNS}
+    first_date, last_date = None, None
+
+    for sym, s in all_data.items():
+        n = len(s.get("c") or [])
+        if n < 30: continue
+        p = _candle_prep(s)
+        liquid = _candle_liquid_flags(s)
+        dates, c = s["d"], s["c"]
+        for i in range(3, n):
+            if not liquid[i]: continue
+            found = _candle_patterns_at(p, i)
+            if not found: continue
+            recent = i >= n - sessions
+            for name, ncandles in found:
+                bias = CANDLE_PATTERNS[name]
+                # ---- backtest: forward returns from this bar's close ----
+                a = agg[name]; a["n"] += 1
+                for f in CANDLE_FWD_BARS:
+                    if i + f < n and c[i + f] is not None and c[i + f] > 0:
+                        ret = (c[i + f] / c[i] - 1) * 100
+                        a[f"sum_{f}"] += ret; a[f"cnt_{f}"] += 1
+                        # "win" = price moved the way the pattern suggests (neutral: counted as up-moves)
+                        if (bias == "bearish" and ret < 0) or (bias != "bearish" and ret > 0):
+                            a[f"win_{f}"] += 1
+                d = dates[i]
+                if first_date is None or d < first_date: first_date = d
+                if last_date is None or d > last_date: last_date = d
+                # ---- recent signals ----
+                if recent:
+                    st = i - ncandles + 1
+                    signals.append({
+                        "symbol": sym, "pattern": name, "bias": bias, "date": d,
+                        "candles": ncandles,
+                        "high": round(max(s["h"][x] for x in range(st, i + 1)), 2),
+                        "low": round(min(s["l"][x] for x in range(st, i + 1)), 2),
+                        "close": round(c[i], 2),
+                    })
+
+    stats = []
+    for name, bias in CANDLE_PATTERNS.items():
+        a = agg[name]
+        row = {"pattern": name, "bias": bias, "occurrences": a["n"]}
+        for f in CANDLE_FWD_BARS:
+            cnt = a[f"cnt_{f}"]
+            row[f"avg_ret_{f}d"] = round(a[f"sum_{f}"] / cnt, 2) if cnt else None
+            row[f"win_rate_{f}d"] = round(a[f"win_{f}"] / cnt * 100, 1) if cnt else None
+            row[f"samples_{f}d"] = cnt
+        stats.append(row)
+    signals.sort(key=lambda x: (x["date"], x["symbol"]), reverse=True)
+    return signals, {"from": first_date, "to": last_date, "patterns": stats}
+
+
+async def run_candle_scan(force: bool = False) -> None:
+    status = PipelineStatus("run_candle_scan")
+    try:
+        today = today_ist()
+        if not force and not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        if force: log.info(f"⚠️  FORCE MODE — bypassing trading-day check for {today}")
+        log.info(f"━━━ Candlestick Pattern Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            signals, stats = _detect_candle_patterns(all_data)
+            from collections import Counter
+            latest = max((s["date"] for s in signals), default=None)
+            today_counts = Counter(s["pattern"] for s in signals if s["date"] == latest)
+            sessions = sorted({s["date"] for s in signals}, reverse=True)
+            for pat in CANDLE_PATTERNS:
+                if today_counts.get(pat): log.info(f"  {pat}: {today_counts[pat]}")
+            log.info(f"Signals: {len(signals)} over {len(sessions)} sessions (latest {latest}: {sum(today_counts.values())})")
+            for r in stats["patterns"]:
+                log.info(f"  [stats] {r['pattern']:<22} n={r['occurrences']:<6} win10={r['win_rate_10d']}%  avg10={r['avg_ret_10d']}%")
+
+            await asyncio.gather(
+                upload_str_with_manifest(client, r2_upload, "candle_patterns.json", json.dumps({
+                    "updated": today, "latest": latest, "sessions": sessions,
+                    "count": len(signals), "summary_latest": dict(today_counts),
+                    "signals": signals,
+                }), schema_v=1, extra_meta={"count": len(signals)}),
+                upload_str_with_manifest(client, r2_upload, "candle_pattern_stats.json", json.dumps({
+                    "updated": today, "horizons": list(CANDLE_FWD_BARS), **stats,
+                }), schema_v=1),
+            )
+        status.success()
+        log.info("━━━ Candlestick Pattern Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
 #-----------------
 def _calc_sma(closes, period):
     n = len(closes)
@@ -5155,6 +5421,8 @@ if __name__ == "__main__":
         case "hlr_scan":      asyncio.run(run_hlr_scan())
         case "pattern_scan":  asyncio.run(run_pattern_scan())
         case "pattern_scan_force": asyncio.run(run_pattern_scan(force=True))
+        case "candle_scan":   asyncio.run(run_candle_scan())
+        case "candle_scan_force": asyncio.run(run_candle_scan(force=True))
         case "stage2_scan":   asyncio.run(run_stage2_scan())
         case "minervini_scan": asyncio.run(run_minervini_scan())
         case "weinstein_scan": asyncio.run(run_weinstein_scan())
