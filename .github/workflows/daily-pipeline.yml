@@ -92,6 +92,13 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py vcp_scan
+      - name: Candlestick Pattern Scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py candle_scan
 
       - name: EP Scan
         uses: nick-fields/retry@v3
