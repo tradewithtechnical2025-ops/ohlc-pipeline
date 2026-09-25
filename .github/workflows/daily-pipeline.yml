@@ -121,6 +121,14 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py weinstein_scan
+      # Home page ticker reads the outputs of the scans above — keep it after them
+      - name: Home Page Ticker
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py home_ticker
       - name: Indices Pipeline
         uses: nick-fields/retry@v3
         with:
