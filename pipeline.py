@@ -3646,6 +3646,9 @@ CANDLE_SIGNAL_SESSIONS = 10          # sessions of signals kept in candle_patter
 CANDLE_FWD_BARS        = (5, 10, 20) # forward-return horizons for the backtest
 CANDLE_AVG_LOOKBACK    = 10          # bars used for "average body / range" references
 CANDLE_TREND_LOOKBACK  = 5           # bars used to judge the trend before a pattern
+CANDLE_TREND_MIN_PCT   = 3.0         # minimum close-to-close move over that window to count as a trend
+CANDLE_TREND_EMA       = 10          # close must be above (uptrend) / below (downtrend) this EMA
+CANDLE_EXTREME_LOOKBACK = 10         # reversal patterns must print the highest high / lowest low of this many prior bars
 
 # pattern name -> bias ("bullish" / "bearish" / "neutral"), in display order
 CANDLE_PATTERNS = {
@@ -3677,24 +3680,37 @@ def _candle_prep(s):
         rs = [rng[j] for j in range(i - lb, i) if rng[j] is not None]
         if len(bs) >= lb // 2: avg_body[i] = sum(bs) / len(bs)
         if len(rs) >= lb // 2: avg_rng[i] = sum(rs) / len(rs)
+    ema = _calc_ema(c, CANDLE_TREND_EMA)  # value at bar i uses closes up to i only
     return {"o": o, "h": h, "l": l, "c": c, "ok": ok, "body": body, "rng": rng,
-            "avg_body": avg_body, "avg_rng": avg_rng, "n": n}
+            "avg_body": avg_body, "avg_rng": avg_rng, "ema": ema, "n": n}
 
 
 def _candle_trend(p, start):
     """Trend over the CANDLE_TREND_LOOKBACK bars before the pattern's first bar `start`.
-    'down' = close fell over the window and sits below the window's average close; 'up' mirrors it."""
+    'up'   = close rose >= CANDLE_TREND_MIN_PCT over the window AND closes above EMA(CANDLE_TREND_EMA);
+    'down' = close fell >= CANDLE_TREND_MIN_PCT over the window AND closes below that EMA."""
     k = CANDLE_TREND_LOOKBACK
     a, b = start - 1 - k, start - 1
     if a < 0: return None
-    c = p["c"]
-    if not (p["ok"][a] and p["ok"][b]): return None
-    win = [c[j] for j in range(a, b + 1) if p["ok"][j]]
-    if len(win) < k: return None
-    avg = sum(win) / len(win)
-    if c[b] < c[a] and c[b] < avg: return "down"
-    if c[b] > c[a] and c[b] > avg: return "up"
+    c, ema = p["c"], p["ema"]
+    if not (p["ok"][a] and p["ok"][b]) or ema[b] is None: return None
+    chg = (c[b] / c[a] - 1) * 100
+    if chg >= CANDLE_TREND_MIN_PCT and c[b] > ema[b]: return "up"
+    if chg <= -CANDLE_TREND_MIN_PCT and c[b] < ema[b]: return "down"
     return None
+
+
+def _candle_at_extreme(p, start, end, side):
+    """True if the pattern (bars start..end) makes the lowest low ('low') or highest high ('high')
+    versus the CANDLE_EXTREME_LOOKBACK bars before it — i.e. it sits at the end of the move."""
+    lb = CANDLE_EXTREME_LOOKBACK
+    a = start - lb
+    if a < 0: return False
+    prior = [j for j in range(a, start) if p["ok"][j]]
+    if len(prior) < lb // 2: return False
+    if side == "low":
+        return min(p["l"][x] for x in range(start, end + 1)) <= min(p["l"][j] for j in prior)
+    return max(p["h"][x] for x in range(start, end + 1)) >= max(p["h"][j] for j in prior)
 
 
 def _candle_patterns_at(p, i):
@@ -3710,18 +3726,21 @@ def _candle_patterns_at(p, i):
     LW = min(O, C) - L          # lower wick
     bull, bear = C > O, C < O
     t1 = _candle_trend(p, i)    # trend before a 1-bar pattern
+    # Reversal patterns must also sit at the end of the move (10-bar low after a fall / high after a rise)
+    low1 = t1 == "down" and _candle_at_extreme(p, i, i, "low")
+    high1 = t1 == "up" and _candle_at_extreme(p, i, i, "high")
 
     # ── Single-candle ──
     # Doji: tiny body on a normal-sized range, only at the end of a trend
-    if B <= 0.1 * R and R >= 0.5 * ar and t1:
+    if B <= 0.1 * R and R >= 0.5 * ar and (low1 or high1):
         if UW <= 0.1 * R and LW >= 0.6 * R: out.append(("Dragonfly Doji", 1))
         elif LW <= 0.1 * R and UW >= 0.6 * R: out.append(("Gravestone Doji", 1))
         else: out.append(("Doji", 1))
-    # Hammer: after a decline, long lower wick (>= 2x body), little upper wick, body in the top part
-    if t1 == "down" and B > 0.1 * R and LW >= 2 * B and UW <= 0.15 * R and min(O, C) >= L + 0.6 * R:
+    # Hammer: at a 10-bar low after a decline, long lower wick (>= 2x body), tiny upper wick, body in the top part
+    if low1 and B > 0.1 * R and LW >= 2 * B and UW <= 0.10 * R and min(O, C) >= L + 0.6 * R:
         out.append(("Hammer", 1))
-    # Shooting Star: after a rise, long upper wick (>= 2x body), little lower wick, body in the bottom part
-    if t1 == "up" and B > 0.1 * R and UW >= 2 * B and LW <= 0.15 * R and max(O, C) <= L + 0.4 * R:
+    # Shooting Star: at a 10-bar high after a rise, long upper wick (>= 2x body), tiny lower wick, body in the bottom part
+    if high1 and B > 0.1 * R and UW >= 2 * B and LW <= 0.10 * R and max(O, C) <= L + 0.4 * R:
         out.append(("Shooting Star", 1))
     # Marubozu: long body (>= 1.5x average) with almost no wicks
     if B >= 1.5 * ab and B >= 0.9 * R:
@@ -3733,27 +3752,29 @@ def _candle_patterns_at(p, i):
         O1, H1, L1, C1, B1 = o[j], h[j], l[j], c[j], body[j]
         bull1, bear1 = C1 > O1, C1 < O1
         t2 = _candle_trend(p, j)  # trend before a 2-bar pattern
+        dn2 = t2 == "down" and _candle_at_extreme(p, j, i, "low")
+        up2 = t2 == "up" and _candle_at_extreme(p, j, i, "high")
         # Engulfing: today's body fully covers yesterday's opposite-colour body
-        if t2 == "down" and bear1 and bull and O <= C1 and C >= O1 and B > B1:
+        if dn2 and bear1 and bull and O <= C1 and C >= O1 and B > B1:
             out.append(("Bullish Engulfing", 2))
-        if t2 == "up" and bull1 and bear and O >= C1 and C <= O1 and B > B1:
+        if up2 and bull1 and bear and O >= C1 and C <= O1 and B > B1:
             out.append(("Bearish Engulfing", 2))
         # Piercing Line: long red, then green opens at/below its close and closes above its midpoint
-        if t2 == "down" and bear1 and B1 >= ab and bull and O <= C1 and (O1 + C1) / 2 < C < O1:
+        if dn2 and bear1 and B1 >= ab and bull and O <= C1 and (O1 + C1) / 2 < C < O1:
             out.append(("Piercing Line", 2))
         # Dark Cloud Cover: long green, then red opens at/above its close and closes below its midpoint
-        if t2 == "up" and bull1 and B1 >= ab and bear and O >= C1 and O1 < C < (O1 + C1) / 2:
+        if up2 and bull1 and B1 >= ab and bear and O >= C1 and O1 < C < (O1 + C1) / 2:
             out.append(("Dark Cloud Cover", 2))
         # Harami: long body, then a small (<= half) opposite body inside it
-        if t2 == "down" and bear1 and B1 >= ab and bull and B <= 0.5 * B1 and O >= C1 and C <= O1:
+        if dn2 and bear1 and B1 >= ab and bull and B <= 0.5 * B1 and O >= C1 and C <= O1:
             out.append(("Bullish Harami", 2))
-        if t2 == "up" and bull1 and B1 >= ab and bear and B <= 0.5 * B1 and O <= C1 and C >= O1:
+        if up2 and bull1 and B1 >= ab and bear and B <= 0.5 * B1 and O <= C1 and C >= O1:
             out.append(("Bearish Harami", 2))
         # Tweezers: matching lows (highs) within 10% of the average range, colours flip
         tol = 0.1 * ar
-        if t2 == "down" and bear1 and bull and abs(L - L1) <= tol:
+        if dn2 and bear1 and bull and abs(L - L1) <= tol:
             out.append(("Tweezer Bottom", 2))
-        if t2 == "up" and bull1 and bear and abs(H - H1) <= tol:
+        if up2 and bull1 and bear and abs(H - H1) <= tol:
             out.append(("Tweezer Top", 2))
 
     # ── Three-candle ──
@@ -3762,13 +3783,15 @@ def _candle_patterns_at(p, i):
         O2, C2, B2 = o[k], c[k], body[k]
         O1, C1, B1 = o[j], c[j], body[j]
         t3 = _candle_trend(p, k)  # trend before a 3-bar pattern
+        dn3 = t3 == "down" and _candle_at_extreme(p, k, i, "low")
+        up3 = t3 == "up" and _candle_at_extreme(p, k, i, "high")
         mid2 = (O2 + C2) / 2
         # Morning Star: long red, small body at/below its close, then green closing above its midpoint
-        if (t3 == "down" and C2 < O2 and B2 >= ab and B1 <= 0.3 * B2 and max(O1, C1) <= C2 + 0.1 * B2
+        if (dn3 and C2 < O2 and B2 >= ab and B1 <= 0.3 * B2 and max(O1, C1) <= C2 + 0.1 * B2
                 and bull and B >= 0.5 * ab and C > mid2):
             out.append(("Morning Star", 3))
         # Evening Star: long green, small body at/above its close, then red closing below its midpoint
-        if (t3 == "up" and C2 > O2 and B2 >= ab and B1 <= 0.3 * B2 and min(O1, C1) >= C2 - 0.1 * B2
+        if (up3 and C2 > O2 and B2 >= ab and B1 <= 0.3 * B2 and min(O1, C1) >= C2 - 0.1 * B2
                 and bear and B >= 0.5 * ab and C < mid2):
             out.append(("Evening Star", 3))
         # Three White Soldiers: 3 solid green bars, higher closes, each opening inside the previous body
