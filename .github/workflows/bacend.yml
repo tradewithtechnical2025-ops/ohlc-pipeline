@@ -3,6 +3,7 @@ name: OHLC Pipeline Scans (Manual)
 # Manual trigger only — runs any of pipeline.py's scan/report modes on
 # demand (VCP, Minervini Trend Template, Weinstein, EP, HLR, status, etc.)
 # without needing a separate .yml per mode.
+# Option values must be the exact pipeline.py mode names (no spaces).
 on:
   workflow_dispatch:
     inputs:
@@ -23,7 +24,8 @@ on:
           - pattern_scan
           - pattern_scan_force
           - candle_scan
-          - Home Page Ticker
+          - candle_scan_force
+          - home_ticker
 
 jobs:
   pipeline-scan:
@@ -46,4 +48,4 @@ jobs:
           WORKER_URL:   ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
-        run: python pipeline.py ${{ inputs.mode }}
+        run: python pipeline.py "${{ inputs.mode }}"
