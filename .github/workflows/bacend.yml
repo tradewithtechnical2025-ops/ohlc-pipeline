@@ -23,6 +23,7 @@ on:
           - pattern_scan
           - pattern_scan_force
           - candle_scan
+          - Home Page Ticker
 
 jobs:
   pipeline-scan:
