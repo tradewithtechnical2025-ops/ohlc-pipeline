@@ -3640,6 +3640,8 @@ async def run_pattern_scan(force: bool = False) -> None:
 #     candle_patterns.json      — signals from the last CANDLE_SIGNAL_SESSIONS sessions
 #     candle_pattern_stats.json — per-pattern backtest over the full OHLC history
 #                                 (forward returns after 5 / 10 / 20 sessions)
+#     candle_patterns_weekly.json      — same scan on COMPLETED weekly candles (last 10 weeks)
+#     candle_pattern_stats_weekly.json — weekly backtest (forward returns after 5 / 10 / 20 weeks)
 #   Does not touch pattern_scan (Inside Bar / NR7 / MCP stay there).
 # ══════════════════════════════════════════════════════════════
 
@@ -3650,9 +3652,12 @@ CANDLE_TREND_LOOKBACK  = 5           # bars used to judge the trend before a pat
 CANDLE_TREND_MIN_PCT   = 3.0         # minimum close-to-close move over that window to count as a trend
 CANDLE_TREND_EMA       = 10          # close must be above (uptrend) / below (downtrend) this EMA
 CANDLE_EXTREME_LOOKBACK = 10         # reversal patterns must print the highest high / lowest low of this many prior bars
+CANDLE_WEEKLY_MIN_BARS = 20          # weekly scan: minimum completed weekly candles per stock
+TWT_REV_MIN_DOWN       = 3          # TWT Reversal: minimum straight down days (lower close, lower high, lower low) before the reversal bar
 
 # pattern name -> bias ("bullish" / "bearish" / "neutral"), in display order
 CANDLE_PATTERNS = {
+    "TWT Reversal": "bullish",
     "Bullish Engulfing": "bullish", "Bearish Engulfing": "bearish",
     "Hammer": "bullish", "Shooting Star": "bearish",
     "Morning Star": "bullish", "Evening Star": "bearish",
@@ -3805,6 +3810,20 @@ def _candle_patterns_at(p, i):
         if (all(cc < oo and bb >= 0.6 * ab and (cc - ll) <= 0.3 * bb for oo, cc, bb, ll in lows3)
                 and C1 < C2 and C < C1 and C2 <= O1 <= O2 and C1 <= O <= O1):
             out.append(("Three Black Crows", 3))
+
+    # ── TWT Reversal (bullish, custom) ──
+    # At least TWT_REV_MIN_DOWN straight down days before today — each day a lower close,
+    # lower high AND lower low than the day before — then today: higher high, higher low,
+    # opens above yesterday's close, closes above yesterday's open and above its own open.
+    j = i - 1
+    if p["ok"][j] and H > h[j] and L > l[j] and O > c[j] and C > o[j] and C > O:
+        run, k = 0, j
+        while (k >= 1 and p["ok"][k] and p["ok"][k - 1]
+               and c[k] < c[k - 1] and h[k] < h[k - 1] and l[k] < l[k - 1]):
+            run += 1
+            k -= 1
+        if run >= TWT_REV_MIN_DOWN:
+            out.append(("TWT Reversal", run + 1))  # down days + the reversal bar
     return out
 
 
@@ -3823,9 +3842,37 @@ def _candle_liquid_flags(s):
     return flags
 
 
-def _detect_candle_patterns(all_data, sessions=CANDLE_SIGNAL_SESSIONS):
+_WEEK_DONE_CACHE = {}
+
+
+def _candle_weekly_series(s, liquid_daily):
+    """Daily -> weekly (ISO week) OHLCV for the candle scan.
+    Each weekly bar is dated by its LAST trading day; its liquidity flag is the daily flag on that day.
+    The running week is dropped unless it is already complete (same rule as the other weekly scans)."""
+    d, o, h, l, c, v = s["d"], s["o"], s["h"], s["l"], s["c"], s["v"]
+    keys, wk = [], {}
+    for i in range(len(d)):
+        if o[i] is None or h[i] is None or l[i] is None or c[i] is None: continue
+        k = date.fromisoformat(d[i]).isocalendar()[:2]
+        w = wk.get(k)
+        if w is None:
+            wk[k] = {"d": d[i], "o": o[i], "h": h[i], "l": l[i], "c": c[i], "v": v[i] or 0, "liq": liquid_daily[i]}
+            keys.append(k)
+        else:
+            w["d"] = d[i]; w["h"] = max(w["h"], h[i]); w["l"] = min(w["l"], l[i])
+            w["c"] = c[i]; w["v"] += v[i] or 0; w["liq"] = liquid_daily[i]
+    if keys:
+        last_d = wk[keys[-1]]["d"]
+        if last_d not in _WEEK_DONE_CACHE: _WEEK_DONE_CACHE[last_d] = _is_week_complete(last_d)
+        if not _WEEK_DONE_CACHE[last_d]: keys.pop()
+    ws = {f: [wk[k][f] for k in keys] for f in ("d", "o", "h", "l", "c", "v")}
+    return ws, [wk[k]["liq"] for k in keys]
+
+
+def _detect_candle_patterns(all_data, sessions=CANDLE_SIGNAL_SESSIONS, tf="D"):
     """Returns (recent_signals, stats). Signals: last `sessions` bars of each liquid stock.
-    Stats: every historical occurrence (liquid at that bar) with forward returns."""
+    Stats: every historical occurrence (liquid at that bar) with forward returns.
+    tf="W" runs the same detector on completed weekly candles (bars / horizons are then weeks)."""
     signals = []
     agg = {name: {"n": 0, **{f"sum_{f}": 0.0 for f in CANDLE_FWD_BARS},
                   **{f"cnt_{f}": 0 for f in CANDLE_FWD_BARS}, **{f"win_{f}": 0 for f in CANDLE_FWD_BARS}}
@@ -3835,8 +3882,12 @@ def _detect_candle_patterns(all_data, sessions=CANDLE_SIGNAL_SESSIONS):
     for sym, s in all_data.items():
         n = len(s.get("c") or [])
         if n < 30: continue
-        p = _candle_prep(s)
         liquid = _candle_liquid_flags(s)
+        if tf == "W":
+            s, liquid = _candle_weekly_series(s, liquid)
+            n = len(s["c"])
+            if n < CANDLE_WEEKLY_MIN_BARS: continue
+        p = _candle_prep(s)
         dates, c = s["d"], s["c"]
         for i in range(3, n):
             if not liquid[i]: continue
@@ -3906,7 +3957,24 @@ async def run_candle_scan(force: bool = False) -> None:
             for r in stats["patterns"]:
                 log.info(f"  [stats] {r['pattern']:<22} n={r['occurrences']:<6} win10={r['win_rate_10d']}%  avg10={r['avg_ret_10d']}%")
 
+            # ── Weekly: same detector on completed weekly candles (horizons = weeks) ──
+            w_signals, w_stats = _detect_candle_patterns(all_data, tf="W")
+            w_latest = max((s["date"] for s in w_signals), default=None)
+            w_counts = Counter(s["pattern"] for s in w_signals if s["date"] == w_latest)
+            w_sessions = sorted({s["date"] for s in w_signals}, reverse=True)
+            for pat in CANDLE_PATTERNS:
+                if w_counts.get(pat): log.info(f"  [W] {pat}: {w_counts[pat]}")
+            log.info(f"Weekly signals: {len(w_signals)} over {len(w_sessions)} weeks (latest week ending {w_latest}: {sum(w_counts.values())})")
+
             await asyncio.gather(
+                upload_str_with_manifest(client, r2_upload, "candle_patterns_weekly.json", json.dumps({
+                    "updated": today, "tf": "W", "latest": w_latest, "sessions": w_sessions,
+                    "count": len(w_signals), "summary_latest": dict(w_counts),
+                    "signals": w_signals,
+                }), schema_v=1, extra_meta={"count": len(w_signals)}),
+                upload_str_with_manifest(client, r2_upload, "candle_pattern_stats_weekly.json", json.dumps({
+                    "updated": today, "tf": "W", "horizons_unit": "weeks", "horizons": list(CANDLE_FWD_BARS), **w_stats,
+                }), schema_v=1),
                 upload_str_with_manifest(client, r2_upload, "candle_patterns.json", json.dumps({
                     "updated": today, "latest": latest, "sessions": sessions,
                     "count": len(signals), "summary_latest": dict(today_counts),
