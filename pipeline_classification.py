@@ -147,7 +147,7 @@ SECTOR_GROUP_MAP = {
     "Carbon Black":                             "Chemicals",
     "Printing Inks":                            "Chemicals",
     "Trading - Chemicals":                      "Chemicals",
-    "Explosives":                               "Explosives",
+    "Explosives":                               "Chemicals",
 
     # ── Cement ──
     "Cement & Cement Products":                 "Cement",
@@ -362,6 +362,7 @@ INDUSTRY_MAP = {
     # variants are mapped here so they land in the same display_industry
     # bucket instead of BIKEWO falling through to its own raw-string group.
     "Auto Dealer": "Auto Dealers",
+    "Auto Dealers": "Auto Dealers",
     "Trading - Auto Components": "Auto Components",
     "Dealers-Commercial Vehicles, Tractors, Construction Vehicles": "Commercial Vehicles",
     "Private Sector Bank": "Private Banks",
@@ -492,7 +493,7 @@ INDUSTRY_MAP = {
     "Compressors, Pumps & Diesel Engines": "Machinery",
     "Compressors Pumps & Diesel Engines": "Machinery",
     "Abrasives & Bearings": "Machinery",
-    "Aluminium Copper & Zinc Products": "Other Industrials",
+    "Aluminium Copper & Zinc Products": "Non-Ferrous Metals",
     "Glass - Industrial": "Other Industrials",
     "Railway Wagons": "Railways",
     "Civil Construction": "Civil Construction",
