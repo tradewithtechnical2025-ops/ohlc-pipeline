@@ -109,8 +109,9 @@ NOISE_PATTERNS = [
 # not actionable for trading. Matched case-insensitively against the exact
 # subject text (regex so "Disclosure"/"Intimation" prefix variants both hit).
 NOISE_SUBJECT_PATTERNS = [
-    r"^updates$",
-    r"^general updates$",
+    # NOTE: "Updates" / "General Updates" are NOT blanket-dropped any more —
+    # NSE files real news under them too (plant inaugurations, supply
+    # agreements, fund-raises, bonus record dates). See _GENERIC_UPDATE_*.
     r"^copy of newspaper publication$",
     r"^certificate under sebi \(depositories and participants\) regulations, 2018$",
     r"^quarterly compliance report on corporate governance",
@@ -126,18 +127,105 @@ NOISE_SUBJECT_PATTERNS = [
     r"^options to purchase securities$",             # ESOP/stock benefit grants — compliance filing, not trading-actionable
     r"^analysts?/institutional investor meet/con\. call updates$",  # analyst meet schedule/outcome/transcript — routine, very high frequency
     r"^analyst/investor meet para a-xbrl$",                          # XBRL-tagged variant of the same analyst-meet noise
+    r"^confirmation of redemption/payment of interest and principal$",  # debt-segment coupon/CP redemption confirmations
+    r"^noc/no dues certificate/consent/permission$",                 # debenture-trustee NOCs (Piramal: ~45 copies in one feed)
+    r"^record date updates$",                                        # debt/CP record dates (equity "Record Date" is kept)
+    r"^movement in units$",                                          # MF/SIF unit movement undertakings
+    r"^annual disclosure$",                                          # trust/large-entity annual compliance disclosure
+    r"^change in auditors?$",                                        # mostly secretarial/internal auditor rotations
+    r"^alteration of capital and fund raising-xbrl$",                # XBRL twin of "Allotment of Securities"
 ]
 _NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
 
 _SUBJECT_TAG_RE = re.compile(r"\|SUBJECT:\s*(.+)$")
+
+# Routine compliance filings matched ANYWHERE in the text (not exact-subject)
+# — NSE subjects come in many prefix/suffix variants ("Compliances-...",
+# "...-XBRL", "Closure of Trading Window" vs "Trading Window"), and BSE's
+# feed has no SUBJECT tag at all, just a free-text description like
+# "Announcement under Regulation 30 (LODR)-Closure of Trading Window".
+# Applied only to exchange feeds (nse_*/bse_*), never to market news, and
+# only to the published announcement JSONs — the results-PDF pipeline reads
+# result_map directly, so nothing here can hide a results filing.
+NOISE_CONTAINS_PATTERNS = [
+    r"trading\s+window",                                        # insider-trading window closure/opening
+    r"(loss|misplace\w*)\s+of\s+(share\s+)?certificates?",      # lost share certificates
+    r"duplicate[\s\-]+(share[\s\-]+)?certificates?",
+    r"reg(ulation)?\.?\s*74\s*\(\s*5\s*\)",                     # SEBI DP Reg 74(5) certificate
+    r"reg(ulation)?\.?\s*39\s*\(\s*3\s*\)",                     # Reg 39(3) lost-certificate intimation
+    r"reg(ulation)?\.?\s*76\b|reconciliation\s+of\s+share\s+capital",  # share-capital audit report
+    r"newspaper\s+(publication|advertisement|advt)",
+    r"annual\s+secretarial\s+compliance",
+    r"business\s+responsibility\s+(and|&)\s+sustainability|\bBRSR\b",
+    r"scrutini[sz]er'?s?\s+report",
+    r"investor\s+(complaints|grievances?)",
+    r"compliance\s+certificate",
+    r"(employee\s+stock\s+option|\bESOP\b|\bESOS\b|\bESPS\b)",
+    r"registrar\s+(and|&)\s+(share\s+)?transfer\s+agent|\bRTA\b",
+]
+_NOISE_CONTAINS_RE = re.compile("|".join(NOISE_CONTAINS_PATTERNS), re.IGNORECASE)
+
+
+# "Updates" / "General Updates" subjects: dropped only when the free text is
+# either empty boilerplate ("X has informed the Exchange about General
+# Updates") or clearly routine. Anything with real content is kept.
+_GENERIC_UPDATE_SUBJECT_RE = re.compile(r"^(general\s+)?updates?$", re.IGNORECASE)
+_GENERIC_UPDATE_TEXT_RE = re.compile(
+    r"^(.{0,120}?has\s+informed\s+the\s+exchange\s+(about|regarding)\s+)?(general\s+)?updates?\.?$",
+    re.IGNORECASE,
+)
+_UPDATE_NOISE_RE = re.compile(
+    r"annual\s+general\s+meeting|\bAGM\b|insider\s+trading|regulation\s+7\s*\(\s*2|"
+    r"special\s+window|annual\s+report|analyst|institutional\s+investor",
+    re.IGNORECASE,
+)
+# NSE's Integrated-filing XBRL twins (…/corporate/xbrl/…xml) duplicate a PDF
+# filed alongside, and their description is only "X has informed the
+# Exchange about <subject>" — no content of their own.
+_NSE_XBRL_LINK_RE = re.compile(r"/corporate/xbrl/[^/]+\.xml$", re.IGNORECASE)
+
+
+def _truncate_keep_subject(raw: str, limit: int = 300) -> str:
+    """Truncate to `limit` chars but never cut off the trailing |SUBJECT: tag
+    — every subject-based filter depends on it, and NSE descriptions longer
+    than 300 chars (spurt-in-volume replies, earnings-call notices, revised
+    annual reports) used to lose it and slip past all of them."""
+    if len(raw) <= limit:
+        return raw
+    idx = raw.rfind("|SUBJECT:")
+    if idx == -1:
+        return raw[:limit]
+    tag = raw[idx:]
+    head_room = max(0, limit - len(tag) - 4)
+    return raw[:head_room].rstrip() + "... " + tag
+
 
 def is_noise(item: dict) -> bool:
     summary = item.get("summary", "")
     if any(p in summary for p in NOISE_PATTERNS):
         return True
     m = _SUBJECT_TAG_RE.search(summary)
-    if m and _NOISE_SUBJECT_RE.match(m.group(1).strip()):
+    subject = m.group(1).strip() if m else ""
+    if subject and _NOISE_SUBJECT_RE.match(subject):
         return True
+    sk = item.get("source_key", "")
+    if not sk.startswith(("nse_", "bse_")):
+        return False
+
+    if sk.startswith("nse_") and _NSE_XBRL_LINK_RE.search(item.get("link", "") or ""):
+        return True
+
+    # NSE: check the SUBJECT tag (the free text is often a generic "X has
+    # informed the Exchange..." sentence). BSE: no tag, so title + text.
+    haystack = subject if m else f"{item.get('title', '')} {summary}"
+    if _NOISE_CONTAINS_RE.search(haystack):
+        return True
+
+    if subject and _GENERIC_UPDATE_SUBJECT_RE.match(subject):
+        text = summary[:m.start()].strip()
+        if (not text or _GENERIC_UPDATE_TEXT_RE.match(text)
+                or _NOISE_CONTAINS_RE.search(text) or _UPDATE_NOISE_RE.search(text)):
+            return True
     return False
 
 
@@ -221,7 +309,7 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                         "link":         entry.get("link", ""),
                         "published":    entry.get("published", ""),
                         "published_ts": ts,
-                        "summary":      entry.get("summary", entry.get("description", "")).strip()[:300],
+                        "summary":      _truncate_keep_subject(entry.get("summary", entry.get("description", "")).strip()),
                         # Optional richer fields — only Business Standard's
                         # feed populates these right now (media:content for
                         # an article thumbnail, bs:source for the wire/
