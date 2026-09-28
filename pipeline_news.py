@@ -693,6 +693,45 @@ _PDF_BOILERPLATE_PRECEDE_RE = re.compile(r"(accompanying|reviewed)[\s\S]{0,15}$"
 _PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
 
 
+# ── Whitespace-squashed fallback ──
+# The tiers above assume clean single-spaced text with a Standalone/
+# Consolidated or (Un)audited qualifier in the heading. Two real-world cases
+# break that (confirmed on DEEPA_28092026132415_bmoutcome.pdf):
+#   • Scanned PDFs with an embedded OCR layer split words mid-token
+#     ("Financia l Results", "naud ited Financi al Re ults"), and
+#     pdfplumber's layout=True mode pads extra spaces inside a line — so
+#     literal single spaces in the patterns above never match.
+#   • Single-entity filers whose table heading is simply "Statement of
+#     Financial Results for the quarter ended ..." — no qualifier and no
+#     audited-word, so none of the four tiers apply.
+# This fallback deletes ALL whitespace and matches against the squashed
+# text, so OCR word-splits and layout padding stop mattering. Only used when
+# the primary tiers find nothing; a false positive costs one AI call, which
+# the AI's own is_results_table check then rejects.
+_PDF_SQUASHED_HEADING_RE = re.compile(
+    r"statementof(?:the)?(?:un-?)?(?:audited)?(?:standalone|consolidated)?(?:un-?)?(?:audited)?"
+    r"financialresults?(?:for|of)(?:the)?(?:quarter|year|half|period|ninemonths|threemonths|sixmonths)"
+    r"|(?:un-?)?audited(?:standalone|consolidated)?financialresults?for(?:the)?"
+    r"(?:quarter|year|half|period|ninemonths|threemonths|sixmonths)",
+    re.IGNORECASE,
+)
+_PDF_SQUASHED_BOILERPLATE_RE = re.compile(r"(accompanying|reviewed)[a-z]{0,12}$", re.IGNORECASE)
+
+
+def _pdf_squashed_heading_candidates(text: str):
+    """Fallback for _pdf_find_heading_candidates — see _PDF_SQUASHED_HEADING_RE.
+    Positions are in squashed-text coordinates (callers only test truthiness)."""
+    squashed = re.sub(r"\s+", "", text)
+    out = []
+    for m in _PDF_SQUASHED_HEADING_RE.finditer(squashed):
+        if _PDF_SQUASHED_BOILERPLATE_RE.search(squashed[max(0, m.start() - 30):m.start()]):
+            continue
+        g = m.group(0).lower()
+        nature = "Consolidated" if "consolidated" in g else "Standalone"
+        out.append((m.start(), m.end(), nature))
+    return out
+
+
 def _pdf_find_heading_candidates(text: str):
     """Returns [(start, end, nature)] for every non-boilerplate heading-like
     match across all three pattern tiers, sorted by position. `nature` is
@@ -720,6 +759,8 @@ def _pdf_find_heading_candidates(text: str):
         if deduped and c[0] - deduped[-1][0] < 20:
             continue
         deduped.append(c)
+    if not deduped:
+        deduped = _pdf_squashed_heading_candidates(text)
     return deduped
 
 
