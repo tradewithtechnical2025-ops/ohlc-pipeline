@@ -3010,6 +3010,7 @@ def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullbac
         if last_swing_high_bar is None or last_swing_low_bar is None: continue
         if last_swing_high_bar<=last_swing_low_bar: continue
         if closes[i] is None or highs[i] is None or lows[i] is None: continue
+        if last_swing_low_price<=0 or last_swing_high_price<=0: continue  # bad/zero price data
         swing_range_pct=(last_swing_high_price-last_swing_low_price)/last_swing_low_price*100
         if swing_range_pct<min_swing_range_pct: continue
         pullback_pct=(last_swing_high_price-lows[i])/last_swing_high_price*100
@@ -3080,6 +3081,7 @@ def _detect_pullback_tf(all_data, tf="W", ema_periods=(10, 30), length_pull=2,
         if last_swing_high_bar <= last_swing_low_bar: continue
         if tc[i] is None or th[i] is None or tl[i] is None: continue
 
+        if last_swing_low_price <= 0 or last_swing_high_price <= 0: continue  # bad/zero price data
         swing_range_pct = (last_swing_high_price - last_swing_low_price) / last_swing_low_price * 100
         if swing_range_pct < min_swing_range_pct: continue
         pullback_pct = (last_swing_high_price - tl[i]) / last_swing_high_price * 100
@@ -3472,7 +3474,11 @@ async def run_hlr_scan() -> None:
             all_data=await download_all_chunks(client)
             log.info(f"Loaded {len(all_data)} stocks")
             _zero=[(sym,s_["d"][i]) for sym,s_ in all_data.items() for i,c in enumerate(s_.get("c") or []) if c is not None and c<=0]
-            if _zero: log.warning(f"⚠ Zero/negative closes: {len(_zero)} → {_zero[:20]}")
+            if _zero:
+                log.warning(f"⚠ Zero/negative closes: {len(_zero)} → {_zero[:20]}")
+                _bad={sym for sym,_ in _zero}
+                all_data={k:v for k,v in all_data.items() if k not in _bad}
+                log.warning(f"⚠ Excluded {len(_bad)} symbol(s) with bad prices from HLR/Pullback scan: {sorted(_bad)}")
             hlr_signals=_detect_hlr(all_data)
             order={"BO":0,"Consolidating near HLR":1,"Near HLR":2}
             hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
