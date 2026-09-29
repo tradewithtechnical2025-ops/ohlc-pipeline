@@ -178,9 +178,14 @@ async def build_isin_map(client):
     cache_task   = asyncio.create_task(r2_download(client, "ikey_map.json"))
     nse_bod, bse_bod, cached = await asyncio.gather(nse_bod_task, bse_bod_task, cache_task)
 
+    # Fall back to the cache per exchange. Previously the BSE cache was only
+    # used when the NSE download failed, so a BSE-only BOD failure left
+    # bse_bod empty and the daily run then pruned every BSE stock.
     if not nse_bod and isinstance(cached, dict):
         log.info(f"  Using cached ikey_map.json ({len(cached.get('nse',{}))} NSE entries)")
         nse_bod = cached.get("nse", {})
+    if not bse_bod and isinstance(cached, dict):
+        log.info(f"  Using cached ikey_map.json ({len(cached.get('bse',{}))} BSE entries)")
         bse_bod = cached.get("bse", {})
 
     nse_map = {}; bse_map = {}
@@ -196,7 +201,14 @@ async def build_isin_map(client):
             if ikey: bse_map[sym] = ikey
 
     log.info(f"✓ NSE: {len(nse_map)} resolved   ✓ BSE: {len(bse_map)} resolved")
+    if not bse_map:
+        log.warning("⚠ BSE: 0 symbols resolved — BSE stocks will be skipped this run")
     return nse_map, bse_map
+
+def combine_ikeys(nse_map, bse_map) -> dict[str, str]:
+    """NSE + BSE in one lookup. If a symbol exists on both exchanges the
+    NSE instrument wins (deeper liquidity); previously BSE overwrote it."""
+    return {**bse_map, **nse_map}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -356,7 +368,7 @@ async def run_full() -> None:
         sem = asyncio.Semaphore(CONCURRENCY)
         async with httpx.AsyncClient() as client:
             nse_map, bse_map = await build_isin_map(client)
-            all_ikeys = {**nse_map, **bse_map}
+            all_ikeys = combine_ikeys(nse_map, bse_map)
             live = set(all_ikeys)
 
             all_data = await download_75m_chunks(client)
@@ -402,7 +414,7 @@ async def run_daily() -> None:
         sem = asyncio.Semaphore(CONCURRENCY)
         async with httpx.AsyncClient() as client:
             nse_map, bse_map = await build_isin_map(client)
-            all_ikeys = {**nse_map, **bse_map}
+            all_ikeys = combine_ikeys(nse_map, bse_map)
             live = set(all_ikeys)
 
             all_data = await download_75m_chunks(client)
@@ -411,10 +423,17 @@ async def run_daily() -> None:
             results = await asyncio.gather(*tasks)
             fetched = {sym: c for sym, c in results if c}
             log.info(f"✓ {len(fetched)} fetched today  ✗ {len(live) - len(fetched)} no data")
+            log.info(f"   NSE {sum(1 for x in fetched if x in nse_map)}/{len(nse_map)}   "
+                     f"BSE {sum(1 for x in fetched if x in bse_map and x not in nse_map)}/{len(bse_map)}")
 
-            pruned = [s for s in list(all_data) if s not in live]
-            for s in pruned: del all_data[s]
-            if pruned: log.info(f"🗑  Pruned {len(pruned)} stocks")
+            # Only prune when BOTH exchanges resolved — an empty map from a
+            # failed download must never wipe that exchange's stored history.
+            if nse_map and bse_map:
+                pruned = [s for s in list(all_data) if s not in live]
+                for s in pruned: del all_data[s]
+                if pruned: log.info(f"🗑  Pruned {len(pruned)} stocks")
+            else:
+                log.warning("Skipping prune — NSE or BSE map is empty (likely a BOD/cache failure)")
 
             total_new = 0
             for sym, candles in fetched.items():
