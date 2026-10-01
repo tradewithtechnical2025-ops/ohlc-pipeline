@@ -872,6 +872,34 @@ _PDF_NON_RESULT_PATTERNS = [
 ]
 _PDF_NON_RESULT_RE = re.compile("|".join(_PDF_NON_RESULT_PATTERNS), re.IGNORECASE)
 
+# Strong announcement-level evidence that the attached PDF really is a
+# financial-results filing. NSE's archive filename prefix is NOT guaranteed
+# to equal the current trading symbol (e.g. Pranav Constructions files as
+# PCPL_... while the NSE symbol/result-calendar entry is PRANAV). In those
+# cases a filename-symbol calendar hard gate would incorrectly drop a genuine
+# result. This detector is deliberately strict: generic "Outcome of Board
+# Meeting" does NOT match; the free-text must explicitly say financial results
+# were submitted/approved/considered or identify audited/unaudited financial
+# results for a reporting period.
+_PDF_EXPLICIT_RESULT_RE = re.compile(
+    r"(?:has\s+submitted.{0,120}?financial\s+results?|"
+    r"(?:approved|considered|adopted|taken\s+on\s+record).{0,120}?financial\s+results?|"
+    r"(?:unaudited|un-audited|audited|standalone|consolidated).{0,100}?financial\s+results?|"
+    r"financial\s+results?.{0,100}?(?:period|quarter|year|half[\s-]?year|nine\s+months?|six\s+months?|three\s+months?)\s+ended)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _has_explicit_financial_results_text(it: dict) -> bool:
+    """True only when NSE announcement free-text explicitly confirms results.
+
+    The SUBJECT tag is intentionally excluded because a generic subject such as
+    'Outcome of Board Meeting' is not proof of a results filing.
+    """
+    summary = it.get("summary", "") or ""
+    free_text = summary.split("|SUBJECT:", 1)[0].strip()
+    return bool(_PDF_EXPLICIT_RESULT_RE.search(free_text))
+
 
 def _extract_filename_symbol(link: str) -> str:
     """Best-effort NSE symbol/scrip-code guess from a filing's own filename
@@ -2797,14 +2825,36 @@ async def run():
 
         before_cal = len(all_pdf_candidates)
         if calendar_payload:
-            all_pdf_candidates = [
-                it for it in all_pdf_candidates
-                if _in_result_calendar(_extract_filename_symbol(it.get("link", "")), calendar_payload, it.get("link", ""))
-            ]
+            kept_pdf_candidates = []
+            explicit_result_bypass = 0
+            for it in all_pdf_candidates:
+                # Explicit NSE wording is stronger evidence than the archive
+                # filename prefix. The prefix can be an old/internal company
+                # code rather than the live NSE symbol (PCPL -> PRANAV), so do
+                # not let that mismatch suppress a confirmed results filing.
+                if _has_explicit_financial_results_text(it):
+                    kept_pdf_candidates.append(it)
+                    explicit_result_bypass += 1
+                    continue
+
+                # Generic board outcomes still need the calendar guard; this
+                # preserves the existing protection against NCD/KMP/fundraise
+                # PDFs that share the same generic NSE subject.
+                if _in_result_calendar(
+                    _extract_filename_symbol(it.get("link", "")),
+                    calendar_payload,
+                    it.get("link", ""),
+                ):
+                    kept_pdf_candidates.append(it)
+
+            all_pdf_candidates = kept_pdf_candidates
             dropped_cal = before_cal - len(all_pdf_candidates)
+            if explicit_result_bypass:
+                print(f"  ✓ {explicit_result_bypass} announcement(s) kept by explicit financial-results text "
+                      f"(calendar symbol check bypassed; handles NSE filename/symbol mismatches)")
             if dropped_cal:
-                print(f"  🗑 {dropped_cal} announcement(s) dropped — symbol not on result_calendar.json for that date "
-                      f"(likely not an actual results filing despite the 'Outcome of Board Meeting' subject)")
+                print(f"  🗑 {dropped_cal} announcement(s) dropped — no explicit financial-results text and "
+                      f"filename symbol not on result_calendar.json for that date")
 
         merged_pdf_feed = all_pdf_candidates
         merged_pdf_feed.sort(key=_effective_ts, reverse=True)
