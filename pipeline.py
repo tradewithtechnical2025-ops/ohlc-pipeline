@@ -2659,6 +2659,10 @@ def _today_gap_events(gaps_by_sym, today):
 # _build_screener_feed
 # ══════════════════════════════════════════════════════════════
 
+# Shakeout + Pause: a pause only counts while the shakeout's reclaim day is
+# at most this many trading sessions old.
+SHAKEOUT_PAUSE_MAX_AGE = 10
+
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
     result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None, vcp_map=None, ath_map=None):
     cls_map={}
@@ -2874,15 +2878,26 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             # _detect_pause). Surface that here so the frontend can build a
             # "Shakeout + Pause" filter without re-fetching shakeout_signals.json
             # itself. ───
-            _pause_cats=[cat for cat,rec in _es_cats.items() if rec.get("pause_valid")]
-            _pause_clean_cats=[cat for cat,rec in _es_cats.items() if rec.get("pause_clean")]
-            _pause_days_vals=[rec.get("pause_days") for rec in _es_cats.values() if rec.get("pause_days") is not None]
+            # Only RECENT shakeouts count for the pause: a reclaim older than
+            # SHAKEOUT_PAUSE_MAX_AGE trading sessions is stale (shakeout_signals.json
+            # keeps old signals, which made ~40% of stocks show a pause).
+            def _so_age(rec):
+                rd=rec.get("recovery_date")
+                if not rd: return None
+                return sum(1 for d in dates if d and d>rd)   # sessions since the reclaim day (0 = today)
+            _fresh={cat:rec for cat,rec in _es_cats.items()
+                    if _so_age(rec) is not None and _so_age(rec)<=SHAKEOUT_PAUSE_MAX_AGE}
+            _ages=[_so_age(rec) for rec in _es_cats.values() if _so_age(rec) is not None]
+            row["shakeout_age"]=min(_ages) if _ages else None
+            _pause_cats=[cat for cat,rec in _fresh.items() if rec.get("pause_valid")]
+            _pause_clean_cats=[cat for cat,rec in _fresh.items() if rec.get("pause_clean")]
+            _pause_days_vals=[rec.get("pause_days") for cat,rec in _fresh.items() if cat in _pause_cats and rec.get("pause_days") is not None]
             row["shakeout_pause"]=bool(_pause_cats)
             row["shakeout_pause_clean"]=bool(_pause_clean_cats)
             row["shakeout_pause_cats"]=_pause_cats
             row["shakeout_pause_days"]=max(_pause_days_vals) if _pause_days_vals else None
         else:
-            row["ema_shakeout"]=False; row["ema_shakeout_cats"]=[]
+            row["ema_shakeout"]=False; row["ema_shakeout_cats"]=[]; row["shakeout_age"]=None
             row["shakeout_pause"]=False; row["shakeout_pause_clean"]=False
             row["shakeout_pause_cats"]=[]; row["shakeout_pause_days"]=None
         _htf_rec=(htf_map or {}).get(sym,{}).get("HTF")
