@@ -2659,9 +2659,9 @@ def _today_gap_events(gaps_by_sym, today):
 # _build_screener_feed
 # ══════════════════════════════════════════════════════════════
 
-# Shakeout + Pause: a pause only counts while the shakeout's reclaim day is
-# at most this many trading sessions old.
-SHAKEOUT_PAUSE_MAX_AGE = 10
+# Shakeout + Pause: only a LIVE pause counts (still running today). This is an
+# extra safety cap on how old the reclaim day may be, in trading sessions.
+SHAKEOUT_PAUSE_MAX_AGE = 20
 
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
     result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None, vcp_map=None, ath_map=None):
@@ -2878,15 +2878,20 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             # _detect_pause). Surface that here so the frontend can build a
             # "Shakeout + Pause" filter without re-fetching shakeout_signals.json
             # itself. ───
-            # Only RECENT shakeouts count for the pause: a reclaim older than
-            # SHAKEOUT_PAUSE_MAX_AGE trading sessions is stale (shakeout_signals.json
-            # keeps old signals, which made ~40% of stocks show a pause).
+            # shakeout_signals.json keeps old signals, which made ~40% of stocks
+            # show a pause — only live pauses are kept (see _so_live).
             def _so_age(rec):
                 rd=rec.get("recovery_date")
                 if not rd: return None
                 return sum(1 for d in dates if d and d>rd)   # sessions since the reclaim day (0 = today)
-            _fresh={cat:rec for cat,rec in _es_cats.items()
-                    if _so_age(rec) is not None and _so_age(rec)<=SHAKEOUT_PAUSE_MAX_AGE}
+            # LIVE pause only: the pause must still be running today, i.e. it
+            # covers every session since the reclaim day (age <= pause_days).
+            # A pause that already ended (breakout or breakdown since) has
+            # age > pause_days and is historical — not shown.
+            def _so_live(rec):
+                a=_so_age(rec); pd=rec.get("pause_days")
+                return a is not None and pd is not None and a<=SHAKEOUT_PAUSE_MAX_AGE and a<=pd
+            _fresh={cat:rec for cat,rec in _es_cats.items() if _so_live(rec)}
             _ages=[_so_age(rec) for rec in _es_cats.values() if _so_age(rec) is not None]
             row["shakeout_age"]=min(_ages) if _ages else None
             _pause_cats=[cat for cat,rec in _fresh.items() if rec.get("pause_valid")]
