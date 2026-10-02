@@ -2018,7 +2018,8 @@ async def backup_pattern_history(client, feed, today, gap_new=None, gap_filled=N
     log.info(f"  🗄  pattern_history: {today} → {fname}  ({len(day)} signals, {n_sym} stocks, {len(hist)} dates)")
 
 # ── DEP (Delayed EP) classification — sequential state machine ──
-# ep_type = historical character (EP / Runner EP); state = dynamic current
+# ep_type = Earnings EP / Normal EP (set from the Results catalyst in run_ep_scan);
+# state = dynamic current
 # behavior (Watch / Runner / Consolidation / Pullback / Dead). No buy trigger.
 def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                volume_lookback=20, max_ep_age_days=30):
@@ -2177,7 +2178,6 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                     runner_ep = True
                     break
 
-            ep_type = "Runner EP" if runner_ep else "EP"
 
             # Dynamic highest high since EP.
             valid_highs = [
@@ -2337,7 +2337,9 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
 
                 "runner_peak": round(runner_peak, 2),
 
-                "ep_type": ep_type,
+                # Final value (Earnings EP / Normal EP) is set in run_ep_scan
+                # from the Results catalyst; runner_ep only drives the state machine.
+                "ep_type": "Normal EP",
                 "state": state,
 
                 "age": age,
@@ -3124,6 +3126,7 @@ async def run_ep_scan() -> None:
                     result_symbols = result_calendar.get(result_date, [])
                     if sig["symbol"] in result_symbols:
                         sig["catalyst"] = "Results"
+                        sig["ep_type"] = "Earnings EP"
                         sig["result_date"] = result_date
                     else:
                         sig["catalyst"] = ""
@@ -3131,6 +3134,9 @@ async def run_ep_scan() -> None:
                 except Exception:
                     sig["catalyst"] = ""
                     sig["result_date"] = ""
+            from collections import Counter as _Counter
+            log.info(f"DEP states: {dict(_Counter(s.get('state') for s in signals))}  "
+                     f"types: {dict(_Counter(s.get('ep_type') for s in signals))}")
             signals.sort(key=lambda x:(x["ep_date"],x["gap_pct"]),reverse=True)
             for sig in signals:
                 sym=sig["symbol"]; sc=screener.get(sym,{}); ci=cls_map_ep.get(sym,{}); fund=fund_lookup.get(sym,{})
