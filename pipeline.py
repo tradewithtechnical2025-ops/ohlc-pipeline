@@ -1984,7 +1984,7 @@ def _build_group_ma_history_multi(classification, ma_history_by_label, field_nam
     return output
 
 
-PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo"]
+PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo","ttm_squeeze","bb_squeeze","vol_shocker"]
 HLR_STATE_KEYS={"BO":"hlr_bo","Near HLR":"hlr_near","Consolidating near HLR":"hlr_consol"}
 GAP_STATE_KEYS={"Near Gap":"gap_near","Consolidating near Gap":"gap_consol","Gap Filled":"gap_just_filled"}
 
@@ -3222,6 +3222,12 @@ async def run_ep_scan() -> None:
             log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
             for row in screener_feed:
                 row.update(mtf_ma_map.get(row["symbol"],{}))
+            sq_map=_calc_squeeze_vol_flags(all_data)
+            for row in screener_feed:
+                row.update(sq_map.get(row["symbol"],{}))
+            log.info(f"Squeeze/VolShock: TTM {sum(1 for v in sq_map.values() if v['ttm_squeeze'])}  "
+                     f"BB {sum(1 for v in sq_map.values() if v['bb_squeeze'])}  "
+                     f"VolShocker {sum(1 for v in sq_map.values() if v['vol_shocker'])}")
             ep_pat_map={}
             for sig in signals:
                 # Dead EPs (closed below gap_lower) used to be excluded by the old
@@ -3254,6 +3260,9 @@ async def run_ep_scan() -> None:
                 if row.get("htf_forming"): pats.add("HTF")
                 if row.get("mini_htf_forming"): pats.add("Mini HTF")
                 if row.get("is_vcp"): pats.add("VCP")
+                if row.get("ttm_squeeze"): pats.add("TTM Squeeze")
+                if row.get("bb_squeeze"): pats.add("BB Squeeze")
+                if row.get("vol_shocker"): pats.add("Vol Shocker")
                 if sym in ep_pat_map: pats|=ep_pat_map[sym]
                 row["patterns"]="||".join(sorted(pats))
             feed_pat={row["symbol"]:row["patterns"] for row in screener_feed}
@@ -4464,6 +4473,96 @@ def _calc_sma(closes, period):
 # ══════════════════════════════════════════════════════════════
 # MULTI-TIMEFRAME EMA / SMA  —  Daily SMA + Weekly + Monthly EMA/SMA
 # ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# SQUEEZE + VOLUME SHOCKER  —  runs inside run_ep_scan, merged into
+# screener_feed.json (no separate R2 file)
+#   ttm_squeeze  : BB(20,2) fully inside Keltner(20, 1.5×ATR); ttm_squeeze_days = streak
+#   bb_squeeze   : BB(20,2) width as % of SMA20 <= BB_SQUEEZE_MAX_BBW_PCT; bb_squeeze_days = streak
+#   vol_shocker  : today's volume >= VOL_SHOCKER_X × avg of previous 20 sessions
+#                  (vol_shock_dir = up / down / flat vs previous close)
+# ══════════════════════════════════════════════════════════════
+SQUEEZE_LEN            = 20
+TTM_BB_MULT            = 2.0
+TTM_KC_MULT            = 1.5
+BB_SQUEEZE_MAX_BBW_PCT = 8.0    # BB(20,2) width (upper-lower)/SMA20 in %; tune freely
+VOL_SHOCKER_X          = 3.0
+VOL_SHOCKER_LOOKBACK   = 20
+
+SQUEEZE_MAX_STREAK     = 60     # cap for the consecutive-days count (performance)
+
+def _squeeze_at(highs, lows, closes, i):
+    """(ttm_on, bbw_pct) for bar i using the 20 bars ending at i; (None, None) if data missing."""
+    L = SQUEEZE_LEN
+    if i - L < 0:
+        return None, None
+    win_c = closes[i - L + 1:i + 1]
+    if any(v is None for v in win_c):
+        return None, None
+    sma = sum(win_c) / L
+    if sma <= 0:
+        return None, None
+    sd = (sum((x - sma) ** 2 for x in win_c) / L) ** 0.5   # population stdev (TradingView ta.stdev)
+    bb_up, bb_lo = sma + TTM_BB_MULT * sd, sma - TTM_BB_MULT * sd
+    bbw = (bb_up - bb_lo) / sma * 100
+    trs = []
+    for k in range(i - L + 1, i + 1):
+        h, l, pc = highs[k], lows[k], closes[k - 1]
+        if None in (h, l, pc): continue
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < L:
+        return None, bbw
+    atr = sum(trs) / L                                         # SMA of TR (LazyBear TTM)
+    kc_up, kc_lo = sma + TTM_KC_MULT * atr, sma - TTM_KC_MULT * atr
+    return (bb_up < kc_up and bb_lo > kc_lo), bbw
+
+def _calc_squeeze_vol_flags(all_data):
+    """Returns {symbol: {ttm_squeeze, ttm_squeeze_days, bb_squeeze, bb_squeeze_days,
+    bb_width_pct, vol_shocker, vol_shock_x, vol_shock_dir}} for the latest bar.
+    *_squeeze_days = consecutive trading days the squeeze has been ON up to today
+    (0 = off). The frontend lets the user pick the day range to filter on."""
+    out = {}
+    for sym, s in all_data.items():
+        highs, lows, closes, volumes = s["h"], s["l"], s["c"], s["v"]
+        n = len(closes)
+        if n < SQUEEZE_LEN + 1 or closes[-1] is None:
+            continue
+        row = {"ttm_squeeze": False, "ttm_squeeze_days": 0,
+               "bb_squeeze": False, "bb_squeeze_days": 0, "bb_width_pct": None,
+               "vol_shocker": False, "vol_shock_x": None, "vol_shock_dir": None}
+
+        # ── Squeeze streaks, walking back from today ──
+        ttm_run = bb_run = True
+        for back in range(SQUEEZE_MAX_STREAK):
+            i = n - 1 - back
+            ttm_on, bbw = _squeeze_at(highs, lows, closes, i)
+            if back == 0 and bbw is not None:
+                row["bb_width_pct"] = round(bbw, 2)
+            if ttm_run and ttm_on: row["ttm_squeeze_days"] += 1
+            else: ttm_run = False
+            if bb_run and bbw is not None and bbw <= BB_SQUEEZE_MAX_BBW_PCT: row["bb_squeeze_days"] += 1
+            else: bb_run = False
+            if not ttm_run and not bb_run:
+                break
+        row["ttm_squeeze"] = row["ttm_squeeze_days"] > 0
+        row["bb_squeeze"] = row["bb_squeeze_days"] > 0
+
+        # ── Volume shocker ──
+        vol = volumes[-1]
+        prev_vols = [v for v in volumes[-VOL_SHOCKER_LOOKBACK - 1:-1] if v is not None]
+        if vol and len(prev_vols) == VOL_SHOCKER_LOOKBACK:
+            avg = sum(prev_vols) / len(prev_vols)
+            if avg > 0:
+                x = vol / avg
+                row["vol_shock_x"] = round(x, 2)
+                if x >= VOL_SHOCKER_X:
+                    row["vol_shocker"] = True
+                    pc = closes[-2]
+                    if pc:
+                        row["vol_shock_dir"] = "up" if closes[-1] > pc else ("down" if closes[-1] < pc else "flat")
+        out[sym] = row
+    return out
+
 
 def _calc_multi_tf_ma(all_data, daily_sma_periods=(10, 21, 50, 200),
                        weekly_periods=(10, 30, 40, 50), monthly_periods=(10, 21)):
