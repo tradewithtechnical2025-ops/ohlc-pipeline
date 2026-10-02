@@ -4,7 +4,10 @@ import asyncio
 import json
 import os
 import random
+import sys
 from datetime import datetime, timedelta, date
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 from r2_manifest import upload_with_manifest
@@ -30,6 +33,59 @@ DEFAULT_HISTORY_DAYS = 365 * 3
 
 EXTENDED_HISTORY_DAYS = {
 }
+
+# ─────────────────────────────────────────────
+# Trading calendar — the daily-feed candle is only merged on a real NSE
+# trading day. On a weekend / holiday the daily feed still returns the LAST
+# session's prices, and stamping them with today's date added a duplicate
+# candle. Same nse_holidays.json the stock pipeline (pipeline.py) uses.
+# ─────────────────────────────────────────────
+HERE = Path(__file__).parent
+try:
+    with open(HERE / "nse_holidays.json") as f:
+        NSE_HOLIDAYS = set(json.load(f))
+except Exception as e:
+    NSE_HOLIDAYS = set()
+    print(f"⚠ nse_holidays.json not loaded ({e}) — only weekends are treated as non-trading days")
+
+
+def today_ist() -> str:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat()
+
+
+def is_trading_day(d: str) -> bool:
+    return date.fromisoformat(d).weekday() < 5 and d not in NSE_HOLIDAYS
+
+
+# ─────────────────────────────────────────────
+# Remove wrong candles — dates to drop from every index's history before
+# upload. Pass them on the command line or via the DROP_DATES env var
+# (handy in GitHub Actions), comma-separated:
+#   python pipeline_indices.py --drop-date 2026-10-02
+#   DROP_DATES=2026-10-02,2026-10-03 python pipeline_indices.py
+# ─────────────────────────────────────────────
+def _parse_drop_dates():
+    raw = [os.environ.get("DROP_DATES", "")]
+    args = sys.argv[1:]
+    for i, a in enumerate(args):
+        if a == "--drop-date" and i + 1 < len(args):
+            raw.append(args[i + 1])
+        elif a.startswith("--drop-date="):
+            raw.append(a.split("=", 1)[1])
+    out = set()
+    for chunk in raw:
+        for d in chunk.split(","):
+            d = d.strip()
+            if not d:
+                continue
+            try:
+                out.add(date.fromisoformat(d).isoformat())
+            except ValueError:
+                print(f"⚠ Ignoring invalid --drop-date value: {d!r} (use YYYY-MM-DD)")
+    return out
+
+
+DROP_DATES = _parse_drop_dates()
 
 WORKER_HEADERS = {
     "X-Secret-Token": WORKER_TOKEN,
@@ -422,15 +478,24 @@ def merge_daily_into_history(parsed, daily_row):
     - No-op if there's no daily-feed row for this symbol, or if the
       history is empty (nothing to anchor the merge to).
 
+    - Skipped on a weekend / NSE holiday: the daily feed then still holds
+      the last session's prices, and appending them under today's date
+      created a duplicate candle.
+    - Skipped when the feed's OHLC is identical to the last historical
+      candle (a stale feed that has not rolled over yet).
+
     Returns (parsed, status) where status is one of:
-      "appended" | "replaced" | "no-daily-row" | "empty-history"
+      "appended" | "replaced" | "no-daily-row" | "empty-history" |
+      "holiday-skip" | "stale-skip"
     """
     if not parsed:
         return parsed, "empty-history"
     if not daily_row:
         return parsed, "no-daily-row"
 
-    today_str = date.today().isoformat()
+    today_str = today_ist()
+    if not is_trading_day(today_str):
+        return parsed, "holiday-skip"
     merged_row = {
         "date"         : today_str,
         "open"         : daily_row.get("open"),
@@ -444,6 +509,11 @@ def merge_daily_into_history(parsed, daily_row):
     }
 
     last_date = str(parsed[-1].get("date", ""))[:10]
+    if last_date != today_str:
+        last = parsed[-1]
+        same = all(last.get(k) == merged_row.get(k) for k in ("open", "high", "low", "close"))
+        if same and merged_row.get("close") is not None:
+            return parsed, "stale-skip"
     if last_date == today_str:
         parsed[-1] = merged_row
         status = "replaced"
@@ -461,6 +531,14 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
             print(f"[{i}/{total}] ✗ {symbol} | no data")
             return symbol, None, None, False, "no-history", None
         parsed, merge_status = merge_daily_into_history(parsed, daily_row)
+        if DROP_DATES:
+            before = len(parsed)
+            parsed = [r for r in parsed if str(r.get("date", ""))[:10] not in DROP_DATES]
+            if len(parsed) != before:
+                print(f"[{i}/{total}]   {symbol}: dropped {before - len(parsed)} candle(s) dated {', '.join(sorted(DROP_DATES))}")
+            if not parsed:
+                print(f"[{i}/{total}] ✗ {symbol} | no data left after --drop-date")
+                return symbol, None, None, False, "no-history", None
         weekly = compute_weekly_return(parsed)
         msw = compute_index_mswing(parsed)
         ohlc_arrays = build_ohlc_arrays(parsed)
@@ -593,6 +671,11 @@ async def main():
         print("\n=================================")
         print(" INDEX PIPELINE STARTED")
         print("=================================\n")
+        _today = today_ist()
+        print(f"Date (IST): {_today} — {'trading day' if is_trading_day(_today) else 'NOT a trading day: daily candle will not be added'}")
+        if DROP_DATES:
+            print(f"Dropping candles dated: {', '.join(sorted(DROP_DATES))}")
+        print()
 
         print("=== INDEX MASTER ===")
         master_rows = await fetch_index_master(client)
@@ -646,7 +729,7 @@ async def main():
         weekly_map = {}
         mswing_map = {}
         index_ohlc_map = {}
-        merge_counts = {"appended": 0, "replaced": 0, "no-daily-row": 0, "empty-history": 0, "no-history": 0}
+        merge_counts = {"appended": 0, "replaced": 0, "holiday-skip": 0, "stale-skip": 0, "no-daily-row": 0, "empty-history": 0, "no-history": 0}
         for symbol, weekly, msw, ok, merge_status, ohlc_arrays in results:
             merge_counts[merge_status] = merge_counts.get(merge_status, 0) + 1
             if ok:
@@ -689,7 +772,8 @@ async def main():
         print(" INDEX PIPELINE COMPLETED")
         print("=================================")
         print(f"\n📅 Daily-merge into history — appended: {merge_counts['appended']} | "
-              f"replaced: {merge_counts['replaced']} | no daily row: {merge_counts['no-daily-row']} | "
+              f"replaced: {merge_counts['replaced']} | holiday skip: {merge_counts['holiday-skip']} | "
+              f"stale skip: {merge_counts['stale-skip']} | no daily row: {merge_counts['no-daily-row']} | "
               f"empty history: {merge_counts['empty-history']} | no history at all: {merge_counts['no-history']}")
         print(f"\n✅ Success: {success}")
         print(f"❌ Failed : {failed}")
