@@ -2017,7 +2017,7 @@ async def backup_pattern_history(client, feed, today, gap_new=None, gap_filled=N
     n_sym=len(all_syms)
     log.info(f"  🗄  pattern_history: {today} → {fname}  ({len(day)} signals, {n_sym} stocks, {len(hist)} dates)")
 
-# ── DEP (Delayed EP) classification ──
+# ── DEP (Delayed EP) classification — sequential state machine ──
 # ep_type = historical character (EP / Runner EP); state = dynamic current
 # behavior (Watch / Runner / Consolidation / Pullback / Dead). No buy trigger.
 def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
@@ -2025,7 +2025,78 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
 
     signals = []
 
+    def _is_lower_high_lower_low(highs, lows, j):
+        """
+        Structure deterioration:
+        current bar makes both a lower high and lower low
+        versus previous bar.
+        """
+        if j <= 0:
+            return False
+
+        vals = (highs[j], highs[j - 1], lows[j], lows[j - 1])
+        if any(v is None for v in vals):
+            return False
+
+        return highs[j] < highs[j - 1] and lows[j] < lows[j - 1]
+
+    def _three_lower_closes(closes, j):
+        """
+        Three consecutive closing declines:
+        C[j] < C[j-1] < C[j-2] < C[j-3]
+
+        This intentionally requires repeated deterioration,
+        not one red candle.
+        """
+        if j < 3:
+            return False
+
+        vals = (closes[j], closes[j - 1], closes[j - 2], closes[j - 3])
+        if any(v is None for v in vals):
+            return False
+
+        return (
+            closes[j] < closes[j - 1]
+            and closes[j - 1] < closes[j - 2]
+            and closes[j - 2] < closes[j - 3]
+        )
+
+    def _pullback_stabilized(closes, j):
+        """
+        Pullback -> Consolidation:
+
+        Require:
+        1. enough candles after the decline,
+        2. no new closing low during the last 3 sessions,
+        3. recent closes overlap rather than continue migrating down.
+
+        This prevents one/two quiet candles from instantly
+        converting a Pullback into Consolidation.
+        """
+        if j < 4:
+            return False
+
+        vals = [closes[k] for k in range(j - 4, j + 1)]
+        if any(v is None for v in vals):
+            return False
+
+        # Lowest close of the older part of this 5-bar window.
+        prior_low = min(vals[0:2])
+
+        # Last 3 closes must not establish a new closing low.
+        last3 = vals[2:5]
+        no_new_low = min(last3) >= prior_low
+
+        # Recent closes should show overlap / loss of downward direction.
+        recent_down_moves = sum(
+            1 for a, b in zip(last3, last3[1:])
+            if b < a
+        )
+
+        return no_new_low and recent_down_moves <= 1
+
     for sym, s in all_data.items():
+
         dates = s["d"]
         highs = s["h"]
         lows = s["l"]
@@ -2044,16 +2115,22 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
 
         for i in range(scan_from, n):
 
-            # ── EP GATE ──────────────────────────────
+            # ==========================================================
+            # EP GATE
+            # ==========================================================
+
             prev_high = highs[i - 1]
             ep_low = lows[i]
+            ep_high = highs[i]
+            ep_close = closes[i]
 
-            if prev_high is None or ep_low is None:
+            if any(v is None for v in (prev_high, ep_low, ep_high, ep_close)):
                 continue
 
             if prev_high <= 0 or ep_low <= 0:
                 continue
 
+            # True gap-up.
             if ep_low <= prev_high:
                 continue
 
@@ -2063,7 +2140,7 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                 continue
 
             hist_vol = [
-                v for v in volumes[i-volume_lookback:i]
+                v for v in volumes[i - volume_lookback:i]
                 if v is not None
             ]
 
@@ -2080,107 +2157,154 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
             if vol_x < volume_spike_x:
                 continue
 
-            # ── EP REFERENCES ────────────────────────
-            ep_high = highs[i]
-            ep_close = closes[i]
-
-            if ep_high is None or ep_close is None:
-                continue
-
             age = n - 1 - i
 
-            post_closes = [
-                closes[j]
-                for j in range(i + 1, n)
-                if closes[j] is not None
-            ]
+            # ==========================================================
+            # HISTORICAL EP TYPE
+            #
+            # Runner EP:
+            # first 4 post-EP sessions contain a close >= EP High + 3%.
+            # Once true, historical EP Type remains Runner EP.
+            # ==========================================================
 
-            # ── DEAD ─────────────────────────────────
-            dead = any(c < prev_high for c in post_closes)
-
-            # ── RUNNER EP ────────────────────────────
-            runner = False
+            runner_ep = False
             runner_end = min(i + 4, n - 1)
 
             for j in range(i + 1, runner_end + 1):
                 c = closes[j]
 
                 if c is not None and c >= ep_high * 1.03:
-                    runner = True
+                    runner_ep = True
                     break
 
-            ep_type = "Runner EP" if runner else "EP"
+            ep_type = "Runner EP" if runner_ep else "EP"
 
-            # ── DYNAMIC PEAK ─────────────────────────
+            # Dynamic highest high since EP.
             valid_highs = [
                 h for h in highs[i:n]
                 if h is not None
             ]
 
-            peak = max(valid_highs) if valid_highs else ep_high
-            last_close = closes[-1]
+            runner_peak = max(valid_highs) if valid_highs else ep_high
 
-            # ── CURRENT STATE ────────────────────────
-            if dead:
+            # ==========================================================
+            # CURRENT STATE — SEQUENTIAL STATE MACHINE
+            # ==========================================================
+
+            # Dead is terminal and checked first, so an EP that fails within
+            # its first 2 sessions shows Dead instead of being hidden as Watch.
+            dead_early = any(
+                closes[j] is not None and closes[j] < prev_high
+                for j in range(i + 1, n)
+            )
+
+            if dead_early:
                 state = "Dead"
 
             elif age < 2:
                 state = "Watch"
 
             else:
-                recent = [
-                    c
-                    for c in closes[max(i + 1, n - 5):n]
-                    if c is not None
-                ]
+                # Runner EP starts as Runner.
+                # Normal EP starts as Consolidation.
+                state = "Runner" if runner_ep else "Consolidation"
 
-                pullback = False
-                stable = False
+                for j in range(i + 1, n):
 
-                if len(recent) >= 3:
+                    c = closes[j]
 
-                    down_moves = sum(
-                        1
-                        for a, b in zip(recent, recent[1:])
-                        if b < a
+                    if c is None:
+                        continue
+
+                    # --------------------------------------------------
+                    # DEAD — terminal state
+                    # --------------------------------------------------
+                    if c < prev_high:
+                        state = "Dead"
+                        break
+
+                    # --------------------------------------------------
+                    # PULLBACK DETECTION
+                    #
+                    # Pullback can start from Runner OR Consolidation.
+                    #
+                    # Evidence:
+                    # A) 3 consecutive closing declines
+                    # OR
+                    # B) Lower High + Lower Low structure
+                    #
+                    # To reduce single-bar noise, LH+LL requires either
+                    # the previous close or current close also to weaken.
+                    # --------------------------------------------------
+
+                    three_down = _three_lower_closes(closes, j)
+                    lh_ll = _is_lower_high_lower_low(highs, lows, j)
+
+                    close_weak = False
+
+                    if j > 0 and closes[j - 1] is not None:
+                        close_weak = closes[j] <= closes[j - 1]
+
+                    pullback_evidence = (
+                        three_down
+                        or (lh_ll and close_weak)
                     )
 
-                    price_range = peak - ep_low
+                    if state in ("Runner", "Consolidation"):
+                        if pullback_evidence:
+                            state = "Pullback"
+                            continue
 
-                    if price_range > 0:
+                    # --------------------------------------------------
+                    # PULLBACK -> CONSOLIDATION
+                    #
+                    # Do not reset Pullback because of one green candle.
+                    # Require actual stabilization.
+                    # --------------------------------------------------
 
-                        positions = [
-                            (c - ep_low) / price_range
-                            for c in recent
+                    if state == "Pullback":
+                        if _pullback_stabilized(closes, j):
+                            state = "Consolidation"
+                            continue
+
+                    # --------------------------------------------------
+                    # CONSOLIDATION -> RUNNER
+                    #
+                    # Only available to historical Runner EP.
+                    #
+                    # If price resumes/maintains upper progression by
+                    # closing at a fresh post-EP closing high, current
+                    # state can return to Runner.
+                    # --------------------------------------------------
+
+                    if state == "Consolidation" and runner_ep:
+
+                        prior_post_ep_closes = [
+                            closes[k]
+                            for k in range(i + 1, j)
+                            if closes[k] is not None
                         ]
 
-                        migration = positions[-1] - positions[0]
+                        if prior_post_ep_closes:
+                            prior_best_close = max(prior_post_ep_closes)
 
-                        if down_moves >= 2 and migration <= -0.15:
-                            pullback = True
+                            if c > prior_best_close:
+                                state = "Runner"
 
-                        recent_span = max(recent) - min(recent)
+            # ==========================================================
+            # RETURNS
+            # ==========================================================
 
-                        if recent_span <= price_range * 0.12:
-                            stable = True
+            last_close = closes[-1]
 
-                if pullback:
-                    state = "Pullback"
-
-                elif stable:
-                    state = "Consolidation"
-
-                elif runner:
-                    state = "Runner"
-
-                else:
-                    state = "Consolidation"
-
-            # ── RETURNS ──────────────────────────────
             ep_5d_idx = min(i + 5, n - 1)
             ep_5d_return = ""
 
-            if ep_5d_idx > i and closes[ep_5d_idx] is not None:
+            if (
+                ep_5d_idx > i
+                and closes[ep_5d_idx] is not None
+                and ep_close
+            ):
                 ep_5d_return = round(
                     (closes[ep_5d_idx] - ep_close) / ep_close * 100,
                     2
@@ -2193,6 +2317,10 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                     (last_close - ep_close) / ep_close * 100,
                     2
                 )
+
+            # ==========================================================
+            # OUTPUT
+            # ==========================================================
 
             signals.append({
                 "symbol": sym,
@@ -2207,7 +2335,7 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                 "ep_candle_low": round(ep_low, 2),
                 "ep_candle_close": round(ep_close, 2),
 
-                "runner_peak": round(peak, 2),
+                "runner_peak": round(runner_peak, 2),
 
                 "ep_type": ep_type,
                 "state": state,
@@ -2225,17 +2353,20 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
 
                 "last_date": dates[-1],
 
-                # Existing frontend compatibility
+                # Existing frontend compatibility.
                 "consolidation": age,
             })
 
-    # Latest EP per symbol
+    # Latest EP per symbol.
     seen = {}
 
     for sig in signals:
         sym = sig["symbol"]
 
-        if sym not in seen or sig["ep_date"] > seen[sym]["ep_date"]:
+        if (
+            sym not in seen
+            or sig["ep_date"] > seen[sym]["ep_date"]
+        ):
             seen[sym] = sig
 
     return list(seen.values())
