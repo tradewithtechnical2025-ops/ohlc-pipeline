@@ -94,3 +94,99 @@ WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
 def _upstox_headers():
     return {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_TOKEN}"}
+
+ISIN_MAP:     dict[str, str] = {}
+BSE_ISIN_MAP: dict[str, str] = {}
+BSE_META:     dict[str, dict] = {}
+
+INDEX_SYMBOLS = {
+    "nifty50"    : "NIFTY50",
+    "nifty500"   : "NIF500",
+    "smallmid400": "NIFMID400",
+}
+
+# ══════════════════════════════════════════════════════════════
+# INSTRUMENT MAP  (BOD instruments file — no rate limit)
+# ══════════════════════════════════════════════════════════════
+
+NSE_BOD_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+BSE_BOD_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
+
+
+def _parse_bod_instruments(instruments, segment) -> dict[str, str]:
+    """Parse BOD instruments list into {trading_symbol → instrument_key} map."""
+    NSE_SUFFIXES = ("-EQ","-BE","-BL","-SM","-IL","-IV","-W1","-W2","-W3","-W4","-W5")
+    sym_map = {}
+    for inst in instruments:
+        if inst.get("segment") != segment: continue
+        if segment == "NSE_EQ":
+            itype = inst.get("instrument_type", "")
+            if itype in ("SG","GB","TB","GS","CE","PE","FF","MF"): continue
+        tsym = (inst.get("trading_symbol") or "").upper()
+        ikey = inst.get("instrument_key")
+        if not tsym or not ikey: continue
+        sym_map[tsym] = ikey
+        for suffix in NSE_SUFFIXES:
+            if tsym.endswith(suffix):
+                base = tsym[:-len(suffix)]
+                if base and base not in sym_map:
+                    sym_map[base] = ikey
+                break
+    return sym_map
+
+
+async def _load_bod_map(client, url, segment) -> dict[str, str]:
+    """
+    Downloads Upstox BOD instruments .json.gz.
+    Falls back to cached ikey_map.json from R2 if download fails.
+    """
+    import gzip
+
+    # Try downloading BOD file
+    for attempt in range(RETRY):
+        try:
+            r = await client.get(url, headers=_upstox_headers(), timeout=60, follow_redirects=True)
+        except httpx.RequestError as e:
+            log.warning(f"  BOD download error ({e}), retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        if r.status_code != 200:
+            log.warning(f"  BOD {url} → HTTP {r.status_code}, retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        try:
+            instruments = json.loads(gzip.decompress(r.content))
+        except Exception as e:
+            log.warning(f"  BOD decompress error: {e}"); break
+        sym_map = _parse_bod_instruments(instruments, segment)
+        log.info(f"  BOD {segment}: {len(sym_map)} instruments")
+        return sym_map
+
+    log.warning(f"  BOD {segment} failed — falling back to cached ikey_map.json")
+    return {}  # caller will use cache
+
+
+async def build_isin_map(client):
+    log.info("Building instrument map…")
+
+    # Download classification.json from R2 first (always needed)
+    log.info("Fetching classification.json from R2…")
+    master = await r2_download(client, "classification.json")
+    if not master or not isinstance(master, list):
+        raise RuntimeError("classification.json missing or invalid in R2!")
+
+    # Try BOD files + cached map concurrently
+    nse_bod_task = asyncio.create_task(_load_bod_map(client, NSE_BOD_URL, "NSE_EQ"))
+    bse_bod_task = asyncio.create_task(_load_bod_map(client, BSE_BOD_URL, "BSE_EQ"))
+    cache_task   = asyncio.create_task(r2_download(client, "ikey_map.json"))
+
+    nse_bod, bse_bod, cached = await asyncio.gather(nse_bod_task, bse_bod_task, cache_task)
+
+    # If BOD failed, use cached map
+    if not nse_bod and isinstance(cached, dict):
+        log.info(f"  Using cached ikey_map.json ({len(cached.get('nse',{}))} NSE entries)")
+        nse_bod = cached.get("nse", {})
+        bse_bod = cached.get("bse", {})
+
+    nse_map = {}; bse_map = {}; bse_meta_raw = {}
+    nse_miss = []; bse_miss = []
+
+    for stock in master:
