@@ -2208,6 +2208,9 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                 # Runner EP starts as Runner.
                 # Normal EP starts as Consolidation.
                 state = "Runner" if runner_ep else "Consolidation"
+                # Start of the current consolidation base (reset after a
+                # Pullback stabilizes) -- its lowest low is the breakdown level.
+                cons_start = i + 1
 
                 for j in range(i + 1, n):
 
@@ -2224,17 +2227,7 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                         break
 
                     # --------------------------------------------------
-                    # PULLBACK DETECTION
-                    #
-                    # Pullback can start from Runner OR Consolidation.
-                    #
-                    # Evidence:
-                    # A) 3 consecutive closing declines
-                    # OR
-                    # B) Lower High + Lower Low structure
-                    #
-                    # To reduce single-bar noise, LH+LL requires either
-                    # the previous close or current close also to weaken.
+                    # PULLBACK DETECTION (state-aware, see rules below)
                     # --------------------------------------------------
 
                     three_down = _three_lower_closes(closes, j)
@@ -2245,13 +2238,29 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                     if j > 0 and closes[j - 1] is not None:
                         close_weak = closes[j] <= closes[j - 1]
 
-                    pullback_evidence = (
-                        three_down
-                        or (lh_ll and close_weak)
+                    # Runner -> Pullback: 3 lower closes, or LH+LL on two
+                    # consecutive bars with a weaker close (one bar is noise).
+                    lh_ll_prev = (
+                        _is_lower_high_lower_low(highs, lows, j - 1)
+                        if j - 1 > i else False
                     )
 
-                    if state in ("Runner", "Consolidation"):
-                        if pullback_evidence:
+                    if state == "Runner":
+                        if three_down or (lh_ll and lh_ll_prev and close_weak):
+                            state = "Pullback"
+                            continue
+
+                    # Consolidation -> Pullback: 3 lower closes, or a close
+                    # below the lowest low of the current base. A dip that
+                    # stays inside the base is still Consolidation.
+                    if state == "Consolidation":
+                        base_lows = [
+                            lows[k] for k in range(cons_start, j)
+                            if lows[k] is not None
+                        ]
+                        base_break = len(base_lows) >= 2 and c < min(base_lows)
+
+                        if three_down or base_break:
                             state = "Pullback"
                             continue
 
@@ -2265,6 +2274,7 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                     if state == "Pullback":
                         if _pullback_stabilized(closes, j):
                             state = "Consolidation"
+                            cons_start = j
                             continue
 
                     # --------------------------------------------------
