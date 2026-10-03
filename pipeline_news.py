@@ -1478,7 +1478,8 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
 
 async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = "",
                                        scrip_code: str = None, fallback_board_meeting_date: str = None,
-                                       symbol_override: str = None, exchange: str = "NSE"):
+                                       symbol_override: str = None, exchange: str = "NSE",
+                                       preextracted_text: str | None = None):
     """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
     {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
     flow through the same grouping/dedup/Telegram code.
@@ -2311,10 +2312,17 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 return True
         return False
 
-    incomplete_pdf_links = {it.get("link") for it in existing_items if _looks_stale_or_wrong(it)}
+    # Do NOT automatically re-run already-successfully-stored PDF links.
+    # Earlier versions deliberately retried records that looked stale/incomplete,
+    # but that makes a completed result re-enter the "new PDF" batch on every
+    # poll and can burn Gemini calls even when there are no new results.
+    # Reprocessing is now opt-in for maintenance/backfills only.
+    reprocess_stale = os.environ.get("REPROCESS_STALE_RESULTS", "0").strip().lower() in ("1", "true", "yes")
+    incomplete_pdf_links = ({it.get("link") for it in existing_items if _looks_stale_or_wrong(it)}
+                            if reprocess_stale else set())
     if incomplete_pdf_links:
-        print(f"  ↻ {len(incomplete_pdf_links)} existing PDF-sourced record(s) look stale/incomplete/implausible — "
-              f"will retry parsing them")
+        print(f"  ↻ REPROCESS_STALE_RESULTS enabled: retrying {len(incomplete_pdf_links)} "
+              f"existing stale/incomplete PDF record(s)")
 
     new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
     new_pdf = [it for it in pdf_items if it["link"] not in existing_links or it["link"] in incomplete_pdf_links]
@@ -2561,10 +2569,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             print(f"  ⚠ pre-AI PDF preflight failed for {it['link'].split('/')[-1]}: {type(e).__name__}: {e}")
             return it
 
+    new_dupe_links = []  # persisted so skipped copies never re-enter a later run
     if singleton_pdf:
         singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
         latest = {}
         unkeyed = []
+        pre_superseded_links = []
         for it in singleton_pdf:
             key = it.get("_pre_result_key")
             if not key:
@@ -2574,13 +2584,20 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             # published_ts is available for both exchanges and is preferable
             # here because BSE GUID filenames carry no embedded timestamp.
             if prior is None or it.get("published_ts", 0) >= prior.get("published_ts", 0):
+                if prior is not None:
+                    pre_superseded_links.append(prior["link"])
                 latest[key] = it
-        pre_superseded = len(singleton_pdf) - len(latest) - len(unkeyed)
+            else:
+                pre_superseded_links.append(it["link"])
+        pre_superseded = len(pre_superseded_links)
         singleton_pdf = list(latest.values()) + unkeyed
         if pre_superseded:
-            print(f"  ⏭ {pre_superseded} same-run resubmission PDF(s) removed BEFORE AI — Gemini calls saved")
-
-    new_dupe_links = []  # populated only once a group's winner actually parses OK
+            # These are deterministic same-result resubmissions. Persist them
+            # in the existing duplicate-link store so they are skipped on all
+            # future runs instead of becoming "new" again.
+            new_dupe_links.extend(pre_superseded_links)
+            print(f"  ⏭ {pre_superseded} same-run resubmission PDF(s) removed BEFORE AI — "
+                  f"Gemini calls saved; marked processed for future runs")
 
     async def process_pdf_group(sym: str, bucket: str, group_items: list[dict]):
         for idx, it in enumerate(group_items):
