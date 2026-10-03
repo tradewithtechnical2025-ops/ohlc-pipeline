@@ -30,7 +30,7 @@ API_URL   = "https://www.nseindia.com/api/corporate-announcements"
 RSS_URL   = "https://www.nseindia.com/content/RSS/Online_announcements.xml"
 EQUITY_L  = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
-HISTORY_DAYS = 90          # keep ~4 months: 20-session tracking window + pre-EP news
+HISTORY_DAYS = 10          # TEST MODE: keep/fetch only the last 10 calendar days
 TEXT_MAX     = 300         # exchange summary is enough; the PDF link has the rest
 
 MARKET_OPEN  = dtime(9, 15)
