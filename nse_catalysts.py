@@ -185,7 +185,7 @@ def _event_meta(subject: str, text: str, category: str) -> dict:
     if category == "Order":
         if re.search(r"\bl1\b|first lowest|lowest bidder|preferred bidder", both, re.I):
             out.update(event_type="L1 Bidder", stage="L1 / Awaiting Award")
-        elif re.search(r"letter of award|letter of acceptance|\bloa\b|awarded|order received|work order|purchase order|supply order", both, re.I):
+        elif re.search(r"letter of award|letter of acceptance|\bloa\b|awarded|bagging/receiving|order received|work order|purchase order|supply order|contract win", both, re.I):
             out.update(event_type="Order Award", stage="Awarded")
     elif category == "Acquisition":
         out["event_type"] = "Acquisition"
@@ -858,6 +858,143 @@ def fetch_catalysts(session, today: date, lookback_days: int,
     return fetch_rss(session, is_trading_day, next_trading_day), "rss"
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conservative lifecycle consolidation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LIFECYCLE_CATEGORIES = {
+    "Order", "Acquisition", "Divestment", "Scheme of Arrangement",
+    "Strategic Agreement", "Corporate Action",
+}
+
+_LIFECYCLE_STOP = {
+    "limited", "company", "exchange", "informed", "regarding", "about", "under",
+    "pursuant", "regulation", "sebi", "listing", "obligations", "disclosure",
+    "requirements", "general", "updates", "update", "press", "release", "outcome",
+    "board", "meeting", "held", "dated", "the", "and", "for", "with", "from",
+    "that", "this", "has", "have", "its", "their", "private", "ltd",
+}
+
+def _life_tokens(item: dict) -> set[str]:
+    raw = f"{item.get('subject','')} {item.get('text','')}".lower()
+    raw = re.sub(r"https?://\S+", " ", raw)
+    toks = set(re.findall(r"[a-z][a-z0-9]{2,}", raw))
+    return {t for t in toks if t not in _LIFECYCLE_STOP}
+
+def _money_markers(item: dict) -> set[str]:
+    raw = f"{item.get('text','')} {item.get('order_value_text','')}".lower().replace(",", "")
+    vals = set()
+    for m in re.finditer(r"(?:rs\.?|₹|inr)?\s*(\d+(?:\.\d+)?)\s*(?:crore|crores|cr\b)", raw, re.I):
+        try:
+            vals.add(f"{float(m.group(1)):.2f}")
+        except Exception:
+            pass
+    if item.get("order_value_cr") is not None:
+        try: vals.add(f"{float(item['order_value_cr']):.2f}")
+        except Exception: pass
+    return vals
+
+def _life_similarity(a: dict, b: dict) -> float:
+    ta, tb = _life_tokens(a), _life_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta | tb))
+
+def _same_lifecycle(a: dict, b: dict) -> bool:
+    cat = a.get("category")
+    if cat != b.get("category") or cat not in _LIFECYCLE_CATEGORIES:
+        return False
+    try:
+        da = datetime.fromisoformat(str(a.get("dt", "")).replace("Z", "+00:00"))
+        db = datetime.fromisoformat(str(b.get("dt", "")).replace("Z", "+00:00"))
+        gap = abs((da.date() - db.date()).days)
+    except Exception:
+        gap = 999
+    if gap > 14:
+        return False
+
+    sim = _life_similarity(a, b)
+    ma, mb = _money_markers(a), _money_markers(b)
+
+    # Orders are especially collision-prone: same value (L1 -> award) or very
+    # strong project/customer wording is required. Different order values never merge.
+    if cat == "Order":
+        if ma and mb and not (ma & mb):
+            return False
+        return bool(ma & mb) or sim >= 0.62
+
+    # Scheme filings often use generic exchange boilerplate; same-symbol filings
+    # close in time are consolidated only when their meaningful wording overlaps.
+    if cat == "Scheme of Arrangement":
+        return sim >= 0.30
+
+    # Capital-action duplicates (Outcome + QIP/Preferential/Buyback etc.) are
+    # normally filed minutes apart. Restrict the looser rule to the same day.
+    if cat == "Corporate Action":
+        return (gap == 0 and sim >= 0.22) or sim >= 0.58
+
+    # Acquisition/divestment/strategic-agreement lifecycle updates normally repeat
+    # the target/counterparty/project name, so require meaningful token overlap.
+    return sim >= 0.42
+
+_STAGE_RANK = {
+    "L1 / Awaiting Award": 10, "Announced": 10, "MoU": 10, "Non-Binding MoU": 5,
+    "Approved": 20, "Board Approved": 20, "Approved / Agreement": 25,
+    "Agreement Signed": 30, "Definitive / Signed": 30, "Exchange NOC": 35,
+    "Awarded": 40, "NCLT Approved": 45, "Record Date": 50,
+    "Completion Delayed/Extended": 55, "Effective / Completed": 60, "Completed": 60,
+}
+
+def _lifecycle_winner(a: dict, b: dict) -> tuple[dict, dict]:
+    ra = _STAGE_RANK.get(a.get("stage"), 0)
+    rb = _STAGE_RANK.get(b.get("stage"), 0)
+    if ra != rb:
+        return (a, b) if ra > rb else (b, a)
+    return (a, b) if str(a.get("dt", "")) >= str(b.get("dt", "")) else (b, a)
+
+def _carry_enrichment(winner: dict, loser: dict) -> None:
+    """Keep useful structured facts when a later lifecycle filing is terse."""
+    protected = {"id", "dt", "react_date", "session", "category", "subject", "text", "link", "event_type", "stage"}
+    for k, v in loser.items():
+        if k not in protected and k not in winner and v not in (None, "", [], {}):
+            winner[k] = v
+
+def consolidate_lifecycles(data: dict) -> int:
+    """Conservatively collapse duplicate stages of the same underlying event per symbol.
+
+    Returns the number of cards removed. Manual rows are never consolidated.
+    """
+    removed = 0
+    for sym in list(data):
+        items = sorted(data[sym], key=lambda x: x.get("dt", ""), reverse=True)
+        kept = []
+        for item in items:
+            if item.get("manual") or item.get("category") not in _LIFECYCLE_CATEGORIES:
+                kept.append(item)
+                continue
+            hit = None
+            for i, prev in enumerate(kept):
+                if prev.get("manual"):
+                    continue
+                if _same_lifecycle(item, prev):
+                    hit = i
+                    break
+            if hit is None:
+                kept.append(item)
+                continue
+            winner, loser = _lifecycle_winner(item, kept[hit])
+            _carry_enrichment(winner, loser)
+            kept[hit] = winner
+            removed += 1
+        kept.sort(key=lambda x: x.get("dt", ""), reverse=True)
+        data[sym] = kept
+        if not kept:
+            del data[sym]
+    return removed
+
+
 def merge_catalysts(hist: dict, new: dict, today: date, keep_days: int = HISTORY_DAYS) -> int:
     """
     hist/new: {symbol: [items]}. Dedupes on item id, keeps each symbol's list
@@ -1125,6 +1262,13 @@ def main():
             _it.pop("_lookup_symbol", None)
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
+
+    # Collapse duplicate lifecycle filings only after old + fresh rows are merged,
+    # so L1 -> award, announced -> completed, and scheme stage updates can meet.
+    lifecycle_removed = consolidate_lifecycles(history)
+    if lifecycle_removed:
+        print(f"  🔗 Lifecycle consolidation → removed={lifecycle_removed} duplicate stage card(s)")
+
     total = sum(len(v) for v in history.values())
 
     payload = {
