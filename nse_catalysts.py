@@ -203,96 +203,138 @@ def _extract_pdf_text(session, url: str) -> str:
         return ""
 
 
+def _normalize_pdf_text(text: str) -> str:
+    """Normalize common pypdf spacing artifacts without using OCR/AI."""
+    s = re.sub(r"\s+", " ", text or " ").strip()
+    # CFF/Type1 PDFs can emit decimals one glyph at a time: "75 . 9 6".
+    s = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", s)
+    s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
+    # Clean punctuation/hyphen spacing created by line-oriented extraction.
+    s = re.sub(r"\s+([,.;:])", r"\1", s)
+    s = re.sub(r"\bN\s*-\s*Type\b", "N-Type", s, flags=re.I)
+    s = re.sub(r"\bGlass\s*-\s*to\s*-\s*Glass\b", "Glass-to-Glass", s, flags=re.I)
+    return s
+
+
 def _clean_field(v: str, max_len: int = 350) -> str:
     v = re.sub(r"\s+", " ", v or "").strip(" :-;|\t\r\n")
-    return v[:max_len].strip()
+    v = re.sub(r"\s+([,.;:])", r"\1", v)
+    # Never let signature/footer prose leak into a table value.
+    v = re.split(r"\b(?:This is for your information|Yours faithfully|Thanking you)\b", v,
+                 maxsplit=1, flags=re.I)[0]
+    return v[:max_len].strip(" :-;|")
 
 
-def _label_value(clean: str, labels: list[str], stop_labels: list[str] | None = None,
-                 max_chars: int = 450) -> str:
-    """Best-effort extraction from standard SEBI Reg-30 order disclosure tables."""
-    stops = stop_labels or []
-    label_alt = "|".join(labels)
-    m = re.search(rf"(?:{label_alt})\s*[:;\-]?\s*", clean, re.I)
+def _table_items(clean: str) -> dict[int, str]:
+    """Return numbered SEBI disclosure rows (1..9), bounded by the next row."""
+    hits = list(re.finditer(r"(?<!\d)\b([1-9])\.\s+", clean))
+    rows = {}
+    for i, m in enumerate(hits):
+        n = int(m.group(1))
+        if n in rows:
+            continue
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(clean)
+        rows[n] = clean[m.end():end].strip()
+    return rows
+
+
+def _row_answer(row: str, label_pattern: str, max_len: int = 400) -> str:
+    if not row:
+        return ""
+    m = re.search(label_pattern, row, re.I)
     if not m:
         return ""
-    tail = clean[m.end():m.end() + max_chars]
-    if stops:
-        stop_alt = "|".join(stops)
-        sm = re.search(rf"\s+(?:{stop_alt})\s*[:;\-]?", tail, re.I)
-        if sm:
-            tail = tail[:sm.start()]
-    return _clean_field(tail)
+    return _clean_field(row[m.end():], max_len)
 
 
 def _extract_order_details(text: str) -> dict:
-    clean = re.sub(r"\s+", " ", text or " ").strip()
+    clean = _normalize_pdf_text(text)
     if not clean:
         return {}
 
-    # Common labels used in SEBI Regulation-30 order/contract disclosure tables.
-    entity = _label_value(
-        clean,
-        [r"name of (?:the )?entity awarding (?:the )?order\(s\)/contract\(s\)"],
-        [r"significant terms", r"whether order", r"nature of order"],
+    rows = _table_items(clean)
+
+    entity = _row_answer(
+        rows.get(1, ""),
+        r"name of (?:the )?entity awarding (?:the )?order\(s\)/\s*contract\(s\)",
     )
-    purpose = _label_value(
-        clean,
-        [r"nature of order\(s\)\s*/\s*contract\(s\)",
-         r"significant terms and conditions of order\(s\)/contract\(s\) awarded in brief"],
-        [r"whether domestic", r"time period", r"broad consideration", r"whether the promoter"],
+    terms = _row_answer(
+        rows.get(2, ""),
+        r"significant terms and conditions of order\(s\)/\s*contract\(s\) awarded in brief",
     )
-    execution = _label_value(
-        clean,
-        [r"time period by which (?:the )?order\(s\)\s*/?\s*contract\(s\) is to be executed"],
-        [r"broad consideration", r"whether the promoter", r"whether order"],
+    nature = _row_answer(
+        rows.get(4, ""),
+        r"nature of order\(s\)\s*/\s*contract\(s\)",
+    )
+    # Prefer a descriptive terms row, but ignore generic boilerplate.
+    if terms and not re.fullmatch(r"as per (?:the )?terms of (?:the )?order", terms, re.I):
+        purpose = terms
+    else:
+        purpose = nature
+
+    execution = _row_answer(
+        rows.get(6, ""),
+        r"time period by which (?:the )?order\(s\)\s*/?\s*contract\(s\) is to be executed",
     )
 
-    # Domestic/international: prefer the explicit table answer after the label.
     order_type = ""
-    tm = re.search(
-        r"whether (?:the )?order\(s\)\s*/?\s*contract\(s\).*?awarded by domestic\s*/\s*international entity\s*[:;\-]?\s*"
-        r"(domestic|international)", clean, re.I,
-    )
+    # Row 5 is the cleanest standardized domestic/international field.
+    row5 = rows.get(5, "")
+    tm = re.search(r"whether domestic or international\s+(domestic|international)\b", row5, re.I)
     if not tm:
-        tm = re.search(r"whether domestic or international\s*[:;\-]?\s*(domestic|international)", clean, re.I)
+        tm = re.search(r"\b(domestic|international)\b", row5, re.I)
+    if not tm:
+        row3 = rows.get(3, "")
+        tm = re.search(r"\b(domestic|international)(?:\s+entit(?:y|ies))?\b\s*$", row3, re.I)
     if tm:
         order_type = tm.group(1).title()
 
+    # Row 9 specifically answers the related-party question. Do not search the
+    # whole PDF because unrelated Yes/No answers create false positives.
     related_party = None
-    rpm = re.search(
-        r"whether (?:the )?order\(s\)/contract\(s\).*?related party transactions?.{0,180}?\b(yes|no)\b",
-        clean, re.I,
-    )
-    if rpm:
-        related_party = rpm.group(1).lower() == "yes"
+    row9 = rows.get(9, "")
+    if row9:
+        yn = re.search(r"\b(Yes|No)\b\s*$", row9, re.I)
+        if not yn:
+            answers = re.findall(r"\b(Yes|No)\b", row9, re.I)
+            if answers:
+                yn = type("_M", (), {"group": lambda self, _n: answers[-1]})()
+        if yn:
+            related_party = yn.group(1).lower() == "yes"
 
-    # Amount extraction: currency symbol is optional because some PDF font
-    # encodings lose the ₹ glyph. Require strong order/value context instead.
+    # Prefer row 7 (Broad consideration / size) for monetary value. This avoids
+    # unrelated amounts elsewhere in the filing. Fall back to contextual scan.
+    money_scopes = []
+    if rows.get(7):
+        money_scopes.append((rows[7], 2))
+    money_scopes.append((clean, 0))
     candidates = []
-    for m in _MONEY_RE.finditer(clean):
-        lo, hi = max(0, m.start() - 260), min(len(clean), m.end() + 260)
-        context = clean[lo:hi]
-        strong_value_context = re.search(
-            r"order value|total order value|broad consideration|size of (?:the )?order|"
-            r"order\(s\)/contract\(s\)|contract value|value of (?:the )?(?:order|contract)",
-            context, re.I,
-        )
-        if not strong_value_context and not _ORDER_CONTEXT_RE.search(context):
-            continue
-        value_cr = _money_to_cr(m.group(1), m.group(2))
-        if value_cr is not None and value_cr > 0:
-            candidates.append((value_cr, m.group(0).strip(), context,
-                               1 if strong_value_context else 0))
+    for scope, scope_score in money_scopes:
+        for m in _MONEY_RE.finditer(scope):
+            lo, hi = max(0, m.start() - 220), min(len(scope), m.end() + 220)
+            context = scope[lo:hi]
+            strong = bool(re.search(
+                r"order value|total order value|broad consideration|size of (?:the )?order|"
+                r"order\(s\)/contract\(s\)|contract value|value of (?:the )?(?:order|contract)",
+                context, re.I,
+            ))
+            if scope_score == 0 and not strong and not _ORDER_CONTEXT_RE.search(context):
+                continue
+            value_cr = _money_to_cr(m.group(1), m.group(2))
+            if value_cr is not None and value_cr > 0:
+                candidates.append((scope_score + (1 if strong else 0), value_cr,
+                                   m.group(0).strip(), context))
+        if candidates and scope_score == 2:
+            break
 
     out = {}
     if candidates:
-        # Prefer amounts explicitly tied to order value/consideration, then largest.
-        value_cr, raw, context, _ = max(candidates, key=lambda x: (x[3], x[0]))
+        # Highest-confidence scope first; largest amount only breaks ties.
+        _, value_cr, raw, context = max(candidates, key=lambda x: (x[0], x[1]))
         out.update({
             "order_value_cr": value_cr,
             "order_value_text": raw,
-            "detail_excerpt": context[:500],
+            "detail_excerpt": _clean_field(context, 500),
         })
     if entity:
         out["order_from"] = entity
@@ -307,7 +349,6 @@ def _extract_order_details(text: str) -> dict:
     if out:
         out["detail_source"] = "pdf_local"
     return out
-
 
 def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str],
                             today: date, initial_build: bool = False) -> tuple[int, int]:
