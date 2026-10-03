@@ -96,12 +96,14 @@ _ROUTINE_ALLOTMENT = re.compile(
 _ROUTINE_CORP_ACTION = re.compile(
     r"(?:tds|kyc|non[- ]?compliant).*dividend|withholding of .*dividend|"
     r"dividend.*(?:tds|kyc|non[- ]?compliant)|non[- ]credit of dividend|"
+    r"(?:agm|annual general meeting).*approval of dividend|approval of dividend.*(?:agm|annual general meeting)|"
+    r"clarification.*valuation methodology.*preferential issue|"
     r"dispatch.*(?:buyback|rights)|trading approval.*(?:bonus|split|rights|preferential)", re.I)
 
 # Insolvency/proceeding steps that do not change the economic state of the case.
 _CIRP_PROCEDURAL = re.compile(
-    r"(?:prior |post[- ]facto )?intimation.*(?:coc|committee of creditors).*meeting|"
-    r"(?:outcome|voting results?).*(?:coc|committee of creditors).*meeting|"
+    r"(?:prior |post[- ]facto )?intimation.*(?:(?:coc|committee of creditors).*meeting|meeting.*(?:coc|committee of creditors))|"
+    r"(?:outcome|voting results?).*(?:(?:coc|committee of creditors).*meeting|meeting.*(?:coc|committee of creditors))|"
     r"appointment of (?:the )?(?:irp|rp|resolution professional)|"
     r"interim resolution professional.*(?:performing|functions)|"
     r"cirp.*trading window|trading window.*cirp", re.I)
@@ -115,12 +117,16 @@ _SCHEME_PROCEDURAL = re.compile(
     r"(?:hearing date|date of hearing).*?(?:scheme|merger|demerger|amalgamation)|"
     r"(?:petition|second motion petition).*(?:admitted|admission)", re.I)
 
+# Only explicit senior executive changes are catalysts. NSE's generic subjects such as
+# "Resignation of Director/KMP/SMP" are intentionally NOT enough on their own;
+# otherwise hundreds of routine personnel filings enter the feed.
 _MANAGEMENT_CHANGE = re.compile(
-    r"(?:appointment|appointed|resignation|resigned|cessation).*?"
+    r"(?:appointment|appointed|resignation|resigned|cessation|retirement|vacation of office).*?"
     r"(?:chief executive officer|\bceo\b|managing director|\bmd\b|chief financial officer|\bcfo\b|"
-    r"whole[- ]time director|executive director|key managerial personnel|\bkmp\b)|"
-    r"(?:chief executive officer|\bceo\b|managing director|chief financial officer|\bcfo\b|"
-    r"whole[- ]time director|executive director).*?(?:appointment|resignation|cessation)", re.I)
+    r"whole[- ]time director|whole time director)|"
+    r"(?:chief executive officer|\bceo\b|managing director|\bmd\b|chief financial officer|\bcfo\b|"
+    r"whole[- ]time director|whole time director).*?"
+    r"(?:appointment|appointed|resignation|resigned|cessation|retirement|vacation of office)", re.I)
 _REGULATORY_GRANT = re.compile(
     r"(?:grant|receipt|received|obtained|renewal).*?(?:licen[cs]e|registration|regulatory approval|certificate of registration)|"
     r"(?:licen[cs]e|registration|regulatory approval|certificate of registration).*?(?:granted|received|obtained|renewed)", re.I)
