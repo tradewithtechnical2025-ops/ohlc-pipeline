@@ -1,7 +1,7 @@
 """
 nse_catalysts.py
 Pulls NSE corporate announcements, keeps only the ones that can explain a gap
-(orders, deals, results, news verification, negative events, price-movement
+(orders, deals, news verification, negative events, price-movement
 clarifications), and stores them per symbol so the EP scanner can show WHY an
 EP happened.
 
@@ -89,7 +89,10 @@ def classify(subject: str, text: str) -> str | None:
     text = (text or "").strip()
     both = f"{subject} {text}"
 
-    if _IGNORE_SUBJECT.search(subject) and not _RESULTS.search(text):
+    # Results are handled by the dedicated results pipeline, not catalysts.
+    if _RESULTS.search(both) or re.search(r"outcome of board meeting", subject, re.I) and _RESULTS.search(text):
+        return None
+    if _IGNORE_SUBJECT.search(subject):
         return None
     if _NEGATIVE.search(both):
         return "Negative"
@@ -99,9 +102,6 @@ def classify(subject: str, text: str) -> str | None:
         return "Clarification"
     if _NEWS.search(subject):
         return "News"
-    if _RESULTS.search(subject) or (re.search(r"outcome of board meeting", subject, re.I)
-                                    and _RESULTS.search(text)):
-        return "Results"
     if _ORDER.search(both):
         return "Order"
     if _DEAL.search(both):
@@ -152,6 +152,103 @@ def _make_item(symbol, dt, subject, text, link, is_trading_day, next_trading_day
         "text":       text[:TEXT_MAX],
         "link":       link or "",
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Local PDF enrichment (NO AI)
+# Only new Order catalysts are opened. Extraction is deliberately conservative:
+# if a reliable order-value phrase is not found, the item is left unchanged.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MONEY_RE = re.compile(
+    r"(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.\d+)?)\s*"
+    r"(crores?|cr\.?|lakhs?|lacs?|millions?|mn\.?|billions?|bn\.?)",
+    re.I,
+)
+_ORDER_CONTEXT_RE = re.compile(
+    r"order|contract|letter of award|letter of intent|\bloa?\b|work order|purchase order|"
+    r"notification of award|mandate|awarded|bagged|won|wins",
+    re.I,
+)
+
+
+def _money_to_cr(number: str, unit: str) -> float | None:
+    try:
+        value = float(number.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    u = unit.lower().replace(".", "")
+    if u.startswith("cr") or u.startswith("crore"):
+        return round(value, 4)
+    if u.startswith("lakh") or u.startswith("lac"):
+        return round(value / 100.0, 4)
+    if u.startswith("million") or u == "mn":
+        return round(value / 10.0, 4)
+    if u.startswith("billion") or u == "bn":
+        return round(value * 100.0, 4)
+    return None
+
+
+def _extract_pdf_text(session, url: str) -> str:
+    if not url or url == "-" or not url.lower().split("?", 1)[0].endswith(".pdf"):
+        return ""
+    try:
+        from pypdf import PdfReader
+        r = session.get(url, timeout=40)
+        r.raise_for_status()
+        reader = PdfReader(io.BytesIO(r.content))
+        # Order details are normally near the beginning; cap work at 12 pages.
+        return "\n".join((p.extract_text() or "") for p in reader.pages[:12])
+    except Exception as e:
+        print(f"  ⚠ PDF detail extraction failed for {url.rsplit('/', 1)[-1]} ({e})")
+        return ""
+
+
+def _extract_order_details(text: str) -> dict:
+    clean = re.sub(r"\s+", " ", text or " ").strip()
+    if not clean:
+        return {}
+
+    candidates = []
+    for m in _MONEY_RE.finditer(clean):
+        lo, hi = max(0, m.start() - 220), min(len(clean), m.end() + 220)
+        context = clean[lo:hi]
+        if not _ORDER_CONTEXT_RE.search(context):
+            continue
+        value_cr = _money_to_cr(m.group(1), m.group(2))
+        if value_cr is not None and value_cr > 0:
+            candidates.append((value_cr, m.group(0).strip(), context))
+
+    if not candidates:
+        return {}
+
+    # Prefer the largest order-context amount. This avoids many small incidental
+    # figures, while remaining conservative because an order keyword is required.
+    value_cr, raw, context = max(candidates, key=lambda x: x[0])
+    return {
+        "order_value_cr": value_cr,
+        "order_value_text": raw,
+        "detail_source": "pdf_local",
+        "detail_excerpt": context[:500],
+    }
+
+
+def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str]) -> tuple[int, int]:
+    """Enrich only genuinely new Order items; never uses AI."""
+    checked = enriched = 0
+    for items in new_items.values():
+        for it in items:
+            if it.get("category") != "Order" or it.get("id") in existing_ids:
+                continue
+            checked += 1
+            text = _extract_pdf_text(session, it.get("link", ""))
+            details = _extract_order_details(text)
+            if details:
+                it.update(details)
+                enriched += 1
+    if checked:
+        print(f"  ✓ Local order-PDF enrichment → checked={checked}, value_found={enriched}, AI=0")
+    return checked, enriched
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,10 +511,28 @@ def main():
     else:
         history = {}
 
+    # Remove historical Results entries too; results are maintained by the
+    # dedicated results pipeline and should not duplicate catalyst storage.
+    removed_results = 0
+    for sym in list(history):
+        before = len(history[sym])
+        history[sym] = [x for x in history[sym] if x.get("category") != "Results"]
+        removed_results += before - len(history[sym])
+        if not history[sym]:
+            del history[sym]
+    if removed_results:
+        print(f"  🗑 Removed {removed_results} old Results item(s) from catalyst history")
+
+    existing_ids = {x.get("id") for items in history.values() for x in items if x.get("id")}
+
     new_items, source = fetch_catalysts(
         nse_session, today, HISTORY_DAYS, is_trading_day, next_trading_day
     )
     fetched = sum(len(v) for v in new_items.values())
+
+    # No AI: only genuinely new Order PDFs are inspected locally for order value.
+    enrich_new_orders_local(nse_session, new_items, existing_ids)
+
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
     total = sum(len(v) for v in history.values())
 
