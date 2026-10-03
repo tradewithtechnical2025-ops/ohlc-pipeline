@@ -673,74 +673,190 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
         return {}
 
 
-def enrich_new_orders(session, new_items: dict, existing_ids: set[str],
-                      today: date, initial_build: bool = False,
-                      market_cap_map: dict | None = None,
-                      ttm_sales_map: dict | None = None) -> tuple[int, int]:
-    """Local-first enrichment for genuinely new Order PDFs; Gemini only when needed."""
-    checked = enriched = values_found = gemini_ok = local_fallback = 0
+def _extract_money_candidates(clean: str) -> list[tuple[float, str, str]]:
+    """Return plausible disclosed monetary amounts as (crore, raw, context)."""
+    out = []
+    for m in _MONEY_RE.finditer(clean or ""):
+        value = _money_to_cr(m.group(1), m.group(2))
+        if value is None or value <= 0:
+            continue
+        lo, hi = max(0, m.start() - 140), min(len(clean), m.end() + 180)
+        out.append((value, m.group(0).strip(), _clean_field(clean[lo:hi], 420)))
+    return out
+
+
+def _best_money(clean: str, context_re: str = "") -> tuple[float | None, str, str]:
+    candidates = _extract_money_candidates(clean)
+    if not candidates:
+        return None, "", ""
+    if context_re:
+        contextual = [x for x in candidates if re.search(context_re, x[2], re.I)]
+        if contextual:
+            candidates = contextual
+    # Largest contextual amount is normally the transaction/demand/issue value.
+    value, raw, context = max(candidates, key=lambda x: x[0])
+    return value, raw, context
+
+
+def _extract_local_catalyst_details(category: str, text: str) -> dict:
+    """Conservative non-AI parser for material catalyst PDFs.
+
+    Only stores fields that can be recovered directly from machine-readable text.
+    Missing/ambiguous facts are intentionally left blank.
+    """
+    clean = _normalize_pdf_text(text)
+    if not clean:
+        return {}
+    out = {}
+
+    if category == "Order":
+        return _extract_order_details(clean)
+
+    if category == "Acquisition":
+        value, raw, _ = _best_money(clean, r"consideration|purchase price|transaction value|acquisition|acquir")
+        if value is not None:
+            out["transaction_value_cr"] = value
+            out["transaction_value_text"] = raw
+        pct = re.search(r"(?:acquir(?:e|ed|ing)|purchase|stake|shareholding)[^.%]{0,120}?([0-9]+(?:\.[0-9]+)?)\s*%", clean, re.I)
+        if not pct:
+            pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%[^.]{0,100}?(?:stake|shareholding|equity)", clean, re.I)
+        if pct:
+            out["stake_acquired_pct"] = float(pct.group(1))
+        post = re.search(r"(?:post[- ]?(?:acquisition|transaction)|after (?:the )?acquisition)[^.%]{0,120}?([0-9]+(?:\.[0-9]+)?)\s*%", clean, re.I)
+        if post:
+            out["post_transaction_stake_pct"] = float(post.group(1))
+        target = re.search(r"(?:acquisition of|acquire(?:d|s|ing)?(?: up to)?(?: an?)?(?: additional)?(?: \d+(?:\.\d+)?\s*%)?(?: equity shares? in| stake in)?)\s+([A-Z][A-Za-z0-9&.,'()\- ]{2,100}?)(?=\s+(?:for|from|through|by|at|pursuant|vide|which|,|\())", clean)
+        if target:
+            out["target"] = _clean_field(target.group(1), 120)
+
+    elif category == "Divestment":
+        value, raw, _ = _best_money(clean, r"consideration|sale value|transaction value|sale|disposal|divest")
+        if value is not None:
+            out["transaction_value_cr"] = value
+            out["transaction_value_text"] = raw
+        pct = re.search(r"(?:sale|sell|sold|disposal|divestment|transfer)[^.%]{0,130}?([0-9]+(?:\.[0-9]+)?)\s*%", clean, re.I)
+        if pct:
+            out["stake_sold_pct"] = float(pct.group(1))
+        buyer = re.search(r"(?:buyer|purchaser|transferee)\s*[:\-]?\s*([A-Z][A-Za-z0-9&.,'()\- ]{2,120}?)(?=\s{2,}|\.|;|,\s*(?:for|at|pursuant))", clean, re.I)
+        if buyer:
+            out["buyer"] = _clean_field(buyer.group(1), 120)
+
+    elif category == "Negative":
+        value, raw, context = _best_money(clean, r"penalty|demand|fine|tax|claim|litigation|show cause|order")
+        if value is not None:
+            out["amount_cr"] = value
+            out["amount_text"] = raw
+            out["amount_context"] = context
+        authority = re.search(r"(?:authority|regulator|department|issued by|order (?:passed|received) from)\s*[:\-]?\s*([A-Z][A-Za-z0-9&.,'()\-/ ]{3,120}?)(?=\.|;|\n| dated | vide )", clean, re.I)
+        if authority:
+            out["authority"] = _clean_field(authority.group(1), 120)
+
+    elif category == "Strategic Agreement":
+        value, raw, _ = _best_money(clean, r"investment|project|agreement|consideration|contract|value")
+        if value is not None:
+            out["agreement_value_cr"] = value
+            out["agreement_value_text"] = raw
+        if re.search(r"non[- ]binding", clean, re.I):
+            out["binding_status"] = "Non-Binding"
+        elif re.search(r"definitive agreement|binding agreement|executed.*agreement|agreement.*executed", clean, re.I):
+            out["binding_status"] = "Binding / Definitive"
+        cp = re.search(r"(?:agreement|mou|memorandum of understanding|collaboration|partnership)\s+(?:with|between)\s+([A-Z][A-Za-z0-9&.,'()\- ]{2,120}?)(?=\.|;|,\s*(?:for|to|and))", clean, re.I)
+        if cp:
+            out["counterparty"] = _clean_field(cp.group(1), 120)
+
+    elif category == "Scheme of Arrangement":
+        if re.search(r"demerger|hive[- ]?off", clean, re.I):
+            out["scheme_type"] = "Demerger"
+        elif re.search(r"merger|amalgamation", clean, re.I):
+            out["scheme_type"] = "Merger / Amalgamation"
+        eff = re.search(r"(?:effective date|appointed date|record date)\s*(?:is|shall be|:|-)?\s*([0-3]?\d[\-/ ][A-Za-z0-9\-/ ]{4,20})", clean, re.I)
+        if eff:
+            out["scheme_date_text"] = _clean_field(eff.group(1), 40)
+
+    elif category == "Corporate Action":
+        value, raw, _ = _best_money(clean, r"issue size|fund raise|fundraise|qip|preferential|buyback|rights issue|consideration")
+        if value is not None:
+            out["issue_value_cr"] = value
+            out["issue_value_text"] = raw
+        ratio = re.search(r"(?:bonus|ratio|rights)[^\d]{0,50}(\d+)\s*[:/]\s*(\d+)", clean, re.I)
+        if ratio:
+            out["ratio"] = f"{ratio.group(1)}:{ratio.group(2)}"
+        price = re.search(r"(?:issue price|floor price|buyback price)[^₹RsINR0-9]{0,30}(?:₹|Rs\.?|INR)?\s*([0-9][0-9,]*(?:\.\d+)?)", clean, re.I)
+        if price:
+            out["price_per_security"] = float(price.group(1).replace(',', ''))
+
+    if out:
+        out["detail_source"] = "local_pdf"
+    return out
+
+
+def _apply_materiality_ratios(it: dict, category: str, details: dict,
+                               market_cap_map: dict | None, ttm_sales_map: dict | None) -> None:
+    symbol = str(it.get("_lookup_symbol") or it.get("symbol") or "").strip().upper()
+    if not symbol:
+        return
+    mcap = (market_cap_map or {}).get(symbol)
+    ttm = (ttm_sales_map or {}).get(symbol)
+    value_key = {
+        "Order": "order_value_cr",
+        "Acquisition": "transaction_value_cr",
+        "Divestment": "transaction_value_cr",
+        "Negative": "amount_cr",
+        "Strategic Agreement": "agreement_value_cr",
+        "Corporate Action": "issue_value_cr",
+    }.get(category)
+    if not value_key or details.get(value_key) is None:
+        return
+    try:
+        value = float(details[value_key])
+        prefix = {
+            "Order": "order", "Acquisition": "transaction", "Divestment": "transaction",
+            "Negative": "amount", "Strategic Agreement": "agreement", "Corporate Action": "issue"
+        }[category]
+        if mcap is not None and float(mcap) > 0:
+            it[f"{prefix}_to_market_cap_pct"] = round(value / float(mcap) * 100.0, 2)
+        if category == "Order" and ttm is not None and float(ttm) > 0:
+            it["order_to_ttm_sales_pct"] = round(value / float(ttm) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+
+def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: date,
+                       initial_build: bool = False, market_cap_map: dict | None = None,
+                       ttm_sales_map: dict | None = None) -> tuple[int, int]:
+    """PDF enrichment with NO AI/API calls.
+
+    New catalysts are checked immediately. Existing history can be backfilled in
+    controlled batches by the caller; failed/scan-only PDFs are marked checked so
+    they are not downloaded repeatedly.
+    """
+    supported = {"Order", "Acquisition", "Divestment", "Negative",
+                 "Strategic Agreement", "Scheme of Arrangement", "Corporate Action"}
+    checked = enriched = values_found = 0
     for items in new_items.values():
         for it in items:
-            if it.get("category") != "Order" or it.get("id") in existing_ids:
+            cat = it.get("category")
+            if cat not in supported or it.get("id") in existing_ids:
                 continue
             if initial_build and str(it.get("dt", ""))[:10] != today.isoformat():
                 continue
-
             checked += 1
-            url = it.get("link", "")
-            fname = url.rsplit("/", 1)[-1] if url else "order.pdf"
-            pdf_bytes = _download_pdf_bytes(session, url)
+            pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
             if not pdf_bytes:
+                it["local_pdf_checked"] = True
                 continue
-
-            # Cheap/local path first. Gemini is used only when the parser cannot
-            # recover enough trader-useful facts from a machine-readable PDF.
             pdf_text = _extract_pdf_text_bytes(pdf_bytes)
-            details = _extract_order_details(pdf_text)
-            local_sufficient = bool(
-                details.get("order_value_cr") and
-                (details.get("order_from") or details.get("order_purpose"))
-            )
-            if local_sufficient:
-                local_fallback += 1
-            else:
-                ai_details = _gemini_order_details(session, pdf_bytes, fname)
-                if ai_details:
-                    # Prefer richer AI fields, but retain any reliable local field
-                    # that Gemini omitted.
-                    merged = dict(details)
-                    merged.update(ai_details)
-                    details = merged
-                    gemini_ok += 1
-
+            details = _extract_local_catalyst_details(cat, pdf_text)
+            it["local_pdf_checked"] = True
             if details:
                 it.update(details)
+                _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
                 enriched += 1
-                order_value = details.get("order_value_cr")
-                if order_value is not None:
+                if any(k.endswith("_cr") for k in details):
                     values_found += 1
-                    try:
-                        order_value = float(order_value)
-                        symbol = str(it.get("symbol") or "").strip().upper()
-                        # Items are grouped by symbol, but _make_item does not store it.
-                        # The caller stamps _lookup_symbol temporarily before enrichment.
-                        symbol = str(it.get("_lookup_symbol") or symbol).strip().upper()
-                        mcap = (market_cap_map or {}).get(symbol)
-                        ttm = (ttm_sales_map or {}).get(symbol)
-                        if mcap is not None and float(mcap) > 0:
-                            it["order_to_market_cap_pct"] = round(order_value / float(mcap) * 100.0, 2)
-                        if ttm is not None and float(ttm) > 0:
-                            it["order_to_ttm_sales_pct"] = round(order_value / float(ttm) * 100.0, 2)
-                    except (TypeError, ValueError, ZeroDivisionError):
-                        pass
-
     if initial_build:
-        print(f"  ⚡ Initial/rebuild mode → historical Order PDFs skipped; only {today.isoformat()} orders enriched")
-    if checked:
-        print(f"  ✓ Order-PDF enrichment → checked={checked}, details_found={enriched}, "
-              f"value_found={values_found}, Gemini={gemini_ok}, local_fallback={local_fallback}")
-    elif initial_build:
-        print("  ✓ Order-PDF enrichment → checked=0")
+        print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
+    print(f"  ✓ Local PDF enrichment (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
     return checked, enriched
 
 
@@ -1249,9 +1365,8 @@ def main():
         for _it in _items:
             _it["_lookup_symbol"] = str(_sym).strip().upper()
 
-    # Local PDF parsing runs first for genuinely new Orders; Gemini is fallback only when needed.
-    # Non-Order catalysts never reach Gemini.
-    enrich_new_orders(
+    # Local-only PDF enrichment. No Gemini/AI request is made anywhere in this path.
+    enrich_local_pdfs(
         nse_session, new_items, existing_ids, today, initial_build,
         market_cap_map, ttm_sales_map
     )
