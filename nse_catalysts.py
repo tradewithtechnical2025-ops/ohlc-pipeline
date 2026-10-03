@@ -823,10 +823,19 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["scheme_date_text"] = _clean_field(eff.group(1), 40)
 
     elif category == "Corporate Action":
-        value, raw, _ = _best_money(clean, r"issue size|fund raise|fundraise|qip|preferential|buyback|rights issue|consideration")
-        if value is not None:
-            out["issue_value_cr"] = value
-            out["issue_value_text"] = raw
+        # A dividend/bonus/split PDF can contain large unrelated rupee figures
+        # (paid-up capital, turnover, reserves, etc.).  Only fund-raise / buyback
+        # style actions are allowed to populate issue_value_* fields.
+        ca_head = clean[:2500]
+        value_action = bool(re.search(
+            r"\b(?:qip|qualified institutional placement|preferential issue|rights issue|buyback|fund ?raise|fundraising)\b",
+            ca_head, re.I
+        ))
+        if value_action:
+            value, raw, _ = _best_money(clean, r"issue size|fund raise|fundraise|qip|preferential|buyback|rights issue|consideration")
+            if value is not None:
+                out["issue_value_cr"] = value
+                out["issue_value_text"] = raw
         ratio = re.search(r"(?:bonus|ratio|rights)[^\d]{0,50}(\d+)\s*[:/]\s*(\d+)", clean, re.I)
         if ratio:
             out["ratio"] = f"{ratio.group(1)}:{ratio.group(2)}"
@@ -897,6 +906,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
             pdf_text = _extract_pdf_text_bytes(pdf_bytes)
             details = _extract_local_catalyst_details(cat, pdf_text)
             it["local_pdf_checked"] = True
+            it["local_parser_version"] = 3
             if details:
                 it.update(details)
                 _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
@@ -905,8 +915,80 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
                     values_found += 1
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
-    print(f"  ✓ Local PDF enrichment v2 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
+    print(f"  ✓ Local PDF enrichment v3 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
     return checked, enriched
+
+
+
+_LOCAL_ENRICHMENT_FIELDS = {
+    "order_value_cr", "order_value_text", "company_share_of_order_cr",
+    "transaction_value_cr", "transaction_value_text", "stake_acquired_pct",
+    "post_transaction_stake_pct", "target", "stake_sold_pct", "buyer",
+    "amount_cr", "amount_text", "amount_context", "authority",
+    "agreement_value_cr", "agreement_value_text", "binding_status", "counterparty",
+    "scheme_type", "scheme_date_text", "issue_value_cr", "issue_value_text",
+    "ratio", "price_per_security", "detail_excerpt",
+    "order_to_market_cap_pct", "order_to_ttm_sales_pct",
+    "transaction_to_market_cap_pct", "amount_to_market_cap_pct",
+    "agreement_to_market_cap_pct", "issue_to_market_cap_pct",
+}
+
+
+def _clear_local_enrichment(item: dict) -> None:
+    """Remove only fields owned by the local parser; preserve NSE/event metadata."""
+    for key in _LOCAL_ENRICHMENT_FIELDS:
+        item.pop(key, None)
+    if item.get("detail_source") in {"local_pdf", "pdf_local"}:
+        item.pop("detail_source", None)
+
+
+def revalidate_local_history(session, history: dict, market_cap_map: dict | None = None,
+                             ttm_sales_map: dict | None = None) -> tuple[int, int, int]:
+    """One-time v3 reparse of legacy local-PDF enrichment.
+
+    Old v1/v2 values may have been merged forward even after the parser became
+    stricter.  Every locally enriched historical row is therefore reparsed once
+    with v3.  The version marker prevents repeat downloads on later runs.
+    Gemini/manual enrichment is never touched.
+    """
+    checked = changed = values = 0
+    supported = {"Order", "Acquisition", "Divestment", "Negative",
+                 "Strategic Agreement", "Scheme of Arrangement", "Corporate Action"}
+    for sym, items in history.items():
+        for it in items:
+            if it.get("manual") or it.get("category") not in supported:
+                continue
+            if it.get("detail_source") not in {"local_pdf", "pdf_local"}:
+                continue
+            if int(it.get("local_parser_version") or 0) >= 3:
+                continue
+
+            checked += 1
+            before = {k: it.get(k) for k in _LOCAL_ENRICHMENT_FIELDS if k in it}
+            pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
+            _clear_local_enrichment(it)
+            it["local_pdf_checked"] = True
+            it["local_parser_version"] = 3
+
+            if pdf_bytes:
+                pdf_text = _extract_pdf_text_bytes(pdf_bytes)
+                details = _extract_local_catalyst_details(it.get("category"), pdf_text)
+                if details:
+                    it.update(details)
+                    it["_lookup_symbol"] = str(sym).strip().upper()
+                    _apply_materiality_ratios(it, it.get("category"), details,
+                                              market_cap_map, ttm_sales_map)
+                    it.pop("_lookup_symbol", None)
+                    if any(k.endswith("_cr") for k in details):
+                        values += 1
+
+            after = {k: it.get(k) for k in _LOCAL_ENRICHMENT_FIELDS if k in it}
+            if before != after:
+                changed += 1
+
+    if checked:
+        print(f"  ♻ Local PDF v3 history revalidation → checked={checked}, changed={changed}, value_found={values}")
+    return checked, changed, values
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1369,6 +1451,10 @@ def main():
     )
     print(f"  ✓ Materiality lookup → market_cap={len(market_cap_map)} symbols, "
           f"ttm_sales={len(ttm_sales_map)} symbols")
+
+    # Reparse legacy local-PDF fields once with the current strict rules.
+    # This removes stale v1/v2 false values that would otherwise survive merge.
+    revalidate_local_history(r2_session, history, market_cap_map, ttm_sales_map)
 
     # Re-apply today's backend rules to historical rows as well. This removes
     # old Results, Other, Clarification/News Verification, routine allotments,
