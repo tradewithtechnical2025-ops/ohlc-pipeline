@@ -30,7 +30,7 @@ API_URL   = "https://www.nseindia.com/api/corporate-announcements"
 RSS_URL   = "https://www.nseindia.com/content/RSS/Online_announcements.xml"
 EQUITY_L  = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
-HISTORY_DAYS = 10          # TEST MODE: keep/fetch only the last 10 calendar days
+HISTORY_DAYS = 20          # TEST MODE: keep/fetch only the last 20 calendar days
 TEXT_MAX     = 300         # exchange summary is enough; the PDF link has the rest
 
 MARKET_OPEN  = dtime(9, 15)
@@ -161,13 +161,13 @@ def _make_item(symbol, dt, subject, text, link, is_trading_day, next_trading_day
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MONEY_RE = re.compile(
-    r"(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.\d+)?)\s*"
+    r"(?:(?:₹|rs\.?|inr)\s*)?([0-9][0-9,]*(?:\.\d+)?)\s*"
     r"(crores?|cr\.?|lakhs?|lacs?|millions?|mn\.?|billions?|bn\.?)",
     re.I,
 )
 _ORDER_CONTEXT_RE = re.compile(
-    r"order|contract|letter of award|letter of intent|\bloa?\b|work order|purchase order|"
-    r"notification of award|mandate|awarded|bagged|won|wins",
+    r"order|contract|letter of award|letter of acceptance|letter of intent|\bloa?\b|"
+    r"work order|purchase order|supply order|notification of award|mandate|awarded|bagged|won|wins",
     re.I,
 )
 
@@ -197,11 +197,32 @@ def _extract_pdf_text(session, url: str) -> str:
         r = session.get(url, timeout=40)
         r.raise_for_status()
         reader = PdfReader(io.BytesIO(r.content))
-        # Order details are normally near the beginning; cap work at 12 pages.
         return "\n".join((p.extract_text() or "") for p in reader.pages[:12])
     except Exception as e:
         print(f"  ⚠ PDF detail extraction failed for {url.rsplit('/', 1)[-1]} ({e})")
         return ""
+
+
+def _clean_field(v: str, max_len: int = 350) -> str:
+    v = re.sub(r"\s+", " ", v or "").strip(" :-;|\t\r\n")
+    return v[:max_len].strip()
+
+
+def _label_value(clean: str, labels: list[str], stop_labels: list[str] | None = None,
+                 max_chars: int = 450) -> str:
+    """Best-effort extraction from standard SEBI Reg-30 order disclosure tables."""
+    stops = stop_labels or []
+    label_alt = "|".join(labels)
+    m = re.search(rf"(?:{label_alt})\s*[:;\-]?\s*", clean, re.I)
+    if not m:
+        return ""
+    tail = clean[m.end():m.end() + max_chars]
+    if stops:
+        stop_alt = "|".join(stops)
+        sm = re.search(rf"\s+(?:{stop_alt})\s*[:;\-]?", tail, re.I)
+        if sm:
+            tail = tail[:sm.start()]
+    return _clean_field(tail)
 
 
 def _extract_order_details(text: str) -> dict:
@@ -209,28 +230,83 @@ def _extract_order_details(text: str) -> dict:
     if not clean:
         return {}
 
+    # Common labels used in SEBI Regulation-30 order/contract disclosure tables.
+    entity = _label_value(
+        clean,
+        [r"name of (?:the )?entity awarding (?:the )?order\(s\)/contract\(s\)"],
+        [r"significant terms", r"whether order", r"nature of order"],
+    )
+    purpose = _label_value(
+        clean,
+        [r"nature of order\(s\)\s*/\s*contract\(s\)",
+         r"significant terms and conditions of order\(s\)/contract\(s\) awarded in brief"],
+        [r"whether domestic", r"time period", r"broad consideration", r"whether the promoter"],
+    )
+    execution = _label_value(
+        clean,
+        [r"time period by which (?:the )?order\(s\)\s*/?\s*contract\(s\) is to be executed"],
+        [r"broad consideration", r"whether the promoter", r"whether order"],
+    )
+
+    # Domestic/international: prefer the explicit table answer after the label.
+    order_type = ""
+    tm = re.search(
+        r"whether (?:the )?order\(s\)\s*/?\s*contract\(s\).*?awarded by domestic\s*/\s*international entity\s*[:;\-]?\s*"
+        r"(domestic|international)", clean, re.I,
+    )
+    if not tm:
+        tm = re.search(r"whether domestic or international\s*[:;\-]?\s*(domestic|international)", clean, re.I)
+    if tm:
+        order_type = tm.group(1).title()
+
+    related_party = None
+    rpm = re.search(
+        r"whether (?:the )?order\(s\)/contract\(s\).*?related party transactions?.{0,180}?\b(yes|no)\b",
+        clean, re.I,
+    )
+    if rpm:
+        related_party = rpm.group(1).lower() == "yes"
+
+    # Amount extraction: currency symbol is optional because some PDF font
+    # encodings lose the ₹ glyph. Require strong order/value context instead.
     candidates = []
     for m in _MONEY_RE.finditer(clean):
-        lo, hi = max(0, m.start() - 220), min(len(clean), m.end() + 220)
+        lo, hi = max(0, m.start() - 260), min(len(clean), m.end() + 260)
         context = clean[lo:hi]
-        if not _ORDER_CONTEXT_RE.search(context):
+        strong_value_context = re.search(
+            r"order value|total order value|broad consideration|size of (?:the )?order|"
+            r"order\(s\)/contract\(s\)|contract value|value of (?:the )?(?:order|contract)",
+            context, re.I,
+        )
+        if not strong_value_context and not _ORDER_CONTEXT_RE.search(context):
             continue
         value_cr = _money_to_cr(m.group(1), m.group(2))
         if value_cr is not None and value_cr > 0:
-            candidates.append((value_cr, m.group(0).strip(), context))
+            candidates.append((value_cr, m.group(0).strip(), context,
+                               1 if strong_value_context else 0))
 
-    if not candidates:
-        return {}
-
-    # Prefer the largest order-context amount. This avoids many small incidental
-    # figures, while remaining conservative because an order keyword is required.
-    value_cr, raw, context = max(candidates, key=lambda x: x[0])
-    return {
-        "order_value_cr": value_cr,
-        "order_value_text": raw,
-        "detail_source": "pdf_local",
-        "detail_excerpt": context[:500],
-    }
+    out = {}
+    if candidates:
+        # Prefer amounts explicitly tied to order value/consideration, then largest.
+        value_cr, raw, context, _ = max(candidates, key=lambda x: (x[3], x[0]))
+        out.update({
+            "order_value_cr": value_cr,
+            "order_value_text": raw,
+            "detail_excerpt": context[:500],
+        })
+    if entity:
+        out["order_from"] = entity
+    if purpose:
+        out["order_purpose"] = purpose
+    if order_type:
+        out["order_type"] = order_type
+    if execution:
+        out["execution_period"] = execution
+    if related_party is not None:
+        out["related_party"] = related_party
+    if out:
+        out["detail_source"] = "pdf_local"
+    return out
 
 
 def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str],
@@ -241,7 +317,7 @@ def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str],
     today. This keeps a 90-day rebuild fast instead of opening every historical
     Order PDF. Normal incremental runs still inspect every genuinely new Order.
     """
-    checked = enriched = 0
+    checked = enriched = values_found = 0
     for items in new_items.values():
         for it in items:
             if it.get("category") != "Order" or it.get("id") in existing_ids:
@@ -256,10 +332,12 @@ def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str],
             if details:
                 it.update(details)
                 enriched += 1
+                if details.get("order_value_cr") is not None:
+                    values_found += 1
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical Order PDFs skipped; only {today.isoformat()} orders enriched")
     if checked:
-        print(f"  ✓ Local order-PDF enrichment → checked={checked}, value_found={enriched}, AI=0")
+        print(f"  ✓ Local order-PDF enrichment → checked={checked}, details_found={enriched}, value_found={values_found}, AI=0")
     elif initial_build:
         print("  ✓ Local order-PDF enrichment → checked=0, AI=0")
     return checked, enriched
