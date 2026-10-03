@@ -45,4 +45,5 @@ jobs:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           WORKER_URL:   ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: python nse_catalysts.py
