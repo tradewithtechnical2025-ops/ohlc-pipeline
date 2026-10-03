@@ -290,3 +290,147 @@ def merge_catalysts(hist: dict, new: dict, today: date, keep_days: int = HISTORY
         if not hist[sym]:
             del hist[sym]
     return added
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_session():
+    """Create and prime a browser-like NSE session."""
+    import requests
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    })
+    # NSE's API normally expects cookies from the home page. Failure to prime
+    # is non-fatal because fetch_catalysts() can still fall back to RSS.
+    try:
+        s.get("https://www.nseindia.com/", timeout=20)
+    except Exception as e:
+        print(f"  ⚠ NSE session prime failed ({e}) — API will be tried anyway")
+    return s
+
+
+def _load_nse_holidays(session, year: int) -> set[date]:
+    """Best-effort NSE CM holiday calendar; weekdays are the safe fallback."""
+    holidays = set()
+    try:
+        r = session.get(
+            "https://www.nseindia.com/api/holiday-master?type=trading",
+            headers={"Accept": "application/json, text/plain, */*",
+                     "Referer": "https://www.nseindia.com/resources/exchange-communication-holidays"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        rows = payload.get("CM", []) if isinstance(payload, dict) else []
+        for row in rows:
+            raw = str(row.get("tradingDate") or row.get("date") or "").strip()
+            for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                try:
+                    d = datetime.strptime(raw, fmt).date()
+                    if d.year in (year, year + 1):
+                        holidays.add(d)
+                    break
+                except ValueError:
+                    pass
+        print(f"  ✓ NSE holiday calendar → {len(holidays)} CM holiday(s) loaded")
+    except Exception as e:
+        print(f"  ⚠ NSE holiday calendar unavailable ({e}) — using Mon-Fri fallback")
+    return holidays
+
+
+def _r2_get_json(session, filename: str):
+    import os
+    import time
+    worker_url = os.environ["WORKER_URL"].rstrip("/")
+    token = os.environ["WORKER_TOKEN"]
+    try:
+        sep = "&" if "?" in filename else "?"
+        r = session.get(
+            f"{worker_url}/{filename}{sep}v={int(time.time())}",
+            headers={"X-Secret-Token": token, "Cache-Control": "no-cache"},
+            timeout=30,
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"  ⚠ R2 read {filename} failed ({e}) — starting with empty history")
+        return None
+
+
+def _r2_put_json(session, filename: str, payload: dict):
+    import json
+    import os
+    worker_url = os.environ["WORKER_URL"].rstrip("/")
+    token = os.environ["WORKER_TOKEN"]
+    r = session.post(
+        f"{worker_url}?file={filename}",
+        headers={"X-Secret-Token": token, "Content-Type": "application/json"},
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=120,
+    )
+    r.raise_for_status()
+    print(f"  ✓ Uploaded {filename}")
+
+
+def main():
+    import os
+
+    # Fail clearly in GitHub Actions instead of silently doing nothing.
+    for key in ("WORKER_URL", "WORKER_TOKEN"):
+        if not os.environ.get(key):
+            raise RuntimeError(f"Missing required environment variable: {key}")
+
+    today = date.today()
+    print(f"Catalyst scan starting for {today.isoformat()}...")
+
+    nse_session = _build_session()
+    holidays = _load_nse_holidays(nse_session, today.year)
+
+    def is_trading_day(d: date) -> bool:
+        return d.weekday() < 5 and d not in holidays
+
+    def next_trading_day(d: date) -> date:
+        x = d + timedelta(days=1)
+        while not is_trading_day(x):
+            x += timedelta(days=1)
+        return x
+
+    # Existing R2 payload shape: {"updated": ..., "data": {SYMBOL: [...]}}
+    # Accept a bare symbol->items dict too, so an older/manual file is not lost.
+    r2_session = _build_session()
+    old_payload = _r2_get_json(r2_session, "nse_catalysts.json") or {}
+    if isinstance(old_payload, dict) and isinstance(old_payload.get("data"), dict):
+        history = old_payload["data"]
+    elif isinstance(old_payload, dict):
+        history = old_payload
+    else:
+        history = {}
+
+    new_items, source = fetch_catalysts(
+        nse_session, today, HISTORY_DAYS, is_trading_day, next_trading_day
+    )
+    fetched = sum(len(v) for v in new_items.values())
+    added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
+    total = sum(len(v) for v in history.values())
+
+    payload = {
+        "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source": source,
+        "data": history,
+    }
+    _r2_put_json(r2_session, "nse_catalysts.json", payload)
+
+    print(f"  ✓ Catalyst scan complete: source={source}, fetched={fetched}, "
+          f"new={added}, symbols={len(history)}, stored={total}")
+
+
+if __name__ == "__main__":
+    main()
