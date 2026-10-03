@@ -69,9 +69,11 @@ _CLARIFICATION = re.compile(r"price movement|spurt in volume|movement in (the )?
 _RESULTS = re.compile(r"financial results?|audited results|unaudited results", re.I)
 
 _ORDER = re.compile(
-    r"orders?/contracts?|awarding of order|bagging|receiving of order|letter of (intent|award)|"
-    r"\bloi\b|work order|purchase order|notification of award|order wins?|"
-    r"\border (of|for|from|worth|valued)\b|\bmandate\b|deals? worth|contract (of|for|from|worth)",
+    r"orders?/contracts?|awarding of order|bagging|receiv(?:e|ed|ing) (?:an? )?order|"
+    r"supply order|work order|purchase order|order (?:received|awarded|secured)|"
+    r"letter of (?:intent|award|acceptance)|\bloa\b|\bloi\b|notification of award|"
+    r"order wins?|\border (?:of|for|from|worth|valued)\b|\bmandate\b|deals? worth|"
+    r"contract (?:award|awarded|of|for|from|worth)|\bl1\b|first lowest|lowest bidder",
     re.I)
 
 _DEAL = re.compile(
