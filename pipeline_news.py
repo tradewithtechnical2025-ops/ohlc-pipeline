@@ -1048,6 +1048,64 @@ def _dedup_bse_by_link(items: list[dict]) -> list[dict]:
     return out
 
 
+# ── Results-PDF candidate widening (calendar + generic board-outcome) ──────
+# BSE/NSE descriptions are often just "Outcome of the Board Meeting" or
+# "As per attachment" even when the PDF carries the quarterly results
+# (confirmed: Hindusthan Insulators, 3 Oct 2026). Two extra ways a PDF can
+# become a candidate; the real filter for both is the cheap heading
+# pre-check inside parse_financial_results_pdf (no Gemini call unless the
+# PDF text actually has a "Financial Results" heading):
+#   1. CALENDAR: the symbol is on result_calendar.json for the filing date
+#      (+/- 1 day) -> check its PDF no matter what the description says.
+#   2. LOOSE (BSE only): generic "Outcome of Board Meeting" text, symbol not
+#      necessarily on the calendar (surprise / short-notice results).
+# Items carry a flag (_cal_fallback / _loose) so build_results_detailed can
+# (a) accept them, and (b) give up on them sooner than on strict results.
+BSE_PDF_FEED_CAP = 3000          # bse_results_pdf_feed.json (was 500)
+SOFT_GIVE_UP_ATTEMPTS = 4        # retry cap for calendar/loose fallback items
+_GENERIC_OUTCOME_RE = re.compile(r"outcome\s+of\s+(the\s+)?board\s+meeting", re.IGNORECASE)
+
+
+def _on_calendar_strict(symbol: str, calendar: dict, iso_date: str) -> bool:
+    """Unlike _in_result_calendar this does NOT fail open: unknown symbol,
+    unknown date or empty calendar -> False. Used only to ADD candidates."""
+    if not symbol or not calendar or not iso_date:
+        return False
+    try:
+        d = datetime.strptime(iso_date, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return any(symbol in (calendar.get((d + timedelta(days=k)).isoformat()) or []) for k in (-1, 0, 1))
+
+
+def _nse_on_calendar_strict(link: str, calendar: dict) -> bool:
+    fts = _filing_ts(link)
+    if not fts:
+        return False
+    try:
+        iso = datetime.strptime(fts, "%d%m%Y%H%M%S").date().isoformat()
+    except ValueError:
+        return False
+    return _on_calendar_strict(_extract_filename_symbol(link), calendar, iso)
+
+
+def _bse_extra_candidate_kind(it: dict, calendar: dict, bse_symbol_map: dict | None):
+    """For a BSE item that failed _is_bse_results_pdf: 'calendar', 'loose' or None."""
+    link = it.get("link", "")
+    code = it.get("scripcode", "")
+    if not link.lower().endswith(".pdf") or not code:
+        return None
+    if is_noise(it):
+        return None   # trading window, 74(5), scrutinizer, ESOP... never worth a fetch
+    sym = ((bse_symbol_map or {}).get(code, code) or "").upper()
+    if _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", ""))):
+        return "calendar"
+    text = f"{it.get('title', '')} {it.get('summary', '')}"
+    if _GENERIC_OUTCOME_RE.search(text) and not _PDF_NON_RESULT_RE.search(text):
+        return "loose"
+    return None
+
+
 def _pdf_quarter_label(period_end_iso: str):
     try:
         d = datetime.strptime(period_end_iso, "%Y-%m-%d")
@@ -2123,7 +2181,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     avoids re-fetching ~150+ files every poll).
     """
     xbrl_items = [it for it in results_items if XBRL_LINK_RE.search(it.get("link", ""))]
-    pdf_items = [it for it in board_items if _is_board_outcome_pdf(it)]
+    pdf_items = [it for it in board_items if _is_board_outcome_pdf(it) or it.get("_cal_fallback")]
 
     # BSE candidates (already pre-filtered by _is_bse_results_pdf before
     # this function is called) are tagged _exchange="BSE" so process_pdf
@@ -2269,7 +2327,11 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     GIVE_UP_ATTEMPTS = 15
     failures_payload = await r2_get(client, "nse_xbrl_failures.json")
     failures = (failures_payload or {}).get("links", {})
-    given_up_links = {link for link, e in failures.items() if e.get("attempts", 0) >= GIVE_UP_ATTEMPTS}
+    # Calendar/loose fallback PDFs are mostly governance letters with no results
+    # heading (a deterministic "no" every run) -> stop retrying them sooner.
+    soft_links = {it["link"] for it in pdf_items if it.get("_cal_fallback") or it.get("_loose")}
+    given_up_links = {link for link, e in failures.items()
+                      if e.get("attempts", 0) >= (SOFT_GIVE_UP_ATTEMPTS if link in soft_links else GIVE_UP_ATTEMPTS)}
     if given_up_links:
         before_xbrl, before_pdf = len(new_xbrl), len(new_pdf)
         new_xbrl = [it for it in new_xbrl if it["link"] not in given_up_links]
@@ -2819,6 +2881,22 @@ async def run():
         calendar_payload = await r2_get(client, "result_calendar.json")
         if not calendar_payload:
             print("  ⚠ result_calendar.json unavailable — skipping calendar cross-check this run")
+        # Calendar fallback: symbol is due today per result_calendar.json but its
+        # subject/text never says "results" -> still check the PDF itself.
+        if calendar_payload:
+            cal_fb = 0
+            for it in pdf_source_items:
+                link = it.get("link", "")
+                if not link.lower().endswith(".pdf") or link in seen_pdf_links:
+                    continue
+                if is_noise(it) or not _nse_on_calendar_strict(link, calendar_payload):
+                    continue
+                it["_cal_fallback"] = True
+                seen_pdf_links.add(link)
+                pdf_candidates_now.append(it)
+                cal_fb += 1
+            if cal_fb:
+                print(f"  + {cal_fb} NSE PDF(s) added via result_calendar.json (no results wording in subject/text)")
         existing_pdf_feed = await r2_get(client, "nse_results_pdf_feed.json")
         existing_pdf_items = (existing_pdf_feed or {}).get("items", [])
         all_pdf_candidates = dedup_items(pdf_candidates_now + existing_pdf_items)
@@ -2878,12 +2956,28 @@ async def run():
         # item's probable symbol is needed for the calendar lookup itself,
         # not only for later parsing.
         bse_symbol_map = await _load_bse_symbol_map(client)
-        bse_candidates_now = [
-            it for it in _dedup_bse_by_link(
-                sorted(result_map.get("bse_announcements", []), key=lambda x: x.get("published_ts", 0), reverse=True)
-            )
-            if _is_bse_results_pdf(it)
-        ]
+        bse_sorted = _dedup_bse_by_link(
+            sorted(result_map.get("bse_announcements", []), key=lambda x: x.get("published_ts", 0), reverse=True)
+        )
+        bse_candidates_now = [it for it in bse_sorted if _is_bse_results_pdf(it)]
+        # Extra candidates (calendar-listed symbol, or generic board outcome). They
+        # bypass the calendar gate below on purpose - the PDF heading check decides.
+        bse_extra = []
+        for it in bse_sorted:
+            if _is_bse_results_pdf(it):
+                continue
+            kind = _bse_extra_candidate_kind(it, calendar_payload, bse_symbol_map)
+            if kind == "calendar":
+                it["_cal_fallback"] = True
+            elif kind == "loose":
+                it["_loose"] = True
+            else:
+                continue
+            bse_extra.append(it)
+        if bse_extra:
+            print(f"  + {len(bse_extra)} BSE PDF(s) added as extra candidates "
+                  f"({sum(1 for i in bse_extra if i.get('_cal_fallback'))} via calendar, "
+                  f"{sum(1 for i in bse_extra if i.get('_loose'))} generic board-outcome)")
         if calendar_payload:
             before_bse_cal = len(bse_candidates_now)
             bse_candidates_now = [
@@ -2895,13 +2989,14 @@ async def run():
             if dropped_bse_cal:
                 print(f"  🗑 {dropped_bse_cal} BSE announcement(s) dropped — symbol not on result_calendar.json "
                       f"for that date (likely a stale/non-current-quarter filing despite matching the results text pattern)")
+        bse_candidates_now = bse_candidates_now + bse_extra
         existing_bse_feed = await r2_get(client, "bse_results_pdf_feed.json")
         existing_bse_items = (existing_bse_feed or {}).get("items", [])
         merged_bse_feed = _dedup_bse_by_link(dedup_items(bse_candidates_now + existing_bse_items))
         merged_bse_feed.sort(key=_effective_ts, reverse=True)
-        merged_bse_feed = merged_bse_feed[:500]
+        merged_bse_feed = merged_bse_feed[:BSE_PDF_FEED_CAP]
         print(f"  bse_results_pdf_feed.json: {len(existing_bse_items)} existing + "
-              f"{max(len(merged_bse_feed) - len(existing_bse_items), 0)} new = {len(merged_bse_feed)} (capped at 500)")
+              f"{max(len(merged_bse_feed) - len(existing_bse_items), 0)} new = {len(merged_bse_feed)} (capped at {BSE_PDF_FEED_CAP})")
         await r2_put(client, "bse_results_pdf_feed.json", make_payload(merged_bse_feed))
 
         # ── Financial results detail (P&L from XBRL / AI-extracted PDF) ──
