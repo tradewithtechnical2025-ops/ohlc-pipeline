@@ -41,7 +41,6 @@ jobs:
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: python pipeline_ipo.py
       - name: Run Catalyst scan
-        if: ${{ github.event.inputs.mode == 'full' }}
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           WORKER_URL:   ${{ secrets.WORKER_URL }}
