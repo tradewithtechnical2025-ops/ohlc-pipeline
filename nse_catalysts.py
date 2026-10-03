@@ -233,21 +233,35 @@ def _extract_order_details(text: str) -> dict:
     }
 
 
-def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str]) -> tuple[int, int]:
-    """Enrich only genuinely new Order items; never uses AI."""
+def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str],
+                            today: date, initial_build: bool = False) -> tuple[int, int]:
+    """Enrich genuinely new Order items; never uses AI.
+
+    On an initial/rebuild run (no R2 history), inspect only announcements dated
+    today. This keeps a 90-day rebuild fast instead of opening every historical
+    Order PDF. Normal incremental runs still inspect every genuinely new Order.
+    """
     checked = enriched = 0
     for items in new_items.values():
         for it in items:
             if it.get("category") != "Order" or it.get("id") in existing_ids:
                 continue
+            if initial_build:
+                item_day = str(it.get("dt", ""))[:10]
+                if item_day != today.isoformat():
+                    continue
             checked += 1
             text = _extract_pdf_text(session, it.get("link", ""))
             details = _extract_order_details(text)
             if details:
                 it.update(details)
                 enriched += 1
+    if initial_build:
+        print(f"  ⚡ Initial/rebuild mode → historical Order PDFs skipped; only {today.isoformat()} orders enriched")
     if checked:
         print(f"  ✓ Local order-PDF enrichment → checked={checked}, value_found={enriched}, AI=0")
+    elif initial_build:
+        print("  ✓ Local order-PDF enrichment → checked=0, AI=0")
     return checked, enriched
 
 
@@ -524,6 +538,7 @@ def main():
         print(f"  🗑 Removed {removed_results} old Results item(s) from catalyst history")
 
     existing_ids = {x.get("id") for items in history.values() for x in items if x.get("id")}
+    initial_build = not bool(existing_ids)
 
     new_items, source = fetch_catalysts(
         nse_session, today, HISTORY_DAYS, is_trading_day, next_trading_day
@@ -531,7 +546,7 @@ def main():
     fetched = sum(len(v) for v in new_items.values())
 
     # No AI: only genuinely new Order PDFs are inspected locally for order value.
-    enrich_new_orders_local(nse_session, new_items, existing_ids)
+    enrich_new_orders_local(nse_session, new_items, existing_ids, today, initial_build)
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
     total = sum(len(v) for v in history.values())
