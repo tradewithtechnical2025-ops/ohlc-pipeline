@@ -52,29 +52,87 @@ _IGNORE_SUBJECT = re.compile(
     r"movement in units|noc/no dues|corrigendum",
     re.I)
 
-# Hard-noise filters: do not store these in nse_catalysts.json and never send
-# them to Gemini. These are exchange surveillance / routine compliance items.
+# Hard noise: reject before any PDF/AI work.
 _BACKEND_NOISE = re.compile(
     r"news verification|exchange has sought clarification|clarification.*(?:price|volume)|"
     r"spurt in (?:price|volume)|significant movement in (?:the )?price|movement in (?:the )?price|"
-    r"inter[- ]se transfer.*promoter|promoter.*inter[- ]se transfer|regulation 10\(6\)|"
-    r"appointment|re-appointment|reappointment|statutory auditor|secretarial auditor|"
-    r"internal auditor|cost auditor|scrutinizer",
+    r"inter[- ]se transfer.*promoter|promoter.*inter[- ]se transfer|regulation 10\(6\)",
     re.I)
 
-# Routine completion/allotment after an already announced fund raise is not a
-# catalyst for this feed. New/proposed fund raises remain eligible below.
+# Professional-service appointments are routine. Do NOT use a blanket
+# 'appointment/resignation' rule: CEO/MD/CFO/WTD/director changes may be material.
+_ROUTINE_PROFESSIONAL = re.compile(
+    r"(?:appointment|re-appointment|reappointment).*"
+    r"(?:statutory auditor|secretarial auditor|internal auditor|cost auditor|scrutinizer|"
+    r"chartered accountant|\bca firm\b)|"
+    r"(?:statutory auditor|secretarial auditor|internal auditor|cost auditor|scrutinizer).*"
+    r"(?:appointment|re-appointment|reappointment)", re.I)
+
+# SAST/promoter-shareholding disclosures are not acquisitions by the listed company.
+_SAST_NOISE = re.compile(
+    r"disclosure.*regulation\s*(?:29|31)\s*\(?[12]?\)?|"
+    r"regulation\s*29\s*\(?2\)?|regulation\s*31|"
+    r"substantial acquisition of shares and takeovers regulations|\bsast\b", re.I)
+_PROMOTER_MPS_SALE = re.compile(
+    r"sale of (?:equity )?shares by (?:a )?promoter.*(?:open market|minimum public shareholding)|"
+    r"promoter.*(?:minimum public shareholding|\bmps\b)", re.I)
+
+# Incorporating/funding one's own subsidiary is not an external acquisition catalyst.
+_SUBSIDIARY_INCORPORATION = re.compile(
+    r"incorporation of (?:a |an )?(?:wholly owned |step[- ]down )?subsidiar|"
+    r"incorporat(?:e|ed|ion).*\b(?:wos|wholly owned subsidiary|step[- ]down subsidiary)\b", re.I)
+_INTERNAL_SUB_INVESTMENT = re.compile(
+    r"(?:additional )?investment.*(?:wholly owned subsidiary|\bwos\b)|"
+    r"subscription.*(?:rights issue|equity shares).*?(?:wholly owned subsidiary|\bwos\b)|"
+    r"(?:wholly owned subsidiary|\bwos\b).*?(?:rights issue|additional investment|capital infusion)", re.I)
+
+# Routine completion/allotment after an already-announced raise is not a new catalyst.
 _ROUTINE_ALLOTMENT = re.compile(
     r"allotment of (?:equity shares|shares|securities).*pursuant to (?:a )?(?:preferential|rights|qip)|"
-    r"allotted .*securities.*preferential issue",
+    r"allotted .*securities.*preferential issue|conversion of .*warrants.*(?:equity shares|preferential)",
     re.I)
+
+# Administrative dividend/buyback paperwork and duplicate communications.
+_ROUTINE_CORP_ACTION = re.compile(
+    r"(?:tds|kyc|non[- ]?compliant).*dividend|withholding of .*dividend|"
+    r"dividend.*(?:tds|kyc|non[- ]?compliant)|non[- ]credit of dividend|"
+    r"dispatch.*(?:buyback|rights)|trading approval.*(?:bonus|split|rights|preferential)", re.I)
+
+# Insolvency/proceeding steps that do not change the economic state of the case.
+_CIRP_PROCEDURAL = re.compile(
+    r"(?:prior |post[- ]facto )?intimation.*(?:coc|committee of creditors).*meeting|"
+    r"(?:outcome|voting results?).*(?:coc|committee of creditors).*meeting|"
+    r"appointment of (?:the )?(?:irp|rp|resolution professional)|"
+    r"interim resolution professional.*(?:performing|functions)|"
+    r"cirp.*trading window|trading window.*cirp", re.I)
+
+# Scheme notices/reports are procedural; retain approvals, NCLT orders, effective dates,
+# record dates and implementation/completion milestones.
+_SCHEME_PROCEDURAL = re.compile(
+    r"board meeting.*(?:scheduled|to consider).*(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:audit committee|independent directors?).*report.*(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:notice|convening).*(?:shareholders?|creditors?).*meeting.*(?:scheme|merger|demerger)|"
+    r"(?:hearing date|date of hearing).*?(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:petition|second motion petition).*(?:admitted|admission)", re.I)
+
+_MANAGEMENT_CHANGE = re.compile(
+    r"(?:appointment|appointed|resignation|resigned|cessation).*?"
+    r"(?:chief executive officer|\bceo\b|managing director|\bmd\b|chief financial officer|\bcfo\b|"
+    r"whole[- ]time director|executive director|key managerial personnel|\bkmp\b)|"
+    r"(?:chief executive officer|\bceo\b|managing director|chief financial officer|\bcfo\b|"
+    r"whole[- ]time director|executive director).*?(?:appointment|resignation|cessation)", re.I)
+_REGULATORY_GRANT = re.compile(
+    r"(?:grant|receipt|received|obtained|renewal).*?(?:licen[cs]e|registration|regulatory approval|certificate of registration)|"
+    r"(?:licen[cs]e|registration|regulatory approval|certificate of registration).*?(?:granted|received|obtained|renewed)", re.I)
 
 _NEGATIVE = re.compile(
     r"insolvency|\bcirp\b|default in interest|default in principal|show cause|"
     r"pendency of any litigation|pendency of litigation|actions? (initiated|taken)|"
     r"orders? passed|fire incident|\bfire\b|penalty|search and seizure|\braid\b|"
-    r"fraud|suspension of",
-    re.I)
+    r"fraud|suspension of|liquidation|resolution plan (?:rejected|dismissed)", re.I)
+_ADVERSE_TAX_ORDER = re.compile(
+    r"(?:receipt of |received )?(?:an? )?order from .*?(?:income tax|gst|tax authority)|"
+    r"(?:income tax|gst|tax authority).*?(?:demand|penalty|order|show cause)", re.I)
 
 _DEBT = re.compile(r"non.?convertible|debenture|\bncds?\b|commercial paper|\bbonds?\b|\bisin\b", re.I)
 _RESULTS = re.compile(r"financial results?|audited results|unaudited results", re.I)
@@ -84,34 +142,74 @@ _ORDER = re.compile(
     r"supply order|work order|purchase order|order (?:received|awarded|secured)|"
     r"letter of (?:intent|award|acceptance)|\bloa\b|\bloi\b|notification of award|"
     r"order wins?|\border (?:of|for|from|worth|valued)\b|\bmandate\b|deals? worth|"
-    r"contract (?:award|awarded|of|for|from|worth)|\bl1\b|first lowest|lowest bidder",
+    r"contract (?:award|awarded|of|for|from|worth)|\bl1\b|first lowest|lowest bidder|preferred bidder",
     re.I)
+_ORDER_PRE_BID = re.compile(
+    r"bid submitted|submission of bid|tender participation|participat(?:e|ion).*tender|"
+    r"expression of interest|\beoi\b|pre[- ]qualification|technical bid qualified", re.I)
+_ORDER_CANCEL = re.compile(r"(?:order|contract).*(?:cancelled|canceled|terminated)|(?:cancellation|termination).*(?:order|contract)", re.I)
 
 _ACQUISITION = re.compile(
-    r"acquisition|acquir(?:e|ed|ing)|purchase of .*stake|stake acquisition|"
-    r"completion of acquisition|become .*wholly[- ]owned subsidiary",
-    re.I)
+    r"acquisition|acquir(?:e|ed|ing)|purchase of .*stake|purchase of .*business|"
+    r"purchase of .*assets?|stake acquisition|completion of acquisition|"
+    r"purchase .*equity shares|definitive agreement.*acquir", re.I)
 _DIVESTMENT = re.compile(
     r"sale or disposal|divestment|disinvestment|sale of .*stake|sale of .*shareholding|"
     r"transfer of (?:the )?entire equity|ceased to be .*subsidiary|sale of surplus land|"
-    r"asset monetisation|asset monetization",
-    re.I)
+    r"asset monetisation|asset monetization|business sale|sale of undertaking", re.I)
 _SCHEME = re.compile(
     r"scheme of arrangement|amalgamation|merger|demerger|scheme .*implemented|"
-    r"restructuring pursuant to .*scheme",
-    re.I)
+    r"restructuring pursuant to .*scheme", re.I)
 _STRATEGIC_AGREEMENT = re.compile(
     r"intellectual property license|licen[cs]e agreement|strategic (?:agreement|partnership|collaboration)|"
     r"joint venture|\bjv\b|memorandum of understanding|\bmou\b|technical collaboration|"
     r"manufacturing agreement|distribution agreement|technology agreement|"
-    r"execution of .*agreement|signing of .*agreement",
-    re.I)
+    r"port operations agreement|hotel management agreement", re.I)
 _CORP_ACTION = re.compile(
     r"buy ?back|bonus|stock split|sub-division|rights issue|qualified institutional|\bqip\b|"
-    r"fund rais|preferential issue|dividend",
-    re.I)
+    r"fund rais|preferential issue|dividend", re.I)
 
 _VAGUE_SUBJECT = re.compile(r"press release|general updates|^updates$|disclosure of material issue|agreements?", re.I)
+
+
+def _event_meta(subject: str, text: str, category: str) -> dict:
+    """Cheap deterministic event type/stage hints for frontend and dedupe work."""
+    both = f"{subject or ''} {text or ''}"
+    out = {}
+    if category == "Order":
+        if re.search(r"\bl1\b|first lowest|lowest bidder|preferred bidder", both, re.I):
+            out.update(event_type="L1 Bidder", stage="L1 / Awaiting Award")
+        elif re.search(r"letter of award|letter of acceptance|\bloa\b|awarded|order received|work order|purchase order|supply order", both, re.I):
+            out.update(event_type="Order Award", stage="Awarded")
+    elif category == "Acquisition":
+        out["event_type"] = "Acquisition"
+        if re.search(r"completed|completion|acquired", both, re.I): out["stage"] = "Completed"
+        elif re.search(r"definitive agreement|agreement signed|entered into.*agreement", both, re.I): out["stage"] = "Agreement Signed"
+        elif re.search(r"approved|board.*approval", both, re.I): out["stage"] = "Approved"
+        else: out["stage"] = "Announced"
+    elif category == "Divestment":
+        out["event_type"] = "Divestment"
+        if re.search(r"extension|extended|delay", both, re.I): out["stage"] = "Completion Delayed/Extended"
+        elif re.search(r"completed|completion|ceased to be", both, re.I): out["stage"] = "Completed"
+        elif re.search(r"agreement|approved", both, re.I): out["stage"] = "Approved / Agreement"
+        else: out["stage"] = "Announced"
+    elif category == "Scheme of Arrangement":
+        if re.search(r"demerger|hive[- ]?off", both, re.I): out["event_type"] = "Demerger"
+        elif re.search(r"merger|amalgamation", both, re.I): out["event_type"] = "Merger"
+        else: out["event_type"] = "Scheme of Arrangement"
+        if re.search(r"effective date|became effective|implemented|fully implemented|completed", both, re.I): out["stage"] = "Effective / Completed"
+        elif re.search(r"nclt.*(?:approved|approval)|(?:approved|sanctioned).*nclt", both, re.I): out["stage"] = "NCLT Approved"
+        elif re.search(r"record date", both, re.I): out["stage"] = "Record Date"
+        elif re.search(r"observation letter|no[- ]?objection|\bnoc\b", both, re.I): out["stage"] = "Exchange NOC"
+        elif re.search(r"approved|outcome of board meeting", both, re.I): out["stage"] = "Board Approved"
+    elif category == "Strategic Agreement":
+        if re.search(r"joint venture|\bjv\b", both, re.I): out["event_type"] = "Joint Venture"
+        elif re.search(r"licen[cs]e|intellectual property", both, re.I): out["event_type"] = "IP / Licence Agreement"
+        else: out["event_type"] = "Strategic Agreement"
+        if re.search(r"non[- ]binding", both, re.I): out["stage"] = "Non-Binding MoU"
+        elif re.search(r"definitive|executed|entered into|signed", both, re.I): out["stage"] = "Definitive / Signed"
+        elif re.search(r"memorandum of understanding|\bmou\b", both, re.I): out["stage"] = "MoU"
+    return out
 
 
 def classify(subject: str, text: str) -> str | None:
@@ -120,37 +218,49 @@ def classify(subject: str, text: str) -> str | None:
     text = (text or "").strip()
     both = f"{subject} {text}"
 
-    # Results are handled by the dedicated results pipeline.
     if _RESULTS.search(both) or (re.search(r"outcome of board meeting", subject, re.I) and _RESULTS.search(text)):
         return None
+    if (_BACKEND_NOISE.search(both) or _ROUTINE_PROFESSIONAL.search(both) or
+            _ROUTINE_ALLOTMENT.search(both) or _ROUTINE_CORP_ACTION.search(both) or
+            _SAST_NOISE.search(both) or _PROMOTER_MPS_SALE.search(both) or
+            _SUBSIDIARY_INCORPORATION.search(both) or _INTERNAL_SUB_INVESTMENT.search(both) or
+            _CIRP_PROCEDURAL.search(both) or _SCHEME_PROCEDURAL.search(both)):
+        return None
+    if _IGNORE_SUBJECT.search(subject) or _DEBT.search(both):
+        return None
 
-    # Drop obvious exchange/routine noise before any PDF/AI work.
-    if _BACKEND_NOISE.search(both) or _ROUTINE_ALLOTMENT.search(both):
-        return None
-    if _IGNORE_SUBJECT.search(subject):
-        return None
-    if _DEBT.search(both):
-        return None
+    # Positive regulatory grants must be resolved before the broad NSE subject
+    # "granting/withdrawal/.../suspension" can trigger the Negative regex.
+    if _REGULATORY_GRANT.search(both):
+        return "Regulatory Approval"
+    if _MANAGEMENT_CHANGE.search(both):
+        return "Management Change"
 
-    # Material event rules. Generic NSE subjects such as General Updates are
-    # deliberately reclassified from their text before being discarded.
+    # Cancellation/termination of an order is adverse, never a fresh Order win.
+    if _ORDER_CANCEL.search(both) or _ADVERSE_TAX_ORDER.search(both):
+        return "Negative"
     if _NEGATIVE.search(both):
         return "Negative"
+
+    # Do not promote mere tender participation into an Order catalyst.
+    if _ORDER_PRE_BID.search(both):
+        return None
     if _ORDER.search(both):
         return "Order"
-    if _ACQUISITION.search(both):
-        return "Acquisition"
+
+    # Divestment is checked before acquisition so JV dilution/business-sale text
+    # containing the counterparty's word 'acquire' is not mislabeled Acquisition.
     if _DIVESTMENT.search(both):
         return "Divestment"
     if _SCHEME.search(both):
         return "Scheme of Arrangement"
     if _STRATEGIC_AGREEMENT.search(both):
         return "Strategic Agreement"
+    if _ACQUISITION.search(both):
+        return "Acquisition"
     if _CORP_ACTION.search(both):
         return "Corporate Action"
 
-    # Unresolved General Updates / Updates / Agreements are not stored merely
-    # for manual review anymore. This is what keeps the backend file controlled.
     if _VAGUE_SUBJECT.search(subject):
         return None
     return None
@@ -187,7 +297,7 @@ def _make_item(symbol, dt, subject, text, link, is_trading_day, next_trading_day
         return None
     rd, sess = react_info(dt, is_trading_day, next_trading_day)
     text = re.sub(r"\s+", " ", text or "").strip()
-    return {
+    item = {
         "id":         f"{dt.strftime('%Y%m%d%H%M%S')}|{subject[:40]}|{(link or '')[-60:]}",
         "dt":         dt.isoformat(timespec="seconds"),
         "react_date": rd,
@@ -197,10 +307,12 @@ def _make_item(symbol, dt, subject, text, link, is_trading_day, next_trading_day
         "text":       text[:TEXT_MAX],
         "link":       link or "",
     }
+    item.update(_event_meta(subject, text, category))
+    return item
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Order PDF enrichment: Gemini first, local parser as fallback
+# Order PDF enrichment: local parser first, Gemini only when local extraction is insufficient
 # Only genuinely new Order catalysts are opened. On a clean/rebuild run, only
 # today's Order PDFs are enriched so historical backfill remains fast. Gemini is
 # never called for non-Order catalysts. Market cap is intentionally NOT requested
@@ -559,7 +671,7 @@ def enrich_new_orders(session, new_items: dict, existing_ids: set[str],
                       today: date, initial_build: bool = False,
                       market_cap_map: dict | None = None,
                       ttm_sales_map: dict | None = None) -> tuple[int, int]:
-    """Gemini-first enrichment for genuinely new Order PDFs; local parser fallback."""
+    """Local-first enrichment for genuinely new Order PDFs; Gemini only when needed."""
     checked = enriched = values_found = gemini_ok = local_fallback = 0
     for items in new_items.values():
         for it in items:
@@ -575,14 +687,25 @@ def enrich_new_orders(session, new_items: dict, existing_ids: set[str],
             if not pdf_bytes:
                 continue
 
-            details = _gemini_order_details(session, pdf_bytes, fname)
-            if details:
-                gemini_ok += 1
+            # Cheap/local path first. Gemini is used only when the parser cannot
+            # recover enough trader-useful facts from a machine-readable PDF.
+            pdf_text = _extract_pdf_text_bytes(pdf_bytes)
+            details = _extract_order_details(pdf_text)
+            local_sufficient = bool(
+                details.get("order_value_cr") and
+                (details.get("order_from") or details.get("order_purpose"))
+            )
+            if local_sufficient:
+                local_fallback += 1
             else:
-                text = _extract_pdf_text_bytes(pdf_bytes)
-                details = _extract_order_details(text)
-                if details:
-                    local_fallback += 1
+                ai_details = _gemini_order_details(session, pdf_bytes, fname)
+                if ai_details:
+                    # Prefer richer AI fields, but retain any reliable local field
+                    # that Gemini omitted.
+                    merged = dict(details)
+                    merged.update(ai_details)
+                    details = merged
+                    gemini_ok += 1
 
             if details:
                 it.update(details)
@@ -958,6 +1081,10 @@ def main():
             if x.get("category") != cat:
                 x["category"] = cat
                 reclassified += 1
+            # Refresh deterministic stage/type metadata on retained history.
+            for k in ("event_type", "stage"):
+                x.pop(k, None)
+            x.update(_event_meta(x.get("subject", ""), x.get("text", ""), cat))
             cleaned.append(x)
         history[sym] = cleaned
         if not history[sym]:
@@ -979,7 +1106,7 @@ def main():
         for _it in _items:
             _it["_lookup_symbol"] = str(_sym).strip().upper()
 
-    # Gemini reads only genuinely new Order PDFs; local parser is the fallback.
+    # Local PDF parsing runs first for genuinely new Orders; Gemini is fallback only when needed.
     # Non-Order catalysts never reach Gemini.
     enrich_new_orders(
         nse_session, new_items, existing_ids, today, initial_build,
