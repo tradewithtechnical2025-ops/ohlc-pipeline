@@ -2570,8 +2570,43 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             return it
 
     new_dupe_links = []  # persisted so skipped copies never re-enter a later run
+
+    # Normalize the already-stored business keys once.  A newly published PDF
+    # can have a brand-new URL while still representing the exact same
+    # symbol+period+nature result.  If the cheap local preflight can identify
+    # that key unambiguously, there is no reason to spend another Gemini call.
+    def _norm_result_key(key):
+        sym, period, nature = key
+        return ((sym or "").strip().upper(),
+                (period or "").strip(),
+                (nature or "").strip().lower())
+
+    existing_pre_keys = {
+        _norm_result_key(_result_key(r)) for r in existing_items
+        if _result_key(r)[0] and _result_key(r)[1] and _result_key(r)[2]
+    }
+
     if singleton_pdf:
         singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
+
+        # Different URL, but an already-stored result business key: mark this
+        # link processed and stop before AI.  Ambiguous/unkeyed PDFs are left
+        # untouched and continue through the normal parser, so this cannot
+        # silently drop a filing the preflight failed to identify.
+        already_stored_links = []
+        still_needed = []
+        for it in singleton_pdf:
+            key = it.get("_pre_result_key")
+            if key and _norm_result_key(key) in existing_pre_keys:
+                already_stored_links.append(it["link"])
+            else:
+                still_needed.append(it)
+        singleton_pdf = still_needed
+        if already_stored_links:
+            new_dupe_links.extend(already_stored_links)
+            print(f"  ⏭ {len(already_stored_links)} PDF(s) match already-stored "
+                  f"symbol+period+nature — skipped BEFORE AI; marked processed")
+
         latest = {}
         unkeyed = []
         pre_superseded_links = []
@@ -2600,6 +2635,21 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                   f"Gemini calls saved; marked processed for future runs")
 
     async def process_pdf_group(sym: str, bucket: str, group_items: list[dict]):
+        # Apply the same already-stored business-key guard to cross-exchange
+        # groups.  Preflight is local (pdfplumber only) and its cached bytes/
+        # text are reused by process_pdf if AI is genuinely needed.
+        checked_items = list(await asyncio.gather(*(_preflight_pdf(it) for it in group_items)))
+        stored_matches = [it for it in checked_items
+                          if it.get("_pre_result_key")
+                          and _norm_result_key(it["_pre_result_key"]) in existing_pre_keys]
+        if stored_matches:
+            # The whole clean group represents one same-symbol/day result.
+            # Persist every copy so none re-enters on a later poll.
+            new_dupe_links.extend(it["link"] for it in checked_items)
+            print(f"  ⏭ {sym} ({bucket}): result already stored — skipping "
+                  f"{len(checked_items)} cross-exchange copy/copies BEFORE AI")
+            return None
+        group_items = checked_items
         for idx, it in enumerate(group_items):
             ex = it.get("_exchange", "NSE")
             result = await process_pdf(it)
