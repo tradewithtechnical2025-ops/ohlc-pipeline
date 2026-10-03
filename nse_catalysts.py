@@ -514,7 +514,9 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
 
 
 def enrich_new_orders(session, new_items: dict, existing_ids: set[str],
-                      today: date, initial_build: bool = False) -> tuple[int, int]:
+                      today: date, initial_build: bool = False,
+                      market_cap_map: dict | None = None,
+                      ttm_sales_map: dict | None = None) -> tuple[int, int]:
     """Gemini-first enrichment for genuinely new Order PDFs; local parser fallback."""
     checked = enriched = values_found = gemini_ok = local_fallback = 0
     for items in new_items.values():
@@ -543,8 +545,23 @@ def enrich_new_orders(session, new_items: dict, existing_ids: set[str],
             if details:
                 it.update(details)
                 enriched += 1
-                if details.get("order_value_cr") is not None:
+                order_value = details.get("order_value_cr")
+                if order_value is not None:
                     values_found += 1
+                    try:
+                        order_value = float(order_value)
+                        symbol = str(it.get("symbol") or "").strip().upper()
+                        # Items are grouped by symbol, but _make_item does not store it.
+                        # The caller stamps _lookup_symbol temporarily before enrichment.
+                        symbol = str(it.get("_lookup_symbol") or symbol).strip().upper()
+                        mcap = (market_cap_map or {}).get(symbol)
+                        ttm = (ttm_sales_map or {}).get(symbol)
+                        if mcap is not None and float(mcap) > 0:
+                            it["order_to_market_cap_pct"] = round(order_value / float(mcap) * 100.0, 2)
+                        if ttm is not None and float(ttm) > 0:
+                            it["order_to_ttm_sales_pct"] = round(order_value / float(ttm) * 100.0, 2)
+                    except (TypeError, ValueError, ZeroDivisionError):
+                        pass
 
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical Order PDFs skipped; only {today.isoformat()} orders enriched")
@@ -782,6 +799,59 @@ def _r2_put_json(session, filename: str, payload: dict):
     print(f"  ✓ Uploaded {filename}")
 
 
+def _build_materiality_maps(classification_payload, fundamentals_payload):
+    """Return symbol -> market cap (₹ cr) and symbol -> TTM sales (₹ cr)."""
+    market_cap_map = {}
+    ttm_sales_map = {}
+
+    # classification.json may be a list, {"data": [...]}, {"stocks": [...]},
+    # or a symbol-keyed dict. Prefer nse_code, then symbol.
+    rows = classification_payload
+    if isinstance(rows, dict):
+        if isinstance(rows.get("data"), list):
+            rows = rows["data"]
+        elif isinstance(rows.get("stocks"), list):
+            rows = rows["stocks"]
+        elif all(isinstance(v, dict) for v in rows.values()):
+            rows = list(rows.values())
+        else:
+            rows = []
+    if isinstance(rows, list):
+        for x in rows:
+            if not isinstance(x, dict):
+                continue
+            sym = str(x.get("nse_code") or x.get("symbol") or "").strip().upper()
+            try:
+                mcap = float(x.get("market_cap_cr"))
+                if sym and mcap > 0:
+                    market_cap_map[sym] = mcap
+            except (TypeError, ValueError):
+                pass
+
+    # fundamentals_summary.json shape: {"updated": ..., "stocks": {SYMBOL: {...}}}
+    stocks = fundamentals_payload.get("stocks", {}) if isinstance(fundamentals_payload, dict) else {}
+    if isinstance(stocks, dict):
+        for key, x in stocks.items():
+            if not isinstance(x, dict):
+                continue
+            sym = str(x.get("symbol") or key or "").strip().upper()
+            quarters = x.get("quarters") or []
+            vals = []
+            for q in quarters[:4]:
+                if not isinstance(q, dict):
+                    continue
+                try:
+                    sales = float(q.get("sales"))
+                    if sales >= 0:
+                        vals.append(sales)
+                except (TypeError, ValueError):
+                    pass
+            # Require four reported quarters. Source sales are rupees; 1 crore = 1e7 rupees.
+            if sym and len(vals) == 4:
+                ttm_sales_map[sym] = sum(vals) / 1e7
+
+    return market_cap_map, ttm_sales_map
+
 def main():
     import os
 
@@ -816,6 +886,17 @@ def main():
     else:
         history = {}
 
+    # Materiality inputs are read from the same R2 store. They are used only
+    # to calculate the two ratios below; raw market cap / TTM sales are not
+    # duplicated into nse_catalysts.json.
+    classification_payload = _r2_get_json(r2_session, "classification.json") or {}
+    fundamentals_payload = _r2_get_json(r2_session, "fundamentals_summary.json") or {}
+    market_cap_map, ttm_sales_map = _build_materiality_maps(
+        classification_payload, fundamentals_payload
+    )
+    print(f"  ✓ Materiality lookup → market_cap={len(market_cap_map)} symbols, "
+          f"ttm_sales={len(ttm_sales_map)} symbols")
+
     # Remove historical Results entries too; results are maintained by the
     # dedicated results pipeline and should not duplicate catalyst storage.
     removed_results = 0
@@ -836,9 +917,23 @@ def main():
     )
     fetched = sum(len(v) for v in new_items.values())
 
+    # Stamp the group symbol temporarily so enrichment can join to the R2
+    # classification/fundamentals lookups without changing the stored schema.
+    for _sym, _items in new_items.items():
+        for _it in _items:
+            _it["_lookup_symbol"] = str(_sym).strip().upper()
+
     # Gemini reads only genuinely new Order PDFs; local parser is the fallback.
     # Non-Order catalysts never reach Gemini.
-    enrich_new_orders(nse_session, new_items, existing_ids, today, initial_build)
+    enrich_new_orders(
+        nse_session, new_items, existing_ids, today, initial_build,
+        market_cap_map, ttm_sales_map
+    )
+
+    # Internal join key must never be persisted.
+    for _items in new_items.values():
+        for _it in _items:
+            _it.pop("_lookup_symbol", None)
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
     total = sum(len(v) for v in history.values())
