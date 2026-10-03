@@ -23,6 +23,9 @@ Output (R2, flat key):
 import csv
 import io
 import re
+import os
+import json
+import base64
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, time as dtime, timedelta
 
@@ -155,9 +158,11 @@ def _make_item(symbol, dt, subject, text, link, is_trading_day, next_trading_day
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Local PDF enrichment (NO AI)
-# Only new Order catalysts are opened. Extraction is deliberately conservative:
-# if a reliable order-value phrase is not found, the item is left unchanged.
+# Order PDF enrichment: Gemini first, local parser as fallback
+# Only genuinely new Order catalysts are opened. On a clean/rebuild run, only
+# today's Order PDFs are enriched so historical backfill remains fast. Gemini is
+# never called for non-Order catalysts. Market cap is intentionally NOT requested
+# from Gemini because it is market data, not a filing fact.
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MONEY_RE = re.compile(
@@ -350,37 +355,204 @@ def _extract_order_details(text: str) -> dict:
         out["detail_source"] = "pdf_local"
     return out
 
-def enrich_new_orders_local(session, new_items: dict, existing_ids: set[str],
-                            today: date, initial_build: bool = False) -> tuple[int, int]:
-    """Enrich genuinely new Order items; never uses AI.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_ORDER_MODEL = os.environ.get("GEMINI_ORDER_MODEL", os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")).strip()
 
-    On an initial/rebuild run (no R2 history), inspect only announcements dated
-    today. This keeps a 90-day rebuild fast instead of opening every historical
-    Order PDF. Normal incremental runs still inspect every genuinely new Order.
-    """
-    checked = enriched = values_found = 0
+_ORDER_AI_PROMPT = r"""
+You are extracting factual details from an Indian listed company's order/contract announcement PDF.
+Read the ENTIRE PDF carefully, including tables, annexures and footnotes.
+
+Return ONLY one valid JSON object. Do not use markdown. Do not infer facts that are not disclosed.
+Use null for unavailable fields and [] for unavailable lists.
+
+Schema:
+{
+  "order_value_cr": number|null,
+  "order_value_text": string|null,
+  "customer": string|null,
+  "order_scope": string|null,
+  "order_type": "Domestic"|"International"|null,
+  "execution_period": string|null,
+  "quantity_or_capacity": string|null,
+  "project_location": string|null,
+  "related_party": boolean|null,
+  "promoter_interest": boolean|null,
+  "tax_inclusion": string|null,
+  "currency": string|null,
+  "company_share_of_order_cr": number|null,
+  "other_material_details": [string],
+  "summary": string|null
+}
+
+Rules:
+- order_value_cr must be the disclosed order/contract value converted to INR crore when the PDF permits a reliable conversion.
+- Preserve the original disclosed amount in order_value_text.
+- If the announcement covers multiple orders, use the disclosed aggregate total when available and explain the split in other_material_details.
+- customer is the awarding entity/client. Do not include table headings or row numbers.
+- order_scope is a concise description of the actual goods/services/project scope.
+- Capture MW/MWp, units, kilometres, tonnes, project capacity or other meaningful quantity in quantity_or_capacity when disclosed.
+- Capture project/site/geography in project_location when disclosed.
+- related_party must come from the specific related-party disclosure, not an unrelated Yes/No elsewhere.
+- promoter_interest must come from the promoter/promoter-group interest disclosure.
+- tax_inclusion should say whether the stated order value includes/excludes taxes if explicitly disclosed.
+- company_share_of_order_cr is only for consortium/JV orders where the company's own share is explicitly disclosed or directly calculable from disclosed figures.
+- other_material_details should contain only decision-useful factual details from the PDF, such as consortium share, repeat order, tender/LOA status, milestone, special terms, or customer/project specifics. Avoid boilerplate.
+- summary must be one concise factual sentence. Do not call the order bullish/bearish, good/bad, material/immaterial, or predict stock-price impact.
+- Do NOT provide market cap, revenue, valuation, order-to-market-cap ratio, or any fact not contained in this PDF.
+""".strip()
+
+
+def _download_pdf_bytes(session, url: str) -> bytes:
+    if not url or url == "-" or not url.lower().split("?", 1)[0].endswith(".pdf"):
+        return b""
+    try:
+        r = session.get(url, timeout=45)
+        r.raise_for_status()
+        data = r.content
+        if not data.startswith(b"%PDF"):
+            return b""
+        return data
+    except Exception as e:
+        print(f"  ⚠ PDF download failed for {url.rsplit('/', 1)[-1]} ({e})")
+        return b""
+
+
+def _extract_pdf_text_bytes(pdf_bytes: bytes) -> str:
+    if not pdf_bytes:
+        return ""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join((p.extract_text() or "") for p in reader.pages[:12])
+    except Exception:
+        return ""
+
+
+def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict:
+    if not GEMINI_API_KEY or not pdf_bytes:
+        return {}
+    try:
+        payload = {
+            "contents": [{"parts": [
+                {"text": _ORDER_AI_PROMPT},
+                {"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(pdf_bytes).decode("ascii")}},
+            ]}],
+            "generationConfig": {
+                "temperature": 0.05,
+                "maxOutputTokens": 4096,
+                "responseMimeType": "application/json",
+            },
+        }
+        r = session.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_ORDER_MODEL}:generateContent?key={GEMINI_API_KEY}",
+            json=payload, timeout=120,
+        )
+        if r.status_code == 429:
+            print(f"    · [{filename}] Gemini skipped: quota/rate limit")
+            return {}
+        r.raise_for_status()
+        data = r.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return {}
+        raw = "".join(p.get("text", "") for p in candidates[0].get("content", {}).get("parts", []))
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M).strip()
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return {}
+
+        out = {}
+        # Map AI schema to existing catalyst keys so the frontend remains compatible.
+        mapping = {
+            "order_value_cr": "order_value_cr",
+            "order_value_text": "order_value_text",
+            "customer": "order_from",
+            "order_scope": "order_purpose",
+            "order_type": "order_type",
+            "execution_period": "execution_period",
+            "quantity_or_capacity": "quantity_or_capacity",
+            "project_location": "project_location",
+            "related_party": "related_party",
+            "promoter_interest": "promoter_interest",
+            "tax_inclusion": "tax_inclusion",
+            "currency": "currency",
+            "company_share_of_order_cr": "company_share_of_order_cr",
+            "other_material_details": "other_material_details",
+            "summary": "order_summary",
+        }
+        for src, dst in mapping.items():
+            v = obj.get(src)
+            if v is not None and v != "" and v != []:
+                out[dst] = v
+
+        # Basic type/sanity guards. Bad AI fields are dropped, allowing local fallback.
+        if "order_value_cr" in out:
+            try:
+                v = float(out["order_value_cr"])
+                if not (0 < v < 10_000_000):
+                    raise ValueError
+                out["order_value_cr"] = round(v, 4)
+            except (TypeError, ValueError):
+                out.pop("order_value_cr", None)
+        if "company_share_of_order_cr" in out:
+            try:
+                v = float(out["company_share_of_order_cr"])
+                if v <= 0:
+                    raise ValueError
+                out["company_share_of_order_cr"] = round(v, 4)
+            except (TypeError, ValueError):
+                out.pop("company_share_of_order_cr", None)
+        for k in ("related_party", "promoter_interest"):
+            if k in out and not isinstance(out[k], bool):
+                out.pop(k, None)
+        if out:
+            out["detail_source"] = "gemini_pdf"
+        return out
+    except Exception as e:
+        print(f"    · [{filename}] Gemini extraction failed ({e})")
+        return {}
+
+
+def enrich_new_orders(session, new_items: dict, existing_ids: set[str],
+                      today: date, initial_build: bool = False) -> tuple[int, int]:
+    """Gemini-first enrichment for genuinely new Order PDFs; local parser fallback."""
+    checked = enriched = values_found = gemini_ok = local_fallback = 0
     for items in new_items.values():
         for it in items:
             if it.get("category") != "Order" or it.get("id") in existing_ids:
                 continue
-            if initial_build:
-                item_day = str(it.get("dt", ""))[:10]
-                if item_day != today.isoformat():
-                    continue
+            if initial_build and str(it.get("dt", ""))[:10] != today.isoformat():
+                continue
+
             checked += 1
-            text = _extract_pdf_text(session, it.get("link", ""))
-            details = _extract_order_details(text)
+            url = it.get("link", "")
+            fname = url.rsplit("/", 1)[-1] if url else "order.pdf"
+            pdf_bytes = _download_pdf_bytes(session, url)
+            if not pdf_bytes:
+                continue
+
+            details = _gemini_order_details(session, pdf_bytes, fname)
+            if details:
+                gemini_ok += 1
+            else:
+                text = _extract_pdf_text_bytes(pdf_bytes)
+                details = _extract_order_details(text)
+                if details:
+                    local_fallback += 1
+
             if details:
                 it.update(details)
                 enriched += 1
                 if details.get("order_value_cr") is not None:
                     values_found += 1
+
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical Order PDFs skipped; only {today.isoformat()} orders enriched")
     if checked:
-        print(f"  ✓ Local order-PDF enrichment → checked={checked}, details_found={enriched}, value_found={values_found}, AI=0")
+        print(f"  ✓ Order-PDF enrichment → checked={checked}, details_found={enriched}, "
+              f"value_found={values_found}, Gemini={gemini_ok}, local_fallback={local_fallback}")
     elif initial_build:
-        print("  ✓ Local order-PDF enrichment → checked=0, AI=0")
+        print("  ✓ Order-PDF enrichment → checked=0")
     return checked, enriched
 
 
@@ -664,8 +836,9 @@ def main():
     )
     fetched = sum(len(v) for v in new_items.values())
 
-    # No AI: only genuinely new Order PDFs are inspected locally for order value.
-    enrich_new_orders_local(nse_session, new_items, existing_ids, today, initial_build)
+    # Gemini reads only genuinely new Order PDFs; local parser is the fallback.
+    # Non-Order catalysts never reach Gemini.
+    enrich_new_orders(nse_session, new_items, existing_ids, today, initial_build)
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
     total = sum(len(v) for v in history.values())
