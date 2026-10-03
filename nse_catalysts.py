@@ -336,6 +336,45 @@ _ORDER_CONTEXT_RE = re.compile(
     re.I,
 )
 
+# Local money extraction must be conservative.  These phrases commonly occur in
+# explanatory classification tables and are NOT transaction values.
+_MONEY_RANGE_NOISE_RE = re.compile(
+    r"(?:up to|above|below|less than|more than|between)\s*(?:₹|rs\.?|inr)?\s*[0-9][0-9,.]*\s*(?:crores?|cr\.?)|"
+    r"[0-9][0-9,.]*\s*(?:crores?|cr\.?)\s*(?:to|[-–—])\s*(?:₹|rs\.?|inr)?\s*[0-9][0-9,.]*\s*(?:crores?|cr\.?)|"
+    r"project classification|significant orders|large orders|mega orders|ultra[- ]?mega orders",
+    re.I,
+)
+
+_STRONG_MONEY_CONTEXT_RE = re.compile(
+    r"consideration|purchase price|transaction value|order value|contract value|broad consideration|"
+    r"issue size|fund ?raise|penalty|fine|demand|claim amount|amount payable|investment of|project cost|"
+    r"aggregate consideration|total consideration|sale value|buyback size",
+    re.I,
+)
+
+def _has_inr_marker(raw: str, context: str) -> bool:
+    """True only when the amount is explicitly INR/Rupee denominated nearby."""
+    raw = raw or ""
+    context = context or ""
+    if re.search(r"(?:₹|\brs\.?\b|\binr\b|rupees?)", raw, re.I):
+        return True
+    # Allow a currency heading immediately around a tabular value.
+    return bool(re.search(r"(?:₹|\brs\.?\b|\binr\b|rupees?).{0,45}$", context[:max(0, len(context)//2)], re.I))
+
+def _money_candidate_is_safe(raw: str, context: str, *, standardized_row: bool = False) -> bool:
+    if _MONEY_RANGE_NOISE_RE.search(context or ""):
+        return False
+    unit_m = re.search(r"(crores?|cr\.?|lakhs?|lacs?|millions?|mn\.?|billions?|bn\.?)", raw or "", re.I)
+    unit = (unit_m.group(1).lower().replace('.', '') if unit_m else "")
+    # Never convert a bare million/billion amount: currency may be USD/EUR/etc.
+    if unit.startswith(("million", "billion")) or unit in {"mn", "bn"}:
+        return _has_inr_marker(raw, context) and bool(_STRONG_MONEY_CONTEXT_RE.search(context or ""))
+    # Generic catalyst parsing requires explicit rupee/INR denomination.
+    if not standardized_row and not _has_inr_marker(raw, context):
+        return False
+    # Even with currency, reject isolated amounts without transaction context.
+    return standardized_row or bool(_STRONG_MONEY_CONTEXT_RE.search(context or ""))
+
 
 def _money_to_cr(number: str, unit: str) -> float | None:
     try:
@@ -485,10 +524,15 @@ def _extract_order_details(text: str) -> dict:
             ))
             if scope_score == 0 and not strong and not _ORDER_CONTEXT_RE.search(context):
                 continue
+            raw = m.group(0).strip()
+            # Row 7 is NSE's standardized consideration/size row, so a bare
+            # "Crore" value is acceptable there. Elsewhere require explicit
+            # INR/Rupee denomination + strong order-value context.
+            if not _money_candidate_is_safe(raw, context, standardized_row=(scope_score == 2)):
+                continue
             value_cr = _money_to_cr(m.group(1), m.group(2))
             if value_cr is not None and value_cr > 0:
-                candidates.append((scope_score + (1 if strong else 0), value_cr,
-                                   m.group(0).strip(), context))
+                candidates.append((scope_score + (1 if strong else 0), value_cr, raw, context))
         if candidates and scope_score == 2:
             break
 
@@ -680,8 +724,12 @@ def _extract_money_candidates(clean: str) -> list[tuple[float, str, str]]:
         value = _money_to_cr(m.group(1), m.group(2))
         if value is None or value <= 0:
             continue
-        lo, hi = max(0, m.start() - 140), min(len(clean), m.end() + 180)
-        out.append((value, m.group(0).strip(), _clean_field(clean[lo:hi], 420)))
+        lo, hi = max(0, m.start() - 180), min(len(clean), m.end() + 220)
+        raw = m.group(0).strip()
+        context = _clean_field(clean[lo:hi], 520)
+        if not _money_candidate_is_safe(raw, context, standardized_row=False):
+            continue
+        out.append((value, raw, context))
     return out
 
 
@@ -691,9 +739,10 @@ def _best_money(clean: str, context_re: str = "") -> tuple[float | None, str, st
         return None, "", ""
     if context_re:
         contextual = [x for x in candidates if re.search(context_re, x[2], re.I)]
-        if contextual:
-            candidates = contextual
-    # Largest contextual amount is normally the transaction/demand/issue value.
+        if not contextual:
+            return None, "", ""
+        candidates = contextual
+    # Largest amount is used only after currency + context validation.
     value, raw, context = max(candidates, key=lambda x: x[0])
     return value, raw, context
 
@@ -856,7 +905,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
                     values_found += 1
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
-    print(f"  ✓ Local PDF enrichment (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
+    print(f"  ✓ Local PDF enrichment v2 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
     return checked, enriched
 
 
