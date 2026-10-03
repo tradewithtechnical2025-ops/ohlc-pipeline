@@ -1,9 +1,8 @@
 """
 nse_catalysts.py
-Pulls NSE corporate announcements, keeps only the ones that can explain a gap
-(orders, deals, news verification, negative events, price-movement
-clarifications), and stores them per symbol so the EP scanner can show WHY an
-EP happened.
+Pulls NSE corporate announcements, keeps a trader-focused set of material
+events, drops routine exchange/compliance noise at the backend, and stores them
+per symbol so the frontend can show WHY an event may matter.
 
 Sources, in order:
   1. www.nseindia.com/api/corporate-announcements  (JSON, has the symbol, supports
@@ -48,11 +47,26 @@ MARKET_CLOSE = dtime(15, 30)
 
 _IGNORE_SUBJECT = re.compile(
     r"trading window|declaration of nav|shareholders meeting|newspaper publication|"
-    r"change in director|change in management|change in company secretary|appointment|"
-    r"resignation|cessation|redemption|payment of interest|record date|esop|esos|"
     r"investor presentation|analyst|institutional investor|board meeting intimation|"
     r"regulation 51|regulation 57|amendment to aoa|notice of shareholders|credit rating|"
-    r"change in auditor|movement in units|noc/no dues|takeover regulations|corrigendum",
+    r"movement in units|noc/no dues|corrigendum",
+    re.I)
+
+# Hard-noise filters: do not store these in nse_catalysts.json and never send
+# them to Gemini. These are exchange surveillance / routine compliance items.
+_BACKEND_NOISE = re.compile(
+    r"news verification|exchange has sought clarification|clarification.*(?:price|volume)|"
+    r"spurt in (?:price|volume)|significant movement in (?:the )?price|movement in (?:the )?price|"
+    r"inter[- ]se transfer.*promoter|promoter.*inter[- ]se transfer|regulation 10\(6\)|"
+    r"appointment|re-appointment|reappointment|statutory auditor|secretarial auditor|"
+    r"internal auditor|cost auditor|scrutinizer",
+    re.I)
+
+# Routine completion/allotment after an already announced fund raise is not a
+# catalyst for this feed. New/proposed fund raises remain eligible below.
+_ROUTINE_ALLOTMENT = re.compile(
+    r"allotment of (?:equity shares|shares|securities).*pursuant to (?:a )?(?:preferential|rights|qip)|"
+    r"allotted .*securities.*preferential issue",
     re.I)
 
 _NEGATIVE = re.compile(
@@ -63,9 +77,6 @@ _NEGATIVE = re.compile(
     re.I)
 
 _DEBT = re.compile(r"non.?convertible|debenture|\bncds?\b|commercial paper|\bbonds?\b|\bisin\b", re.I)
-
-_CLARIFICATION = re.compile(r"price movement|spurt in volume|movement in (the )?price", re.I)
-
 _RESULTS = re.compile(r"financial results?|audited results|unaudited results", re.I)
 
 _ORDER = re.compile(
@@ -76,43 +87,72 @@ _ORDER = re.compile(
     r"contract (?:award|awarded|of|for|from|worth)|\bl1\b|first lowest|lowest bidder",
     re.I)
 
-_DEAL = re.compile(
-    r"acquisition|acquire|sale or disposal|disposal|scheme of arrangement|merger|"
-    r"demerger|amalgamation|joint venture|\bjv\b|collaborat|partner(ship)?|agreement|"
-    r"charter|\bqip\b|qualified institutional|fund rais|preferential issue|buy ?back|"
-    r"bonus|split|restructuring|stake",
+_ACQUISITION = re.compile(
+    r"acquisition|acquir(?:e|ed|ing)|purchase of .*stake|stake acquisition|"
+    r"completion of acquisition|become .*wholly[- ]owned subsidiary",
+    re.I)
+_DIVESTMENT = re.compile(
+    r"sale or disposal|divestment|disinvestment|sale of .*stake|sale of .*shareholding|"
+    r"transfer of (?:the )?entire equity|ceased to be .*subsidiary|sale of surplus land|"
+    r"asset monetisation|asset monetization",
+    re.I)
+_SCHEME = re.compile(
+    r"scheme of arrangement|amalgamation|merger|demerger|scheme .*implemented|"
+    r"restructuring pursuant to .*scheme",
+    re.I)
+_STRATEGIC_AGREEMENT = re.compile(
+    r"intellectual property license|licen[cs]e agreement|strategic (?:agreement|partnership|collaboration)|"
+    r"joint venture|\bjv\b|memorandum of understanding|\bmou\b|technical collaboration|"
+    r"manufacturing agreement|distribution agreement|technology agreement|"
+    r"execution of .*agreement|signing of .*agreement",
+    re.I)
+_CORP_ACTION = re.compile(
+    r"buy ?back|bonus|stock split|sub-division|rights issue|qualified institutional|\bqip\b|"
+    r"fund rais|preferential issue|dividend",
     re.I)
 
-_NEWS = re.compile(r"news verification", re.I)
-
-_VAGUE_SUBJECT = re.compile(r"press release|general updates|^updates$|disclosure of material issue", re.I)
+_VAGUE_SUBJECT = re.compile(r"press release|general updates|^updates$|disclosure of material issue|agreements?", re.I)
 
 
 def classify(subject: str, text: str) -> str | None:
-    """Returns a catalyst category, or None for noise that should be dropped."""
+    """Trader-focused catalyst category, or None when the event should not be stored."""
     subject = (subject or "").strip()
     text = (text or "").strip()
     both = f"{subject} {text}"
 
-    # Results are handled by the dedicated results pipeline, not catalysts.
-    if _RESULTS.search(both) or re.search(r"outcome of board meeting", subject, re.I) and _RESULTS.search(text):
+    # Results are handled by the dedicated results pipeline.
+    if _RESULTS.search(both) or (re.search(r"outcome of board meeting", subject, re.I) and _RESULTS.search(text)):
+        return None
+
+    # Drop obvious exchange/routine noise before any PDF/AI work.
+    if _BACKEND_NOISE.search(both) or _ROUTINE_ALLOTMENT.search(both):
         return None
     if _IGNORE_SUBJECT.search(subject):
         return None
+    if _DEBT.search(both):
+        return None
+
+    # Material event rules. Generic NSE subjects such as General Updates are
+    # deliberately reclassified from their text before being discarded.
     if _NEGATIVE.search(both):
         return "Negative"
-    if _DEBT.search(both):
-        return None             # NCD / CP / bond issuance and redemption: not an equity catalyst
-    if _CLARIFICATION.search(both):
-        return "Clarification"
-    if _NEWS.search(subject):
-        return "News"
     if _ORDER.search(both):
         return "Order"
-    if _DEAL.search(both):
-        return "Corporate action"
+    if _ACQUISITION.search(both):
+        return "Acquisition"
+    if _DIVESTMENT.search(both):
+        return "Divestment"
+    if _SCHEME.search(both):
+        return "Scheme of Arrangement"
+    if _STRATEGIC_AGREEMENT.search(both):
+        return "Strategic Agreement"
+    if _CORP_ACTION.search(both):
+        return "Corporate Action"
+
+    # Unresolved General Updates / Updates / Agreements are not stored merely
+    # for manual review anymore. This is what keeps the backend file controlled.
     if _VAGUE_SUBJECT.search(subject):
-        return "Other"          # kept for manual review; the text says what it is
+        return None
     return None
 
 
@@ -899,17 +939,31 @@ def main():
     print(f"  ✓ Materiality lookup → market_cap={len(market_cap_map)} symbols, "
           f"ttm_sales={len(ttm_sales_map)} symbols")
 
-    # Remove historical Results entries too; results are maintained by the
-    # dedicated results pipeline and should not duplicate catalyst storage.
-    removed_results = 0
+    # Re-apply today's backend rules to historical rows as well. This removes
+    # old Results, Other, Clarification/News Verification, routine allotments,
+    # auditor appointments, promoter inter-se transfers and other noise already
+    # present in R2. Manual rows are preserved.
+    removed_noise = 0
+    reclassified = 0
     for sym in list(history):
-        before = len(history[sym])
-        history[sym] = [x for x in history[sym] if x.get("category") != "Results"]
-        removed_results += before - len(history[sym])
+        cleaned = []
+        for x in history[sym]:
+            if x.get("manual"):
+                cleaned.append(x)
+                continue
+            cat = classify(x.get("subject", ""), x.get("text", ""))
+            if not cat:
+                removed_noise += 1
+                continue
+            if x.get("category") != cat:
+                x["category"] = cat
+                reclassified += 1
+            cleaned.append(x)
+        history[sym] = cleaned
         if not history[sym]:
             del history[sym]
-    if removed_results:
-        print(f"  🗑 Removed {removed_results} old Results item(s) from catalyst history")
+    if removed_noise or reclassified:
+        print(f"  🧹 Historical cleanup → removed={removed_noise}, reclassified={reclassified}")
 
     existing_ids = {x.get("id") for items in history.values() for x in items if x.get("id")}
     initial_build = not bool(existing_ids)
