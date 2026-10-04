@@ -1020,6 +1020,17 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             r"appeal (?:has been )?allowed|in favour of (?:the )?company|no (?:further )?liability|"
             r"proceedings? (?:has been |were )?(?:dropped|closed)|penalty (?:has been )?(?:waived|deleted))",
             clean, re.I))
+        # "Set aside" is only a relief when what was set aside was AGAINST the company.
+        # If an award in its favour was set aside, or the company says it will
+        # appeal / challenge, the outcome is adverse.
+        adverse = bool(re.search(
+            r"set aside (?:the |an? )?(?:arbitral |arbitration )?award|award[^.]{0,120}?(?:is|was|has been|were|stands?) set aside|"
+            r"strong case to challenge|(?:preferring|prefer|filing|file) an? (?:appeal|appropriate petition|review petition|special leave)|"
+            r"intends? to (?:appeal|challenge)|taking appropriate legal steps",
+            clean, re.I))
+        if adverse:
+            relief = False
+        tax_ctx = re.search(r"\bgst\b(?!\s*(?:in|no\.?|number|:)?\s*\d)|income[- ]tax|tax demand|taxation|\bitat\b|assessment order|customs duty", clean, re.I)
 
         if re.search(r"\b(?:sfio|serious fraud investigation office)\b", clean, re.I):
             out["negative_type"] = "SFIO Investigation"
@@ -1027,7 +1038,7 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
         elif re.search(r"\b(?:enforcement directorate|\bed\b|cbi|central bureau of investigation)\b", clean, re.I):
             out["negative_type"] = "Regulatory Investigation"
             out["negative_stage"] = "Investigation / Notice"
-        elif relief and re.search(r"gst|income tax|tax demand|taxation|itat|assessment", clean, re.I):
+        elif relief and tax_ctx:
             out["negative_type"] = "Tax / Litigation Relief"
             out["negative_stage"] = "Relief / Set Aside"
         elif relief and re.search(r"litigation|dispute|court|tribunal|arbitrat", clean, re.I):
@@ -1035,7 +1046,8 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["negative_stage"] = "Relief / Favourable Outcome"
         elif re.search(r"arbitrat(?:ion|or|ral)|arbitral award", clean, re.I):
             out["negative_type"] = "Litigation / Arbitration"
-            out["negative_stage"] = "Award / Order" if re.search(r"award|order", clean, re.I) else "Update"
+            out["negative_stage"] = ("Adverse Order" if adverse else
+                                     "Award / Order" if re.search(r"award|order", clean, re.I) else "Update")
         elif re.search(r"show[ -]?cause", clean, re.I):
             out["negative_type"] = "Show Cause Notice"
             out["negative_stage"] = "Notice"
@@ -1182,7 +1194,7 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             r"sebi\s*\((?:listing|lodr|prohibition|substantial|issue|pit)[^)]{0,120}\)\s*(?:regulations?)?(?:,?\s*\d{4})?|"
             r"sebi (?:master )?circular[^.;]{0,120}", " ", clean, flags=re.I)
         exch_action = re.compile(
-            r"(?:penalty|fine|notice|levied|imposed|action|suspension|show cause|email|letter)[^.]{0,90}"
+            r"(?:penalty|fine\b|show cause notice)[^.]{0,40}?(?:imposed|levied|issued)?\s*by\s+(?:the\s+)?"
             r"(?:national stock exchange|\bnse\b|bse limited|\bbse\b)|"
             r"(?:national stock exchange|\bnse\b|bse limited|\bbse\b)[^.]{0,60}"
             r"(?:imposed|levied|has fined|issued|initiated|suspended)", re.I)
@@ -1479,7 +1491,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
     return checked, changed, values
 
 
-NEG_PARSER_VERSION = 1.4        # 1.4: authority ignores SEBI-regulation / addressee boilerplate
+NEG_PARSER_VERSION = 1.5        # 1.5: adverse set-aside (award against company), GSTIN not tax, exchange authority only when it acted
 NEG_REVALIDATE_BATCH = int(os.environ.get("NEG_REVALIDATE_BATCH", "40"))
 
 
@@ -1496,7 +1508,7 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
                 neg_ver = 0.0
             if neg_ver >= NEG_PARSER_VERSION:
                 continue
-            if it.get("negative_type") == "Order Cancellation":
+            if it.get("negative_type") == "Order Cancellation" or it.get("cancels") or it.get("category_override") == "Negative":
                 it["negative_parser_version"] = NEG_PARSER_VERSION   # set by the order check
                 continue
             if checked >= NEG_REVALIDATE_BATCH:
@@ -2105,10 +2117,15 @@ _CANCEL_RE = re.compile(
     r"\W+(?:\w+\W+){0,6}?(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|order|contract)|"
     r"(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|order|contract)"
     r"\W+(?:\w+\W+){0,6}?(?:cancell?ed|terminated|withdrawn|annulled|short[- ]?closed)", re.I)
+_PLACED_STRONG_RE = re.compile(
+    r"placement of (?:the )?(?:purchase |work )?order on|(?:placed|awarded) (?:the |an? )?(?:purchase |work )?(?:order|contract) (?:on|to) m/?s|"
+    r"approv\w* (?:for |the )?(?:placing|placement|award) of (?:the )?(?:purchase |work )?order", re.I)
 _PLACED_RE = re.compile(
     r"name of (?:the )?entity to (?:which|whom) (?:the )?order|placement of (?:the )?(?:purchase |work )?order on|"
     r"(?:placed|awarded) (?:the |an? )?(?:purchase |work )?(?:order|contract) (?:on|to) m/?s", re.I)
-_L1_RE = re.compile(r"\bl[- ]?1\b(?:\s*bidder)?|lowest bidder|first lowest", re.I)
+_L1_RE = re.compile(
+    r"(?:declared|emerged|stood|ranked|been|is|as)\s+(?:as\s+)?(?:the\s+)?(?:l[- ]?1|lowest)\b(?!\s*(?:position|pipeline|order\s*book))|"
+    r"\bl[- ]?1\s*(?:bidder|stage|bid)\b|lowest (?:evaluated )?bidder|first lowest", re.I)
 _PREF_BIDDER_RE = re.compile(r"preferred bidder", re.I)
 _MINING_RE = re.compile(r"mining lease|mineral block|composite licen[cs]e|limestone block|coal block", re.I)
 _LOI_RE = re.compile(r"letter of intent|\bloi\b", re.I)
@@ -2117,6 +2134,11 @@ _ANY_AMOUNT_RE = re.compile(
     r"(?:₹|rs\.?|inr|usd|us\$|eur|€|sgd|aed|gbp|£|\$)\s*[0-9]|[0-9][0-9,.]*\s*(?:crores?|lakhs?|lacs?)\b|"
     r"[0-9][0-9,.]*\s*(?:million|billion)\s*(?:us\s*dollars?|usd|dollars?)", re.I)
 _QTY_RE = re.compile(r"\b\d[\d,.]*\s*(?:GW|MWh|MWp|MW|TPH)\b(?:\s*/\s*\d[\d,.]*\s*(?:GWh|MWh))?")
+_BAND_RE = re.compile(
+    r"(?:major|significant|large|mega|big|sizeable|ultra[- ]mega)\W{0,3}(?:order)?\W{0,3}(?:indicates?|means?|denotes?|refers? to|is defined as|classification)"
+    r"[^.]{0,80}?(?:(?:over|above|exceeding|more than|greater than|upwards of)\s*(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr)"
+    r"|(?:between|from|range of)\s*(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr)?\s*(?:and|to|-|–)\s*(?:₹|rs\.?|inr)?\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr))",
+    re.I)
 _ANNUAL_RE = re.compile(r"per annum|yearly revenue|annual(?:ly)? revenue|revenue per year|per year for|p\.a\.", re.I)
 _VENDOR_RE = re.compile(r"entity to (?:which|whom).{0,60}?awarded\s*[;:]?\s*(.{3,90}?)(?=\s+(?:b\s*\.|2\s*\.|\(ii\)|whether)(?:\s|$))", re.I)
 _CANCEL_PARTY_RE = re.compile(r"(?:received |awarded |issued )?(?:from|by)\s+((?:[A-Z][\w&.,'()-]*\s?){1,6})", re.M)
@@ -2136,7 +2158,11 @@ def _order_doc_check(pdf_text: str, nse_text: str) -> dict:
     out = {"subject": subject}
     if _CANCEL_RE.search(f"{nse_text or ''} {subject}") or _CANCEL_RE.search(clean[:1200]):
         out["doc_type"] = "cancellation"
-    elif _PLACED_RE.search(clean) or _PLACED_RE.search(head):
+    elif _PLACED_STRONG_RE.search(head) or (
+            # Annexure label alone is ambiguous (some recipients name themselves there),
+            # so it needs a named vendor and must not be a "Bagging/Receiving" filing.
+            _PLACED_RE.search(clean) and _VENDOR_RE.search(clean)
+            and not re.search(r"bagging|receiv", nse_text or "", re.I)):
         out["doc_type"] = "placed"
     else:
         out["doc_type"] = "received"
@@ -2152,7 +2178,41 @@ def _order_doc_check(pdf_text: str, nse_text: str) -> dict:
     if q:
         out["quantity"] = q.group(0)
     out["annual"] = bool(_ANNUAL_RE.search(clean))
+    b = _BAND_RE.search(clean)
+    if b:
+        lo = b.group(1) or b.group(2)
+        out["band_min"] = float(lo.replace(",", ""))
+        if b.group(3):
+            out["band_max"] = float(b.group(3).replace(",", ""))
+    out["_head"] = head[:1500]
     return out
+
+
+def _apply_band(it: dict, chk: dict) -> bool:
+    """Company only disclosed a size band: show it as a band, never as an exact value."""
+    lo = chk.get("band_min")
+    if lo is None:
+        return False
+    v = it.get("order_value_cr")
+    if v is not None and not (abs(v - lo) < 0.01 or (chk.get("band_max") and abs(v - chk["band_max"]) < 0.01)):
+        return False          # an exact value was disclosed elsewhere; keep it
+    it["order_value_cr"] = lo
+    it["order_value_role"] = "band_min"
+    hi = chk.get("band_max")
+    it["order_value_text"] = (f"₹{lo:,.0f}–{hi:,.0f} Cr (company band)" if hi else f"Over ₹{lo:,.0f} Cr (company band)")
+    return True
+
+
+def _ai_value_in_head(av: float, chk: dict) -> bool:
+    """True when the AI's figure is printed in the title/subject area, i.e. the filing's headline number."""
+    head = chk.get("_head", "")
+    for m in re.finditer(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr)", head, re.I):
+        try:
+            if abs(float(m.group(1).replace(",", "")) - av) < 0.01:
+                return True
+        except ValueError:
+            pass
+    return False
 
 
 def _set_ratio(it: dict, sym: str, category: str, key: str, value: float,
@@ -2229,6 +2289,61 @@ def _to_cancellation(it: dict, history_items: list, hv: float | None, htxt: str)
     elif len(cands) > 1:
         it["needs_review"] = True
         it["review_reason"] = f"cancellation matches {len(cands)} earlier orders from {party}"
+
+
+STAGE_CHECK_VERSION = 3
+
+
+def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
+    """Re-run only the PDF type check on rows whose stage/category the first
+    order-check version changed (L1 / LoI / Preferred Bidder / Capex)."""
+    checked = changed = 0
+    for sym, items in history.items():
+        for it in items:
+            if checked >= limit:
+                break
+            if it.get("manual") or int(it.get("stage_check_v") or 0) >= STAGE_CHECK_VERSION:
+                continue
+            was_capex = it.get("category_override") == "Capex"
+            if not (was_capex or it.get("stage_override") in {"L1 / Awaiting Award", "Letter of Intent", "Preferred Bidder"}
+                    or it.get("value_source") == "gemini_pdf" or it.get("needs_review")):
+                continue
+            pdf = _download_pdf_bytes(session, it.get("link", ""))
+            if not pdf:
+                continue
+            checked += 1
+            chk = _order_doc_check(_extract_pdf_text_bytes(pdf), it.get("text", ""))
+            if was_capex and chk["doc_type"] != "placed":
+                # Back to a received order; value/customer come from the next order check.
+                for k in ("category_override", "event_type_override", "stage_override", "capex_value_cr",
+                          "capex_value_text", "capex_to_market_cap_pct", "vendor", "capex_purpose", "order_check_v"):
+                    it.pop(k, None)
+                it["category"] = "Order"
+                it["event_type"], it["stage"] = "Order Award", "Awarded"
+                changed += 1
+            if not was_capex and it.get("category") == "Order":
+                if _apply_band(it, chk):
+                    changed += 1
+                av, lv = it.get("order_value_cr"), it.get("local_value_cr")
+                if it.get("needs_review") and av is not None and (
+                        _ai_value_in_head(float(av), chk)
+                        or (lv is not None and any(x is not it and x.get("order_value_cr") is not None
+                                                   and abs(float(x["order_value_cr"]) - float(lv)) < 0.01
+                                                   for x in items))):
+                    it.pop("needs_review", None); it.pop("review_reason", None)
+                    changed += 1
+            if was_capex and chk["doc_type"] == "placed":
+                pass
+            elif not was_capex:
+                new_stage = chk.get("stage") or "Awarded"
+                new_type = chk.get("event_type") or "Order Award"
+                if new_stage != it.get("stage"):
+                    it["stage_override"] = it["stage"] = new_stage
+                    it["event_type_override"] = it["event_type"] = new_type
+                    changed += 1
+            it["stage_check_v"] = STAGE_CHECK_VERSION
+    if checked:
+        print(f"  🔁 Stage re-check → checked={checked}, changed={changed}")
 
 
 def process_orders(session, history: dict, market_cap_map: dict | None = None,
@@ -2371,9 +2486,16 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                         it["order_value_text"] = f"₹{av} Cr"
                         if lv and abs(lv - av) / max(lv, av) > AI_AGREE_TOL:
                             it["local_value_cr"] = lv
-                            it["needs_review"] = True
-                            it["review_reason"] = "AI and PDF table disagree"
+                            other_card = any(x is not it and x.get("order_value_cr") is not None
+                                             and abs(float(x["order_value_cr"]) - lv) < 0.01
+                                             for x in history.get(sym, []))
+                            # Local picked an earlier order's figure ("in continuation to our letter…")
+                            # or a YTD/order-book number while AI matches the headline: AI is right.
+                            if not (other_card or _ai_value_in_head(av, chk)):
+                                it["needs_review"] = True
+                                it["review_reason"] = "AI and PDF table disagree"
                     it["value_source"] = "gemini_pdf"
+                    _apply_band(it, chk)
                     _set_ratio(it, sym, "Order", "order_value_cr", it["order_value_cr"],
                                market_cap_map, ttm_sales_map)
                     if basis == "annual" and ttm_sales_map:
@@ -2384,6 +2506,7 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                         except (TypeError, ValueError):
                             pass
         it["order_check_v"] = ORDER_CHECK_VERSION
+        it["stage_check_v"] = STAGE_CHECK_VERSION
     stats["queued"] += max(0, len(queue) - stats["checked"])
     print("  🔎 Order check → " + ", ".join(f"{k}={v}" for k, v in stats.items()))
     return stats
@@ -2740,6 +2863,14 @@ def main():
             for k in ("event_type", "stage"):
                 x.pop(k, None)
             x.update(_event_meta(x.get("subject", ""), x.get("text", ""), cat))
+            if cat == "Negative" and (x.get("cancels") or (x.get("category_override") == "Negative"
+                                                         and _ORDER_CANCEL.search(f"{x.get('subject', '')} {x.get('text', '')}"))):
+                x["negative_type"], x["negative_stage"] = "Order Cancellation", "Cancelled"
+                x.pop("authority", None)
+                if x.get("amount_cr") is None and x.get("cancels"):
+                    _o = next((y for y in history.get(sym, []) if y.get("id") == x["cancels"]), None)
+                    if _o and _o.get("order_value_cr") is not None:
+                        x["amount_cr"] = _o["order_value_cr"]
             # Decisions made by the PDF order check survive the daily re-tagging.
             if x.get("event_type_override"):
                 x["event_type"] = x["event_type_override"]
@@ -2830,6 +2961,9 @@ def main():
     # Cross-check values against the NSE headline before lifecycle consolidation,
     # so merged cards carry the corrected figure.
     apply_headline_quality(history, market_cap_map, ttm_sales_map)
+
+    # One-time re-check of stages/categories set by the first order-check version.
+    recheck_order_stages(nse_session, history)
 
     # Order check: heading value → PDF type check → AI only when needed.
     process_orders(nse_session, history, market_cap_map, ttm_sales_map)
