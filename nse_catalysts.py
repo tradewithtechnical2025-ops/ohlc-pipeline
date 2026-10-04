@@ -865,7 +865,7 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["buyer"] = _clean_field(buyer.group(1), 120)
 
     elif category == "Negative":
-        # Negative parser v1.1: precision-first.  Determine event semantics before
+        # Negative parser v1.2: precision-first.  Determine event semantics before
         # selecting money so project values / facilities / historical references
         # cannot become the primary adverse amount.
         relief = bool(re.search(
@@ -921,23 +921,47 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
         # context describes an adverse monetary role; generic project/facility/
         # transaction values are ignored.
         candidates = _extract_money_candidates(clean)
-        role_patterns = {
-            "tax_demand": r"tax (?:demand|liability)|demand(?:ed|ing)? (?:tax|liability)|assessment.*demand|demand raised",
-            "penalty": r"penalty|\bfine\b|penal amount",
-            "interest": r"interest (?:thereon|therein|amount|liability)|along with interest",
-            "award": r"arbitral award|arbitration|compensation|damages|claim awarded|award.*(?:amount|inr|rs\.?|₹)",
-            "claim": r"litigation|dispute|claim|show[ -]?cause|notice.*(?:amount|demand)",
-        }
         reject_role = re.compile(r"project (?:cost|value)|development cost|contract value|order value|"
                                  r"credit facility|loan facility|secured facility|charge (?:created|amount)|"
                                  r"turnover|revenue|net worth|share capital|consideration", re.I)
-        role_hits = {k: [] for k in role_patterns}
+        role_hits = {"tax_demand": [], "penalty": [], "interest": [], "award": [], "claim": []}
+
+        # v1.2: assign a monetary role only when the role is explicitly attached
+        # to that amount. This prevents one figure from being copied into tax,
+        # penalty and interest merely because those words occur later in a paragraph.
+        def _explicit_money_role(raw: str, context: str, role: str) -> bool:
+            eraw = re.escape(raw)
+            if role == "tax_demand":
+                pats = [
+                    rf"(?:tax (?:demand|liability)|demand(?:ed|ing)? (?:tax|liability)|demand raised)[^.;:]{{0,55}}{eraw}",
+                    rf"{eraw}[^.;:]{{0,28}}(?:tax )?demand\b",
+                ]
+            elif role == "penalty":
+                pats = [
+                    rf"(?:penalty|fine|penal amount)(?:\s+(?:of|amounting to|aggregating to|is|:|-))?[^.;:]{{0,35}}{eraw}",
+                ]
+            elif role == "interest":
+                pats = [
+                    rf"interest(?:\s+(?:of|amounting to|aggregating to|is|:|-))[^.;:]{{0,30}}{eraw}",
+                ]
+            elif role == "award":
+                pats = [
+                    rf"(?:arbitral award|arbitration|compensation|damages|award(?:ed)? amount)[^.;:]{{0,90}}{eraw}",
+                    rf"{eraw}[^.;:]{{0,90}}(?:arbitral award|awarded by|compensation|damages)",
+                ]
+            else:  # claim / general litigation exposure
+                pats = [
+                    rf"(?:claim|dispute|litigation|show[ -]?cause|notice)[^.;:]{{0,90}}{eraw}",
+                    rf"{eraw}[^.;:]{{0,55}}(?:claim|dispute|litigation)",
+                ]
+            return any(re.search(pat, context, re.I | re.S) for pat in pats)
+
         for cand in candidates:
             value, raw, context = cand
             if reject_role.search(context) and not re.search(r"penalty|tax demand|demand raised|arbitral award|compensation|damages", context, re.I):
                 continue
-            for role, pat in role_patterns.items():
-                if re.search(pat, context, re.I):
+            for role in role_hits:
+                if _explicit_money_role(raw, context, role):
                     role_hits[role].append(cand)
 
         def _pick(role):
@@ -1157,7 +1181,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
     Gemini/manual enrichment is never touched.
     """
     checked = changed = values = 0
-    supported = {"Order", "Acquisition", "Divestment", "Negative",
+    supported = {"Order", "Acquisition", "Divestment",
                  "Strategic Agreement", "Scheme of Arrangement", "Corporate Action"}
     for sym, items in history.items():
         for it in items:
@@ -1200,7 +1224,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
 
 
 def revalidate_negative_history(session, history: dict, market_cap_map: dict | None = None) -> tuple[int, int, int]:
-    """One-time local Negative v1.1 refresh. Other v4.1 category parsers stay frozen."""
+    """One-time local Negative v1.2 refresh. Other v4.1 category parsers stay frozen."""
     checked = changed = values = 0
     for sym, items in history.items():
         for it in items:
@@ -1210,7 +1234,7 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
                 neg_ver = float(it.get("negative_parser_version") or 0)
             except (TypeError, ValueError):
                 neg_ver = 0.0
-            if neg_ver >= 1.1:
+            if neg_ver >= 1.2:
                 continue
             checked += 1
             neg_fields = ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage",
@@ -1219,7 +1243,7 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
                           "total_exposure_cr", "amount_to_market_cap_pct")
             before = {k: it.get(k) for k in neg_fields if k in it}
             pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
-            it["negative_parser_version"] = 1.1
+            it["negative_parser_version"] = 1.2
             if not pdf_bytes:
                 continue
             details = _extract_local_catalyst_details("Negative", _extract_pdf_text_bytes(pdf_bytes))
@@ -1237,7 +1261,7 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
             if before != after:
                 changed += 1
     if checked:
-        print(f"  ♻ Negative local history v1.1 → checked={checked}, changed={changed}, value_found={values}")
+        print(f"  ♻ Negative local history v1.2 → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
@@ -1356,6 +1380,67 @@ def fetch_catalysts(session, today: date, lookback_days: int,
 
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Negative adverse -> relief lifecycle consolidation (v1.2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _negative_money_markers(item: dict) -> set[str]:
+    vals = set()
+    for key in ("amount_cr", "tax_demand_cr", "penalty_cr", "award_amount_cr"):
+        try:
+            if item.get(key) is not None:
+                vals.add(f"{float(item[key]):.3f}")
+        except Exception:
+            pass
+    raw = f"{item.get('text','')} {item.get('amount_text','')} {item.get('tax_demand_text','')}".replace(",", "")
+    for m in re.finditer(r"(?:rs\.?|₹|inr)\s*(\d+(?:\.\d+)?)\s*(crore|crores|cr\b|million|mn\b|lakh|lakhs)", raw, re.I):
+        try:
+            unit = m.group(2).lower()
+            v = float(m.group(1))
+            if unit.startswith("million") or unit == "mn": v /= 10.0
+            elif unit.startswith("lakh"): v /= 100.0
+            vals.add(f"{v:.3f}")
+        except Exception:
+            pass
+    return vals
+
+def consolidate_negative_relief_lifecycles(data: dict) -> int:
+    """Collapse an earlier adverse tax/litigation card when a later filing
+    clearly records relief/set-aside for the same monetary matter. Conservative:
+    same symbol, <=20 days, and a shared explicit monetary marker are required.
+    """
+    removed = 0
+    relief_types = {"Tax / Litigation Relief", "Litigation Relief"}
+    for sym in list(data):
+        items = sorted(data[sym], key=lambda x: x.get("dt", ""), reverse=True)
+        drop = set()
+        for i, newer in enumerate(items):
+            if newer.get("category") != "Negative" or newer.get("negative_type") not in relief_types:
+                continue
+            nm = _negative_money_markers(newer)
+            if not nm:
+                continue
+            try:
+                nd = datetime.fromisoformat(str(newer.get("dt", "")).replace("Z", "+00:00")).date()
+            except Exception:
+                continue
+            for j in range(i + 1, len(items)):
+                older = items[j]
+                if older.get("category") != "Negative" or older.get("negative_type") in relief_types:
+                    continue
+                try:
+                    od = datetime.fromisoformat(str(older.get("dt", "")).replace("Z", "+00:00")).date()
+                except Exception:
+                    continue
+                if (nd - od).days > 20:
+                    break
+                if nm & _negative_money_markers(older):
+                    drop.add(j)
+        if drop:
+            data[sym] = [x for j, x in enumerate(items) if j not in drop]
+            removed += len(drop)
+    return removed
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Conservative lifecycle consolidation
@@ -1723,8 +1808,20 @@ def main():
                 removed_noise += 1
                 continue
             if x.get("category") != cat:
+                old_cat = x.get("category")
                 x["category"] = cat
                 reclassified += 1
+                # v1.2: Negative parser metadata must never leak into a row that
+                # has been deterministically reclassified to another category.
+                if old_cat == "Negative" and cat != "Negative":
+                    for _k in ("negative_parser_version", "negative_type", "negative_stage",
+                               "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
+                               "interest_cr", "interest_text", "award_amount_cr", "award_amount_text",
+                               "total_exposure_cr", "amount_cr", "amount_text", "amount_context",
+                               "amount_to_market_cap_pct", "authority"):
+                        x.pop(_k, None)
+                    if x.get("detail_source") in {"local_pdf", "pdf_local"}:
+                        x.pop("detail_source", None)
             # Refresh deterministic stage/type metadata on retained history.
             for k in ("event_type", "stage"):
                 x.pop(k, None)
@@ -1779,7 +1876,7 @@ def main():
     for _items in new_items.values():
         for _it in _items:
             if _it.get("category") == "Negative" and _it.get("local_pdf_checked"):
-                _it["negative_parser_version"] = 1.1
+                _it["negative_parser_version"] = 1.2
 
     # Internal join key must never be persisted.
     for _items in new_items.values():
@@ -1787,6 +1884,12 @@ def main():
             _it.pop("_lookup_symbol", None)
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
+
+    # Negative v1.2: when a later filing explicitly sets aside / grants relief
+    # on the same monetary matter, suppress the older adverse card.
+    negative_relief_removed = consolidate_negative_relief_lifecycles(history)
+    if negative_relief_removed:
+        print(f"  🔗 Negative relief lifecycle → removed={negative_relief_removed} superseded adverse card(s)")
 
     # Collapse duplicate lifecycle filings only after old + fresh rows are merged,
     # so L1 -> award, announced -> completed, and scheme stage updates can meet.
