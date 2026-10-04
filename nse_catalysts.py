@@ -272,6 +272,12 @@ def classify(subject: str, text: str) -> str | None:
     if _MANAGEMENT_CHANGE.search(both):
         return "Management Change"
 
+    # A substantive merger/demerger/amalgamation/NCLT scheme filing must beat the
+    # broad Negative phrase "order(s) passed". Procedural scheme noise was already
+    # rejected above by _SCHEME_PROCEDURAL.
+    if _SCHEME.search(both) and re.search(r"(?:scheme|merger|demerger|amalgamation|nclt|nclat)", both, re.I):
+        return "Scheme of Arrangement"
+
     # Cancellation/termination of an order is adverse, never a fresh Order win.
     if _ORDER_CANCEL.search(both) or _ADVERSE_TAX_ORDER.search(both):
         return "Negative"
@@ -859,24 +865,40 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["buyer"] = _clean_field(buyer.group(1), 120)
 
     elif category == "Negative":
-        # Negative disclosures need type/stage even when no reliable amount exists.
-        # This remains fully local: machine-readable PDF text + deterministic regex.
+        # Negative parser v1.1: precision-first.  Determine event semantics before
+        # selecting money so project values / facilities / historical references
+        # cannot become the primary adverse amount.
+        relief = bool(re.search(
+            r"(?:set aside|quashed|demand (?:has been |was )?(?:deleted|dropped|withdrawn)|"
+            r"appeal (?:has been )?allowed|in favour of (?:the )?company|no (?:further )?liability|"
+            r"proceedings? (?:has been |were )?(?:dropped|closed)|penalty (?:has been )?(?:waived|deleted))",
+            clean, re.I))
+
         if re.search(r"\b(?:sfio|serious fraud investigation office)\b", clean, re.I):
             out["negative_type"] = "SFIO Investigation"
             out["negative_stage"] = "Investigation / Notice"
         elif re.search(r"\b(?:enforcement directorate|\bed\b|cbi|central bureau of investigation)\b", clean, re.I):
             out["negative_type"] = "Regulatory Investigation"
             out["negative_stage"] = "Investigation / Notice"
+        elif relief and re.search(r"gst|income tax|tax demand|taxation|itat|assessment", clean, re.I):
+            out["negative_type"] = "Tax / Litigation Relief"
+            out["negative_stage"] = "Relief / Set Aside"
+        elif relief and re.search(r"litigation|dispute|court|tribunal|arbitrat", clean, re.I):
+            out["negative_type"] = "Litigation Relief"
+            out["negative_stage"] = "Relief / Favourable Outcome"
+        elif re.search(r"arbitrat(?:ion|or|ral)|arbitral award", clean, re.I):
+            out["negative_type"] = "Litigation / Arbitration"
+            out["negative_stage"] = "Award / Order" if re.search(r"award|order", clean, re.I) else "Update"
         elif re.search(r"show[ -]?cause", clean, re.I):
             out["negative_type"] = "Show Cause Notice"
             out["negative_stage"] = "Notice"
-        elif re.search(r"\b(?:gst|income tax|tax authority|tax demand)\b", clean, re.I):
+        elif re.search(r"\b(?:gst|income tax|tax authority|tax demand|assessment order)\b", clean, re.I):
             out["negative_type"] = "Tax / GST"
             out["negative_stage"] = "Demand / Order" if re.search(r"demand|order", clean, re.I) else "Notice"
         elif re.search(r"penalty|\bfine\b", clean, re.I):
             out["negative_type"] = "Penalty / Fine"
             out["negative_stage"] = "Order / Penalty"
-        elif re.search(r"litigation|dispute|court|tribunal|arbitration", clean, re.I):
+        elif re.search(r"litigation|dispute|court|tribunal", clean, re.I):
             out["negative_type"] = "Litigation / Dispute"
             out["negative_stage"] = "Update"
         elif re.search(r"search and seizure|\braid\b", clean, re.I):
@@ -895,14 +917,90 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["negative_type"] = "Insolvency / CIRP"
             out["negative_stage"] = "Material Update"
 
-        value, raw, context = _best_money(clean, r"penalty|demand|fine|tax|claim|litigation|show cause|order")
-        if value is not None:
-            out["amount_cr"] = value
-            out["amount_text"] = raw
-            out["amount_context"] = context
-        authority = re.search(r"(?:authority|regulator|department|issued by|order (?:passed|received) from)\s*[:\-]?\s*([A-Z][A-Za-z0-9&.,'()\-/ ]{3,120}?)(?=\.|;|\n| dated | vide )", clean, re.I)
-        if authority:
-            out["authority"] = _clean_field(authority.group(1), 120)
+        # Role-aware money extraction.  A candidate is accepted only when its local
+        # context describes an adverse monetary role; generic project/facility/
+        # transaction values are ignored.
+        candidates = _extract_money_candidates(clean)
+        role_patterns = {
+            "tax_demand": r"tax (?:demand|liability)|demand(?:ed|ing)? (?:tax|liability)|assessment.*demand|demand raised",
+            "penalty": r"penalty|\bfine\b|penal amount",
+            "interest": r"interest (?:thereon|therein|amount|liability)|along with interest",
+            "award": r"arbitral award|arbitration|compensation|damages|claim awarded|award.*(?:amount|inr|rs\.?|₹)",
+            "claim": r"litigation|dispute|claim|show[ -]?cause|notice.*(?:amount|demand)",
+        }
+        reject_role = re.compile(r"project (?:cost|value)|development cost|contract value|order value|"
+                                 r"credit facility|loan facility|secured facility|charge (?:created|amount)|"
+                                 r"turnover|revenue|net worth|share capital|consideration", re.I)
+        role_hits = {k: [] for k in role_patterns}
+        for cand in candidates:
+            value, raw, context = cand
+            if reject_role.search(context) and not re.search(r"penalty|tax demand|demand raised|arbitral award|compensation|damages", context, re.I):
+                continue
+            for role, pat in role_patterns.items():
+                if re.search(pat, context, re.I):
+                    role_hits[role].append(cand)
+
+        def _pick(role):
+            vals = role_hits.get(role) or []
+            return max(vals, key=lambda x: x[0]) if vals else None
+
+        tax = _pick("tax_demand")
+        pen = _pick("penalty")
+        intr = _pick("interest")
+        award = _pick("award")
+        claim = _pick("claim")
+        if tax:
+            out["tax_demand_cr"], out["tax_demand_text"] = tax[0], tax[1]
+        if pen:
+            out["penalty_cr"], out["penalty_text"] = pen[0], pen[1]
+        if intr:
+            out["interest_cr"], out["interest_text"] = intr[0], intr[1]
+        if award:
+            out["award_amount_cr"], out["award_amount_text"] = award[0], award[1]
+
+        # Primary amount represents the principal adverse exposure, not a sum that
+        # could double-count overlapping disclosures. Keep separate role fields too.
+        primary = None
+        if out.get("negative_type") == "Litigation / Arbitration":
+            primary = award or claim
+        elif out.get("negative_type") in {"Tax / GST", "Show Cause Notice"}:
+            primary = tax or pen or claim
+        elif out.get("negative_type") == "Penalty / Fine":
+            primary = pen or tax or claim
+        elif out.get("negative_type") not in {"Tax / Litigation Relief", "Litigation Relief", "Insolvency / CIRP", "Insolvency / Resolution Plan", "Insolvency / Liquidation"}:
+            primary = claim or pen or tax or award
+        if primary:
+            out["amount_cr"], out["amount_text"], out["amount_context"] = primary
+
+        # Total exposure is emitted only when distinct tax + penalty amounts can be
+        # identified. Interest is intentionally excluded because it is often open-ended.
+        if tax and pen and abs(tax[0] - pen[0]) > 1e-9:
+            out["total_exposure_cr"] = round(tax[0] + pen[0], 6)
+        elif tax and pen and re.search(r"tax liability.{0,80}penalty|demand.{0,80}penalty", clean, re.I | re.S):
+            # Same numerical amount can legitimately apply once as tax and once as penalty.
+            out["total_exposure_cr"] = round(tax[0] + pen[0], 6)
+
+        # Authority is whitelist/context based.  Never save fragments such as
+        # 'Transcript', 'Letter', 'BSE Limited P', or arbitrary prose.
+        auth_patterns = [
+            r"Serious Fraud Investigation Office(?: \(SFIO\))?", r"Enforcement Directorate(?: \(ED\))?",
+            r"Central Bureau of Investigation(?: \(CBI\))?", r"Securities and Exchange Board of India(?: \(SEBI\))?",
+            r"Reserve Bank of India(?: \(RBI\))?", r"National Stock Exchange of India(?: Limited)?", r"BSE Limited",
+            r"Income Tax Appellate Tribunal(?: \(ITAT\))?", r"Income Tax Department", r"National Faceless Assessment (?:Unit|Centre)",
+            r"(?:Additional |Assistant |Joint |Deputy )?Commissioner(?: of Income Tax|,? CGST(?: & Central Excise)?| of GST)?",
+            r"(?:CGST|SGST|GST) (?:Department|Authority|Officer|Commissionerate)",
+            r"National Company Law Tribunal(?: \(NCLT\))?", r"National Company Law Appellate Tribunal(?: \(NCLAT\))?",
+            r"Regional Provident Fund Commissioner(?: \(RPFC\))?",
+        ]
+        found_auth = []
+        for pat in auth_patterns:
+            m = re.search(pat, clean, re.I)
+            if m:
+                val = _clean_field(m.group(0), 120)
+                if val.lower() not in {x.lower() for x in found_auth}:
+                    found_auth.append(val)
+        if found_auth:
+            out["authority"] = "; ".join(found_auth[:2])
 
     elif category == "Strategic Agreement":
         value, raw, _ = _best_money(clean, r"investment|project|agreement|consideration|contract|value")
@@ -1029,7 +1127,9 @@ _LOCAL_ENRICHMENT_FIELDS = {
     "transaction_value_cr", "transaction_value_text", "stake_acquired_pct",
     "post_transaction_stake_pct", "target", "stake_sold_pct", "buyer",
     "amount_cr", "amount_text", "amount_context", "authority",
-    "negative_type", "negative_stage",
+    "negative_type", "negative_stage", "tax_demand_cr", "tax_demand_text",
+    "penalty_cr", "penalty_text", "interest_cr", "interest_text",
+    "award_amount_cr", "award_amount_text", "total_exposure_cr",
     "agreement_value_cr", "agreement_value_text", "binding_status", "counterparty",
     "scheme_type", "scheme_date_text", "issue_value_cr", "issue_value_text",
     "ratio", "price_per_security", "detail_excerpt",
@@ -1100,24 +1200,32 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
 
 
 def revalidate_negative_history(session, history: dict, market_cap_map: dict | None = None) -> tuple[int, int, int]:
-    """One-time local Negative refresh. Other v4.1 category parsers stay frozen."""
+    """One-time local Negative v1.1 refresh. Other v4.1 category parsers stay frozen."""
     checked = changed = values = 0
     for sym, items in history.items():
         for it in items:
             if it.get("manual") or it.get("category") != "Negative":
                 continue
-            if int(it.get("negative_parser_version") or 0) >= 1:
+            try:
+                neg_ver = float(it.get("negative_parser_version") or 0)
+            except (TypeError, ValueError):
+                neg_ver = 0.0
+            if neg_ver >= 1.1:
                 continue
             checked += 1
-            before = {k: it.get(k) for k in ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage") if k in it}
+            neg_fields = ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage",
+                          "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
+                          "interest_cr", "interest_text", "award_amount_cr", "award_amount_text",
+                          "total_exposure_cr", "amount_to_market_cap_pct")
+            before = {k: it.get(k) for k in neg_fields if k in it}
             pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
-            it["negative_parser_version"] = 1
+            it["negative_parser_version"] = 1.1
             if not pdf_bytes:
                 continue
             details = _extract_local_catalyst_details("Negative", _extract_pdf_text_bytes(pdf_bytes))
             if details:
                 # Replace only Negative-owned local fields; do not touch other category enrichment.
-                for k in ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage", "amount_to_market_cap_pct"):
+                for k in neg_fields:
                     it.pop(k, None)
                 it.update(details)
                 it["_lookup_symbol"] = str(sym).strip().upper()
@@ -1125,11 +1233,11 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
                 it.pop("_lookup_symbol", None)
                 if details.get("amount_cr") is not None:
                     values += 1
-            after = {k: it.get(k) for k in ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage") if k in it}
+            after = {k: it.get(k) for k in neg_fields if k in it}
             if before != after:
                 changed += 1
     if checked:
-        print(f"  ♻ Negative local history v1 → checked={checked}, changed={changed}, value_found={values}")
+        print(f"  ♻ Negative local history v1.1 → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
@@ -1671,7 +1779,7 @@ def main():
     for _items in new_items.values():
         for _it in _items:
             if _it.get("category") == "Negative" and _it.get("local_pdf_checked"):
-                _it["negative_parser_version"] = 1
+                _it["negative_parser_version"] = 1.1
 
     # Internal join key must never be persisted.
     for _items in new_items.values():
