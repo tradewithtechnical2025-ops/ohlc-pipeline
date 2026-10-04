@@ -79,12 +79,13 @@ _PROMOTER_MPS_SALE = re.compile(
 
 # Incorporating/funding one's own subsidiary is not an external acquisition catalyst.
 _SUBSIDIARY_INCORPORATION = re.compile(
-    r"incorporation of (?:a |an )?(?:wholly owned |step[- ]down )?subsidiar|"
-    r"incorporat(?:e|ed|ion).*\b(?:wos|wholly owned subsidiary|step[- ]down subsidiary)\b", re.I)
+    r"incorporation of (?:a |an |one or more |[a-z0-9 -]+ )?(?:wholly owned |step[- ]down )?subsidiar(?:y|ies)|"
+    r"incorporat(?:e|ed|ion).*\b(?:wos|wholly owned subsidiar(?:y|ies)|step[- ]down subsidiar(?:y|ies))\b", re.I)
 _INTERNAL_SUB_INVESTMENT = re.compile(
-    r"(?:additional )?investment.*(?:wholly owned subsidiary|\bwos\b)|"
-    r"subscription.*(?:rights issue|equity shares).*?(?:wholly owned subsidiary|\bwos\b)|"
-    r"(?:wholly owned subsidiary|\bwos\b).*?(?:rights issue|additional investment|capital infusion)", re.I)
+    r"(?:additional )?investment.*(?:wholly owned subsidiar(?:y|ies)|\bwos\b)|"
+    r"(?:subscription|subscribe|subscribed).*?(?:rights issue|equity shares|share capital|preference shares|warrants).*?(?:wholly owned subsidiar(?:y|ies)|\bwos\b)|"
+    r"(?:wholly owned subsidiar(?:y|ies)|\bwos\b).*?(?:rights issue|additional investment|capital infusion|subscription|subscribe|subscribed)|"
+    r"investment (?:in|into).*?(?:wholly owned subsidiar(?:y|ies)|\bwos\b)", re.I)
 
 # Batch-1 precision rules: acquisition/divestment/strategic agreement.
 # These are deliberately summary-text rules so obvious exchange disclosures are
@@ -329,10 +330,17 @@ def classify(subject: str, text: str) -> str | None:
     # Batch-3: adverse licence/registration action must beat the broad NSE subject
     # "granting/withdrawal/surrender/cancellation/suspension". Only an explicit
     # positive grant/receipt/renewal is a Regulatory Approval catalyst.
-    if _REGULATORY_ADVERSE.search(both):
+    # NSE's subject taxonomy itself contains the words withdrawal/cancellation/
+    # suspension even for a positive receipt. Prefer the actual announcement text
+    # when it explicitly says a licence/registration was granted or received.
+    if _REGULATORY_GRANT.search(text) and not _REGULATORY_ADVERSE.search(text):
+        return "Regulatory Approval"
+    if _REGULATORY_ADVERSE.search(text):
         return "Negative"
     if _REGULATORY_GRANT.search(both):
         return "Regulatory Approval"
+    if _REGULATORY_ADVERSE.search(both):
+        return "Negative"
     if _MANAGEMENT_CHANGE.search(both):
         return "Management Change"
 
