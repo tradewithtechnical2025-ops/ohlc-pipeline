@@ -2410,7 +2410,25 @@ def _r2_get_json(session, filename: str):
         return None
 
 
-def _r2_put_json(session, filename: str, payload: dict):
+def _r2_get_json_strict(session, filename: str) -> tuple[bool, object]:
+    """(ok, data). 404 -> (True, None). Any other failure -> (False, None), so callers
+    never mistake a network glitch for an empty file and overwrite real history."""
+    import time
+    worker_url = os.environ["WORKER_URL"].rstrip("/")
+    token = os.environ["WORKER_TOKEN"]
+    try:
+        r = session.get(f"{worker_url}/{filename}?v={int(time.time())}",
+                        headers={"X-Secret-Token": token, "Cache-Control": "no-cache"}, timeout=30)
+        if r.status_code == 404:
+            return True, None
+        r.raise_for_status()
+        return True, r.json()
+    except Exception as e:
+        print(f"  ⚠ R2 read {filename} failed ({e})")
+        return False, None
+
+
+def _r2_put_json(session, filename: str, payload: dict, quiet: bool = False):
     import json
     import os
     worker_url = os.environ["WORKER_URL"].rstrip("/")
@@ -2422,7 +2440,152 @@ def _r2_put_json(session, filename: str, payload: dict):
         timeout=120,
     )
     r.raise_for_status()
-    print(f"  ✓ Uploaded {filename}")
+    if not quiet:
+        print(f"  ✓ Uploaded {filename}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Corporate Action PDF check (no AI)
+# NSE's summary often says "approved" while the PDF says the board only
+# RECOMMENDED it, subject to shareholder approval (postal ballot / EGM). The
+# stage comes from the PDF; credit and record dates are captured when stated.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CA_CHECK_BATCH = int(os.environ.get("CA_CHECK_BATCH", "20"))
+CA_CHECK_VERSION = 1
+_DATE_TXT = r"(?:[A-Z][a-z]+\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Z][a-z]+,?\s+\d{4}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4})"
+_CA_SH_APPROVED = re.compile(r"(?:approved|passed)\s+by\s+(?:the\s+)?(?:shareholders|members)|requisite majority|result[s]? of (?:the )?(?:postal ballot|e-?voting|egm)", re.I)
+_CA_SH_PENDING = re.compile(r"subject to (?:the )?(?:approval|consent) of (?:the )?(?:shareholders|members)|\brecommend(?:ed|s)?\b[^.]{0,80}(?:bonus|issu|split|sub-division)|draft postal ballot notice|convening (?:an? )?(?:extra[- ]?ordinary general meeting|egm)", re.I)
+_CA_CREDIT = re.compile(r"(?:credited|dispatched|allot(?:ted|ment)).{0,200}?on or before\s+(" + _DATE_TXT + r")", re.I)
+_CA_RECORD = re.compile(r"record date[^.]{0,60}?(?:is|as|fixed as|fixed|be|:)\s*(?:on\s+)?(?:[A-Z][a-z]+day,?\s+)?(" + _DATE_TXT + r")", re.I)
+
+
+def process_corp_actions(session, history: dict, limit: int = CA_CHECK_BATCH) -> None:
+    checked = changed = 0
+    for sym, items in history.items():
+        for it in items:
+            if checked >= limit:
+                break
+            if (it.get("manual") or it.get("category") != "Corporate Action"
+                    or int(it.get("ca_check_v") or 0) >= CA_CHECK_VERSION
+                    or it.get("event_type") in {"Dividend"}):
+                continue
+            pdf = _download_pdf_bytes(session, it.get("link", ""))
+            if not pdf:
+                continue
+            checked += 1
+            clean = _normalize_pdf_text(_extract_pdf_text_bytes(pdf))
+            before = (it.get("stage"), it.get("credit_by"), it.get("record_date"))
+            m = _CA_RECORD.search(clean)
+            if m:
+                it["record_date"] = m.group(1)
+            m = _CA_CREDIT.search(clean)
+            if m:
+                it["credit_by"] = m.group(1)
+            # Never move a later stage (record date / allotment / completed) backwards.
+            if it.get("stage") in {None, "", "Announced", "Approved", "Board Recommended"}:
+                if _CA_SH_APPROVED.search(clean):
+                    it["stage_override"] = it["stage"] = "Shareholders Approved"
+                elif _CA_SH_PENDING.search(clean):
+                    it["stage_override"] = it["stage"] = "Board Recommended"
+                if it.get("record_date"):
+                    it["stage_override"] = it["stage"] = "Record Date"
+            it["ca_check_v"] = CA_CHECK_VERSION
+            if (it.get("stage"), it.get("credit_by"), it.get("record_date")) != before:
+                changed += 1
+    if checked:
+        print(f"  🏷 Corporate action check → checked={checked}, changed={changed}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-symbol 3-year event archive (for chart markers)
+#   cat_hist_<SYMBOL>.json  → {"symbol", "updated", "events": [compact event, ...]}
+#   cat_hist__index.json    → {SYMBOL: {"h": hash of its 20-day window, "n", "last"}}
+# The rolling 20-day file stays small; charts fetch one symbol's archive on demand.
+# Inside the 20-day window the archive mirrors the live file (so fixes, merges and
+# removals carry over); older events are frozen and kept for ARCHIVE_YEARS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARCHIVE_YEARS = 3
+ARCHIVE_PREFIX = "cat_hist_"
+ARCHIVE_INDEX = "cat_hist__index.json"
+ARCHIVE_BATCH = int(os.environ.get("ARCHIVE_BATCH", "200"))   # symbol files written per run
+
+
+def archive_key(symbol: str) -> str:
+    return ARCHIVE_PREFIX + re.sub(r"[^A-Z0-9]", "_", str(symbol).upper()) + ".json"
+
+
+def _compact_event(it: dict) -> dict:
+    """Only what a chart marker and its tooltip need."""
+    cat = it.get("category")
+    relief = cat == "Negative" and re.search(r"relief|favourable|set aside|quashed|in favour",
+                                              f"{it.get('negative_type', '')} {it.get('negative_stage', '')}", re.I)
+    value = next((it.get(k) for k in ("order_value_cr", "capex_value_cr", "transaction_value_cr", "issue_value_cr",
+                                      "total_exposure_cr", "amount_cr", "agreement_value_cr")
+                  if it.get(k) is not None), None)
+    mcap = next((it.get(k) for k in ("order_to_market_cap_pct", "capex_to_market_cap_pct",
+                                     "transaction_to_market_cap_pct", "amount_to_market_cap_pct",
+                                     "agreement_to_market_cap_pct", "issue_to_market_cap_pct")
+                 if it.get(k) is not None), None)
+    summary = it.get("order_summary") or it.get("event_summary") or re.sub(
+        r"^.{0,120}?\bhas\s+informed\s+the\s+exchange\s+(?:about|regarding|that)\s+", "", it.get("text") or "", flags=re.I)
+    out = {
+        "id": it.get("id"), "dt": it.get("dt"), "react_date": it.get("react_date"), "session": it.get("session"),
+        "category": "Relief" if relief else cat,
+        "type": it.get("negative_type") if cat == "Negative" else it.get("event_type"),
+        "stage": it.get("negative_stage") if cat == "Negative" else it.get("stage"),
+        "value_cr": value, "mcap_pct": mcap, "ttm_pct": it.get("order_to_ttm_sales_pct"),
+        "ratio": it.get("ratio"), "customer": it.get("order_from") or it.get("vendor"),
+        "record_date": it.get("record_date"), "credit_by": it.get("credit_by"),
+        "summary": (summary or "")[:220], "link": it.get("link"),
+    }
+    return {k: v for k, v in out.items() if v not in (None, "")}
+
+
+def update_symbol_archives(session, history: dict, suppressed: dict, today: date) -> None:
+    import hashlib
+    ok, index = _r2_get_json_strict(session, ARCHIVE_INDEX)
+    if not ok:
+        print("  ⚠ Archive skipped this run (index unreadable)")
+        return
+    index = index if isinstance(index, dict) else {}
+    win_cut = (today - timedelta(days=HISTORY_DAYS)).isoformat()
+    arch_cut = (today - timedelta(days=365 * ARCHIVE_YEARS + 1)).isoformat()
+    written = failed = pending = 0
+    for sym in sorted(history):
+        compact = sorted((_compact_event(x) for x in history[sym] if x.get("id")),
+                         key=lambda e: e.get("dt", ""), reverse=True)
+        h = hashlib.sha1(json.dumps(compact, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        if (index.get(sym) or {}).get("h") == h:
+            continue
+        if written >= ARCHIVE_BATCH:
+            pending += 1
+            continue
+        key = archive_key(sym)
+        ok, arch = _r2_get_json_strict(session, key)
+        if not ok:
+            failed += 1
+            continue
+        cur_ids = {e["id"] for e in compact}
+        old = (arch or {}).get("events") or []
+        # Keep frozen history (older than the live window, younger than 3 years);
+        # inside the window the live file is the truth.
+        kept = [e for e in old if e.get("id") not in cur_ids and e.get("id") not in suppressed
+                and arch_cut <= str(e.get("dt", ""))[:10] < win_cut]
+        events = sorted(kept + compact, key=lambda e: e.get("dt", ""), reverse=True)
+        try:
+            _r2_put_json(session, key, {"symbol": sym, "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                        "events": events}, quiet=True)
+        except Exception as e:
+            print(f"  ⚠ Archive write {key} failed ({e})")
+            failed += 1
+            continue
+        index[sym] = {"h": h, "n": len(events), "last": events[0].get("dt", "") if events else ""}
+        written += 1
+    if written:
+        _r2_put_json(session, ARCHIVE_INDEX, index, quiet=True)
+    print(f"  📚 Symbol archive → written={written}, pending={pending}, failed={failed}, symbols={len(index)}")
 
 
 def _build_materiality_maps(classification_payload, fundamentals_payload):
@@ -2671,6 +2834,9 @@ def main():
     # Order check: heading value → PDF type check → AI only when needed.
     process_orders(nse_session, history, market_cap_map, ttm_sales_map)
 
+    # Corporate actions: stage (recommended vs shareholder-approved) and dates from the PDF.
+    process_corp_actions(nse_session, history)
+
     # Defensive final hygiene after merge: no Negative-only metadata may survive
     # on a card whose final category is something else.
     scrub_negative_metadata_from_nonnegative(history)
@@ -2702,6 +2868,13 @@ def main():
         "data": history,
     }
     _r2_put_json(r2_session, "nse_catalysts.json", payload)
+
+    # Per-symbol 3-year archive for chart markers. Runs after the main upload so
+    # an archive problem can never block the live file.
+    try:
+        update_symbol_archives(r2_session, history, suppressed, today)
+    except Exception as e:
+        print(f"  ⚠ Symbol archive step failed ({e})")
 
     print(f"  ✓ Catalyst scan complete: source={source}, fetched={fetched}, "
           f"new={added}, symbols={len(history)}, stored={total}")
