@@ -3204,9 +3204,29 @@ async def run_ep_scan() -> None:
             if isinstance(catalysts_raw,list):
                 catalyst_rows=catalysts_raw
             elif isinstance(catalysts_raw,dict):
+                # nse_catalysts.json production shape is normally:
+                # {"updated": ..., "source": ..., "data": {"SYMBOL": [events...]}}
+                # Older/alternate builds may expose a flat list under
+                # events/items/catalysts/data. Support both shapes.
                 for key in ("events","items","catalysts","data"):
-                    if isinstance(catalysts_raw.get(key),list):
-                        catalyst_rows=catalysts_raw[key]; break
+                    block=catalysts_raw.get(key)
+                    if isinstance(block,list):
+                        catalyst_rows=block
+                        break
+                    if isinstance(block,dict):
+                        for block_sym, block_events in block.items():
+                            if not isinstance(block_events,list):
+                                continue
+                            for ev in block_events:
+                                if not isinstance(ev,dict):
+                                    continue
+                                e=dict(ev)
+                                # Symbol is the dictionary key in the production file.
+                                e.setdefault("symbol",block_sym)
+                                catalyst_rows.append(e)
+                        if catalyst_rows:
+                            break
+                log.info(f"EP catalyst input: {len(catalyst_rows)} event row(s)")
 
             def _next_trading_day(d):
                 dt=date.fromisoformat(d)+timedelta(days=1)
@@ -3216,17 +3236,28 @@ async def run_ep_scan() -> None:
                 return d
 
             def _event_reaction_date(row):
+                # Prefer the catalyst backend's already-normalized reaction date
+                # and session. This is holiday-aware and avoids recalculating an
+                # AH filing from the raw announcement timestamp.
+                react=str(row.get("react_date") or row.get("reaction_date") or "").strip()[:10]
+                timing=str(row.get("session") or row.get("catalyst_timing") or "").strip().upper()
+                if react:
+                    try:
+                        date.fromisoformat(react)
+                        return react, timing
+                    except Exception:
+                        pass
+
                 raw=str(row.get("dt") or row.get("datetime") or row.get("timestamp") or row.get("date") or "").strip()
-                if not raw: return "", ""
+                if not raw: return "", timing
                 d=raw[:10]
                 try: date.fromisoformat(d)
-                except Exception: return "", ""
-                m=re.search(r"[T\s](\d{1,2}):(\d{2})",raw)
-                if m:
-                    hm=(int(m.group(1)),int(m.group(2)))
-                    timing="AH" if hm >= (15,30) else "IH"
-                else:
-                    timing=""
+                except Exception: return "", timing
+                if not timing:
+                    m=re.search(r"[T\s](\d{1,2}):(\d{2})",raw)
+                    if m:
+                        hm=(int(m.group(1)),int(m.group(2)))
+                        timing="AH" if hm >= (15,30) else "IH"
                 rd=_next_trading_day(d) if timing == "AH" else (d if is_trading_day(d) else _next_trading_day(d))
                 return rd,timing
 
@@ -3266,6 +3297,9 @@ async def run_ep_scan() -> None:
                         "result_date":rd,"session":sess,"quarter":meta.get("quarter_label") or "",
                         "next_trading_date":next_td
                     })
+
+            log.info(f"EP catalyst indexes: events={len(events_by_reaction)} reaction key(s), "
+                     f"results={len(results_by_reaction)} reaction key(s), candidates={len(signals)}")
 
             kept_signals=[]
             for sig in signals:
