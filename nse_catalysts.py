@@ -337,6 +337,8 @@ def _event_meta(subject: str, text: str, category: str) -> dict:
         if re.search(r"\bclos(?:ed|ure)\b|completed|completion", both, re.I): out["stage"] = "Completed"
         elif re.search(r"record date", both, re.I): out["stage"] = "Record Date"
         elif re.search(r"allot(?:ted|ment)", both, re.I): out["stage"] = "Allotment"
+        elif re.search(r"\brecommend(?:ed|s|ation)?\b|subject to (?:the )?(?:approval|consent) of (?:the )?(?:shareholders|members)", both, re.I):
+            out["stage"] = "Board Recommended"     # shareholder approval still pending
         elif re.search(r"approved|approval|outcome of board meeting", both, re.I): out["stage"] = "Approved"
         else: out["stage"] = "Announced"
     elif category == "Regulatory Approval":
@@ -1173,9 +1175,22 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             r"National Company Law Tribunal(?: \(NCLT\))?", r"National Company Law Appellate Tribunal(?: \(NCLAT\))?",
             r"Regional Provident Fund Commissioner(?: \(RPFC\))?",
         ]
+        # Every filing names SEBI's regulations and is addressed to NSE/BSE; those
+        # mentions are boilerplate, not the authority that acted.
+        auth_text = re.sub(
+            r"securities and exchange board of india\s*\((?:listing|prohibition|substantial|issue|share based|delisting)[^)]{0,120}\)\s*(?:regulations?)?(?:,?\s*\d{4})?|"
+            r"sebi\s*\((?:listing|lodr|prohibition|substantial|issue|pit)[^)]{0,120}\)\s*(?:regulations?)?(?:,?\s*\d{4})?|"
+            r"sebi (?:master )?circular[^.;]{0,120}", " ", clean, flags=re.I)
+        exch_action = re.compile(
+            r"(?:penalty|fine|notice|levied|imposed|action|suspension|show cause|email|letter)[^.]{0,90}"
+            r"(?:national stock exchange|\bnse\b|bse limited|\bbse\b)|"
+            r"(?:national stock exchange|\bnse\b|bse limited|\bbse\b)[^.]{0,60}"
+            r"(?:imposed|levied|has fined|issued|initiated|suspended)", re.I)
         found_auth = []
         for pat in auth_patterns:
-            m = re.search(pat, clean, re.I)
+            if re.search(r"Stock Exchange|BSE", pat) and not exch_action.search(auth_text):
+                continue
+            m = re.search(pat, auth_text, re.I)
             if m:
                 val = _clean_field(m.group(0), 120)
                 if val.lower() not in {x.lower() for x in found_auth}:
@@ -1372,7 +1387,7 @@ def backfill_local_history(session, history: dict, market_cap_map: dict | None =
         it["local_pdf_checked"] = True
         it["local_parser_version"] = 4.1
         if cat == "Negative":
-            it["negative_parser_version"] = 1.3
+            it["negative_parser_version"] = NEG_PARSER_VERSION
         if details:
             it.update(details)
             it["_lookup_symbol"] = str(sym).strip().upper()
@@ -1464,6 +1479,10 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
     return checked, changed, values
 
 
+NEG_PARSER_VERSION = 1.4        # 1.4: authority ignores SEBI-regulation / addressee boilerplate
+NEG_REVALIDATE_BATCH = int(os.environ.get("NEG_REVALIDATE_BATCH", "40"))
+
+
 def revalidate_negative_history(session, history: dict, market_cap_map: dict | None = None) -> tuple[int, int, int]:
     """One-time local Negative v1.3 refresh. Other v4.1 category parsers stay frozen."""
     checked = changed = values = 0
@@ -1475,8 +1494,13 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
                 neg_ver = float(it.get("negative_parser_version") or 0)
             except (TypeError, ValueError):
                 neg_ver = 0.0
-            if neg_ver >= 1.3:
+            if neg_ver >= NEG_PARSER_VERSION:
                 continue
+            if it.get("negative_type") == "Order Cancellation":
+                it["negative_parser_version"] = NEG_PARSER_VERSION   # set by the order check
+                continue
+            if checked >= NEG_REVALIDATE_BATCH:
+                break
             checked += 1
             neg_fields = ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage",
                           "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
@@ -1484,7 +1508,7 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
                           "total_exposure_cr", "relief_reference_cr", "relief_reference_text", "amount_to_market_cap_pct")
             before = {k: it.get(k) for k in neg_fields if k in it}
             pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
-            it["negative_parser_version"] = 1.3
+            it["negative_parser_version"] = NEG_PARSER_VERSION
             if not pdf_bytes:
                 continue
             details = _extract_local_catalyst_details("Negative", _extract_pdf_text_bytes(pdf_bytes))
@@ -1502,7 +1526,7 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
             if before != after:
                 changed += 1
     if checked:
-        print(f"  ♻ Negative local history v1.3 → checked={checked}, changed={changed}, value_found={values}")
+        print(f"  ♻ Negative local history v{NEG_PARSER_VERSION} → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
@@ -2183,7 +2207,7 @@ def _to_cancellation(it: dict, history_items: list, hv: float | None, htxt: str)
     it["category_override"] = it["category"] = "Negative"
     it["negative_type"] = "Order Cancellation"
     it["negative_stage"] = "Cancelled"
-    it["negative_parser_version"] = 1.3       # keep the Negative PDF parser from relabelling it
+    it["negative_parser_version"] = NEG_PARSER_VERSION   # keep the Negative PDF parser from relabelling it
     it.pop("event_type", None); it.pop("stage", None)
     if hv is not None:
         it["amount_cr"], it["amount_text"] = hv, htxt
@@ -2624,7 +2648,7 @@ def main():
     for _items in new_items.values():
         for _it in _items:
             if _it.get("category") == "Negative" and _it.get("local_pdf_checked"):
-                _it["negative_parser_version"] = 1.3
+                _it["negative_parser_version"] = NEG_PARSER_VERSION
 
     # Internal join key must never be persisted.
     for _items in new_items.values():
