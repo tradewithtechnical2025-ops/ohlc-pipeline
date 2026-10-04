@@ -70,9 +70,9 @@ _ROUTINE_PROFESSIONAL = re.compile(
 
 # SAST/promoter-shareholding disclosures are not acquisitions by the listed company.
 _SAST_NOISE = re.compile(
-    r"disclosure.*regulation\s*(?:29|31)\s*\(?[12]?\)?|"
-    r"regulation\s*29\s*\(?2\)?|regulation\s*31|"
-    r"substantial acquisition of shares and takeovers regulations|\bsast\b", re.I)
+    r"disclosure.*regulation\s*(?:10\s*\(?[56]\)?|29|31)\s*\(?[12]?\)?|"
+    r"regulation\s*(?:10\s*\(?[56]\)?|29\s*\(?2\)?|31)|"
+    r"substantial acquisition of shares and takeovers[^.]{0,35}regulations|\bsast\b", re.I)
 _PROMOTER_MPS_SALE = re.compile(
     r"sale of (?:equity )?shares by (?:a )?promoter.*(?:open market|minimum public shareholding)|"
     r"promoter.*(?:minimum public shareholding|\bmps\b)", re.I)
@@ -86,6 +86,27 @@ _INTERNAL_SUB_INVESTMENT = re.compile(
     r"subscription.*(?:rights issue|equity shares).*?(?:wholly owned subsidiary|\bwos\b)|"
     r"(?:wholly owned subsidiary|\bwos\b).*?(?:rights issue|additional investment|capital infusion)", re.I)
 
+# Batch-1 precision rules: acquisition/divestment/strategic agreement.
+# These are deliberately summary-text rules so obvious exchange disclosures are
+# resolved before any PDF enrichment.
+_ACQ_ROUTINE_INTERNAL = re.compile(
+    r"(?:acquisition|acquire|subscription|investment).*?(?:equity shares|share capital|rights issue).*?"
+    r"(?:wholly owned subsidiary|\bwos\b)|"
+    r"(?:wholly owned subsidiary|\bwos\b).*?(?:acquisition|acquire|subscription|investment).*?"
+    r"(?:equity shares|share capital|rights issue)|"
+    r"apportionment of (?:the )?cost of acquisition", re.I)
+_ACQ_DILUTION = re.compile(
+    r"dilution of (?:the )?(?:company['’ ]s )?shareholding|non[- ]participation in (?:the )?rights issue|"
+    r"shareholding.*(?:has been|is|was|will be|stands)\s+(?:reduced|diluted)|ceased to be .*subsidiary", re.I)
+_STRATEGIC_TO_ORDER = re.compile(
+    r"\bdeal win\b|(?:agreement|partnership).*?(?:customer contract|customer win|order awarded)", re.I)
+_STRATEGIC_TO_DIVEST = re.compile(
+    r"(?:mou|agreement).*?(?:sale of entire|sale of .*stake|sale of .*shareholding|disinvestment)|"
+    r"extinguishment of .*shares.*(?:buyback|joint venture)", re.I)
+_JV_STRATEGIC = re.compile(
+    r"(?:investment|equity investment|subscription).*?(?:joint venture|\bjv\b)|"
+    r"(?:joint venture|\bjv\b).*?(?:investment|equity investment|subscription|incorporation)", re.I)
+
 # Routine completion/allotment after an already-announced raise is not a new catalyst.
 _ROUTINE_ALLOTMENT = re.compile(
     r"allotment of (?:equity shares|shares|securities).*pursuant to (?:a )?(?:preferential|rights|qip)|"
@@ -98,7 +119,9 @@ _ROUTINE_CORP_ACTION = re.compile(
     r"dividend.*(?:tds|kyc|non[- ]?compliant)|non[- ]credit of dividend|"
     r"(?:agm|annual general meeting).*approval of dividend|approval of dividend.*(?:agm|annual general meeting)|"
     r"clarification.*valuation methodology.*preferential issue|"
-    r"dispatch.*(?:buyback|rights)|trading approval.*(?:bonus|split|rights|preferential)", re.I)
+    r"dispatch.*(?:buyback|rights)|trading approval.*(?:bonus|split|rights|preferential)|"
+    r"record date.*dividend|dividend.*record date|"
+    r"(?:payment|credit|remittance).*dividend|dividend.*(?:payment|credit|remittance)", re.I)
 
 # Insolvency/proceeding steps that do not change the economic state of the case.
 _CIRP_PROCEDURAL = re.compile(
@@ -145,7 +168,9 @@ _SCHEME_PROCEDURAL = re.compile(
     r"(?:audit committee|independent directors?).*report.*(?:scheme|merger|demerger|amalgamation)|"
     r"(?:notice|convening).*(?:shareholders?|creditors?).*meeting.*(?:scheme|merger|demerger)|"
     r"(?:hearing date|date of hearing).*?(?:scheme|merger|demerger|amalgamation)|"
-    r"(?:petition|second motion petition).*(?:admitted|admission)", re.I)
+    r"(?:petition|second motion petition).*(?:admitted|admission)|"
+    r"(?:filing|submission).*?(?:petition|application).*?(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:scheme|merger|demerger|amalgamation).*?(?:filing|submission).*?(?:petition|application)", re.I)
 
 # Only explicit senior executive changes are catalysts. NSE's generic subjects such as
 # "Resignation of Director/KMP/SMP" are intentionally NOT enough on their own;
@@ -160,6 +185,18 @@ _MANAGEMENT_CHANGE = re.compile(
 _REGULATORY_GRANT = re.compile(
     r"(?:grant|receipt|received|obtained|renewal).*?(?:licen[cs]e|registration|regulatory approval|certificate of registration)|"
     r"(?:licen[cs]e|registration|regulatory approval|certificate of registration).*?(?:granted|received|obtained|renewed)", re.I)
+
+# Batch-3 precision: distinguish genuine regulatory grants from adverse licence actions
+# and routine exchange/administrative approvals. Adverse action always wins.
+_REGULATORY_ADVERSE = re.compile(
+    r"(?:suspension|suspended|cancel(?:lation|led)|revocation|revoked|withdrawal|withdrawn|surrender).*?"
+    r"(?:licen[cs]e|registration|regulatory approval|certificate)|"
+    r"(?:licen[cs]e|registration|regulatory approval|certificate).*?"
+    r"(?:suspension|suspended|cancel(?:lation|led)|revocation|revoked|withdrawal|withdrawn|surrender)", re.I)
+_REGULATORY_ROUTINE = re.compile(
+    r"(?:in[- ]principle|trading|listing) approval.*?(?:shares|securities|allotment|esop|bonus|rights|preferential)|"
+    r"approval.*?(?:listing|trading).*?(?:shares|securities|allotment)|"
+    r"exchange approval.*?(?:allotment|listing|trading)", re.I)
 
 _NEGATIVE = re.compile(
     r"insolvency|\bcirp\b|default in interest|default in principal|show cause|"
@@ -245,6 +282,29 @@ def _event_meta(subject: str, text: str, category: str) -> dict:
         if re.search(r"non[- ]binding", both, re.I): out["stage"] = "Non-Binding MoU"
         elif re.search(r"definitive|executed|entered into|signed", both, re.I): out["stage"] = "Definitive / Signed"
         elif re.search(r"memorandum of understanding|\bmou\b", both, re.I): out["stage"] = "MoU"
+    elif category == "Corporate Action":
+        if re.search(r"buy ?back", both, re.I): out["event_type"] = "Buyback"
+        elif re.search(r"bonus", both, re.I): out["event_type"] = "Bonus"
+        elif re.search(r"stock split|sub-division", both, re.I): out["event_type"] = "Stock Split"
+        elif re.search(r"rights issue", both, re.I): out["event_type"] = "Rights Issue"
+        elif re.search(r"qualified institutional|\bqip\b", both, re.I): out["event_type"] = "QIP"
+        elif re.search(r"preferential issue", both, re.I): out["event_type"] = "Preferential Issue"
+        elif re.search(r"dividend", both, re.I): out["event_type"] = "Dividend"
+        else: out["event_type"] = "Corporate Action"
+        if re.search(r"clos(?:ed|ure)|completed|completion", both, re.I): out["stage"] = "Completed"
+        elif re.search(r"record date", both, re.I): out["stage"] = "Record Date"
+        elif re.search(r"allot(?:ted|ment)", both, re.I): out["stage"] = "Allotment"
+        elif re.search(r"approved|approval|outcome of board meeting", both, re.I): out["stage"] = "Approved"
+        else: out["stage"] = "Announced"
+    elif category == "Regulatory Approval":
+        out["event_type"] = "Regulatory Approval"
+        if re.search(r"renewal|renewed", both, re.I): out["stage"] = "Renewed"
+        elif re.search(r"grant|granted|receipt|received|obtained|certificate of registration", both, re.I): out["stage"] = "Granted / Received"
+        else: out["stage"] = "Approved"
+    elif category == "Management Change":
+        out["event_type"] = "Management Change"
+        if re.search(r"resignation|resigned|cessation|retirement|vacation of office", both, re.I): out["stage"] = "Exit"
+        elif re.search(r"appointment|appointed|reappointment|re-appointed", both, re.I): out["stage"] = "Appointment"
     return out
 
 
@@ -260,13 +320,17 @@ def classify(subject: str, text: str) -> str | None:
             _ROUTINE_ALLOTMENT.search(both) or _ROUTINE_CORP_ACTION.search(both) or
             _SAST_NOISE.search(both) or _PROMOTER_MPS_SALE.search(both) or
             _SUBSIDIARY_INCORPORATION.search(both) or _INTERNAL_SUB_INVESTMENT.search(both) or
-            _CIRP_PROCEDURAL.search(both) or _SCHEME_PROCEDURAL.search(both)):
+            _CIRP_PROCEDURAL.search(both) or _SCHEME_PROCEDURAL.search(both) or
+            _REGULATORY_ROUTINE.search(both)):
         return None
     if _IGNORE_SUBJECT.search(subject) or _DEBT.search(both):
         return None
 
-    # Positive regulatory grants must be resolved before the broad NSE subject
-    # "granting/withdrawal/.../suspension" can trigger the Negative regex.
+    # Batch-3: adverse licence/registration action must beat the broad NSE subject
+    # "granting/withdrawal/surrender/cancellation/suspension". Only an explicit
+    # positive grant/receipt/renewal is a Regulatory Approval catalyst.
+    if _REGULATORY_ADVERSE.search(both):
+        return "Negative"
     if _REGULATORY_GRANT.search(both):
         return "Regulatory Approval"
     if _MANAGEMENT_CHANGE.search(both):
@@ -284,11 +348,27 @@ def classify(subject: str, text: str) -> str | None:
     if _NEGATIVE.search(both):
         return "Negative"
 
+    # An explicit acquisition of customer contracts/business/assets remains an
+    # Acquisition even though the acquired object contains the word "contract".
+    if _ACQUISITION.search(both) and re.search(r"acquir(?:e|ed|ing).*?(?:customer contracts?|business|assets?)", both, re.I):
+        return "Acquisition"
+
     # Do not promote mere tender participation into an Order catalyst.
     if _ORDER_PRE_BID.search(both):
         return None
     if _ORDER.search(both):
         return "Order"
+
+    # Batch-1 cross-category resolution.  Economic substance beats NSE's broad
+    # Acquisition/Agreement subject labels.
+    if _ACQ_DILUTION.search(both) or _STRATEGIC_TO_DIVEST.search(both):
+        return "Divestment"
+    if _STRATEGIC_TO_ORDER.search(both):
+        return "Order"
+    if _JV_STRATEGIC.search(both):
+        return "Strategic Agreement"
+    if _ACQ_ROUTINE_INTERNAL.search(both):
+        return None
 
     # Divestment is checked before acquisition so JV dilution/business-sale text
     # containing the counterparty's word 'acquire' is not mislabeled Acquisition.
@@ -1493,7 +1573,7 @@ def consolidate_negative_relief_lifecycles(data: dict) -> int:
 
 _LIFECYCLE_CATEGORIES = {
     "Order", "Acquisition", "Divestment", "Scheme of Arrangement",
-    "Strategic Agreement", "Corporate Action",
+    "Strategic Agreement", "Corporate Action", "Regulatory Approval",
 }
 
 _LIFECYCLE_STOP = {
@@ -1562,13 +1642,18 @@ def _same_lifecycle(a: dict, b: dict) -> bool:
     if cat == "Corporate Action":
         return (gap == 0 and sim >= 0.22) or sim >= 0.58
 
+    # Regulatory grants/renewals can be duplicated by exchange filings, but do not
+    # merge different licences merely because the company is the same.
+    if cat == "Regulatory Approval":
+        return (gap == 0 and sim >= 0.45) or sim >= 0.70
+
     # Acquisition/divestment/strategic-agreement lifecycle updates normally repeat
     # the target/counterparty/project name, so require meaningful token overlap.
     return sim >= 0.42
 
 _STAGE_RANK = {
     "L1 / Awaiting Award": 10, "Announced": 10, "MoU": 10, "Non-Binding MoU": 5,
-    "Approved": 20, "Board Approved": 20, "Approved / Agreement": 25,
+    "Approved": 20, "Board Approved": 20, "Approved / Agreement": 25, "Allotment": 35,
     "Agreement Signed": 30, "Definitive / Signed": 30, "Exchange NOC": 35,
     "Awarded": 40, "NCLT Approved": 45, "Record Date": 50,
     "Completion Delayed/Extended": 55, "Effective / Completed": 60, "Completed": 60,
