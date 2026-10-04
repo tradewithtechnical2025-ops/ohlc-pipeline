@@ -561,6 +561,11 @@ def _extract_order_details(text: str) -> dict:
             if value_cr is not None and value_cr > 0:
                 role_context = _nearest_role_context(scope, m.start(), m.end())
                 role_score, role = _order_amount_role_score(raw, role_context)
+                # v4.1: component economics (TDR, land premium, PBG, advance,
+                # tranche, etc.) must never populate the headline order_value_cr.
+                # If no total/headline candidate exists, leave order_value_cr blank.
+                if role == "component":
+                    continue
                 candidates.append((scope_score, role_score, (1 if strong else 0), value_cr, raw, context, role))
         if candidates and scope_score == 2:
             # Row 7 is authoritative, but it can contain both a total and its
@@ -939,7 +944,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
             pdf_text = _extract_pdf_text_bytes(pdf_bytes)
             details = _extract_local_catalyst_details(cat, pdf_text)
             it["local_pdf_checked"] = True
-            it["local_parser_version"] = 4
+            it["local_parser_version"] = 4.1
             if details:
                 it.update(details)
                 _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
@@ -948,7 +953,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
                     values_found += 1
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
-    print(f"  ✓ Local PDF enrichment v4 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
+    print(f"  ✓ Local PDF enrichment v4.1 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
     return checked, enriched
 
 
@@ -977,11 +982,11 @@ def _clear_local_enrichment(item: dict) -> None:
 
 def revalidate_local_history(session, history: dict, market_cap_map: dict | None = None,
                              ttm_sales_map: dict | None = None) -> tuple[int, int, int]:
-    """One-time v4 reparse of legacy local-PDF enrichment.
+    """One-time v4.1 reparse/normalization of local-PDF enrichment.
 
     Old v1/v2 values may have been merged forward even after the parser became
     stricter.  Every locally enriched historical row is therefore reparsed once
-    with v4.  The version marker prevents repeat downloads on later runs.
+    with v4.1.  The version marker prevents repeat downloads on later runs.
     Gemini/manual enrichment is never touched.
     """
     checked = changed = values = 0
@@ -991,9 +996,12 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
         for it in items:
             if it.get("manual") or it.get("category") not in supported:
                 continue
-            if it.get("detail_source") not in {"local_pdf", "pdf_local"}:
+            source = it.get("detail_source")
+            if source not in {None, "local_pdf", "pdf_local"}:
                 continue
-            if int(it.get("local_parser_version") or 0) >= 4:
+            if not it.get("local_pdf_checked") and source not in {"local_pdf", "pdf_local"}:
+                continue
+            if float(it.get("local_parser_version") or 0) >= 4.1:
                 continue
 
             checked += 1
@@ -1001,7 +1009,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
             pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
             _clear_local_enrichment(it)
             it["local_pdf_checked"] = True
-            it["local_parser_version"] = 4
+            it["local_parser_version"] = 4.1
 
             if pdf_bytes:
                 pdf_text = _extract_pdf_text_bytes(pdf_bytes)
@@ -1020,7 +1028,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
                 changed += 1
 
     if checked:
-        print(f"  ♻ Local PDF v4 history revalidation → checked={checked}, changed={changed}, value_found={values}")
+        print(f"  ♻ Local PDF v4.1 history revalidation → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
