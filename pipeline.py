@@ -2219,10 +2219,14 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
             # CURRENT STATE — SEQUENTIAL STATE MACHINE
             # ==========================================================
 
-            # Dead is terminal and checked first, so an EP that fails within
-            # its first 2 sessions shows Dead instead of being hidden as Watch.
+            # Dead is terminal and checked first. Gap EP keeps the original
+            # previous-high failure level. For Non-Gap EP, previous close is
+            # the meaningful reaction base; using previous high can mark a
+            # valid non-gap reaction Dead immediately even while it holds the
+            # breakout move above the prior close.
+            dead_level = prev_high if is_gap_ep else prev_close
             dead_early = any(
-                closes[j] is not None and closes[j] < prev_high
+                closes[j] is not None and closes[j] < dead_level
                 for j in range(i + 1, n)
             )
 
@@ -2250,7 +2254,7 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                     # --------------------------------------------------
                     # DEAD — terminal state
                     # --------------------------------------------------
-                    if c < prev_high:
+                    if c < dead_level:
                         state = "Dead"
                         break
 
@@ -2400,19 +2404,10 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                 "consolidation": age,
             })
 
-    # Latest EP per symbol.
-    seen = {}
-
-    for sig in signals:
-        sym = sig["symbol"]
-
-        if (
-            sym not in seen
-            or sig["ep_date"] > seen[sym]["ep_date"]
-        ):
-            seen[sym] = sig
-
-    return list(seen.values())
+    # Return every qualifying candidate. Catalyst gating happens later in
+    # run_ep_scan(); collapsing here can let a newer uncatalyzed Non-Gap EP
+    # hide an older valid Gap/Earnings/Event EP for the same symbol.
+    return signals
 
 def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,volume_spike_x=1.5,close_position_min=0.5,volume_lookback=20,max_result_age_days=30):
     today_str=today_ist(); cutoff=(date.fromisoformat(today_str)-timedelta(days=max_result_age_days)).isoformat()
@@ -2867,6 +2862,10 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             # Explicit field for the frontend's All/NSE/BSE filter — safer
             # than parsing the "NSE:"/"BSE:" prefix back out of tv_code.
             "exchange":_cls_exch,
+            # Actual market-data date for this row. Never use the pipeline run
+            # date here: weekend/holiday runs must still identify the latest
+            # trading session represented by the OHLC values.
+            "date":dates[ltp_idx], "as_of_date":dates[ltp_idx],
             "sector":cls_info.get("sector_group",""),"industry":cls_info.get("display_industry",""),
             "mcap":cls_info.get("market_cap_cr"),"themes":cls_info.get("themes",[]),
             "ltp":ltp,"pct_ch":pct_ch,"volume":vol,"rvol":rvol,"rvol50":rvol50,
@@ -3039,6 +3038,19 @@ async def run_ep_scan() -> None:
                 if isinstance(res,Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
                 elif res and "stocks" in res: all_data.update(res["stocks"])
             log.info(f"Loaded {len(all_data)} stocks")
+
+            # Authoritative market-data date for screener_feed/history.
+            # On weekends/holidays the pipeline may run today, while OHLC still
+            # ends on the previous trading session. Never label that snapshot
+            # with the calendar run date.
+            _market_dates = [
+                str(series.get("d", [])[-1])[:10]
+                for series in all_data.values()
+                if isinstance(series, dict) and series.get("d")
+            ]
+            market_data_date = max(_market_dates) if _market_dates else today
+            log.info(f"Market data as-of date: {market_data_date} (run date: {today})")
+
             screener={}
             if isinstance(screener_raw,list):
                 for row in screener_raw:
@@ -3290,7 +3302,15 @@ async def run_ep_scan() -> None:
                 if sig.get("reaction_type") == "Gap EP":
                     kept_signals.append(sig)
 
-            signals=kept_signals
+            # Catalyst gating is complete. Only now choose the latest VALID
+            # EP per symbol, so an uncatalyzed Non-Gap candidate cannot erase
+            # an older valid signal.
+            latest_valid={}
+            for sig in kept_signals:
+                sym=sig.get("symbol")
+                if sym and (sym not in latest_valid or sig.get("ep_date","") > latest_valid[sym].get("ep_date","")):
+                    latest_valid[sym]=sig
+            signals=list(latest_valid.values())
             from collections import Counter as _Counter
             log.info(f"DEP states: {dict(_Counter(s.get('state') for s in signals))}  "
                      f"types: {dict(_Counter(s.get('ep_type') for s in signals))}")
@@ -3364,7 +3384,7 @@ async def run_ep_scan() -> None:
             gaps_by_sym=await update_gap_tracker(client,all_data,today)
             gap_state=_build_gap_state(all_data,gaps_by_sym,today)
             gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
-            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,today,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map,vcp_map=vcp_map,ath_map=ath_map)
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,market_data_date,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map,vcp_map=vcp_map,ath_map=ath_map)
             mtf_ma_map=_calc_multi_tf_ma(all_data)
             log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
             for row in screener_feed:
@@ -3418,13 +3438,12 @@ async def run_ep_scan() -> None:
             for sig in pr_signals:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
 
-            # ── Date confirmation for frontend: authoritative pipeline date,
-            # not the client's local clock. today = today_ist() (IST calendar
-            # date this run actually processed), so even if a run is delayed
-            # or a stale cache is served, the frontend can show the true
-            # as-of date instead of silently implying "today".
+            # ── Date confirmation for frontend. as_of_date is the latest
+            # actual OHLC trading session, NOT the calendar day the job ran.
+            # This prevents Saturday/Sunday/holiday runs from showing a fake
+            # non-trading date in the screener frontend.
             screener_meta = {
-                "as_of_date": today,
+                "as_of_date": market_data_date,
                 "generated_at_ist": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
                 "stock_count": len(screener_feed),
             }
@@ -3467,8 +3486,8 @@ async def run_ep_scan() -> None:
                                           schema_v=1, extra_meta={"stock_count": len(screener_feed)}),
                 upload_str_with_manifest(client, r2_upload, "screener_meta.json", json.dumps(screener_meta),
                                           schema_v=1, extra_meta={}),
-                backup_pattern_history(client,screener_feed,today,gap_new=gap_new,gap_filled=gap_filled),
-                archive_screener_feed_history(client, screener_feed, today),
+                backup_pattern_history(client,screener_feed,market_data_date,gap_new=gap_new,gap_filled=gap_filled),
+                archive_screener_feed_history(client, screener_feed, market_data_date),
             )
             log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
         status.success()
