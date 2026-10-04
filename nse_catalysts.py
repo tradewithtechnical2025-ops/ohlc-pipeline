@@ -108,6 +108,36 @@ _CIRP_PROCEDURAL = re.compile(
     r"interim resolution professional.*(?:performing|functions)|"
     r"cirp.*trading window|trading window.*cirp", re.I)
 
+# Some NSE CIRP summaries are completely generic; the filing filename/link carries
+# the procedural meaning.  These patterns are intentionally narrow and are used
+# only for Negative/CIRP rows, never as a global subject filter.
+_CIRP_PROCEDURAL_ITEM = re.compile(
+    r"(?:coc|committee[ _-]?of[ _-]?creditors).{0,40}(?:meeting|outcome|voting)|"
+    r"(?:meeting|outcome|voting).{0,40}(?:coc|committee[ _-]?of[ _-]?creditors)|"
+    r"appointment.{0,30}(?:irp|rp|resolution[ _-]?professional)|"
+    r"(?:irp|rp|resolution[ _-]?professional).{0,30}appointment|"
+    r"trading[ _-]?window|vacation[ _-]?(?:of[ _-]?)?(?:office|director)", re.I)
+
+_CIRP_MATERIAL = re.compile(
+    r"(?:cirp|insolvency).*(?:admit(?:ted|sion)?|initiat(?:ed|ion)|commenc(?:ed|ement))|"
+    r"resolution plan.*(?:approved|rejected|dismissed|accepted)|"
+    r"(?:nclt|nclat).*(?:approved|rejected|sanctioned|dismissed|liquidation)|"
+    r"liquidation.*(?:ordered|order|approved)|"
+    r"(?:settlement|withdrawal|termination).*(?:cirp|insolvency)|"
+    r"(?:cirp|insolvency).*(?:settlement|withdrawal|termination)", re.I)
+
+def _is_cirp_procedural_item(item: dict) -> bool:
+    """Drop only clearly administrative CIRP filings; material case milestones win."""
+    subject = str(item.get("subject") or "")
+    text = str(item.get("text") or "")
+    link = str(item.get("link") or "")
+    both = f"{subject} {text} {link}"
+    if not re.search(r"corporate insolvency resolution process|\bcirp\b|insolvency", both, re.I):
+        return False
+    if _CIRP_MATERIAL.search(both):
+        return False
+    return bool(_CIRP_PROCEDURAL.search(both) or _CIRP_PROCEDURAL_ITEM.search(both))
+
 # Scheme notices/reports are procedural; retain approvals, NCLT orders, effective dates,
 # record dates and implementation/completion milestones.
 _SCHEME_PROCEDURAL = re.compile(
@@ -829,6 +859,42 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["buyer"] = _clean_field(buyer.group(1), 120)
 
     elif category == "Negative":
+        # Negative disclosures need type/stage even when no reliable amount exists.
+        # This remains fully local: machine-readable PDF text + deterministic regex.
+        if re.search(r"\b(?:sfio|serious fraud investigation office)\b", clean, re.I):
+            out["negative_type"] = "SFIO Investigation"
+            out["negative_stage"] = "Investigation / Notice"
+        elif re.search(r"\b(?:enforcement directorate|\bed\b|cbi|central bureau of investigation)\b", clean, re.I):
+            out["negative_type"] = "Regulatory Investigation"
+            out["negative_stage"] = "Investigation / Notice"
+        elif re.search(r"show[ -]?cause", clean, re.I):
+            out["negative_type"] = "Show Cause Notice"
+            out["negative_stage"] = "Notice"
+        elif re.search(r"\b(?:gst|income tax|tax authority|tax demand)\b", clean, re.I):
+            out["negative_type"] = "Tax / GST"
+            out["negative_stage"] = "Demand / Order" if re.search(r"demand|order", clean, re.I) else "Notice"
+        elif re.search(r"penalty|\bfine\b", clean, re.I):
+            out["negative_type"] = "Penalty / Fine"
+            out["negative_stage"] = "Order / Penalty"
+        elif re.search(r"litigation|dispute|court|tribunal|arbitration", clean, re.I):
+            out["negative_type"] = "Litigation / Dispute"
+            out["negative_stage"] = "Update"
+        elif re.search(r"search and seizure|\braid\b", clean, re.I):
+            out["negative_type"] = "Search / Raid"
+            out["negative_stage"] = "Investigation"
+        elif re.search(r"fire|accident|shutdown|plant closure", clean, re.I):
+            out["negative_type"] = "Operational Incident"
+            out["negative_stage"] = "Incident"
+        elif re.search(r"liquidation", clean, re.I):
+            out["negative_type"] = "Insolvency / Liquidation"
+            out["negative_stage"] = "Liquidation"
+        elif re.search(r"resolution plan", clean, re.I):
+            out["negative_type"] = "Insolvency / Resolution Plan"
+            out["negative_stage"] = "Decision"
+        elif re.search(r"\bcirp\b|insolvency", clean, re.I):
+            out["negative_type"] = "Insolvency / CIRP"
+            out["negative_stage"] = "Material Update"
+
         value, raw, context = _best_money(clean, r"penalty|demand|fine|tax|claim|litigation|show cause|order")
         if value is not None:
             out["amount_cr"] = value
@@ -963,6 +1029,7 @@ _LOCAL_ENRICHMENT_FIELDS = {
     "transaction_value_cr", "transaction_value_text", "stake_acquired_pct",
     "post_transaction_stake_pct", "target", "stake_sold_pct", "buyer",
     "amount_cr", "amount_text", "amount_context", "authority",
+    "negative_type", "negative_stage",
     "agreement_value_cr", "agreement_value_text", "binding_status", "counterparty",
     "scheme_type", "scheme_date_text", "issue_value_cr", "issue_value_text",
     "ratio", "price_per_security", "detail_excerpt",
@@ -1029,6 +1096,40 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
 
     if checked:
         print(f"  ♻ Local PDF v4.1 history revalidation → checked={checked}, changed={changed}, value_found={values}")
+    return checked, changed, values
+
+
+def revalidate_negative_history(session, history: dict, market_cap_map: dict | None = None) -> tuple[int, int, int]:
+    """One-time local Negative refresh. Other v4.1 category parsers stay frozen."""
+    checked = changed = values = 0
+    for sym, items in history.items():
+        for it in items:
+            if it.get("manual") or it.get("category") != "Negative":
+                continue
+            if int(it.get("negative_parser_version") or 0) >= 1:
+                continue
+            checked += 1
+            before = {k: it.get(k) for k in ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage") if k in it}
+            pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
+            it["negative_parser_version"] = 1
+            if not pdf_bytes:
+                continue
+            details = _extract_local_catalyst_details("Negative", _extract_pdf_text_bytes(pdf_bytes))
+            if details:
+                # Replace only Negative-owned local fields; do not touch other category enrichment.
+                for k in ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage", "amount_to_market_cap_pct"):
+                    it.pop(k, None)
+                it.update(details)
+                it["_lookup_symbol"] = str(sym).strip().upper()
+                _apply_materiality_ratios(it, "Negative", details, market_cap_map, None)
+                it.pop("_lookup_symbol", None)
+                if details.get("amount_cr") is not None:
+                    values += 1
+            after = {k: it.get(k) for k in ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage") if k in it}
+            if before != after:
+                changed += 1
+    if checked:
+        print(f"  ♻ Negative local history v1 → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
@@ -1510,7 +1611,7 @@ def main():
                 cleaned.append(x)
                 continue
             cat = classify(x.get("subject", ""), x.get("text", ""))
-            if not cat:
+            if not cat or _is_cirp_procedural_item(x):
                 removed_noise += 1
                 continue
             if x.get("category") != cat:
@@ -1527,6 +1628,10 @@ def main():
     if removed_noise or reclassified:
         print(f"  🧹 Historical cleanup → removed={removed_noise}, reclassified={reclassified}")
 
+    # Negative-only local refresh. This does not alter the frozen v4.1 parsers
+    # for Orders, Acquisition, Corporate Action, etc.
+    revalidate_negative_history(r2_session, history, market_cap_map)
+
     existing_ids = {x.get("id") for items in history.values() for x in items if x.get("id")}
     initial_build = not bool(existing_ids)
 
@@ -1534,6 +1639,23 @@ def main():
         nse_session, today, HISTORY_DAYS, is_trading_day, next_trading_day
     )
     fetched = sum(len(v) for v in new_items.values())
+
+    # NSE often gives CIRP filings a generic summary, so use the PDF filename/link
+    # as an additional deterministic signal for clearly procedural fresh rows.
+    fresh_procedural_removed = 0
+    for _sym in list(new_items):
+        _kept = []
+        for _it in new_items[_sym]:
+            if _it.get("category") == "Negative" and _is_cirp_procedural_item(_it):
+                fresh_procedural_removed += 1
+                continue
+            _kept.append(_it)
+        if _kept:
+            new_items[_sym] = _kept
+        else:
+            del new_items[_sym]
+    if fresh_procedural_removed:
+        print(f"  🧹 Fresh CIRP procedural cleanup → removed={fresh_procedural_removed}")
 
     # Stamp the group symbol temporarily so enrichment can join to the R2
     # classification/fundamentals lookups without changing the stored schema.
@@ -1546,6 +1668,10 @@ def main():
         nse_session, new_items, existing_ids, today, initial_build,
         market_cap_map, ttm_sales_map
     )
+    for _items in new_items.values():
+        for _it in _items:
+            if _it.get("category") == "Negative" and _it.get("local_pdf_checked"):
+                _it["negative_parser_version"] = 1
 
     # Internal join key must never be persisted.
     for _items in new_items.values():
