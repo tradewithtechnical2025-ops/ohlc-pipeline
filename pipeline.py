@@ -2022,7 +2022,9 @@ async def backup_pattern_history(client, feed, today, gap_new=None, gap_filled=N
 # state = dynamic current
 # behavior (Watch / Runner / Consolidation / Pullback / Dead). No buy trigger.
 def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
-               volume_lookback=20, max_ep_age_days=30):
+               volume_lookback=20, max_ep_age_days=30,
+               non_gap_move_pct=5.0, non_gap_volume_spike_x=3.0,
+               non_gap_close_position_min=0.60):
 
     signals = []
 
@@ -2099,6 +2101,7 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
     for sym, s in all_data.items():
 
         dates = s["d"]
+        opens = s["o"]
         highs = s["h"]
         lows = s["l"]
         closes = s["c"]
@@ -2121,23 +2124,16 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
             # ==========================================================
 
             prev_high = highs[i - 1]
+            prev_close = closes[i - 1]
+            ep_open = opens[i]
             ep_low = lows[i]
             ep_high = highs[i]
             ep_close = closes[i]
 
-            if any(v is None for v in (prev_high, ep_low, ep_high, ep_close)):
+            if any(v is None for v in (prev_high, prev_close, ep_low, ep_high, ep_close)):
                 continue
 
-            if prev_high <= 0 or ep_low <= 0:
-                continue
-
-            # True gap-up.
-            if ep_low <= prev_high:
-                continue
-
-            gap_pct = (ep_low - prev_high) / prev_high * 100
-
-            if gap_pct < min_gap_pct:
+            if prev_high <= 0 or prev_close <= 0 or ep_low <= 0:
                 continue
 
             hist_vol = [
@@ -2155,8 +2151,40 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
 
             vol_x = volumes[i] / avg_vol
 
-            if vol_x < volume_spike_x:
+            # Existing Gap EP path stays unchanged:
+            # true gap above previous high, >=2% gap, >=2x 20D volume.
+            true_gap_pct = (ep_low - prev_high) / prev_high * 100
+            is_gap_ep = (
+                ep_low > prev_high
+                and true_gap_pct >= min_gap_pct
+                and vol_x >= volume_spike_x
+            )
+
+            # New Non-Gap EP path:
+            # close-vs-previous-close >=5%, >=3x 20D volume,
+            # and close in the upper 40% of the day's range (position >=60%).
+            day_move_pct = (ep_close - prev_close) / prev_close * 100
+            day_range = ep_high - ep_low
+            close_position = ((ep_close - ep_low) / day_range) if day_range > 0 else 1.0
+            is_non_gap_ep = (
+                not is_gap_ep
+                and day_move_pct >= non_gap_move_pct
+                and vol_x >= non_gap_volume_spike_x
+                and close_position >= non_gap_close_position_min
+            )
+
+            if not (is_gap_ep or is_non_gap_ep):
                 continue
+
+            reaction_type = "Gap EP" if is_gap_ep else "Non-Gap EP"
+            # Keep gap_pct meaningful in the UI for both paths: Gap EP uses the
+            # original low-vs-prev-high definition; Non-Gap uses open-vs-prev-close.
+            if is_gap_ep:
+                gap_pct = true_gap_pct
+            elif ep_open is not None and ep_open > 0:
+                gap_pct = (ep_open - prev_close) / prev_close * 100
+            else:
+                gap_pct = 0.0
 
             age = n - 1 - i
 
@@ -2340,6 +2368,9 @@ def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
                 "gap_pct": round(gap_pct, 2),
 
                 "vol_spike_x": round(vol_x, 2),
+                "reaction_type": reaction_type,
+                "day_move_pct": round(day_move_pct, 2),
+                "close_position_pct": round(close_position * 100, 1),
 
                 "ep_candle_high": round(ep_high, 2),
                 "ep_candle_low": round(ep_low, 2),
@@ -2984,7 +3015,7 @@ async def run_ep_scan() -> None:
             ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
             (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
              idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
-             hlr_raw,pb_raw,pat_raw,w_pb_raw,w_hlr_raw,m_pb_raw,ema_shakeout_raw,htf_raw,vcp_raw,ath_raw)=await asyncio.gather(
+             hlr_raw,pb_raw,pat_raw,w_pb_raw,w_hlr_raw,m_pb_raw,ema_shakeout_raw,htf_raw,vcp_raw,ath_raw,catalysts_raw,results_detailed_raw)=await asyncio.gather(
                 asyncio.gather(*ohlc_tasks,return_exceptions=True),
                 r2_download(client,"screener.json"),
                 r2_download(client,"fundamentals_summary.json"),   # ← CHANGED (was r2_download_fund(client))
@@ -3000,6 +3031,8 @@ async def run_ep_scan() -> None:
                 r2_download(client,"htf_test_results.json"),   # ← NEW: htf_test_scan.py's HTF / Mini-HTF flag-pole signals
                 r2_download(client,"vcp_signals.json"),   # ← NEW: run_vcp_scan()'s VCP (Volatility Contraction Pattern) signals
                 r2_download(client,"ath_data.json"),   # ← NEW: All-Time-High per symbol, merged into screener_feed below
+                r2_download(client,"nse_catalysts.json"),  # material NSE events for Event EP attribution
+                r2_download(client,"nse_results_detailed.json"),  # authoritative Results BH/IH/AH session metadata
             )
             all_data={}
             for i,res in enumerate(ohlc_results):
@@ -3149,21 +3182,115 @@ async def run_ep_scan() -> None:
                 return q_name,sales_ch,eps_ch
 
             signals=_detect_ep(all_data)
-            # ── DEP Catalyst: Results on previous trading session ──
+
+            # ── EP catalyst attribution ──
+            # Priority: Earnings EP > Event EP > Normal EP.
+            # Non-Gap EP is catalyst-gated: it is retained only when a Results
+            # filing or material Market Event maps to that reaction session.
+            # Gap EP remains eligible without a catalyst (Normal EP).
+            catalyst_rows=[]
+            if isinstance(catalysts_raw,list):
+                catalyst_rows=catalysts_raw
+            elif isinstance(catalysts_raw,dict):
+                for key in ("events","items","catalysts","data"):
+                    if isinstance(catalysts_raw.get(key),list):
+                        catalyst_rows=catalysts_raw[key]; break
+
+            def _next_trading_day(d):
+                dt=date.fromisoformat(d)+timedelta(days=1)
+                for _ in range(14):
+                    if is_trading_day(dt.isoformat()): return dt.isoformat()
+                    dt+=timedelta(days=1)
+                return d
+
+            def _event_reaction_date(row):
+                raw=str(row.get("dt") or row.get("datetime") or row.get("timestamp") or row.get("date") or "").strip()
+                if not raw: return "", ""
+                d=raw[:10]
+                try: date.fromisoformat(d)
+                except Exception: return "", ""
+                m=re.search(r"[T\s](\d{1,2}):(\d{2})",raw)
+                if m:
+                    hm=(int(m.group(1)),int(m.group(2)))
+                    timing="AH" if hm >= (15,30) else "IH"
+                else:
+                    timing=""
+                rd=_next_trading_day(d) if timing == "AH" else (d if is_trading_day(d) else _next_trading_day(d))
+                return rd,timing
+
+            events_by_reaction={}
+            for ev in catalyst_rows:
+                if not isinstance(ev,dict): continue
+                sym=str(ev.get("symbol") or ev.get("ticker") or "").strip().upper()
+                rd,timing=_event_reaction_date(ev)
+                if not sym or not rd: continue
+                e=dict(ev); e["_catalyst_timing"]=timing
+                events_by_reaction.setdefault((sym,rd),[]).append(e)
+
+            # Results source used by the Earnings Screener. market_session is
+            # already classified as BH / IH / AH; next_trading_date is preferred
+            # over calculating a weekday so exchange holidays are respected.
+            results_by_reaction={}
+            result_items=[]
+            if isinstance(results_detailed_raw,dict):
+                result_items=results_detailed_raw.get("items") or []
+            elif isinstance(results_detailed_raw,list):
+                result_items=results_detailed_raw
+            for it in result_items:
+                if not isinstance(it,dict): continue
+                meta=it.get("meta") or {}; pr=it.get("price_reaction") or {}
+                sym=str(meta.get("symbol") or "").strip().upper()
+                rd=str(meta.get("board_meeting_date") or "")[:10]
+                sess=str(meta.get("market_session") or "").upper()
+                next_td=str(pr.get("next_trading_date") or "")[:10]
+                if not sym or not rd: continue
+                reaction_dates=[]
+                if sess == "BH": reaction_dates=[rd]
+                elif sess == "AH": reaction_dates=[next_td or _next_trading_day(rd)]
+                elif sess == "IH": reaction_dates=[rd, next_td or _next_trading_day(rd)]
+                else: reaction_dates=[rd, next_td or _next_trading_day(rd)]
+                for react_d in dict.fromkeys(x for x in reaction_dates if x):
+                    results_by_reaction.setdefault((sym,react_d),[]).append({
+                        "result_date":rd,"session":sess,"quarter":meta.get("quarter_label") or "",
+                        "next_trading_date":next_td
+                    })
+
+            kept_signals=[]
             for sig in signals:
-                try:
-                    result_date = prev_trading_day(sig["ep_date"])
-                    result_symbols = result_calendar.get(result_date, [])
-                    if sig["symbol"] in result_symbols:
-                        sig["catalyst"] = "Results"
-                        sig["ep_type"] = "Earnings EP"
-                        sig["result_date"] = result_date
-                    else:
-                        sig["catalyst"] = ""
-                        sig["result_date"] = ""
-                except Exception:
-                    sig["catalyst"] = ""
-                    sig["result_date"] = ""
+                sig["catalyst"]=""; sig["result_date"]=""; sig["catalyst_timing"]=""
+                sig["catalyst_category"]=""; sig["catalyst_id"]=""; sig["catalyst_summary"]=""
+                key=(sig["symbol"].upper(),sig["ep_date"])
+
+                result_matches=results_by_reaction.get(key,[])
+                if result_matches:
+                    # If IH qualifies both same day and next day, each detected EP
+                    # is attributed to the actual reaction date being evaluated.
+                    rr=max(result_matches,key=lambda x:x.get("result_date") or "")
+                    sig["catalyst"]="Results"
+                    sig["ep_type"]="Earnings EP"
+                    sig["result_date"]=rr.get("result_date","")
+                    sig["catalyst_timing"]=rr.get("session","")
+                    kept_signals.append(sig)
+                    continue
+
+                matches=events_by_reaction.get(key,[])
+                if matches:
+                    ev=max(matches,key=lambda x:str(x.get("dt") or x.get("datetime") or x.get("timestamp") or x.get("date") or ""))
+                    cat=str(ev.get("category") or ev.get("event_type") or "Event").strip()
+                    sig["ep_type"]="Event EP"; sig["catalyst"]=cat
+                    sig["catalyst_timing"]=ev.get("_catalyst_timing","")
+                    sig["catalyst_category"]=cat
+                    sig["catalyst_id"]=str(ev.get("id") or ev.get("announcement_id") or "")
+                    sig["catalyst_summary"]=str(ev.get("event_summary") or ev.get("summary") or ev.get("subject") or "").strip()
+                    kept_signals.append(sig)
+                    continue
+
+                # No catalyst: preserve existing Gap EP / Normal EP behaviour,
+                # but do not admit the new Non-Gap EP path on price/volume alone.
+                if sig.get("reaction_type") == "Gap EP":
+                    kept_signals.append(sig)
+
+            signals=kept_signals
             from collections import Counter as _Counter
             log.info(f"DEP states: {dict(_Counter(s.get('state') for s in signals))}  "
                      f"types: {dict(_Counter(s.get('ep_type') for s in signals))}")
