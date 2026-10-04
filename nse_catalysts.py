@@ -34,7 +34,7 @@ EQUITY_L  = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
 HISTORY_DAYS = 20          # TEST MODE: keep/fetch only the last 20 calendar days
 TEXT_MAX     = 300         # exchange summary is enough; the PDF link has the rest
-BACKFILL_PDF_BATCH = 150    # max never-opened history PDFs parsed per run (local parser, no AI)
+BACKFILL_PDF_BATCH = 10    # max never-opened history PDFs parsed per run (local parser, no AI)
 BACKFILL_MAX_ATTEMPTS = 3  # failed downloads retried on later runs before giving up
 
 MARKET_OPEN  = dtime(9, 15)
@@ -124,7 +124,10 @@ _ROUTINE_CORP_ACTION = re.compile(
     r"clarification.*valuation methodology.*preferential issue|"
     r"dispatch.*(?:buyback|rights)|trading approval.*(?:bonus|split|rights|preferential)|"
     r"record date.*dividend|dividend.*record date|"
-    r"(?:payment|credit|remittance).*dividend|dividend.*(?:payment|credit|remittance)", re.I)
+    r"(?:payment|credit|remittance).*dividend|dividend.*(?:payment|credit|remittance)|"
+    # PSU press releases about handing the dividend cheque to the Government.
+    r"\bpa(?:ys|id|ying)\b.{0,60}dividend.{0,40}(?:government|\bgoi\b|president of india|ministry)|"
+    r"dividend (?:cheque|warrant).{0,60}(?:government|\bgoi\b|minister|ministry)", re.I)
 
 # Insolvency/proceeding steps that do not change the economic state of the case.
 _CIRP_PROCEDURAL = re.compile(
@@ -250,7 +253,9 @@ _ORDER = re.compile(
 _ORDER_PRE_BID = re.compile(
     r"bid submitted|submission of bid|tender participation|participat(?:e|ion).*tender|"
     r"expression of interest|\beoi\b|pre[- ]qualification|technical bid qualified", re.I)
-_ORDER_CANCEL = re.compile(r"(?:order|contract).*(?:cancelled|canceled|terminated)|(?:cancellation|termination).*(?:order|contract)", re.I)
+_ORDER_CANCEL = re.compile(
+    r"(?:order|contract|letter of (?:award|acceptance|intent)|\blo[ai]\b).*(?:cancelled|canceled|terminated|withdrawn|annulled|short[- ]?closed)|"
+    r"(?:cancell?ation|termination|withdrawal|annulment|short[- ]?closure).*(?:order|contract|letter of (?:award|acceptance|intent)|\blo[ai]\b)", re.I)
 
 _ACQUISITION = re.compile(
     r"acquisition|acquir(?:e|ed|ing)|purchase of .*stake|purchase of .*business|"
@@ -329,7 +334,7 @@ def _event_meta(subject: str, text: str, category: str) -> dict:
         elif re.search(r"preferential issue", both, re.I): out["event_type"] = "Preferential Issue"
         elif re.search(r"dividend", both, re.I): out["event_type"] = "Dividend"
         else: out["event_type"] = "Corporate Action"
-        if re.search(r"clos(?:ed|ure)|completed|completion", both, re.I): out["stage"] = "Completed"
+        if re.search(r"\bclos(?:ed|ure)\b|completed|completion", both, re.I): out["stage"] = "Completed"
         elif re.search(r"record date", both, re.I): out["stage"] = "Record Date"
         elif re.search(r"allot(?:ted|ment)", both, re.I): out["stage"] = "Allotment"
         elif re.search(r"approved|approval|outcome of board meeting", both, re.I): out["stage"] = "Approved"
@@ -346,22 +351,31 @@ def _event_meta(subject: str, text: str, category: str) -> dict:
     return out
 
 
-def classify(subject: str, text: str) -> str | None:
-    """Trader-focused catalyst category, or None when the event should not be stored."""
+def is_explicit_noise(subject: str, text: str) -> bool:
+    """True when a backend noise rule positively matches (results, SAST, CIRP/scheme
+    paperwork, routine allotments, debt, ignored subjects, ...)."""
     subject = (subject or "").strip()
     text = (text or "").strip()
     both = f"{subject} {text}"
-
     if _RESULTS.search(both) or (re.search(r"outcome of board meeting", subject, re.I) and _RESULTS.search(text)):
-        return None
+        return True
     if (_BACKEND_NOISE.search(both) or _ROUTINE_PROFESSIONAL.search(both) or
             _ROUTINE_ALLOTMENT.search(both) or _ROUTINE_CORP_ACTION.search(both) or
             _SAST_NOISE.search(both) or _PROMOTER_MPS_SALE.search(both) or
             _SUBSIDIARY_INCORPORATION.search(both) or _INTERNAL_SUB_INVESTMENT.search(both) or
             _CIRP_PROCEDURAL.search(both) or _SCHEME_PROCEDURAL.search(both) or
             _REGULATORY_ROUTINE.search(both)):
-        return None
-    if _IGNORE_SUBJECT.search(subject) or _DEBT.search(both):
+        return True
+    return bool(_IGNORE_SUBJECT.search(subject) or _DEBT.search(both))
+
+
+def classify(subject: str, text: str) -> str | None:
+    """Trader-focused catalyst category, or None when the event should not be stored."""
+    subject = (subject or "").strip()
+    text = (text or "").strip()
+    both = f"{subject} {text}"
+
+    if is_explicit_noise(subject, text):
         return None
 
     # Batch-3: adverse licence/registration action must beat the broad NSE subject
@@ -515,7 +529,13 @@ _MONEY_RANGE_NOISE_RE = re.compile(
 _STRONG_MONEY_CONTEXT_RE = re.compile(
     r"consideration|purchase price|transaction value|order value|contract value|broad consideration|"
     r"issue size|fund ?raise|penalty|fine|demand|claim amount|amount payable|investment of|project cost|"
-    r"aggregate consideration|total consideration|sale value|buyback size",
+    r"aggregate consideration|total consideration|sale value|buyback size|"
+    # Narrative order totals: "orders totaling Rs 250.78 crores",
+    # "wins new orders of Rs. 1,303 crores", "order worth ₹44 crore".
+    # Must sit directly on the word order/contract, so "order book of Rs X"
+    # or "YTD order intake of Rs X" do not qualify.
+    r"(?:orders?|contracts?)\s+(?:totall?ing|aggregating(?:\s+to)?|amounting\s+to|worth|valued\s+at|"
+    r"of\s+(?:approx\.?\s+|approximately\s+|about\s+)?(?:₹|rs\.?|inr))",
     re.I,
 )
 
@@ -579,9 +599,20 @@ def _normalize_pdf_text(text: str) -> str:
     s = re.sub(r"\s+", " ", text or " ").strip()
     # CFF/Type1 PDFs can emit decimals one glyph at a time: "75 . 9 6".
     s = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", s)
-    s = re.sub(r"(?<=\d)\s+(?=\d)", "", s)
+    # Join only runs of single glyph-split digits ("7 5 . 9 6" -> "75.96").
+    # The old rule also glued a year to the next row number ("2027 7." -> "20277").
+    s = re.sub(r"(?<![\d,.])\d(?:\s\d)+(?![\d,])", lambda m: m.group(0).replace(" ", ""), s)
     # Clean punctuation/hyphen spacing created by line-oriented extraction.
     s = re.sub(r"\s+([,.;:])", r"\1", s)
+    # Thousand separators split by line wrapping inside an amount:
+    # "Rs 7, 600 crores" was read as "600 crores". Only repaired right after a
+    # currency marker so ordinary lists like "1, 2, 3" are untouched.
+    _amt = re.compile(r"((?:₹|rs\.?|inr)\s*\d{1,3}(?:,\d{2,3})*),\s+(?=\d{2,3}\b)", re.I)
+    while True:
+        s2 = _amt.sub(r"\1,", s)
+        if s2 == s:
+            break
+        s = s2
     s = re.sub(r"\bN\s*-\s*Type\b", "N-Type", s, flags=re.I)
     s = re.sub(r"\bGlass\s*-\s*to\s*-\s*Glass\b", "Glass-to-Glass", s, flags=re.I)
     return s
@@ -607,6 +638,27 @@ def _table_items(clean: str) -> dict[int, str]:
         end = hits[i + 1].start() if i + 1 < len(hits) else len(clean)
         rows[n] = clean[m.end():end].strip()
     return rows
+
+
+def _yes_no_answer(row: str) -> bool | None:
+    """Answer of a SEBI Yes/No row. The question itself contains "If yes ...",
+    so only the text after the question ("arm's length" / last '?') counts."""
+    if not row:
+        return None
+    m = None
+    for m in re.finditer(r"arm['’`s ]*\s*length[\"'”’.;:\s]*|\?", row, re.I):
+        pass
+    ans = row[m.end():] if m else row
+    ans = ans.strip(" .:;-\"'”’")
+    if not ans:
+        return None
+    if re.match(r"(?:no\b|nil\b|none\b|n\.?\s?a\.?\b|not applicable|not interested|does not|do not|is not|are not|not a\b|not fall)", ans, re.I):
+        return False
+    if re.match(r"yes\b", ans, re.I):
+        return True
+    if re.search(r"\b(?:does|do|is|are|shall|would) not\b.{0,40}related party|not (?:a )?related party|not fall", ans, re.I):
+        return False
+    return None
 
 
 def _row_answer(row: str, label_pattern: str, max_len: int = 400) -> str:
@@ -665,15 +717,26 @@ def _extract_order_details(text: str) -> dict:
         r"nature of order\(s\)\s*/\s*contract\(s\)",
     )
     # Prefer a descriptive terms row, but ignore generic boilerplate.
-    if terms and not re.fullmatch(r"as per (?:the )?terms of (?:the )?order", terms, re.I):
+    _generic = re.compile(r"(?:as per\b.*|general (?:contract|condition)s?\b.*|standard (?:terms|conditions)\b.*|"
+                          r"one[- ]time|letter of (?:award|acceptance|intent)|n\.?a\.?|not applicable|epc|supply|works?)\.?", re.I)
+    if terms and not _generic.fullmatch(terms.strip()):
         purpose = terms
-    else:
+    elif nature and not _generic.fullmatch(nature.strip()):
         purpose = nature
+    else:
+        purpose = ""
 
     execution = _row_answer(
         rows.get(6, ""),
         r"time period by which (?:the )?order\(s\)\s*/?\s*contract\(s\) is to be executed",
     )
+
+    if execution:
+        # Stop at the next SEBI row if the table boundary was missed.
+        execution = re.split(r"\s*(?:\b\d\.\s*)?(?:broad (?:commercial )?consideration|whether the|"
+                             r"name of the entity)", execution, maxsplit=1, flags=re.I)[0].strip(" .;")
+        if re.search(r"\b(?:19|20)\d{3,}\b", execution) or len(execution) < 3:
+            execution = ""
 
     order_type = ""
     # Row 5 is the cleanest standardized domestic/international field.
@@ -689,16 +752,7 @@ def _extract_order_details(text: str) -> dict:
 
     # Row 9 specifically answers the related-party question. Do not search the
     # whole PDF because unrelated Yes/No answers create false positives.
-    related_party = None
-    row9 = rows.get(9, "")
-    if row9:
-        yn = re.search(r"\b(Yes|No)\b\s*$", row9, re.I)
-        if not yn:
-            answers = re.findall(r"\b(Yes|No)\b", row9, re.I)
-            if answers:
-                yn = type("_M", (), {"group": lambda self, _n: answers[-1]})()
-        if yn:
-            related_party = yn.group(1).lower() == "yes"
+    related_party = _yes_no_answer(rows.get(9, ""))
 
     # Prefer row 7 (Broad consideration / size) for monetary value. This avoids
     # unrelated amounts elsewhere in the filing. Fall back to contextual scan.
@@ -766,48 +820,23 @@ def _extract_order_details(text: str) -> dict:
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_ORDER_MODEL = os.environ.get("GEMINI_ORDER_MODEL", os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")).strip()
+# Extraction needs little reasoning; thinking tokens bill at the output rate.
+# Set GEMINI_THINKING_LEVEL="" to send no thinking config at all.
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip()
+AI_ORDER_BATCH = int(os.environ.get("AI_ORDER_BATCH", "10"))     # max Gemini calls per run
+AI_ORDER_MAX_ATTEMPTS = 2       # failed AI calls per row before giving up
+AI_AGREE_TOL = 0.05             # local vs AI within 5% = confirmed
+_GEMINI_RATE_LIMITED = False
 
 _ORDER_AI_PROMPT = r"""
-You are extracting factual details from an Indian listed company's order/contract announcement PDF.
-Read the ENTIRE PDF carefully, including tables, annexures and footnotes.
-
-Return ONLY one valid JSON object. Do not use markdown. Do not infer facts that are not disclosed.
-Use null for unavailable fields and [] for unavailable lists.
-
-Schema:
-{
-  "order_value_cr": number|null,
-  "order_value_text": string|null,
-  "customer": string|null,
-  "order_scope": string|null,
-  "order_type": "Domestic"|"International"|null,
-  "execution_period": string|null,
-  "quantity_or_capacity": string|null,
-  "project_location": string|null,
-  "related_party": boolean|null,
-  "promoter_interest": boolean|null,
-  "tax_inclusion": string|null,
-  "currency": string|null,
-  "company_share_of_order_cr": number|null,
-  "other_material_details": [string],
-  "summary": string|null
-}
-
+Read this Indian listed company's order/contract announcement PDF. Return ONLY this JSON, nothing else:
+{"value_cr": number|null, "value_basis": "total"|"annual"|"not_disclosed", "tenure_years": number|null, "customer": string|null, "summary": string|null}
 Rules:
-- order_value_cr must be the disclosed order/contract value converted to INR crore when the PDF permits a reliable conversion.
-- Preserve the original disclosed amount in order_value_text.
-- If the announcement covers multiple orders, use the disclosed aggregate total when available and explain the split in other_material_details.
-- customer is the awarding entity/client. Do not include table headings or row numbers.
-- order_scope is a concise description of the actual goods/services/project scope.
-- Capture MW/MWp, units, kilometres, tonnes, project capacity or other meaningful quantity in quantity_or_capacity when disclosed.
-- Capture project/site/geography in project_location when disclosed.
-- related_party must come from the specific related-party disclosure, not an unrelated Yes/No elsewhere.
-- promoter_interest must come from the promoter/promoter-group interest disclosure.
-- tax_inclusion should say whether the stated order value includes/excludes taxes if explicitly disclosed.
-- company_share_of_order_cr is only for consortium/JV orders where the company's own share is explicitly disclosed or directly calculable from disclosed figures.
-- other_material_details should contain only decision-useful factual details from the PDF, such as consortium share, repeat order, tender/LOA status, milestone, special terms, or customer/project specifics. Avoid boilerplate.
-- summary must be one concise factual sentence. Do not call the order bullish/bearish, good/bad, material/immaterial, or predict stock-price impact.
-- Do NOT provide market cap, revenue, valuation, order-to-market-cap ratio, or any fact not contained in this PDF.
+- value_cr: the order/contract value in INR crore (convert rupees/lakh). If only a foreign currency is given, use the INR equivalent stated in the PDF, else null. If several orders, use the stated aggregate.
+- Ignore order book, YTD order intake, revenue, turnover and market cap figures.
+- value_basis "annual" when the PDF gives a yearly revenue/tariff for a multi-year period; then value_cr is the yearly figure and tenure_years the period. Otherwise tenure_years is null.
+- customer: name of the entity that awarded the order; null if withheld.
+- summary: one factual sentence under 25 words saying what work and for whom. No opinions.
 """.strip()
 
 
@@ -848,15 +877,22 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
             ]}],
             "generationConfig": {
                 "temperature": 0.05,
-                "maxOutputTokens": 4096,
+                "maxOutputTokens": 1024,   # JSON is ~100 tokens; cap includes thinking
                 "responseMimeType": "application/json",
             },
         }
-        r = session.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_ORDER_MODEL}:generateContent?key={GEMINI_API_KEY}",
-            json=payload, timeout=120,
-        )
+        global _GEMINI_RATE_LIMITED
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{GEMINI_ORDER_MODEL}:generateContent?key={GEMINI_API_KEY}")
+        if GEMINI_THINKING_LEVEL:
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+        r = session.post(url, json=payload, timeout=120)
+        if r.status_code == 400 and "thinkingConfig" in payload["generationConfig"]:
+            # Model does not accept this thinking setting; retry with its default.
+            payload["generationConfig"].pop("thinkingConfig", None)
+            r = session.post(url, json=payload, timeout=120)
         if r.status_code == 429:
+            _GEMINI_RATE_LIMITED = True
             print(f"    · [{filename}] Gemini skipped: quota/rate limit")
             return {}
         r.raise_for_status()
@@ -871,49 +907,27 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
             return {}
 
         out = {}
-        # Map AI schema to existing catalyst keys so the frontend remains compatible.
-        mapping = {
-            "order_value_cr": "order_value_cr",
-            "order_value_text": "order_value_text",
-            "customer": "order_from",
-            "order_scope": "order_purpose",
-            "order_type": "order_type",
-            "execution_period": "execution_period",
-            "quantity_or_capacity": "quantity_or_capacity",
-            "project_location": "project_location",
-            "related_party": "related_party",
-            "promoter_interest": "promoter_interest",
-            "tax_inclusion": "tax_inclusion",
-            "currency": "currency",
-            "company_share_of_order_cr": "company_share_of_order_cr",
-            "other_material_details": "other_material_details",
-            "summary": "order_summary",
-        }
-        for src, dst in mapping.items():
-            v = obj.get(src)
-            if v is not None and v != "" and v != []:
-                out[dst] = v
-
-        # Basic type/sanity guards. Bad AI fields are dropped, allowing local fallback.
-        if "order_value_cr" in out:
-            try:
-                v = float(out["order_value_cr"])
-                if not (0 < v < 10_000_000):
-                    raise ValueError
+        try:
+            v = obj.get("value_cr")
+            v = float(v) if v is not None else None
+            if v is not None and 0 < v < 10_000_000:
                 out["order_value_cr"] = round(v, 4)
-            except (TypeError, ValueError):
-                out.pop("order_value_cr", None)
-        if "company_share_of_order_cr" in out:
-            try:
-                v = float(out["company_share_of_order_cr"])
-                if v <= 0:
-                    raise ValueError
-                out["company_share_of_order_cr"] = round(v, 4)
-            except (TypeError, ValueError):
-                out.pop("company_share_of_order_cr", None)
-        for k in ("related_party", "promoter_interest"):
-            if k in out and not isinstance(out[k], bool):
-                out.pop(k, None)
+        except (TypeError, ValueError):
+            pass
+        basis = str(obj.get("value_basis") or "").lower()
+        if basis in {"total", "annual", "not_disclosed"}:
+            out["value_basis"] = basis
+        try:
+            t = obj.get("tenure_years")
+            t = float(t) if t is not None else None
+            if t and 0 < t <= 50:
+                out["tenure_years"] = t
+        except (TypeError, ValueError):
+            pass
+        for src, dst in (("customer", "order_from"), ("summary", "order_summary")):
+            v = obj.get(src)
+            if isinstance(v, str) and v.strip() and v.strip().lower() not in {"null", "none", "n/a"}:
+                out[dst] = v.strip()[:300]
         if out:
             out["detail_source"] = "gemini_pdf"
         return out
@@ -1217,6 +1231,15 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
     return out
 
 
+def _is_non_binding_mou(it: dict, details: dict | None = None) -> bool:
+    status = str((details or {}).get("binding_status") or it.get("binding_status") or "")
+    if re.search(r"non[- ]?binding", status, re.I):
+        return True
+    both = f"{it.get('subject', '')} {it.get('text', '')}"
+    return bool(re.search(r"memorandum of understanding|\bmou\b", both, re.I)
+                and not re.search(r"definitive|binding agreement", both, re.I))
+
+
 def _apply_materiality_ratios(it: dict, category: str, details: dict,
                                market_cap_map: dict | None, ttm_sales_map: dict | None) -> None:
     symbol = str(it.get("_lookup_symbol") or it.get("symbol") or "").strip().upper()
@@ -1233,6 +1256,10 @@ def _apply_materiality_ratios(it: dict, category: str, details: dict,
         "Corporate Action": "issue_value_cr",
     }.get(category)
     if not value_key or details.get(value_key) is None:
+        return
+    if category == "Strategic Agreement" and _is_non_binding_mou(it, details):
+        # A non-binding MoU value (often the company's own capex pledge to a
+        # state government) is not revenue; a % of market cap misleads.
         return
     try:
         value = float(details[value_key])
@@ -1284,7 +1311,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
                     values_found += 1
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
-    print(f"  ✓ Local PDF enrichment v4.1 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
+    print(f"  ✓ Local PDF enrichment v4.1 → checked={checked}, details_found={enriched}, value_found={values_found}")
     return checked, enriched
 
 
@@ -1905,6 +1932,439 @@ def _load_nse_holidays(session, year: int) -> set[date]:
     return holidays
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NSE headline cross-check (no AI)
+# The exchange summary often states the value outright ("wins orders of Rs 1,303
+# crores"). It fills gaps where the PDF parser found nothing, and overrides PDF
+# values that are clearly the wrong number (YTD intake, combined announcements,
+# only the first of several work orders).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HEADLINE_AMOUNT_RE = re.compile(
+    r"(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.\d+)?)\s*(lakh crores?|crores?|cr\b\.?|lakhs?|lacs?)", re.I)
+# Amounts in these contexts are not the value of this filing.
+_HEADLINE_SKIP_CONTEXT = re.compile(
+    r"order ?book|order intake|\bytd\b|year[- ]to[- ]date|till date|so far|cumulative|"
+    r"turnover|revenue|market cap|net worth|paid[- ]up|authori[sz]ed capital|dividend", re.I)
+_HEADLINE_VALUE_KEY = {
+    "Order": ("order_value_cr", "order_value_text", "order_value_role"),
+    "Acquisition": ("transaction_value_cr", "transaction_value_text", None),
+    "Divestment": ("transaction_value_cr", "transaction_value_text", None),
+    "Strategic Agreement": ("agreement_value_cr", "agreement_value_text", None),
+    "Corporate Action": ("issue_value_cr", "issue_value_text", None),
+}
+# Only fund-raising corporate actions have an issue size worth showing.
+_HEADLINE_CA_TYPES = {"QIP", "Rights Issue", "Preferential Issue", "Buyback", "Corporate Action"}
+HEADLINE_OVERRIDE_DIFF = 0.15      # >15% apart = different number, not rounding/GST
+NOMINAL_ACQ_MAX_CR = 1.0           # shell/SPV purchases for a few lakh are not catalysts
+NOMINAL_ACQ_MAX_MCAP_PCT = 0.1
+
+
+def _headline_value(text: str) -> tuple[float | None, str]:
+    """First clean ₹ amount in the NSE summary, in crore."""
+    import html as _html
+    t = _html.unescape(text or "")
+    for m in _HEADLINE_AMOUNT_RE.finditer(t):
+        before = t[max(0, m.start() - 45):m.start()]
+        if _HEADLINE_SKIP_CONTEXT.search(before):
+            continue
+        try:
+            n = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        u = m.group(2).lower()
+        cr = n * 1e5 if u.startswith("lakh cr") else n if u.startswith("cr") else n / 100.0
+        if cr <= 0:
+            continue
+        return round(cr, 4), m.group(0).strip()
+    return None, ""
+
+
+def apply_headline_quality(history: dict, market_cap_map: dict | None = None,
+                           ttm_sales_map: dict | None = None) -> tuple[int, int, int]:
+    """Fill/override values from the NSE headline and drop nominal acquisitions.
+
+    Idempotent: once a row carries the headline value, later runs see no
+    difference. The replaced PDF figure is kept as pdf_value_cr for audit.
+    Manual rows are never touched; Gemini values are filled but not overridden.
+    """
+    filled = overridden = dropped = 0
+    for sym in list(history):
+        kept = []
+        for it in history[sym]:
+            if it.get("manual"):
+                kept.append(it)
+                continue
+            cat = it.get("category")
+            # Re-strip ratios that should not exist (e.g. non-binding MoU).
+            if cat == "Strategic Agreement" and _is_non_binding_mou(it):
+                it.pop("agreement_to_market_cap_pct", None)
+
+            keys = _HEADLINE_VALUE_KEY.get(cat)
+            if keys and not (cat == "Corporate Action" and it.get("event_type") not in _HEADLINE_CA_TYPES):
+                vkey, tkey, rkey = keys
+                hv, htxt = _headline_value(it.get("text", ""))
+                cur = it.get(vkey)
+                if hv is not None:
+                    change = False
+                    if cur is None:
+                        change = True
+                        filled += 1
+                    elif (it.get("detail_source") not in {"gemini_pdf", "gemini"}
+                          and it.get("value_source") != "gemini_pdf"):
+                        try:
+                            curf = float(cur)
+                        except (TypeError, ValueError):
+                            curf = None
+                        if curf and abs(hv - curf) / max(hv, curf) > HEADLINE_OVERRIDE_DIFF:
+                            role = str(it.get(rkey) or "") if rkey else ""
+                            # PDF "total" rows are trusted unless the headline is the
+                            # bigger aggregate (several work orders in one filing).
+                            if role != "total" or hv > curf:
+                                change = True
+                                overridden += 1
+                                it.setdefault("pdf_value_cr", curf)
+                    if change:
+                        it[vkey] = hv
+                        it[tkey] = htxt
+                        if rkey:
+                            it[rkey] = "headline"
+                        it["value_source"] = "nse_headline"
+                        for k in list(it):
+                            if k.endswith("_to_market_cap_pct") or k == "order_to_ttm_sales_pct":
+                                it.pop(k, None)
+                        it["_lookup_symbol"] = str(sym).strip().upper()
+                        _apply_materiality_ratios(it, cat, {vkey: hv, "binding_status": it.get("binding_status")},
+                                                  market_cap_map, ttm_sales_map)
+                        it.pop("_lookup_symbol", None)
+
+            if cat == "Acquisition":
+                v = it.get("transaction_value_cr")
+                pct = it.get("transaction_to_market_cap_pct")
+                if (isinstance(v, (int, float)) and v < NOMINAL_ACQ_MAX_CR and
+                        (pct is None or pct < NOMINAL_ACQ_MAX_MCAP_PCT)):
+                    dropped += 1
+                    continue
+            kept.append(it)
+        if kept:
+            history[sym] = kept
+        else:
+            del history[sym]
+    if filled or overridden or dropped:
+        print(f"  🧾 Headline cross-check → filled={filled}, overridden={overridden}, "
+              f"nominal_acquisitions_dropped={dropped}")
+    return filled, overridden, dropped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Order check pipeline (heading → PDF type check → AI only when needed)
+#   1. Value from the heading (NSE summary or the PDF "Sub:" line) — free.
+#   2. Local PDF check: is this really an order RECEIVED? Placed orders go to
+#      Capex, cancellations to Negative, L1 / Preferred Bidder / LoI fix stage.
+#   3. AI only for confirmed orders whose value is not in the heading but is
+#      disclosed somewhere in the PDF. AI returns 5 small fields.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ANNEXURE_VALUE_ROW = re.compile(
+    r"broad (?:commercial )?consideration|size of the order|value of (?:the )?(?:order|contract)|contract value|"
+    r"converted value in inr", re.I)
+ORDER_CHECK_BATCH = int(os.environ.get("ORDER_CHECK_BATCH", "25"))   # PDFs opened per run
+ORDER_CHECK_VERSION = 1
+MINING_LEASE_CATEGORY = "Order"    # set to "Capex" to move mining-lease bids out of Orders
+
+_SUBJECT_LINE_RE = re.compile(
+    r"\bsub(?:ject)?\s*[:.\-–]\s*(.{10,600}?)(?=\bdear\b|\bref(?:erence)?\s*[:.]|\brespected\b|\bpursuant\b|\bin accordance\b|$)",
+    re.I)
+_HEAD_REGION_CHARS = 2500
+_CANCEL_RE = re.compile(
+    r"(?:cancell?ation|cancell?ed|terminat(?:ion|ed)|withdraw(?:al|n)|annul(?:led|ment)|short[- ]?clos(?:ure|ed))"
+    r"\W+(?:\w+\W+){0,6}?(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|order|contract)|"
+    r"(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|order|contract)"
+    r"\W+(?:\w+\W+){0,6}?(?:cancell?ed|terminated|withdrawn|annulled|short[- ]?closed)", re.I)
+_PLACED_RE = re.compile(
+    r"name of (?:the )?entity to (?:which|whom) (?:the )?order|placement of (?:the )?(?:purchase |work )?order on|"
+    r"(?:placed|awarded) (?:the |an? )?(?:purchase |work )?(?:order|contract) (?:on|to) m/?s", re.I)
+_L1_RE = re.compile(r"\bl[- ]?1\b(?:\s*bidder)?|lowest bidder|first lowest", re.I)
+_PREF_BIDDER_RE = re.compile(r"preferred bidder", re.I)
+_MINING_RE = re.compile(r"mining lease|mineral block|composite licen[cs]e|limestone block|coal block", re.I)
+_LOI_RE = re.compile(r"letter of intent|\bloi\b", re.I)
+_FIRM_AWARD_RE = re.compile(r"letter of (?:award|acceptance)|\bloa\b|work order|purchase order|agreement (?:signed|executed)|contract (?:signed|executed)", re.I)
+_ANY_AMOUNT_RE = re.compile(
+    r"(?:₹|rs\.?|inr|usd|us\$|eur|€|sgd|aed|gbp|£|\$)\s*[0-9]|[0-9][0-9,.]*\s*(?:crores?|lakhs?|lacs?)\b|"
+    r"[0-9][0-9,.]*\s*(?:million|billion)\s*(?:us\s*dollars?|usd|dollars?)", re.I)
+_QTY_RE = re.compile(r"\b\d[\d,.]*\s*(?:GW|MWh|MWp|MW|TPH)\b(?:\s*/\s*\d[\d,.]*\s*(?:GWh|MWh))?")
+_ANNUAL_RE = re.compile(r"per annum|yearly revenue|annual(?:ly)? revenue|revenue per year|per year for|p\.a\.", re.I)
+_VENDOR_RE = re.compile(r"entity to (?:which|whom).{0,60}?awarded\s*[;:]?\s*(.{3,90}?)(?=\s+(?:b\s*\.|2\s*\.|\(ii\)|whether)(?:\s|$))", re.I)
+_CANCEL_PARTY_RE = re.compile(r"(?:received |awarded |issued )?(?:from|by)\s+((?:[A-Z][\w&.,'()-]*\s?){1,6})", re.M)
+
+
+def _pdf_subject(text: str) -> str:
+    clean = _normalize_pdf_text(text)
+    m = _SUBJECT_LINE_RE.search(clean[:4000])
+    return m.group(1).strip() if m else ""
+
+
+def _order_doc_check(pdf_text: str, nse_text: str) -> dict:
+    """Free, local classification of an order filing. Never calls AI."""
+    clean = _normalize_pdf_text(pdf_text or "")
+    subject = _pdf_subject(pdf_text or "")
+    head = f"{nse_text or ''} {subject} {clean[:_HEAD_REGION_CHARS]}"
+    out = {"subject": subject}
+    if _CANCEL_RE.search(f"{nse_text or ''} {subject}") or _CANCEL_RE.search(clean[:1200]):
+        out["doc_type"] = "cancellation"
+    elif _PLACED_RE.search(clean) or _PLACED_RE.search(head):
+        out["doc_type"] = "placed"
+    else:
+        out["doc_type"] = "received"
+        if _PREF_BIDDER_RE.search(head):
+            out["stage"] = "Preferred Bidder"
+            out["event_type"] = "Mining Lease" if _MINING_RE.search(clean) else "Order Award"
+        elif _L1_RE.search(head):
+            out["stage"], out["event_type"] = "L1 / Awaiting Award", "L1 Bidder"
+        elif _LOI_RE.search(head) and not _FIRM_AWARD_RE.search(head):
+            out["stage"], out["event_type"] = "Letter of Intent", "Order Award"
+    out["value_disclosed"] = bool(_ANY_AMOUNT_RE.search(clean))
+    q = _QTY_RE.search(head) or _QTY_RE.search(clean)
+    if q:
+        out["quantity"] = q.group(0)
+    out["annual"] = bool(_ANNUAL_RE.search(clean))
+    return out
+
+
+def _set_ratio(it: dict, sym: str, category: str, key: str, value: float,
+               market_cap_map: dict | None, ttm_sales_map: dict | None) -> None:
+    for k in [k for k in it if k.endswith("_to_market_cap_pct") or k == "order_to_ttm_sales_pct"]:
+        it.pop(k, None)
+    it["_lookup_symbol"] = str(sym).strip().upper()
+    _apply_materiality_ratios(it, category, {key: value}, market_cap_map, ttm_sales_map)
+    it.pop("_lookup_symbol", None)
+
+
+_ORDER_OWNED = ("order_value_cr", "order_value_text", "order_value_role", "order_from", "order_purpose",
+                "order_type", "execution_period", "related_party", "order_summary", "detail_excerpt",
+                "order_to_market_cap_pct", "order_to_ttm_sales_pct", "company_share_of_order_cr")
+
+
+def _to_capex(it: dict, sym: str, chk: dict, local: dict, hv: float | None, htxt: str,
+              market_cap_map: dict | None) -> None:
+    clean_vendor = ""
+    m = _VENDOR_RE.search(_normalize_pdf_text(chk.get("_text", "")))
+    if m:
+        clean_vendor = _clean_field(m.group(1), 120)
+    value = hv if hv is not None else local.get("order_value_cr", it.get("order_value_cr"))
+    vtxt = htxt or local.get("order_value_text") or it.get("order_value_text")
+    purpose = local.get("order_purpose") or it.get("order_purpose")
+    for k in _ORDER_OWNED:
+        it.pop(k, None)
+    it["category_override"] = "Capex"
+    it["category"] = "Capex"
+    it["event_type_override"] = it["event_type"] = "Order Placed"
+    it["stage_override"] = it["stage"] = ("Board Approved" if re.search(r"board of directors|board meeting|approval of the board", chk.get("subject", "") + " " + _normalize_pdf_text(chk.get("_text", ""))[:1500], re.I)
+                                          else "Placed")
+    if value is not None:
+        it["capex_value_cr"] = value
+        if vtxt:
+            it["capex_value_text"] = vtxt
+        mcap = (market_cap_map or {}).get(str(sym).strip().upper())
+        try:
+            if mcap and float(mcap) > 0:
+                it["capex_to_market_cap_pct"] = round(float(value) / float(mcap) * 100.0, 2)
+        except (TypeError, ValueError):
+            pass
+    if clean_vendor:
+        it["vendor"] = clean_vendor
+    if purpose:
+        it["capex_purpose"] = purpose
+
+
+def _to_cancellation(it: dict, history_items: list, hv: float | None, htxt: str) -> None:
+    for k in _ORDER_OWNED:
+        it.pop(k, None)
+    it["category_override"] = it["category"] = "Negative"
+    it["negative_type"] = "Order Cancellation"
+    it["negative_stage"] = "Cancelled"
+    it["negative_parser_version"] = 1.3       # keep the Negative PDF parser from relabelling it
+    it.pop("event_type", None); it.pop("stage", None)
+    if hv is not None:
+        it["amount_cr"], it["amount_text"] = hv, htxt
+    # Link to the award it cancels: same symbol, earlier Order card, same counterparty.
+    m = _CANCEL_PARTY_RE.search(it.get("text", ""))
+    party = m.group(1).strip(" .,") if m else ""
+    if len(party) < 4:
+        return
+    cands = [x for x in history_items if x is not it and x.get("category") == "Order"
+             and x.get("dt", "") < it.get("dt", "")
+             and party.lower() in f"{x.get('text', '')} {x.get('order_from', '')}".lower()]
+    if len(cands) == 1:
+        c = cands[0]
+        c["stage_override"] = c["stage"] = "Cancelled"
+        c["cancelled_by"] = it.get("id")
+        it["cancels"] = c.get("id")
+        if it.get("amount_cr") is None and c.get("order_value_cr") is not None:
+            it["amount_cr"] = c["order_value_cr"]
+    elif len(cands) > 1:
+        it["needs_review"] = True
+        it["review_reason"] = f"cancellation matches {len(cands)} earlier orders from {party}"
+
+
+def process_orders(session, history: dict, market_cap_map: dict | None = None,
+                   ttm_sales_map: dict | None = None, pdf_limit: int = ORDER_CHECK_BATCH,
+                   ai_limit: int = AI_ORDER_BATCH) -> dict:
+    """Run the order check once per row (marker order_check_v)."""
+    global _GEMINI_RATE_LIMITED
+    _GEMINI_RATE_LIMITED = False
+    stats = dict(checked=0, heading=0, ai=0, capex=0, cancelled=0, not_disclosed=0, stage_fixed=0, queued=0)
+    queue = []
+    for sym, items in history.items():
+        for it in items:
+            if it.get("manual") or int(it.get("order_check_v") or 0) >= ORDER_CHECK_VERSION:
+                continue
+            cat = it.get("category")
+            is_cancel_neg = cat == "Negative" and _ORDER_CANCEL.search(f"{it.get('subject', '')} {it.get('text', '')}")
+            if cat == "Order" or is_cancel_neg:
+                queue.append((it.get("dt", ""), sym, it))
+    queue.sort(key=lambda t: t[0], reverse=True)
+    ai_sent = 0
+    for _dt, sym, it in queue:
+        if stats["checked"] >= pdf_limit:
+            break
+        pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
+        if not pdf_bytes:
+            continue      # retried next run; unreachable links are handled by backfill
+        stats["checked"] += 1
+        text = _extract_pdf_text_bytes(pdf_bytes)
+        chk = _order_doc_check(text, it.get("text", ""))
+        chk["_text"] = text
+        if it.get("category") == "Negative":
+            chk["doc_type"] = "cancellation"
+
+        # Heading value: NSE summary first, then the PDF "Sub:" line.
+        hv, htxt = _headline_value(it.get("text", ""))
+        hsrc = "nse_headline"
+        if hv is None:
+            hv, htxt = _headline_value(chk.get("subject", ""))
+            hsrc = "pdf_subject"
+
+        # Fresh local parse with the fixed parser (gemini/manual values are kept).
+        local = {}
+        if it.get("detail_source") not in {"gemini_pdf", "gemini"}:
+            local = _extract_order_details(text)
+
+        if chk["doc_type"] == "cancellation":
+            _to_cancellation(it, history.get(sym, []), hv, htxt)
+            stats["cancelled"] += 1
+        elif chk["doc_type"] == "placed":
+            _to_capex(it, sym, chk, local, hv, htxt, market_cap_map)
+            stats["capex"] += 1
+        else:
+            if local:
+                for k in ("order_from", "order_purpose", "order_type", "execution_period", "related_party"):
+                    it.pop(k, None)
+                for k in ("order_from", "order_purpose", "order_type", "execution_period", "related_party"):
+                    if local.get(k) not in (None, ""):
+                        it[k] = local[k]
+            if chk.get("stage"):
+                it["stage_override"] = it["stage"] = chk["stage"]
+                it["event_type_override"] = it["event_type"] = chk["event_type"]
+                if chk.get("event_type") == "Mining Lease" and MINING_LEASE_CATEGORY != "Order":
+                    it["category_override"] = it["category"] = MINING_LEASE_CATEGORY
+                stats["stage_fixed"] += 1
+            if not it.get("event_type"):
+                # Generic press-release wording left it untagged; the PDF says it is an order.
+                it["event_type_override"] = it["event_type"] = "Order Award"
+                it["stage_override"] = it["stage"] = it.get("stage") or "Awarded"
+            if chk.get("quantity") and not it.get("quantity_or_capacity"):
+                it["quantity_or_capacity"] = chk["quantity"]
+
+            if hv is not None and not chk["annual"]:
+                it["order_value_cr"], it["order_value_text"] = hv, htxt
+                it["order_value_role"] = "headline"
+                it["value_source"] = hsrc
+                lv = local.get("order_value_cr")
+                if lv and abs(lv - hv) / max(lv, hv) > HEADLINE_OVERRIDE_DIFF:
+                    it["local_value_cr"] = lv      # audit only; heading wins
+                _set_ratio(it, sym, "Order", "order_value_cr", hv, market_cap_map, ttm_sales_map)
+                stats["heading"] += 1
+            elif (local.get("order_value_cr") is not None and not chk["annual"]
+                  and (local.get("order_value_role") == "total"
+                       or re.search(r"converted value in inr|inr equivalent", local.get("detail_excerpt") or "", re.I))
+                  and _ANNEXURE_VALUE_ROW.search(local.get("detail_excerpt") or "")):
+                # Value read from the SEBI annexure consideration row: reliable, no AI needed.
+                lv = local["order_value_cr"]
+                it["order_value_cr"], it["order_value_text"] = lv, local.get("order_value_text")
+                it["order_value_role"] = "total"
+                it["value_source"] = "pdf_annexure"
+                _set_ratio(it, sym, "Order", "order_value_cr", lv, market_cap_map, ttm_sales_map)
+                stats["annexure"] = stats.get("annexure", 0) + 1
+            elif not chk["value_disclosed"]:
+                for k in ("order_value_cr", "order_value_text", "order_value_role",
+                          "order_to_market_cap_pct", "order_to_ttm_sales_pct"):
+                    it.pop(k, None)
+                it["value_disclosed"] = False
+                stats["not_disclosed"] += 1
+            else:
+                # Value is somewhere in the PDF but not in the heading -> AI.
+                if not GEMINI_API_KEY or ai_sent >= ai_limit or _GEMINI_RATE_LIMITED:
+                    if local.get("order_value_cr") is not None and it.get("order_value_cr") is None:
+                        it["order_value_cr"] = local["order_value_cr"]
+                        it["order_value_text"] = local.get("order_value_text")
+                        it["order_value_role"] = local.get("order_value_role")
+                        _set_ratio(it, sym, "Order", "order_value_cr", local["order_value_cr"],
+                                   market_cap_map, ttm_sales_map)
+                    stats["queued"] += 1
+                    continue          # no marker: AI retried on a later run
+                ai_sent += 1
+                ai = _gemini_order_details(session, pdf_bytes, it.get("link", "").rsplit("/", 1)[-1])
+                if _GEMINI_RATE_LIMITED:
+                    stats["queued"] += 1
+                    continue
+                stats["ai"] += 1
+                it["ai_checked"] = True
+                for k in ("order_from", "order_summary"):
+                    if ai.get(k):
+                        it[k] = ai[k]
+                av, basis = ai.get("order_value_cr"), ai.get("value_basis")
+                if basis == "not_disclosed" or av is None:
+                    if av is None and local.get("order_value_cr") is not None:
+                        av, basis = local["order_value_cr"], "total"
+                    else:
+                        it["value_disclosed"] = False
+                if av is not None:
+                    lv = local.get("order_value_cr")
+                    if basis == "annual":
+                        tenure = ai.get("tenure_years")
+                        it["annual_value_cr"] = av
+                        if tenure:
+                            it["tenure_years"] = tenure
+                            it["order_value_cr"] = round(av * tenure, 2)
+                            it["order_value_role"] = "annual_x_tenure"
+                        else:
+                            it["order_value_cr"] = av
+                            it["order_value_role"] = "annual"
+                        it["order_value_text"] = f"₹{av} Cr per year" + (f" × {tenure:g} yrs" if tenure else "")
+                    else:
+                        it["order_value_cr"], it["order_value_role"] = av, "ai"
+                        it["order_value_text"] = f"₹{av} Cr"
+                        if lv and abs(lv - av) / max(lv, av) > AI_AGREE_TOL:
+                            it["local_value_cr"] = lv
+                            it["needs_review"] = True
+                            it["review_reason"] = "AI and PDF table disagree"
+                    it["value_source"] = "gemini_pdf"
+                    _set_ratio(it, sym, "Order", "order_value_cr", it["order_value_cr"],
+                               market_cap_map, ttm_sales_map)
+                    if basis == "annual" and ttm_sales_map:
+                        ttm = ttm_sales_map.get(str(sym).strip().upper())
+                        try:
+                            if ttm and float(ttm) > 0:     # annuity: yearly revenue vs yearly sales
+                                it["order_to_ttm_sales_pct"] = round(av / float(ttm) * 100.0, 2)
+                        except (TypeError, ValueError):
+                            pass
+        it["order_check_v"] = ORDER_CHECK_VERSION
+    stats["queued"] += max(0, len(queue) - stats["checked"])
+    print("  🔎 Order check → " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    return stats
+
+
 def _r2_get_json(session, filename: str):
     import os
     import time
@@ -2021,6 +2481,13 @@ def main():
     # Accept a bare symbol->items dict too, so an older/manual file is not lost.
     r2_session = _build_session()
     old_payload = _r2_get_json(r2_session, "nse_catalysts.json") or {}
+    # Cards removed on purpose (lifecycle duplicates, superseded adverse cards,
+    # nominal acquisitions). Without this list the API re-delivers them every run,
+    # their PDFs are re-downloaded and they can even consume AI calls again.
+    suppressed = {}
+    if isinstance(old_payload, dict) and isinstance(old_payload.get("suppressed"), dict):
+        _sup_cutoff = (today - timedelta(days=HISTORY_DAYS + 2)).isoformat()
+        suppressed = {k: v for k, v in old_payload["suppressed"].items() if str(v)[:10] >= _sup_cutoff}
     if isinstance(old_payload, dict) and isinstance(old_payload.get("data"), dict):
         history = old_payload["data"]
     elif isinstance(old_payload, dict):
@@ -2056,6 +2523,14 @@ def main():
                 cleaned.append(x)
                 continue
             cat = classify(x.get("subject", ""), x.get("text", ""))
+            if (not cat and x.get("category") and len(x.get("text") or "") >= TEXT_MAX
+                    and not is_explicit_noise(x.get("subject", ""), x.get("text", ""))):
+                # Stored text is cut at TEXT_MAX; the keyword that classified this
+                # row at fetch time may lie past the cut. Keep the fetch-time
+                # category unless a noise rule positively matches.
+                cat = x["category"]
+            if x.get("category_override"):
+                cat = x["category_override"]     # set from the PDF, outranks summary text
             if not cat or _is_cirp_procedural_item(x):
                 removed_noise += 1
                 continue
@@ -2078,6 +2553,11 @@ def main():
             for k in ("event_type", "stage"):
                 x.pop(k, None)
             x.update(_event_meta(x.get("subject", ""), x.get("text", ""), cat))
+            # Decisions made by the PDF order check survive the daily re-tagging.
+            if x.get("event_type_override"):
+                x["event_type"] = x["event_type_override"]
+            if x.get("stage_override"):
+                x["stage"] = x["stage_override"]
             cleaned.append(x)
         history[sym] = cleaned
         if not history[sym]:
@@ -2118,6 +2598,18 @@ def main():
     if fresh_procedural_removed:
         print(f"  🧹 Fresh CIRP procedural cleanup → removed={fresh_procedural_removed}")
 
+    suppressed_skipped = 0
+    if suppressed:
+        for _sym in list(new_items):
+            _kept = [it for it in new_items[_sym] if it.get("id") not in suppressed]
+            suppressed_skipped += len(new_items[_sym]) - len(_kept)
+            if _kept:
+                new_items[_sym] = _kept
+            else:
+                del new_items[_sym]
+    if suppressed_skipped:
+        print(f"  🚫 Previously removed cards skipped → {suppressed_skipped}")
+
     # Stamp the group symbol temporarily so enrichment can join to the R2
     # classification/fundamentals lookups without changing the stored schema.
     for _sym, _items in new_items.items():
@@ -2140,11 +2632,20 @@ def main():
             _it.pop("_lookup_symbol", None)
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
+    _post_merge = {x.get("id"): x.get("dt", "") for items in history.values() for x in items
+                   if x.get("id") and not x.get("manual")}
 
     # Drain the never-opened backlog (rows stored before their PDF was checked).
     # Runs after merge so expired rows are already gone and fresh rows that a
     # rebuild skipped are included. Uses the primed NSE session like fresh enrichment.
     backfill_local_history(nse_session, history, market_cap_map, ttm_sales_map)
+
+    # Cross-check values against the NSE headline before lifecycle consolidation,
+    # so merged cards carry the corrected figure.
+    apply_headline_quality(history, market_cap_map, ttm_sales_map)
+
+    # Order check: heading value → PDF type check → AI only when needed.
+    process_orders(nse_session, history, market_cap_map, ttm_sales_map)
 
     # Defensive final hygiene after merge: no Negative-only metadata may survive
     # on a card whose final category is something else.
@@ -2164,7 +2665,14 @@ def main():
 
     total = sum(len(v) for v in history.values())
 
+    _final_ids = {x.get("id") for items in history.values() for x in items}
+    _newly_suppressed = {k: v for k, v in _post_merge.items() if k not in _final_ids}
+    suppressed.update(_newly_suppressed)
+    if _newly_suppressed:
+        print(f"  🗂 Suppressed for future runs → +{len(_newly_suppressed)} (total {len(suppressed)})")
+
     payload = {
+        "suppressed": suppressed,
         "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source": source,
         "data": history,
