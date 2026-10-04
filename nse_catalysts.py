@@ -451,6 +451,33 @@ def _row_answer(row: str, label_pattern: str, max_len: int = 400) -> str:
     return _clean_field(row[m.end():], max_len)
 
 
+def _order_amount_role_score(raw: str, context: str) -> tuple[int, str]:
+    """Rank an INR amount by semantic role: headline total > component."""
+    c = (context or "").lower()
+    # Component labels are usually immediately adjacent to their amount. Check
+    # them first in this deliberately tight context window.
+    if re.search(r"transferable\s+development\s+rights|\btdr\b|land\s+premium|free\s+sale\s+land|"
+                 r"security\s+deposit|performance\s+(?:bank\s+)?guarantee|\bpbg\b|advance\s+payment|"
+                 r"retention\s+money|liquidated\s+damages|component|portion|tranche", c):
+        return -5, "component"
+    if re.search(r"total\s+(?:development|project|contract|order)\s+(?:cost|value)|"
+                 r"aggregate\s+(?:order|contract|project)\s+value|total\s+consideration|"
+                 r"overall\s+(?:project|order|contract)\s+(?:cost|value)|broad\s+consideration|"
+                 r"size\s+of\s+(?:the\s+)?(?:order|contract)", c):
+        return 8, "total"
+    if re.search(r"order\s+value|contract\s+value|value\s+of\s+(?:the\s+)?(?:order|contract)|"
+                 r"project\s+cost|work\s+order\s+value|loa\s+value", c):
+        return 6, "headline"
+    return 1, "unspecified"
+
+
+def _nearest_role_context(scope: str, start: int, end: int, radius: int = 70) -> str:
+    """Use a tighter window for role detection so a nearby component label does
+    not inherit 'total project value' language from another amount in the row."""
+    lo, hi = max(0, start - radius), min(len(scope), end + radius)
+    return scope[lo:hi]
+
+
 def _extract_order_details(text: str) -> dict:
     clean = _normalize_pdf_text(text)
     if not clean:
@@ -532,17 +559,23 @@ def _extract_order_details(text: str) -> dict:
                 continue
             value_cr = _money_to_cr(m.group(1), m.group(2))
             if value_cr is not None and value_cr > 0:
-                candidates.append((scope_score + (1 if strong else 0), value_cr, raw, context))
+                role_context = _nearest_role_context(scope, m.start(), m.end())
+                role_score, role = _order_amount_role_score(raw, role_context)
+                candidates.append((scope_score, role_score, (1 if strong else 0), value_cr, raw, context, role))
         if candidates and scope_score == 2:
+            # Row 7 is authoritative, but it can contain both a total and its
+            # components. Keep all row-7 candidates and rank by semantic role.
             break
 
     out = {}
     if candidates:
-        # Highest-confidence scope first; largest amount only breaks ties.
-        _, value_cr, raw, context = max(candidates, key=lambda x: (x[0], x[1]))
+        # Standardized row first, then semantic role, then strong context.
+        # Amount size is only the final tie-breaker.
+        _, _, _, value_cr, raw, context, role = max(candidates, key=lambda x: (x[0], x[1], x[2], x[3]))
         out.update({
             "order_value_cr": value_cr,
             "order_value_text": raw,
+            "order_value_role": role,
             "detail_excerpt": _clean_field(context, 500),
         })
     if entity:
@@ -906,7 +939,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
             pdf_text = _extract_pdf_text_bytes(pdf_bytes)
             details = _extract_local_catalyst_details(cat, pdf_text)
             it["local_pdf_checked"] = True
-            it["local_parser_version"] = 3
+            it["local_parser_version"] = 4
             if details:
                 it.update(details)
                 _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
@@ -915,13 +948,13 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
                     values_found += 1
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
-    print(f"  ✓ Local PDF enrichment v3 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
+    print(f"  ✓ Local PDF enrichment v4 (AI disabled) → checked={checked}, details_found={enriched}, value_found={values_found}")
     return checked, enriched
 
 
 
 _LOCAL_ENRICHMENT_FIELDS = {
-    "order_value_cr", "order_value_text", "company_share_of_order_cr",
+    "order_value_cr", "order_value_text", "order_value_role", "company_share_of_order_cr",
     "transaction_value_cr", "transaction_value_text", "stake_acquired_pct",
     "post_transaction_stake_pct", "target", "stake_sold_pct", "buyer",
     "amount_cr", "amount_text", "amount_context", "authority",
@@ -944,11 +977,11 @@ def _clear_local_enrichment(item: dict) -> None:
 
 def revalidate_local_history(session, history: dict, market_cap_map: dict | None = None,
                              ttm_sales_map: dict | None = None) -> tuple[int, int, int]:
-    """One-time v3 reparse of legacy local-PDF enrichment.
+    """One-time v4 reparse of legacy local-PDF enrichment.
 
     Old v1/v2 values may have been merged forward even after the parser became
     stricter.  Every locally enriched historical row is therefore reparsed once
-    with v3.  The version marker prevents repeat downloads on later runs.
+    with v4.  The version marker prevents repeat downloads on later runs.
     Gemini/manual enrichment is never touched.
     """
     checked = changed = values = 0
@@ -960,7 +993,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
                 continue
             if it.get("detail_source") not in {"local_pdf", "pdf_local"}:
                 continue
-            if int(it.get("local_parser_version") or 0) >= 3:
+            if int(it.get("local_parser_version") or 0) >= 4:
                 continue
 
             checked += 1
@@ -968,7 +1001,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
             pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
             _clear_local_enrichment(it)
             it["local_pdf_checked"] = True
-            it["local_parser_version"] = 3
+            it["local_parser_version"] = 4
 
             if pdf_bytes:
                 pdf_text = _extract_pdf_text_bytes(pdf_bytes)
@@ -987,7 +1020,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
                 changed += 1
 
     if checked:
-        print(f"  ♻ Local PDF v3 history revalidation → checked={checked}, changed={changed}, value_found={values}")
+        print(f"  ♻ Local PDF v4 history revalidation → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
