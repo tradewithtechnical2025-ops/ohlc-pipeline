@@ -34,7 +34,7 @@ EQUITY_L  = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
 HISTORY_DAYS = 20          # TEST MODE: keep/fetch only the last 20 calendar days
 TEXT_MAX     = 300         # exchange summary is enough; the PDF link has the rest
-BACKFILL_PDF_BATCH = 10    # max never-opened history PDFs parsed per run (local parser, no AI)
+BACKFILL_PDF_BATCH = 30    # max never-opened history PDFs parsed per run (local parser, no AI)
 BACKFILL_MAX_ATTEMPTS = 3  # failed downloads retried on later runs before giving up
 
 MARKET_OPEN  = dtime(9, 15)
