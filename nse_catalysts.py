@@ -140,7 +140,11 @@ _CIRP_PROCEDURAL_ITEM = re.compile(
     r"(?:meeting|outcome|voting).{0,40}(?:coc|committee[ _-]?of[ _-]?creditors)|"
     r"appointment.{0,30}(?:irp|rp|resolution[ _-]?professional)|"
     r"(?:irp|rp|resolution[ _-]?professional).{0,30}appointment|"
-    r"trading[ _-]?window|vacation[ _-]?(?:of[ _-]?)?(?:office|director)", re.I)
+    r"trading[ _-]?window|vacation[ _-]?(?:of[ _-]?)?(?:office|director)|"
+    # Shareholder-meeting paperwork filed under the CIRP subject (notice,
+    # proceedings, voting results, e-voting, book closure, postal ballot).
+    r"(?:annual|extra[ _-]?ordinary)[ _-]?general[ _-]?meeting|\b[ae]gm\b|"
+    r"e[ _-]?voting|book[ _-]?closure|postal[ _-]?ballot", re.I)
 
 _CIRP_MATERIAL = re.compile(
     r"(?:cirp|insolvency).*(?:admit(?:ted|sion)?|initiat(?:ed|ion)|commenc(?:ed|ement))|"
@@ -171,7 +175,28 @@ _SCHEME_PROCEDURAL = re.compile(
     r"(?:hearing date|date of hearing).*?(?:scheme|merger|demerger|amalgamation)|"
     r"(?:petition|second motion petition).*(?:admitted|admission)|"
     r"(?:filing|submission).*?(?:petition|application).*?(?:scheme|merger|demerger|amalgamation)|"
-    r"(?:scheme|merger|demerger|amalgamation).*?(?:filing|submission).*?(?:petition|application)", re.I)
+    r"(?:scheme|merger|demerger|amalgamation).*?(?:filing|submission).*?(?:petition|application)|"
+    # NSE summaries of court-convened meeting notices often omit the word "scheme"
+    # and only say the meeting is being held per the NCLT's order.
+    r"(?=.*(?:shareholders?|creditors?))(?:notice|convening).{0,60}meeting.*?"
+    r"(?:nclt|nclat|national company law|tribunal|hon['’]?ble)", re.I)
+
+# A court/tribunal/authority order is a legal event, never a business order win.
+# Allows up to four words between "order from/of" and the forum name
+# (e.g. "Order from Hon'ble Delhi High Court").
+_JUDICIAL_ORDER = re.compile(
+    r"\border(?:s)?\s+(?:of|from|by|passed by|issued by|dated\s+\S+\s+(?:of|from|by))\s+(?:the\s+)?"
+    r"(?:[\w.'’()-]+\s+){0,4}?"
+    r"(?:hon['’]?ble|honourable|nclt|nclat|national company law|"
+    r"(?:high|supreme|district|commercial|sessions) court|court\b|"
+    r"(?:securities )?appellate tribunal|arbitral tribunal|tribunal|\bitat\b|\bcestat\b|\bdrt\b|\bdrat\b|"
+    r"consumer (?:forum|commission)|competition commission|\bcci\b)", re.I)
+# A court can also be a customer (e.g. an IT/services contract from a court registry).
+# Explicit procurement wording overrides the judicial reading.
+_JUDICIAL_ORDER_BUSINESS = re.compile(
+    r"awarding of order|bagging|letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|"
+    r"supply order|\bfor (?:the )?(?:supply|design|construction|installation|development|provision|"
+    r"implementation|maintenance)\b|\b(?:it|software|consulting) services\b|\bservices? contract\b", re.I)
 
 # Only explicit senior executive changes are catalysts. NSE's generic subjects such as
 # "Resignation of Director/KMP/SMP" are intentionally NOT enough on their own;
@@ -255,7 +280,15 @@ def _event_meta(subject: str, text: str, category: str) -> dict:
     if category == "Order":
         if re.search(r"\bl1\b|first lowest|lowest bidder|preferred bidder", both, re.I):
             out.update(event_type="L1 Bidder", stage="L1 / Awaiting Award")
-        elif re.search(r"letter of award|letter of acceptance|\bloa\b|awarded|bagging/receiving|order received|work order|purchase order|supply order|contract win", both, re.I):
+        elif re.search(r"letter of intent|\bloi\b", both, re.I) and not re.search(
+                r"letter of award|letter of acceptance|\bloa\b|work order|purchase order", both, re.I):
+            out.update(event_type="Order Award", stage="Letter of Intent")
+        elif re.search(
+                r"letter of award|letter of acceptance|\bloa\b|awarded|bagging/receiving|bagging|"
+                r"awarding of order|notification of award|order received|work order|purchase order|"
+                r"supply order|contract win|receipt of (?:an? )?order|receiv(?:e|ed|es|ing) (?:an? )?order|"
+                r"secured (?:an? |the )?(?:order|contract)|order (?:of|for|from|worth|valued)\b|"
+                r"contract (?:of|for|from|worth)\b|orders? wins?", both, re.I):
             out.update(event_type="Order Award", stage="Awarded")
     elif category == "Acquisition":
         out["event_type"] = "Acquisition"
@@ -351,6 +384,12 @@ def classify(subject: str, text: str) -> str | None:
     # rejected above by _SCHEME_PROCEDURAL.
     if _SCHEME.search(both) and re.search(r"(?:scheme|merger|demerger|amalgamation|nclt|nclat)", both, re.I):
         return "Scheme of Arrangement"
+
+    # A court/tribunal order (NCLAT, High Court, ITAT, ...) is a legal outcome.
+    # Route it to Negative so the litigation parser can tag it adverse or relief;
+    # without this, "Order from ... Tribunal" matched _ORDER as a business win.
+    if _JUDICIAL_ORDER.search(both) and not _JUDICIAL_ORDER_BUSINESS.search(both):
+        return "Negative"
 
     # Cancellation/termination of an order is adverse, never a fresh Order win.
     if _ORDER_CANCEL.search(both) or _ADVERSE_TAX_ORDER.search(both):
