@@ -80,20 +80,20 @@ _PROMOTER_MPS_SALE = re.compile(
 # Incorporating/funding one's own subsidiary is not an external acquisition catalyst.
 _SUBSIDIARY_INCORPORATION = re.compile(
     r"incorporation of (?:a |an |one or more |[a-z0-9 -]+ )?(?:wholly owned |step[- ]down )?subsidiar(?:y|ies)|"
-    r"incorporat(?:e|ed|ion).*\b(?:wos|wholly owned subsidiar(?:y|ies)|step[- ]down subsidiar(?:y|ies))\b", re.I)
+    r"incorporat(?:e|ed|ion).*\b(?:wos|wholly[- ]owned subsidiar(?:y|ies)|step[- ]down subsidiar(?:y|ies))\b", re.I)
 _INTERNAL_SUB_INVESTMENT = re.compile(
-    r"(?:additional )?investment.*(?:wholly owned subsidiar(?:y|ies)|\bwos\b)|"
-    r"(?:subscription|subscribe|subscribed).*?(?:rights issue|equity shares|share capital|preference shares|warrants).*?(?:wholly owned subsidiar(?:y|ies)|\bwos\b)|"
-    r"(?:wholly owned subsidiar(?:y|ies)|\bwos\b).*?(?:rights issue|additional investment|capital infusion|subscription|subscribe|subscribed)|"
-    r"investment (?:in|into).*?(?:wholly owned subsidiar(?:y|ies)|\bwos\b)", re.I)
+    r"(?:additional )?(?:investment|invested).*?(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b)|"
+    r"(?:subscription|subscribe|subscribed).*?(?:rights issue|equity shares|share capital|preference shares|warrants).*?(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b)|"
+    r"(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b).*?(?:rights issue|additional investment|capital infusion|subscription|subscribe|subscribed)|"
+    r"(?:investment|invested) (?:in|into)?.*?(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b)", re.I)
 
 # Batch-1 precision rules: acquisition/divestment/strategic agreement.
 # These are deliberately summary-text rules so obvious exchange disclosures are
 # resolved before any PDF enrichment.
 _ACQ_ROUTINE_INTERNAL = re.compile(
     r"(?:acquisition|acquire|subscription|investment).*?(?:equity shares|share capital|rights issue).*?"
-    r"(?:wholly owned subsidiary|\bwos\b)|"
-    r"(?:wholly owned subsidiary|\bwos\b).*?(?:acquisition|acquire|subscription|investment).*?"
+    r"(?:wholly[- ]owned subsidiary|\bwos\b)|"
+    r"(?:wholly[- ]owned subsidiary|\bwos\b).*?(?:acquisition|acquire|subscription|investment).*?"
     r"(?:equity shares|share capital|rights issue)|"
     r"apportionment of (?:the )?cost of acquisition", re.I)
 _ACQ_DILUTION = re.compile(
@@ -197,7 +197,9 @@ _REGULATORY_ADVERSE = re.compile(
 _REGULATORY_ROUTINE = re.compile(
     r"(?:in[- ]principle|trading|listing) approval.*?(?:shares|securities|allotment|esop|bonus|rights|preferential)|"
     r"approval.*?(?:listing|trading).*?(?:shares|securities|allotment)|"
-    r"exchange approval.*?(?:allotment|listing|trading)", re.I)
+    r"exchange approval.*?(?:allotment|listing|trading)|"
+    r"cancel(?:lation|led).*?(?:employee stock options?|esop)|"
+    r"(?:employee stock options?|esop).*?cancel(?:lation|led)", re.I)
 
 _NEGATIVE = re.compile(
     r"insolvency|\bcirp\b|default in interest|default in principal|show cause|"
