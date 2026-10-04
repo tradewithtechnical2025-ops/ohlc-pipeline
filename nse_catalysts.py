@@ -34,6 +34,8 @@ EQUITY_L  = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
 HISTORY_DAYS = 20          # TEST MODE: keep/fetch only the last 20 calendar days
 TEXT_MAX     = 300         # exchange summary is enough; the PDF link has the rest
+BACKFILL_PDF_BATCH = 10    # max never-opened history PDFs parsed per run (local parser, no AI)
+BACKFILL_MAX_ATTEMPTS = 3  # failed downloads retried on later runs before giving up
 
 MARKET_OPEN  = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
@@ -1287,6 +1289,77 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
 
 
 
+def backfill_local_history(session, history: dict, market_cap_map: dict | None = None,
+                           ttm_sales_map: dict | None = None,
+                           limit: int = BACKFILL_PDF_BATCH) -> tuple[int, int, int]:
+    """Open PDFs of stored catalysts that were never checked, newest first.
+
+    enrich_local_pdfs() only sees fresh rows (and only today's rows on a
+    rebuild), and revalidate_local_history() only reparses rows that were
+    already checked. Rows that slipped past both would stay unenriched for
+    ever; this drains that backlog `limit` PDFs per run with the local parser.
+    Gemini, manual and already-enriched rows are never touched.
+    """
+    supported = {"Order", "Acquisition", "Divestment", "Negative",
+                 "Strategic Agreement", "Scheme of Arrangement", "Corporate Action"}
+    pending = []
+    for sym, items in history.items():
+        for it in items:
+            if (it.get("manual") or it.get("local_pdf_checked") or it.get("detail_source")
+                    or it.get("category") not in supported):
+                continue
+            pending.append((it.get("dt", ""), sym, it))
+    if not pending:
+        return 0, 0, 0
+    # Never-tried rows first (newest first), then earlier failures, so one
+    # unreachable PDF cannot block the queue for BACKFILL_MAX_ATTEMPTS runs.
+    pending.sort(key=lambda t: t[0], reverse=True)
+    pending.sort(key=lambda t: int(t[2].get("local_pdf_attempts") or 0))
+
+    checked = enriched = values = 0
+    consecutive_fail = 0
+    for _dt, sym, it in pending[:max(0, limit)]:
+        if consecutive_fail >= 3:
+            # Session is probably blocked/throttled; stop and try again next run.
+            print("  ⚠ History PDF backfill paused after 3 consecutive download failures")
+            break
+        cat = it["category"]
+        link = it.get("link", "")
+        checked += 1
+        pdf_bytes = _download_pdf_bytes(session, link)
+        if not pdf_bytes:
+            is_pdf_link = bool(link) and link.lower().split("?", 1)[0].endswith(".pdf")
+            attempts = int(it.get("local_pdf_attempts") or 0) + 1
+            if not is_pdf_link or attempts >= BACKFILL_MAX_ATTEMPTS:
+                # Nothing to open, or repeatedly unreachable: stop retrying.
+                it.pop("local_pdf_attempts", None)
+                it["local_pdf_checked"] = True
+            else:
+                it["local_pdf_attempts"] = attempts
+            if is_pdf_link:
+                consecutive_fail += 1
+            continue
+        consecutive_fail = 0
+        details = _extract_local_catalyst_details(cat, _extract_pdf_text_bytes(pdf_bytes))
+        it.pop("local_pdf_attempts", None)
+        it["local_pdf_checked"] = True
+        it["local_parser_version"] = 4.1
+        if cat == "Negative":
+            it["negative_parser_version"] = 1.3
+        if details:
+            it.update(details)
+            it["_lookup_symbol"] = str(sym).strip().upper()
+            _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
+            it.pop("_lookup_symbol", None)
+            enriched += 1
+            if any(k.endswith("_cr") and v is not None for k, v in details.items()):
+                values += 1
+    remaining = sum(1 for _d, _s, x in pending if not x.get("local_pdf_checked"))
+    print(f"  📥 History PDF backfill → checked={checked}, details_found={enriched}, "
+          f"value_found={values}, remaining={remaining}")
+    return checked, enriched, values
+
+
 _LOCAL_ENRICHMENT_FIELDS = {
     "order_value_cr", "order_value_text", "order_value_role", "company_share_of_order_cr",
     "transaction_value_cr", "transaction_value_text", "stake_acquired_pct",
@@ -2067,6 +2140,11 @@ def main():
             _it.pop("_lookup_symbol", None)
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
+
+    # Drain the never-opened backlog (rows stored before their PDF was checked).
+    # Runs after merge so expired rows are already gone and fresh rows that a
+    # rebuild skipped are included. Uses the primed NSE session like fresh enrichment.
+    backfill_local_history(nse_session, history, market_cap_map, ttm_sales_map)
 
     # Defensive final hygiene after merge: no Negative-only metadata may survive
     # on a card whose final category is something else.
