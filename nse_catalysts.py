@@ -865,7 +865,7 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["buyer"] = _clean_field(buyer.group(1), 120)
 
     elif category == "Negative":
-        # Negative parser v1.2: precision-first.  Determine event semantics before
+        # Negative parser v1.3: precision-first.  Determine event semantics before
         # selecting money so project values / facilities / historical references
         # cannot become the primary adverse amount.
         relief = bool(re.search(
@@ -981,6 +981,18 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
             out["interest_cr"], out["interest_text"] = intr[0], intr[1]
         if award:
             out["award_amount_cr"], out["award_amount_text"] = award[0], award[1]
+
+        # v1.3: a favourable order may refer to the historical demand/claim that
+        # has just been set aside. Keep that amount only as a lifecycle reference;
+        # it is not a current adverse exposure and must not populate amount_cr.
+        if relief and candidates:
+            relief_candidates = [c for c in candidates if re.search(
+                r"set aside|quashed|deleted|dropped|withdrawn|appeal.{0,30}allowed|previously upheld|tax demand|demand",
+                c[2], re.I | re.S)]
+            if relief_candidates:
+                ref = max(relief_candidates, key=lambda x: x[0])
+                out["relief_reference_cr"] = ref[0]
+                out["relief_reference_text"] = ref[1]
 
         # Primary amount represents the principal adverse exposure, not a sum that
         # could double-count overlapping disclosures. Keep separate role fields too.
@@ -1224,7 +1236,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
 
 
 def revalidate_negative_history(session, history: dict, market_cap_map: dict | None = None) -> tuple[int, int, int]:
-    """One-time local Negative v1.2 refresh. Other v4.1 category parsers stay frozen."""
+    """One-time local Negative v1.3 refresh. Other v4.1 category parsers stay frozen."""
     checked = changed = values = 0
     for sym, items in history.items():
         for it in items:
@@ -1234,16 +1246,16 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
                 neg_ver = float(it.get("negative_parser_version") or 0)
             except (TypeError, ValueError):
                 neg_ver = 0.0
-            if neg_ver >= 1.2:
+            if neg_ver >= 1.3:
                 continue
             checked += 1
             neg_fields = ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage",
                           "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
                           "interest_cr", "interest_text", "award_amount_cr", "award_amount_text",
-                          "total_exposure_cr", "amount_to_market_cap_pct")
+                          "total_exposure_cr", "relief_reference_cr", "relief_reference_text", "amount_to_market_cap_pct")
             before = {k: it.get(k) for k in neg_fields if k in it}
             pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
-            it["negative_parser_version"] = 1.2
+            it["negative_parser_version"] = 1.3
             if not pdf_bytes:
                 continue
             details = _extract_local_catalyst_details("Negative", _extract_pdf_text_bytes(pdf_bytes))
@@ -1261,7 +1273,7 @@ def revalidate_negative_history(session, history: dict, market_cap_map: dict | N
             if before != after:
                 changed += 1
     if checked:
-        print(f"  ♻ Negative local history v1.2 → checked={checked}, changed={changed}, value_found={values}")
+        print(f"  ♻ Negative local history v1.3 → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
@@ -1382,12 +1394,45 @@ def fetch_catalysts(session, today: date, lookback_days: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Negative adverse -> relief lifecycle consolidation (v1.2)
+# Negative metadata hygiene (v1.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NEGATIVE_OWNED_FIELDS = (
+    "negative_parser_version", "negative_type", "negative_stage",
+    "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
+    "interest_cr", "interest_text", "award_amount_cr", "award_amount_text",
+    "total_exposure_cr", "relief_reference_cr", "relief_reference_text",
+    "amount_cr", "amount_text", "amount_context", "amount_to_market_cap_pct", "authority",
+)
+
+def scrub_negative_metadata_from_nonnegative(data: dict) -> int:
+    """Remove Negative-owned parser fields from every non-Negative row, including
+    rows that were reclassified on an earlier run and therefore do not change
+    category during today's historical cleanup.
+    """
+    changed = 0
+    for items in data.values():
+        for it in items:
+            if it.get("category") == "Negative":
+                continue
+            touched = False
+            for key in _NEGATIVE_OWNED_FIELDS:
+                if key in it:
+                    it.pop(key, None)
+                    touched = True
+            if touched and it.get("detail_source") in {"local_pdf", "pdf_local"}:
+                it.pop("detail_source", None)
+            if touched:
+                changed += 1
+    return changed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Negative adverse -> relief lifecycle consolidation (v1.3)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _negative_money_markers(item: dict) -> set[str]:
     vals = set()
-    for key in ("amount_cr", "tax_demand_cr", "penalty_cr", "award_amount_cr"):
+    for key in ("amount_cr", "tax_demand_cr", "penalty_cr", "award_amount_cr", "relief_reference_cr"):
         try:
             if item.get(key) is not None:
                 vals.add(f"{float(item[key]):.3f}")
@@ -1833,6 +1878,10 @@ def main():
     if removed_noise or reclassified:
         print(f"  🧹 Historical cleanup → removed={removed_noise}, reclassified={reclassified}")
 
+    stale_negative_scrubbed = scrub_negative_metadata_from_nonnegative(history)
+    if stale_negative_scrubbed:
+        print(f"  🧽 Negative metadata scrub → cleaned={stale_negative_scrubbed} non-Negative card(s)")
+
     # Negative-only local refresh. This does not alter the frozen v4.1 parsers
     # for Orders, Acquisition, Corporate Action, etc.
     revalidate_negative_history(r2_session, history, market_cap_map)
@@ -1876,7 +1925,7 @@ def main():
     for _items in new_items.values():
         for _it in _items:
             if _it.get("category") == "Negative" and _it.get("local_pdf_checked"):
-                _it["negative_parser_version"] = 1.2
+                _it["negative_parser_version"] = 1.3
 
     # Internal join key must never be persisted.
     for _items in new_items.values():
@@ -1885,7 +1934,11 @@ def main():
 
     added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
 
-    # Negative v1.2: when a later filing explicitly sets aside / grants relief
+    # Defensive final hygiene after merge: no Negative-only metadata may survive
+    # on a card whose final category is something else.
+    scrub_negative_metadata_from_nonnegative(history)
+
+    # Negative v1.3: when a later filing explicitly sets aside / grants relief
     # on the same monetary matter, suppress the older adverse card.
     negative_relief_removed = consolidate_negative_relief_lifecycles(history)
     if negative_relief_removed:
