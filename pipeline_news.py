@@ -628,16 +628,78 @@ def _opm_value(revenue, total_expenses, finance_costs=None, depreciation=None):
     return round((revenue - total_expenses) / revenue, 4), "ebit"
 
 
+def _operating_profit_value(revenue, total_expenses, finance_costs=None, depreciation=None):
+    """Absolute operating profit in rupees on the SAME basis as _opm_value():
+    EBITDA excluding Other Income = Revenue - (Total Expenses - Finance - D&A).
+    Returns (op, basis). This (not quarter['ebitda'], which is PBT+Fin+D&A
+    and therefore INCLUDES other income) is what an "OP" row must show, so
+    OP and OPM always agree (OPM = OP / Revenue)."""
+    if revenue is None or total_expenses is None:
+        return None, None
+    if finance_costs is not None and depreciation is not None:
+        return round(revenue - (total_expenses - finance_costs - depreciation), 2), "ebitda"
+    return round(revenue - total_expenses, 2), "ebit"
+
+
 def _compute_opm(period_dict: dict) -> None:
     """
     Mutates period_dict in place, adding 'opm' as a decimal fraction (e.g.
-    0.241 = 24.1%) plus 'opm_basis' ("ebitda" or "ebit") — see _opm_value().
+    0.241 = 24.1%) plus 'opm_basis' ("ebitda" or "ebit") — see _opm_value() —
+    and 'operating_profit' (absolute, same basis).
     """
     opm, basis = _opm_value(period_dict.get("revenue"), period_dict.get("total_expenses"),
                             period_dict.get("finance_costs"), period_dict.get("depreciation"))
     if opm is not None:
         period_dict["opm"] = opm
         period_dict["opm_basis"] = basis
+    op, _ = _operating_profit_value(period_dict.get("revenue"), period_dict.get("total_expenses"),
+                                    period_dict.get("finance_costs"), period_dict.get("depreciation"))
+    if op is not None:
+        period_dict["operating_profit"] = op
+
+
+def _reconcile_total_expenses(period: dict, label: str, fname_dbg: str, flags: list,
+                              exceptional=None, assoc_share=None, force_addback: bool = False) -> bool:
+    """Accounting identity check, mutating `period` in place:
+        Total Income - Total Expenses + Share of associates - Exceptional = PBT
+    In a SEBI Reg 33 statement, Total Expenses INCLUDES finance costs and D&A.
+    Summary tables (investor presentations, some press releases, and the
+    occasional AI misread) instead show "Total Expenses" EXCLUDING them —
+    feeding that into _opm_value() double-adds Fin+D&A and inflates OPM
+    (Steamhouse Q1 FY27: 32.8% shown vs 24.05% actual).
+
+    If the gap equals Finance + D&A, they are added back and a flag is
+    recorded. If the identity fails for any other reason, the record is
+    only flagged (never silently "fixed"). force_addback applies the same
+    fix to a comparative column that has no PBT to test against, used when
+    the current column of the same table needed it.
+    Returns True if the add-back was applied."""
+    ti, te, pbt = period.get("total_income"), period.get("total_expenses"), period.get("pbt")
+    fin, dep = period.get("finance_costs"), period.get("depreciation")
+    if ti is None and period.get("revenue") is not None and period.get("other_income") is not None:
+        ti = period["revenue"] + period["other_income"]
+    if te is None:
+        return False
+    if pbt is None or ti is None:
+        if force_addback and fin is not None and dep is not None:
+            period["total_expenses"] = te + fin + dep
+            flags.append(f"{label}:total_expenses_excl_fin_dep_fixed_by_inference")
+            return True
+        return False
+    adj = (exceptional or 0) - (assoc_share or 0)
+    gap = ti - te - pbt - adj
+    tol = max(1e5, 0.005 * abs(ti))
+    if abs(gap) <= tol:
+        return False
+    if fin is not None and dep is not None and abs(gap - (fin + dep)) <= tol:
+        period["total_expenses"] = te + fin + dep
+        flags.append(f"{label}:total_expenses_excl_fin_dep_fixed")
+        print(f"    · [{fname_dbg}] {label}: Total Expenses excluded Finance+D&A — added back "
+              f"(₹{(fin + dep)/1e7:.2f} Cr) so OPM isn't double-counted")
+        return True
+    flags.append(f"{label}:pnl_identity_mismatch_{gap/1e7:.2f}Cr")
+    print(f"    · [{fname_dbg}] {label}: TI − TE − PBT off by ₹{gap/1e7:.2f} Cr — flagged (not auto-fixed)")
+    return False
 
 
 def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
@@ -1097,6 +1159,8 @@ def _bse_extra_candidate_kind(it: dict, calendar: dict, bse_symbol_map: dict | N
         return None
     if is_noise(it):
         return None   # trading window, 74(5), scrutinizer, ESOP... never worth a fetch
+    if _NON_STATEMENT_DESC_RE.search(f"{it.get('title', '')} {it.get('summary', '')}"):
+        return None   # investor presentation / press release / transcript — never the Reg 33 statement
     sym = ((bse_symbol_map or {}).get(code, code) or "").upper()
     if _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", ""))):
         return "calendar"
@@ -1127,6 +1191,7 @@ _AI_EXTRACT_SYSTEM_PROMPT = """You extract structured financial data from an NSE
 The extracted text can be genuinely UNRELIABLE for the numbers table specifically — for scanned or lower-quality PDFs, text extraction has been observed to corrupt digits outright (e.g. "406.95" extracted as "40695" with the decimal point silently dropped, or "436.33" garbled into an unrelated "13635"), not just misalign columns. When the PDF document itself is provided, treat it as the authoritative source for every number in the main results table — read the table directly from the PDF the way a person would, rather than trusting the extracted text's digits. Use the extracted text mainly for things that are awkward to re-derive from the PDF alone (confirming labels, locating which page has the table) and as a fallback only when no PDF is provided at all.
 
 Your job:
+0. Classify the document in "document_type". ONLY the formal SEBI Regulation 33 statement ("Statement of (Un)audited Standalone/Consolidated Financial Results" — column headers like Unaudited/Audited per period, a Total Expenses line, a Profit before tax line, and an EPS row, usually signed by a director with a limited review / audit report) counts as "results_statement". An INVESTOR / EARNINGS PRESENTATION, PRESS RELEASE, earnings call transcript or fact sheet is NOT a results statement EVEN IF it contains a P&L-style summary slide or table (e.g. a "Financial Performance" slide) — classify it as "investor_presentation" / "press_release" / "other" and set is_results_table to false. Presentation tables routinely regroup lines (e.g. "Total Expenses" excluding finance costs and depreciation, EBITDA rows), so their numbers must never be used. If one PDF contains BOTH a presentation and the formal statement, use only the formal statement and classify as "results_statement". Scanned (image-only) pages are common for the statement itself — read them from the PDF.
 1. Determine if this document contains an actual quarterly financial results TABLE (the "Statement of Standalone/Consolidated Financial Results" with line items like Revenue, Expenses, Profit, EPS). If it's only a cover letter, merger intimation, KMP change notice, AGM notice, or similar with no such table, set is_results_table to false and leave other fields null.
 2. Indian results filings very often show BOTH Standalone and Consolidated tables — usually as two SEPARATE tables further apart in the document, not side by side. SEARCH THE ENTIRE TEXT for a table explicitly labeled "Consolidated" before concluding only Standalone exists — don't stop at the first table you see. If a genuine Consolidated table exists, use it throughout (every field below, don't mix bases). Only use Standalone if no Consolidated table is present at all. Record which one you used in "basis" — this field is REQUIRED, never omit it.
 3. Extract values ONLY from the MAIN results table's own rows — never from a subsidiary/joint-venture footnote, a segment-wise breakdown table, or the auditor's report's boilerplate sentences, even if they mention similar words ("total income", "net profit") with numbers nearby. The main table is the one with the full standard line-item structure (Revenue, Expenses, Profit before tax, Tax expense, Profit for the period, EPS).
@@ -1136,6 +1201,8 @@ Your job:
 7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, total_income, total_expenses, PAT, EPS, finance_costs and depreciation if visible as separate columns in the same main table, plus each comparison column's period-end date. Revenue, total_income and total_expenses comparative columns get missed more often than PAT/EPS — the standard NSE quarterly table always has ALL FOUR columns (current quarter, immediately-preceding quarter, same quarter last year, full year) on the SAME rows as the current-quarter figures, so for EVERY row where you found a current-quarter value, actively look at that same row's other columns for the comparative figures too rather than only checking for PAT/EPS comparatives. total_expenses specifically matters even though it isn't shown in the final display on its own — it's what the operating-profit and operating-margin comparisons are computed from downstream, so a missing prior-period total_expenses silently blanks out those comparisons even when revenue/PAT/EPS comparatives are otherwise complete.
 8. Extract the quarter-end date (the date this result is FOR, e.g. "quarter ended June 30, 2026" -> "2026-06-30").
 9. "pat" MUST be the figure the filing's own reported EPS is actually derived from (usually "Profit attributable to Owners/Shareholders of the Company" — NOT a larger "total" figure that also includes non-controlling/minority interest, if the filing distinguishes between the two). Cross-check: PAT divided by shares outstanding should roughly reconcile to the reported EPS.
+9b. Also report "pat_incl_nci" = the TOTAL "Profit for the period" before splitting into owners / non-controlling interest (equal to pat if there's no NCI split).
+9c. "total_expenses" must be the statement's own "Total Expenses" line exactly as printed (it normally INCLUDES finance costs and depreciation). Never compute or regroup it. Also report "exceptional_items" (as printed; positive = charge/loss reducing profit) and "share_of_associates" (profit/(loss) from associates/JVs under equity method, negative if a loss) when those lines exist.
 10. finance_costs and depreciation are separate P&L line items (usually "Finance Costs" and "Depreciation and Amortisation Expense") — extract them if the table shows them; the caller computes EBITDA from these, don't compute it yourself.
 11. Segment-wise revenue is usually in its own table/note (often titled "Segment Information" or "Segment Revenue") — look for it actively rather than only checking the main P&L; most listed operating companies with multiple business lines report this. Omit segment_breakup entirely if the company doesn't report segments.
 12. management_commentary: 1-3 sentence summary of any outlook/commentary/guidance mentioned in the document (not the standard boilerplate disclaimers), or null if there's none.
@@ -1145,6 +1212,7 @@ Your job:
 Return ONLY valid JSON (no markdown fences, no other text) matching exactly this schema:
 {
   "is_results_table": true or false,
+  "document_type": "results_statement" or "investor_presentation" or "press_release" or "other",
   "basis": "Standalone" or "Consolidated" or null,
   "unit": "Crore" or "Million" or "Lakh" or null,
   "period_end": "YYYY-MM-DD" or null,
@@ -1158,12 +1226,15 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
     "pbt": number or null,
     "tax_expense": number or null,
     "pat": number or null,
+    "pat_incl_nci": number or null,
+    "exceptional_items": number or null,
+    "share_of_associates": number or null,
     "comprehensive_income": number or null,
     "eps_basic": number or null,
     "eps_diluted": number or null
   },
-  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
-  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
+  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
+  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
   "segment_breakup": [{"segment": string, "revenue": number}] or omitted,
   "management_commentary": string or null,
   "key_highlights": [string, ...] or omitted,
@@ -1287,6 +1358,11 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     the filename alone. All four are no-ops for NSE (left as None/"NSE"),
     so NSE's existing filename-derived behavior is unchanged."""
     cur = ai.get("current") or {}
+    doc_type = (ai.get("document_type") or "").strip().lower() or None
+    if doc_type and doc_type != "results_statement":
+        print(f"    · [{fname_dbg}] AI classified document as {doc_type!r} — not a Reg 33 statement, rejecting")
+        return None
+    quality_flags = []
     nature = ai.get("basis") or "Standalone"
     unit_word = (ai.get("unit") or "Crore").lower()
     if unit_word.startswith("million"):
@@ -1308,6 +1384,9 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     pbt = scale(cur.get("pbt"))
     tax_expense = scale(cur.get("tax_expense"))
     pat = scale(cur.get("pat"))
+    pat_incl_nci = scale(cur.get("pat_incl_nci"))
+    exceptional_items = scale(cur.get("exceptional_items"))
+    share_of_associates = scale(cur.get("share_of_associates"))
     comprehensive = scale(cur.get("comprehensive_income"))
     eps_basic = cur.get("eps_basic")      # per-share rupee amount — never scaled
     eps_diluted = cur.get("eps_diluted")
@@ -1354,7 +1433,15 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         print(f"    · [{fname_dbg}] no filename timestamp and no fallback date supplied — can't build dedup key")
         return None
 
-    m_sym = re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&]+)", text, re.IGNORECASE)
+    # Text-declared NSE symbol beats the filename prefix: NSE archive filenames
+    # sometimes carry the UPLOADER's name, not the symbol (seen:
+    # "CAVAIBHAVGATTANI_05102026160805_Outcome_of_Board_Meeting.pdf" for
+    # STEAMHOUSE). Cover letters write it several ways:
+    #   "NSE Symbol: X" / "Symbol: X (NSE)" / "National Stock Exchange ... Symbol: X"
+    m_sym = (re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&\-]{2,20})\b", text, re.IGNORECASE)
+             or re.search(r"Symbol\s*[:\-]\s*([A-Z0-9&\-]{2,20})\s*\(\s*NSE\s*\)", text, re.IGNORECASE)
+             or re.search(r"National\s+Stock\s+Exchange[\s\S]{0,600}?Symbol\s*[:\-]\s*([A-Z0-9&\-]{2,20})\b",
+                          text, re.IGNORECASE))
     if symbol_override:
         symbol = symbol_override
     elif m_sym:
@@ -1379,6 +1466,14 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         "comprehensive_income": comprehensive, "eps_basic": eps_basic, "eps_diluted": eps_diluted,
         "period_end": period_end,
     }
+    if pat_incl_nci is not None and pat is not None and abs(pat_incl_nci - pat) > 1:
+        quarter["pat_incl_nci"] = pat_incl_nci
+    if exceptional_items:
+        quarter["exceptional_items"] = exceptional_items
+    if share_of_associates:
+        quarter["share_of_associates"] = share_of_associates
+    cur_fixed = _reconcile_total_expenses(quarter, "current", fname_dbg, quality_flags,
+                                          exceptional=exceptional_items, assoc_share=share_of_associates)
     _compute_opm(quarter)
 
     result = {
@@ -1393,6 +1488,7 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
             "exchange": exchange,
             "source": "pdf",
             "extraction_method": "ai",
+            "document_type": doc_type or "results_statement",
         },
         "quarter": quarter,
     }
@@ -1420,18 +1516,23 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
 
     qoq = ai.get("qoq_prior") or {}
     yoy = ai.get("yoy_prior") or {}
-    qoq_prior = {
-        "revenue": scale(qoq.get("revenue")), "total_income": scale(qoq.get("total_income")),
-        "pat": scale(qoq.get("pat")), "eps_basic": qoq.get("eps_basic"),
-        "total_expenses": scale(qoq.get("total_expenses")),
-        "finance_costs": scale(qoq.get("finance_costs")), "depreciation": scale(qoq.get("depreciation")),
-    }
-    yoy_prior = {
-        "revenue": scale(yoy.get("revenue")), "total_income": scale(yoy.get("total_income")),
-        "pat": scale(yoy.get("pat")), "eps_basic": yoy.get("eps_basic"),
-        "total_expenses": scale(yoy.get("total_expenses")),
-        "finance_costs": scale(yoy.get("finance_costs")), "depreciation": scale(yoy.get("depreciation")),
-    }
+    def _prior(d):
+        return {
+            "revenue": scale(d.get("revenue")), "total_income": scale(d.get("total_income")),
+            "pbt": scale(d.get("pbt")),
+            "pat": scale(d.get("pat")), "eps_basic": d.get("eps_basic"),
+            "total_expenses": scale(d.get("total_expenses")),
+            "finance_costs": scale(d.get("finance_costs")), "depreciation": scale(d.get("depreciation")),
+        }
+    qoq_prior, yoy_prior = _prior(qoq), _prior(yoy)
+    # Same identity check on each comparative column. A prior column with no
+    # PBT can't be tested directly; if the CURRENT column of the same table
+    # needed the Fin+D&A add-back, the comparatives share that layout.
+    for lbl, pr in (("qoq_prior", qoq_prior), ("yoy_prior", yoy_prior)):
+        _reconcile_total_expenses(pr, lbl, fname_dbg, quality_flags,
+                                  force_addback=cur_fixed and pr.get("pbt") is None)
+    if quality_flags:
+        result["meta"]["quality_flags"] = quality_flags
     qoq_header = _quarter_header(qoq.get("period_end")) if qoq.get("period_end") else None
     yoy_header = _quarter_header(yoy.get("period_end")) if yoy.get("period_end") else None
     qoq_fund = _pdf_comparison(quarter, qoq_prior, qoq_header, "qoq")
@@ -1473,7 +1574,53 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
         out["opm_prior"] = round(prior_opm * 100, 2)
         out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
         got_any = True
+    # Absolute operating profit for the "OP" row — same basis as OPM above,
+    # so the card never mixes EBITDA-incl-other-income with OPM-derived OP.
+    cur_op, _ = _operating_profit_value(cur.get("revenue"), cur.get("total_expenses"), *fc_dep(cur))
+    prior_op, _ = _operating_profit_value(prior.get("revenue"), prior.get("total_expenses"), *fc_dep(prior))
+    if cur_op is not None and prior_op is not None:
+        out["operating_profit_prior"] = prior_op
+        if prior_op != 0:
+            out[f"operating_profit_{suffix}_pct"] = round((cur_op - prior_op) / abs(prior_op) * 100, 2)
+        got_any = True
     return out if got_any else None
+
+
+# Cover-letter subject lines that mark a PDF as NOT the Reg 33 statement.
+# Checked only against the first ~3000 chars (the cover letter), so a results
+# PDF that merely mentions "press release" in its notes isn't affected.
+_NON_STATEMENT_SUBJECT_RE = re.compile(
+    r"(?:sub(?:ject)?\.?\s*[:\-]?)[^\n]{0,250}?"
+    r"(investors?['’]?\s+presentation|earnings\s+presentation|analysts?['’]?\s+presentation|"
+    r"press\s+release|media\s+release|earnings\s+(?:call|conference)|conference\s+call|transcript|fact\s*sheet)",
+    re.IGNORECASE)
+_NON_STATEMENT_DESC_RE = re.compile(
+    r"investors?['’]?\s+presentation|earnings\s+presentation|analysts?\s+(?:meet|presentation)|"
+    r"press\s+release|media\s+release|transcript|earnings\s+call|conference\s+call",
+    re.IGNORECASE)
+
+
+def _is_non_statement_doc(text: str) -> bool:
+    head = re.sub(r"[ \t]+", " ", (text or "")[:3000])
+    return bool(_NON_STATEMENT_SUBJECT_RE.search(head))
+
+
+def _scanned_results_likely(content: bytes, text: str) -> bool:
+    """Cover letter references Reg 33 results AND at least one page has
+    (almost) no text layer -> the statement is probably a scanned image."""
+    if not re.search(r"financial\s+results", text or "", re.IGNORECASE):
+        return False
+    if not re.search(r"regulation\s*33|limited\s+review", text or "", re.IGNORECASE):
+        return False
+    if not content:
+        return False
+    try:
+        import pdfplumber
+        import io as _io
+        with pdfplumber.open(_io.BytesIO(content)) as pdf:
+            return any(len((pg.extract_text() or "").strip()) < 80 for pg in pdf.pages)
+    except Exception:
+        return False
 
 
 async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = "",
@@ -1517,16 +1664,28 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         except Exception as e:
             print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
             return None
-    if not text.strip():
-        print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
+    # ── Investor presentation / press release: never a Reg 33 source ──
+    if _is_non_statement_doc(text):
+        print(f"    · [{fname_dbg}] cover letter says investor presentation / press release / transcript — "
+              f"not a results statement, skipping AI call")
         return None
 
     # ── Cheap pre-check BEFORE spending an AI call ──
     # Most "Outcome of Board Meeting" PDFs are governance/KMP-only (no
     # results table) — no point burning a Gemini call on those.
+    # Exception: the statement pages are frequently SCANNED images, so the
+    # text layer only has the cover letter (whose wording, e.g. "Unaudited
+    # Financial Results (Standalone and Consolidated) ...", doesn't match the
+    # heading tiers). If the cover letter cites Reg 33 / limited review and
+    # some pages have no text layer, the table is almost certainly in the
+    # images — send it to Gemini, which reads the PDF natively.
     if not _pdf_find_heading_candidates(text):
-        print(f"    · [{fname_dbg}] no 'Financial Results' heading found — not a results PDF, skipping AI call")
-        return None
+        if _scanned_results_likely(content, text):
+            print(f"    · [{fname_dbg}] no text-layer heading, but cover letter cites Reg 33 results and "
+                  f"pages are image-only — sending PDF to AI")
+        else:
+            print(f"    · [{fname_dbg}] no 'Financial Results' heading found — not a results PDF, skipping AI call")
+            return None
 
     # ── AI extraction (sole extraction path — no regex fallback) ──
     # Send the FULL extracted PDF text (not a truncated head-of-document
@@ -1842,6 +2001,7 @@ def _telegram_fin_table(parsed: dict) -> list:
     cur_pat = q.get("pat")
     cur_eps = q.get("eps_basic")
     cur_opm = round(q["opm"] * 100, 1) if q.get("opm") is not None else None
+    cur_op = q.get("operating_profit")
     cur_header = _shorten_quarter_header(_quarter_header(q.get("period_end"))) or "Cur"
 
     qf = parsed.get("qoq_fundamentals") or {}
@@ -1861,6 +2021,8 @@ def _telegram_fin_table(parsed: dict) -> list:
     qoq_eps = qf.get("eps_prior")
     qoq_opm = qf.get("opm_prior")
     qoq_opm_pp = qf.get("opm_qoq_pp")
+    qoq_op = qf.get("operating_profit_prior")
+    qoq_op_pct = qf.get("operating_profit_qoq_pct")
     qoq_header = _shorten_quarter_header(qf.get("prior_header"))
 
     if yoy_native:
@@ -1873,6 +2035,8 @@ def _telegram_fin_table(parsed: dict) -> list:
         yoy_opm = round(yoy_native["opm"] * 100, 1) if yoy_native.get("opm") is not None else None
         yoy_opm_pp = round((cur_opm - yoy_opm), 1) if (cur_opm is not None and yoy_opm is not None) else None
         yoy_eps = None
+        yoy_op = yoy_native.get("operating_profit")
+        yoy_op_pct = None
         yoy_rev_pct = yoy_pat_pct = None  # computed generically below from the raw values
         yoy_header = _shorten_quarter_header(_quarter_header(yoy_native.get("period_end")))
     else:
@@ -1885,6 +2049,8 @@ def _telegram_fin_table(parsed: dict) -> list:
         yoy_eps = yf.get("eps_prior")
         yoy_opm = yf.get("opm_prior")
         yoy_opm_pp = yf.get("opm_yoy_pp")
+        yoy_op = yf.get("operating_profit_prior")
+        yoy_op_pct = yf.get("operating_profit_yoy_pct")
         yoy_header = _shorten_quarter_header(yf.get("prior_header"))
 
     if not qf and not yf and not yoy_native:
@@ -1898,6 +2064,7 @@ def _telegram_fin_table(parsed: dict) -> list:
 
     rows = [
         ("Sales", _cr(cur_rev), _cr(qoq_rev), qoq_rev_pct, _cr(yoy_rev), yoy_rev_pct, 1, "pct"),
+        ("OP",    _cr(cur_op),  _cr(qoq_op),  qoq_op_pct,  _cr(yoy_op),  yoy_op_pct,  1, "pct"),
         ("PAT",   _cr(cur_pat), _cr(qoq_pat), qoq_pat_pct, _cr(yoy_pat), yoy_pat_pct, 1, "pct"),
         ("EPS",   cur_eps,      qoq_eps,      None,        yoy_eps,      None,        2, "pct"),
         ("OPM%",  cur_opm,      qoq_opm,      qoq_opm_pp,  yoy_opm,      yoy_opm_pp,  1, "pp"),
@@ -1923,7 +2090,7 @@ def _telegram_fin_table(parsed: dict) -> list:
                f"{_fmt_table_num(cur, dec):>9}{_fmt_table_num(qprior, dec):>9}{_fmt_table_num(yprior, dec):>9}")
         lines.append(row)
     lines.append("</pre>")
-    lines.append("<i>Sales/PAT in ₹Cr</i>")
+    lines.append("<i>Sales/OP/PAT in ₹Cr · OP = EBITDA excl. other income</i>")
     return lines
 
 
@@ -2530,6 +2697,9 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
             it["_pre_content"] = content
             it["_pre_text"] = text
+            if _is_non_statement_doc(text):
+                it["_pre_non_statement"] = True
+                return it   # no result key: must never supersede the real statement
             heads = _pdf_find_heading_candidates(text)
             natures = {h[2] for h in heads}
             if len(natures) != 1:
@@ -2588,6 +2758,11 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     if singleton_pdf:
         singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
+        non_stmt = [it["link"] for it in singleton_pdf if it.get("_pre_non_statement")]
+        if non_stmt:
+            new_dupe_links.extend(non_stmt)
+            singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_non_statement")]
+            print(f"  ⏭ {len(non_stmt)} investor presentation / press release PDF(s) skipped BEFORE AI")
 
         # Different URL, but an already-stored result business key: mark this
         # link processed and stop before AI.  Ambiguous/unkeyed PDFs are left
@@ -2639,6 +2814,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         # groups.  Preflight is local (pdfplumber only) and its cached bytes/
         # text are reused by process_pdf if AI is genuinely needed.
         checked_items = list(await asyncio.gather(*(_preflight_pdf(it) for it in group_items)))
+        non_stmt = [it for it in checked_items if it.get("_pre_non_statement")]
+        if non_stmt:
+            new_dupe_links.extend(it["link"] for it in non_stmt)
+            checked_items = [it for it in checked_items if not it.get("_pre_non_statement")]
+            if not checked_items:
+                return None
         stored_matches = [it for it in checked_items
                           if it.get("_pre_result_key")
                           and _norm_result_key(it["_pre_result_key"]) in existing_pre_keys]
