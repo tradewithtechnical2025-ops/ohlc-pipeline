@@ -2353,22 +2353,63 @@ def _tidy_lead(t: str) -> str:
     return t
 
 
+_OCR_OK_UNITS = re.compile(r"^\d+(?:st|nd|rd|th|gw|mw|mwh|mwp|kv|km|ckm|cr|mt|tph|x|s)$", re.I)
+
+
+def _ocr_garbage(text: str) -> bool:
+    """True when a line reads like broken OCR ("5rou that the Clompany l-las been arvarded")."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’\-]*", text or "")
+    if len(words) < 4:
+        return False
+    bad = 0
+    for w in words:
+        if re.fullmatch(r"\d+[A-Za-z]+", w) and not _OCR_OK_UNITS.match(w):
+            bad += 1                                   # "5rou"
+        elif re.fullmatch(r"[a-z]{1,2}-[a-z]{1,3}", w):
+            bad += 1                                   # "l-las"
+        elif re.search(r"[a-z][A-Z][a-z]", w) and not re.match(r"^(?:Mc|Mac|eM|iP|eC|NewGen|RailTel|PowerGrid)", w):
+            bad += 1                                   # "ClOmpany"
+        elif re.fullmatch(r"(?:Cl[oa]\w*|Lr[ya]\w*|l-l\w*|rn\w{0,2})", w):
+            bad += 1                                   # "Clompany", "Lry"
+    return bad / len(words) > 0.08
+
+
+_NSE_BOILER_PREFIX = re.compile(r"^.{0,160}?\bhas\s+informed\s+the\s+exchange\s+(?:about|regarding|that)?\s*", re.I)
+_NSE_TAXONOMY_ONLY = re.compile(
+    r"^(?:bagging/receiving of orders/contracts|awarding of order\(s\)/contract\(s\)|general updates?|press release|"
+    r"updates?|intimation|disclosure)[\s.:-]*$", re.I)
+
+
+def _nse_text_is_informative(text: str) -> bool:
+    """NSE summary already says what the order is (not just the filing category)."""
+    body = _NSE_BOILER_PREFIX.sub("", text or "").strip()
+    body = re.sub(r"^(?:bagging/receiving of orders/contracts|awarding of order\(s\)/contract\(s\))\s*[:\-–]?\s*",
+                  "", body, flags=re.I)
+    return len(body) >= 40 and not _NSE_TAXONOMY_ONLY.match(body)
+
+
 def _local_order_lead(pdf_text: str, subject: str, purpose: str = "") -> str:
     """One factual line about the order without AI: press-release dateline sentence,
-    else the annexure's description of the work, else a descriptive "Sub:" line."""
+    else the letter's "we are pleased to inform…" sentence, else the annexure's
+    description of the work, else a descriptive "Sub:" line. OCR junk is skipped."""
     clean = _normalize_pdf_text(pdf_text or "")
+    cands = []
     m = _DATELINE_RE.search(clean)
     if m:
-        return _tidy_lead(m.group(1))
+        cands.append(m.group(1))
     m = _INFORM_RE.search(clean[:6000]) or _INFORM_LOOSE_RE.search(clean[:6000])
     if m and re.search(r"order|contract|award|acceptance|intent|work|project|supply", m.group(1), re.I):
-        return _tidy_lead(m.group(1))
+        cands.append(m.group(1))
     if purpose and len(purpose) >= 20 and not _GENERIC_PURPOSE.fullmatch(purpose.strip()):
-        return _tidy_lead(purpose)
+        cands.append(purpose)
     subj = _SUBJECT_BOILER.sub("", re.sub(r"\s+", " ", subject or "")).strip(" .:-–")
     # a subject extracted without spaces ("Intimationregardingmajor…") is unreadable
     if len(subj) >= 25 and not _GENERIC_SUBJECT.fullmatch(subj) and not re.search(r"[A-Za-z]{22,}", subj):
-        return _tidy_lead(subj)
+        cands.append(subj)
+    for c in cands:
+        lead = _tidy_lead(c)
+        if lead and not _ocr_garbage(lead):
+            return lead
     return ""
 
 
@@ -2499,7 +2540,7 @@ def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
                         changed += 1
                 if _apply_band(it, chk):
                     changed += 1
-                if not it.get("order_summary"):
+                if not it.get("order_summary") and not _nse_text_is_informative(it.get("text", "")):
                     lead = _local_order_lead(chk.get("_text_all", ""), chk.get("subject", ""), it.get("order_purpose") or "")
                     if lead:
                         it["order_summary"] = lead
@@ -2689,7 +2730,8 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                                 it["order_to_ttm_sales_pct"] = round(av / float(ttm) * 100.0, 2)
                         except (TypeError, ValueError):
                             pass
-        if it.get("category") == "Order" and not it.get("order_summary"):
+        if (it.get("category") == "Order" and not it.get("order_summary")
+                and not _nse_text_is_informative(it.get("text", ""))):
             lead = _local_order_lead(text, chk.get("subject", ""), it.get("order_purpose") or local.get("order_purpose") or "")
             if lead:
                 it["order_summary"] = lead
@@ -3064,6 +3106,8 @@ def main():
                     _o = next((y for y in history.get(sym, []) if y.get("id") == x["cancels"]), None)
                     if _o and _o.get("order_value_cr") is not None:
                         x["amount_cr"] = _o["order_value_cr"]
+            if x.get("order_summary") and _ocr_garbage(x["order_summary"]):
+                x.pop("order_summary", None)       # OCR junk from a scanned PDF; card falls back to NSE text
             # Decisions made by the PDF order check survive the daily re-tagging.
             if x.get("event_type_override"):
                 x["event_type"] = x["event_type_override"]
