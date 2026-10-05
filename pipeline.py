@@ -551,8 +551,17 @@ async def upload_all_chunks(client, all_data, today):
             client, r2_upload, f"ohlc_{i+1}.json", payload,
             schema_v=1, extra_meta={"chunk": i+1, "total": R2_CHUNKS, "stock_count": len(chunk_syms)}
         ))
+    # ohlc_index.json: symbol -> chunk number, written in the same run as the
+    # chunks so the two always agree. dashboard.html reads it to fetch only the
+    # one chunk a chart needs instead of all R2_CHUNKS files.
+    ohlc_index = {s: i + 1 for i in range(R2_CHUNKS) for s in symbols[i*size:(i+1)*size]}
+    tasks.append(upload_str_with_manifest(
+        client, r2_upload, "ohlc_index.json",
+        json.dumps({"updated": today, "total": R2_CHUNKS, "map": ohlc_index}),
+        schema_v=1, extra_meta={"stock_count": n}
+    ))
     await asyncio.gather(*tasks)
-    log.info(f"✓ {R2_CHUNKS} chunks uploaded ({n} stocks)")
+    log.info(f"✓ {R2_CHUNKS} chunks + ohlc_index.json uploaded ({n} stocks)")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3001,6 +3010,139 @@ async def archive_screener_feed_history(client, screener_feed, today, keep_days=
 #  to pipeline_fundamentals_prod.py's per-symbol + summary architecture)
 # ══════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════
+# DASHBOARD SUMMARY — one small file (dash_summary.json) that feeds the
+# dashboard.html widgets, so the dashboard never needs the full screener data.
+# Built from screener_feed in run_ep_scan; no extra OHLC download.
+# ══════════════════════════════════════════════════════════════
+DASH_TOP_N = 60                 # rows kept per list (52W highs, volume shockers)
+DASH_RVOL_MIN = 3.0             # volume shocker: today's volume >= 3x the 20-day average
+DASH_MIN_TURNOVER = 1_00_00_000 # ₹1 crore average daily turnover, filters out illiquid names
+DASH_GROUP_MIN = 3              # sectors / industries need at least this many stocks
+DASH_RESULT_DAYS = 7            # results calendar window ahead of today
+DASH_STAGE_LIST_N = 25          # stocks listed per Weinstein stage
+
+def _dash_num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+def _dash_median(vals):
+    v = sorted(x for x in vals if _dash_num(x) is not None)
+    if not v: return None
+    m = len(v) // 2
+    return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2
+
+def _dash_ad_line(all_data, sessions=20):
+    """Cumulative net advances (advances - declines) for the last `sessions` trading days."""
+    net = {}
+    for s in all_data.values():
+        d, c = s.get("d") or [], s.get("c") or []
+        for i in range(max(1, len(c) - sessions - 1), len(c)):
+            if c[i] is None or c[i - 1] is None or i >= len(d): continue
+            if c[i] > c[i - 1]: net[d[i]] = net.get(d[i], 0) + 1
+            elif c[i] < c[i - 1]: net[d[i]] = net.get(d[i], 0) - 1
+    out, run = [], 0
+    for day in sorted(net)[-sessions:]:
+        run += net[day]; out.append(run)
+    return out
+
+def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, stages_raw):
+    by_sym = {r["symbol"]: r for r in feed if r.get("symbol")}
+    # only stocks that traded in the latest session; stale rows would skew breadth
+    live = [r for r in feed if _dash_num(r.get("ltp")) is not None and _dash_num(r.get("pct_ch")) is not None and r.get("date") == as_of]
+
+    def lite(r, **extra):
+        return {"sym": r["symbol"], "name": r.get("name", ""), "ltp": r.get("ltp"), "chg": r.get("pct_ch"),
+                "rs": r.get("rs_rating"), "rvol": r.get("rvol"), **extra}
+
+    # 52-week highs, strongest RS first
+    highs = sorted((r for r in live if r.get("new_52wh")), key=lambda r: -(_dash_num(r.get("rs_rating")) or 0))
+
+    # volume shockers: liquid stocks trading far above their 20-day average volume
+    def liquid(r):
+        av, ltp = _dash_num(r.get("avg_vol20")), _dash_num(r.get("ltp"))
+        return av is not None and ltp is not None and av * ltp >= DASH_MIN_TURNOVER
+    shockers = sorted((r for r in live if (_dash_num(r.get("rvol")) or 0) >= DASH_RVOL_MIN and liquid(r)),
+                      key=lambda r: -r["rvol"])
+
+    # results calendar: today + next DASH_RESULT_DAYS days
+    today_d = date.fromisoformat(today_ist())
+    end_d = (today_d + timedelta(days=DASH_RESULT_DAYS)).isoformat()
+    results = []
+    for d_str in sorted(result_calendar or {}):
+        if today_d.isoformat() <= d_str <= end_d:
+            for sym in result_calendar[d_str]:
+                results.append({"sym": sym, "name": by_sym.get(sym, {}).get("name", ""), "date": d_str, "when": None})
+    results = results[:300]
+
+    # sectors and industries
+    def groups(field):
+        g = {}
+        for r in live:
+            k = r.get(field)
+            if k: g.setdefault(k, []).append(r)
+        return {k: v for k, v in g.items() if len(v) >= DASH_GROUP_MIN}
+    sectors = [{"name": k, "chg": round(_dash_median(r["pct_ch"] for r in v), 2),
+                "adv": sum(1 for r in v if r["pct_ch"] > 0), "dec": sum(1 for r in v if r["pct_ch"] < 0)}
+               for k, v in groups("sector").items()]
+    sectors.sort(key=lambda x: -x["chg"])
+
+    industries = []
+    for k, v in groups("industry").items():
+        rs_vals = [_dash_num(r.get("rs_rating")) for r in v if _dash_num(r.get("rs_rating")) is not None]
+        if not rs_vals: continue
+        m1, m3 = _dash_median(r.get("1mg") for r in v), _dash_median(r.get("3mg") for r in v)
+        industries.append({"name": k, "rs": round(sum(rs_vals) / len(rs_vals)),
+                           "m1": round(m1, 2) if m1 is not None else None, "m3": round(m3, 2) if m3 is not None else None,
+                           "count": len(v)})
+    industries.sort(key=lambda x: (-x["rs"], -(x["m3"] or 0)))
+    # rank change vs about a week ago, from the rank history this file keeps for itself
+    hist = dict((prev_summary or {}).get("industryRankHistory") or {})
+    week_ago = (date.fromisoformat(as_of) - timedelta(days=7)).isoformat()
+    ref_dates = sorted(d for d in hist if d <= week_ago)
+    ref = hist.get(ref_dates[-1], {}) if ref_dates else {}
+    for i, x in enumerate(industries):
+        x["rank"] = i + 1
+        x["prevRank"] = ref.get(x["name"])
+    hist[as_of] = {x["name"]: x["rank"] for x in industries}
+    hist = {d: hist[d] for d in sorted(hist)[-15:]}
+
+    # breadth
+    adv = sum(1 for r in live if r["pct_ch"] > 0); dec = sum(1 for r in live if r["pct_ch"] < 0)
+    pct = lambda n: round(n / len(live) * 100) if live else 0
+    breadth = {"adv": adv, "dec": dec, "unch": len(live) - adv - dec,
+               "above50": pct(sum(1 for r in live if r.get("above_50"))),
+               "above200": pct(sum(1 for r in live if r.get("above_200"))),
+               "nh": sum(1 for r in live if r.get("new_52wh")), "nl": sum(1 for r in live if r.get("new_52wl")),
+               "adLine": _dash_ad_line(all_data)}
+
+    # Weinstein stages (weekly scan output, may be a few days old)
+    sigs = (stages_raw or {}).get("signals") or []
+    counts = {n: sum(1 for x in sigs if x.get("stage") == n) for n in (1, 2, 3, 4)}
+    stocks = {}
+    for n in (1, 2, 3, 4):
+        rows = []
+        for x in sigs:
+            if x.get("stage") != n or x.get("symbol") not in by_sym: continue
+            r = by_sym[x["symbol"]]
+            rows.append({"sym": x["symbol"], "name": r.get("name", ""), "chg": r.get("pct_ch"),
+                         "rs": r.get("rs_rating"), "weeks": x.get("weeks_in_stage")})
+        rows.sort(key=lambda y: -(_dash_num(y["rs"]) or 0))
+        stocks[n] = rows[:DASH_STAGE_LIST_N]
+
+    return {
+        "v": 1, "asOf": as_of,
+        "generated_at_ist": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
+        "highs52Count": len(highs), "highs52": [lite(r) for r in highs[:DASH_TOP_N]],
+        "volShockers": [lite(r, volLakh=round((_dash_num(r.get("volume")) or 0) / 1e5, 1)) for r in shockers[:DASH_TOP_N]],
+        "results": results,
+        "sectors": sectors,
+        "industries": industries,
+        "industryRankHistory": hist,
+        "breadth": breadth,
+        "stages": {"updated": (stages_raw or {}).get("updated"), "counts": counts, "stocks": stocks},
+    }
+
+
 async def run_ep_scan() -> None:
     status = PipelineStatus("run_ep_scan")
     try:
@@ -3482,7 +3624,21 @@ async def run_ep_scan() -> None:
                 "stock_count": len(screener_feed),
             }
 
+            # dash_summary.json for dashboard.html (previous file keeps the industry rank history)
+            dash_prev, dash_stages = await asyncio.gather(
+                r2_download(client, "dash_summary.json"),
+                r2_download(client, "weinstein_stage_analysis.json"),
+                return_exceptions=True)
+            dash_summary = _build_dash_summary(
+                screener_feed, all_data, result_calendar, market_data_date,
+                dash_prev if isinstance(dash_prev, dict) else {},
+                dash_stages if isinstance(dash_stages, dict) else {})
+            log.info(f"dash_summary: {dash_summary['highs52Count']} 52W highs, {len(dash_summary['volShockers'])} vol shockers, "
+                     f"{len(dash_summary['sectors'])} sectors, {len(dash_summary['industries'])} industries")
+
             await asyncio.gather(
+                upload_str_with_manifest(client, r2_upload, "dash_summary.json", json.dumps(dash_summary),
+                                          schema_v=1, extra_meta={"as_of": market_data_date}),
                 upload_str_with_manifest(client, r2_upload, "ep_signals.json",
                                           json.dumps({"updated":today,"count":len(signals),"signals":signals}),
                                           schema_v=1, extra_meta={"count": len(signals)}),
