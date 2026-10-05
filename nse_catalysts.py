@@ -303,6 +303,10 @@ def _event_meta(subject: str, text: str, category: str) -> dict:
         elif re.search(r"definitive agreement|agreement signed|entered into.*agreement", both, re.I): out["stage"] = "Agreement Signed"
         elif re.search(r"approved|board.*approval", both, re.I): out["stage"] = "Approved"
         else: out["stage"] = "Announced"
+    elif category == "Divestment" and is_voluntary_group_closure(subject, text):
+        out["event_type"] = "Subsidiary Closure"
+        out["stage"] = ("Dissolved" if re.search(r"\bdissolved\b|dissolution order|struck off|stands? closed", both, re.I)
+                        else "Voluntary Liquidation")
     elif category == "Divestment":
         out["event_type"] = "Divestment"
         if re.search(r"extension|extended|delay", both, re.I): out["stage"] = "Completion Delayed/Extended"
@@ -371,6 +375,24 @@ def is_explicit_noise(subject: str, text: str) -> bool:
     return bool(_IGNORE_SUBJECT.search(subject) or _DEBT.search(both))
 
 
+# A group entity the company chooses to wind up while solvent is a restructuring
+# decision (Divestment), not distress. Forced insolvency stays Negative.
+_VOLUNTARY_CLOSURE = re.compile(
+    r"(?:voluntary|solvent|members['’]?\s+voluntary)\s+(?:solvent\s+)?(?:liquidation|winding[- ]?up|dissolution|closure)|"
+    r"\bstrik(?:e|ing)[- ]?off\b|struck off|"
+    r"(?:closure|winding[- ]?up|dissolution|deregistration|liquidation) of (?:the |its |our )?"
+    r"(?:(?:wholly[- ]owned|foreign|overseas|step[- ]down|material|german|us|uk)\s+)*subsidiar", re.I)
+_GROUP_ENTITY = re.compile(r"subsidiar|step[- ]down|joint venture|\bjv\b|associate compan|\bgmbh\b|\bllc\b|\bpte\b|\bb\.?v\.?\b|\bs\.?a\.?\b|\binc\.?\b", re.I)
+_FORCED_INSOLVENCY = re.compile(r"\bcirp\b|corporate insolvency resolution|compulsory (?:liquidation|winding)|"
+                                r"section\s*(?:7|9|10)\b|petition (?:filed )?by (?:the )?(?:financial|operational) creditor", re.I)
+
+
+def is_voluntary_group_closure(subject: str, text: str) -> bool:
+    both = f"{subject or ''} {text or ''}"
+    return bool(_VOLUNTARY_CLOSURE.search(both) and _GROUP_ENTITY.search(both)
+                and not _FORCED_INSOLVENCY.search(both))
+
+
 def classify(subject: str, text: str) -> str | None:
     """Trader-focused catalyst category, or None when the event should not be stored."""
     subject = (subject or "").strip()
@@ -379,6 +401,9 @@ def classify(subject: str, text: str) -> str | None:
 
     if is_explicit_noise(subject, text):
         return None
+
+    if is_voluntary_group_closure(subject, text):
+        return "Divestment"
 
     # Batch-3: adverse licence/registration action must beat the broad NSE subject
     # "granting/withdrawal/surrender/cancellation/suspension". Only an explicit
@@ -480,7 +505,35 @@ def _parse_dt(s: str) -> datetime | None:
     return None
 
 
+_RUPEE_FIXES = (
+    # UTF-8 "₹" decoded as cp1252
+    (re.compile(r"â‚¹"), "₹"),
+    # NSE summaries sometimes carry the rupee as "¥" or as the old Rupee-font backtick.
+    # Only when an Indian unit follows, so a genuine yen amount is left alone.
+    (re.compile(r"[¥`]\s*(?=[\d,]+(?:\.\d+)?\s*(?:lakh\s+)?(?:crores?|cr\b|lakhs?|lacs?))", re.I), "₹"),
+)
+
+
+def _fix_rupee(text: str) -> str:
+    import html as _html
+    text = text or ""
+    # NSE summaries sometimes carry raw HTML entities ("&#8377;" = ₹, "&amp;").
+    # Two passes cover double-encoded "&amp;#8377;".
+    for _ in range(2):
+        if "&" not in text:
+            break
+        text = _html.unescape(text)
+    for pat, rep_ in _RUPEE_FIXES:
+        text = pat.sub(rep_, text)
+    # "Crores.In addition" -> "Crores. In addition" (missing space after a full stop)
+    text = re.sub(r"(?<=[a-z0-9)])\.(?=[A-Z][a-z]+\b)", ". ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text
+
+
 def _make_item(symbol, dt, subject, text, link, is_trading_day, next_trading_day):
+    text = _fix_rupee(text)
+    subject = _fix_rupee(subject)
     category = classify(subject, text)
     if not category or not symbol or not dt:
         return None
@@ -1769,11 +1822,36 @@ _LIFECYCLE_STOP = {
     "that", "this", "has", "have", "its", "their", "private", "ltd",
 }
 
+# NSE subject taxonomy + exchange boilerplate: identical on every filing of a type,
+# so they must never count as evidence that two filings describe the same event.
+_LIFECYCLE_BOILER = {
+    "informed", "exchange", "about", "regarding", "bagging", "receiving", "received", "receipt",
+    "orders", "order", "contracts", "contract", "awarding", "award", "awarded", "limited", "company",
+    "intimation", "announcement", "information", "details", "new", "wins", "win", "secures", "secured",
+    "inc", "corporation", "india", "indian", "copy", "enclosed", "herewith", "kindly", "record",
+}
+
+
 def _life_tokens(item: dict) -> set[str]:
-    raw = f"{item.get('subject','')} {item.get('text','')}".lower()
+    text = item.get("text", "") or ""
+    # Drop "<Company name> has informed the Exchange about/regarding/that" — the
+    # company name would otherwise match every other filing of the same symbol.
+    text = re.sub(r"^.{0,160}?\bhas\s+informed\s+the\s+exchange\s+(?:about|regarding|that)?", " ", text, flags=re.I)
+    raw = f"{text} {item.get('order_summary', '')}".lower()
     raw = re.sub(r"https?://\S+", " ", raw)
     toks = set(re.findall(r"[a-z][a-z0-9]{2,}", raw))
-    return {t for t in toks if t not in _LIFECYCLE_STOP}
+    return {t for t in toks if t not in _LIFECYCLE_STOP and t not in _LIFECYCLE_BOILER}
+
+
+def _customers_differ(a: dict, b: dict) -> bool:
+    ca, cb = (str(x.get("order_from") or "").lower() for x in (a, b))
+    if not ca or not cb:
+        return False
+    ta = {t for t in re.findall(r"[a-z][a-z0-9]{2,}", ca) if t not in _LIFECYCLE_BOILER}
+    tb = {t for t in re.findall(r"[a-z][a-z0-9]{2,}", cb) if t not in _LIFECYCLE_BOILER}
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / max(1, len(ta | tb)) < 0.3
 
 def _money_markers(item: dict) -> set[str]:
     raw = f"{item.get('text','')} {item.get('order_value_text','')}".lower().replace(",", "")
@@ -1790,7 +1868,8 @@ def _money_markers(item: dict) -> set[str]:
 
 def _life_similarity(a: dict, b: dict) -> float:
     ta, tb = _life_tokens(a), _life_tokens(b)
-    if not ta or not tb:
+    # Pure boilerplate on either side: nothing to compare, so no evidence of sameness.
+    if len(ta) < 3 or len(tb) < 3:
         return 0.0
     return len(ta & tb) / max(1, len(ta | tb))
 
@@ -1814,6 +1893,8 @@ def _same_lifecycle(a: dict, b: dict) -> bool:
     # strong project/customer wording is required. Different order values never merge.
     if cat == "Order":
         if ma and mb and not (ma & mb):
+            return False
+        if _customers_differ(a, b):
             return False
         return bool(ma & mb) or sim >= 0.62
 
@@ -1857,6 +1938,9 @@ def _carry_enrichment(winner: dict, loser: dict) -> None:
     for k, v in loser.items():
         if k not in protected and k not in winner and v not in (None, "", [], {}):
             winner[k] = v
+
+SUPPRESS_VERSION = 2
+
 
 def consolidate_lifecycles(data: dict) -> int:
     """Conservatively collapse duplicate stages of the same underlying event per symbol.
@@ -2109,7 +2193,7 @@ ORDER_CHECK_VERSION = 1
 MINING_LEASE_CATEGORY = "Order"    # set to "Capex" to move mining-lease bids out of Orders
 
 _SUBJECT_LINE_RE = re.compile(
-    r"\bsub(?:ject)?\s*[:.\-–]\s*(.{10,600}?)(?=\bdear\b|\bref(?:erence)?\s*[:.]|\brespected\b|\bpursuant\b|\bin accordance\b|$)",
+    r"\bsub(?:ject)?\s*[:.\-–]\s*(.{10,600}?)(?=\bdear\b|\bref(?:erence)?\s*[:.]|\brespected\b|\bpursuant\b|\bin accordance\b|\bthis is\b|\bwe (?:are|wish|hereby)\b|$)",
     re.I)
 _HEAD_REGION_CHARS = 2500
 _CANCEL_RE = re.compile(
@@ -2178,13 +2262,29 @@ def _order_doc_check(pdf_text: str, nse_text: str) -> dict:
     if q:
         out["quantity"] = q.group(0)
     out["annual"] = bool(_ANNUAL_RE.search(clean))
-    b = _BAND_RE.search(clean)
+    # L&T-style: heading says "(Mega*)", a footnote table maps class -> ₹ Cr range.
+    cls = re.search(r"\b(significant|large|major|mega|ultra[- ]?mega)\s*\*", head, re.I) or \
+          re.search(r"\((significant|large|major|mega|ultra[- ]?mega)\s*\*?\)", head, re.I)
+    tbl = re.search(r"classification\s+((?:(?:significant|large|major|mega|ultra[- ]?mega)\s*)+)\s*value in\s*(?:₹|rs\.?|inr)?\s*(?:cr|crores?)\s+(.{0,220})",
+                    clean, re.I)
+    if cls and tbl:
+        labels = [re.sub(r"[- ]", "", x).lower() for x in re.findall(r"ultra[- ]?mega|significant|large|major|mega", tbl.group(1), re.I)]
+        ranges = re.findall(r"([\d,]+)\s*(?:to|-|–)\s*([\d,]+)|>\s*([\d,]+)", tbl.group(2))
+        want = re.sub(r"[- ]", "", cls.group(1)).lower()
+        if want in labels and len(ranges) >= len(labels):
+            lo, hi, over = ranges[labels.index(want)]
+            out["band_min"] = float((lo or over).replace(",", ""))
+            if hi:
+                out["band_max"] = float(hi.replace(",", ""))
+            out["band_label"] = cls.group(1).title()
+    b = None if out.get("band_min") is not None else _BAND_RE.search(clean)
     if b:
         lo = b.group(1) or b.group(2)
         out["band_min"] = float(lo.replace(",", ""))
         if b.group(3):
             out["band_max"] = float(b.group(3).replace(",", ""))
     out["_head"] = head[:1500]
+    out["_text_all"] = clean
     return out
 
 
@@ -2199,7 +2299,11 @@ def _apply_band(it: dict, chk: dict) -> bool:
     it["order_value_cr"] = lo
     it["order_value_role"] = "band_min"
     hi = chk.get("band_max")
-    it["order_value_text"] = (f"₹{lo:,.0f}–{hi:,.0f} Cr (company band)" if hi else f"Over ₹{lo:,.0f} Cr (company band)")
+    if hi:
+        it["band_max_cr"] = hi
+    label = f"{chk['band_label']}: " if chk.get("band_label") else ""
+    it["order_value_text"] = (f"{label}₹{lo:,.0f}–{hi:,.0f} Cr (company band)" if hi else f"{label}Over ₹{lo:,.0f} Cr (company band)")
+    it.pop("value_disclosed", None)
     return True
 
 
@@ -2213,6 +2317,100 @@ def _ai_value_in_head(av: float, chk: dict) -> bool:
         except ValueError:
             pass
     return False
+
+
+_DATELINE_RE = re.compile(
+    r"\b[A-Z][A-Za-z.]+(?:\s*\([^)]{1,20}\))?(?:\s*[|,]\s*|\s+)(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day,?\s+)?"
+    r"(?:\d{1,2}\s?(?:st|nd|rd|th)?\s+[A-Z][a-z]+|[A-Z][a-z]+\.?\s+\d{1,2}\s?(?:st|nd|rd|th)?),?\s+\d{4}\s*[:\-–—]\s*"
+    # sentence ends at a full stop followed by a capital / quote / end — not "approx. ₹2,025"
+    r"(.{40,700}?[a-z0-9)%](?<!Rs)(?<!Sr)(?<!Ltd)(?<!No)(?<!Co)(?<!Mr)(?<!Dr)(?<!St)(?<!approx)(?<!viz)(?<!Pvt)(?<!Inc)(?<!\s[A-Z])\.)(?=\s+[A-Z0-9“\"']|\s*$)")
+_INFORM_RE = re.compile(
+    r"(?:pleased to inform|wish to inform|hereby inform|this is to inform|kindly be informed|we inform|is hereby informed)(?:ed)?(?:\s+you)?(?:\s+that)?\s*,?\s*"
+    r"(.{30,600}?[a-z0-9)%](?<!Rs)(?<!Sr)(?<!Ltd)(?<!No)(?<!Co)(?<!Mr)(?<!Dr)(?<!St)(?<!approx)(?<!viz)(?<!Pvt)(?<!Inc)(?<!\s[A-Z])\.)(?=\s+[A-Z0-9“\"']|\s*$)", re.I)
+_INFORM_LOOSE_RE = re.compile(
+    r"(?:pleased to inform|wish to inform|hereby inform|this is to inform|kindly be informed|we inform|is hereby informed)(?:ed)?(?:\s+you)?(?:\s+that)?\s*,?\s*(.{30,300})", re.I)
+_SUBJECT_BOILER = re.compile(
+    r"^(?:intimation|disclosure)?\s*(?:under|pursuant to|in terms of)?\s*regulation\s*30\b.*?regulations?,?\s*(?:2015)?\s*(?:\([^)]*\))?\s*[-–:]*\s*", re.I)
+_GENERIC_SUBJECT = re.compile(r"(?:press release|intimation|disclosure|outcome of board meeting|update|announcement|"
+                              r"disclosure regarding receipt of (?:a )?major order)\.?", re.I)
+_GENERIC_PURPOSE = re.compile(r"(?:as per\b.*|general (?:contract|condition)s?\b.*|standard (?:terms|conditions)\b.*|"
+                              r"one[- ]time|letter of (?:award|acceptance|intent)|n\.?a\.?|not applicable|epc|supply|works?)\.?", re.I)
+
+
+def _tidy_lead(t: str) -> str:
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s*\((?:“|\")[^)]{1,60}\)", "", t)                       # ("GK Energy" or the "Company")
+    t = re.sub(r"\s*\((?:bse|nse)[^)]{0,60}\)", "", t, flags=re.I)        # (BSE: … | NSE: …)
+    t = re.sub(r"\s*\([A-Z&.]{2,12}\)", "", t)                            # (KPIL), (PT&D)
+    # ", a leading … company …," between the name and the verb
+    t = re.sub(r",\s+(?:one of|an?|the|india['’]s)\s+(?:india['’]s\s+|the\s+)?(?:leading|global|largest|prominent|premier)[^:]{0,220}?,\s+"
+               r"(?=(?:has|have|today|announced|received|secured|won|bagged|signed|is)\b)", " ", t, flags=re.I)
+    t = re.sub(r"^(?:today,?\s+)?the company\b", "The Company", t, flags=re.I)
+    t = re.sub(r"^our company\s+", "", t, flags=re.I)
+    t = t[:1].upper() + t[1:]
+    if len(t) > 260:
+        t = t[:260].rsplit(" ", 1)[0].rstrip(",;:") + "…"
+    return t
+
+
+_OCR_OK_UNITS = re.compile(r"^\d+(?:st|nd|rd|th|gw|mw|mwh|mwp|kv|km|ckm|cr|mt|tph|x|s)$", re.I)
+
+
+def _ocr_garbage(text: str) -> bool:
+    """True when a line reads like broken OCR ("5rou that the Clompany l-las been arvarded")."""
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'’\-]*", text or "")
+    if len(words) < 4:
+        return False
+    bad = 0
+    for w in words:
+        if re.fullmatch(r"\d+[A-Za-z]+", w) and not _OCR_OK_UNITS.match(w):
+            bad += 1                                   # "5rou"
+        elif re.fullmatch(r"[a-z]{1,2}-[a-z]{1,3}", w):
+            bad += 1                                   # "l-las"
+        elif re.search(r"[a-z][A-Z][a-z]", w) and not re.match(r"^(?:Mc|Mac|eM|iP|eC|NewGen|RailTel|PowerGrid)", w):
+            bad += 1                                   # "ClOmpany"
+        elif re.fullmatch(r"(?:Cl[oa]\w*|Lr[ya]\w*|l-l\w*|rn\w{0,2})", w):
+            bad += 1                                   # "Clompany", "Lry"
+    return bad / len(words) > 0.08
+
+
+_NSE_BOILER_PREFIX = re.compile(r"^.{0,160}?\bhas\s+informed\s+the\s+exchange\s+(?:about|regarding|that)?\s*", re.I)
+_NSE_TAXONOMY_ONLY = re.compile(
+    r"^(?:bagging/receiving of orders/contracts|awarding of order\(s\)/contract\(s\)|general updates?|press release|"
+    r"updates?|intimation|disclosure)[\s.:-]*$", re.I)
+
+
+def _nse_text_is_informative(text: str) -> bool:
+    """NSE summary already says what the order is (not just the filing category)."""
+    body = _NSE_BOILER_PREFIX.sub("", text or "").strip()
+    body = re.sub(r"^(?:bagging/receiving of orders/contracts|awarding of order\(s\)/contract\(s\))\s*[:\-–]?\s*",
+                  "", body, flags=re.I)
+    return len(body) >= 40 and not _NSE_TAXONOMY_ONLY.match(body)
+
+
+def _local_order_lead(pdf_text: str, subject: str, purpose: str = "") -> str:
+    """One factual line about the order without AI: press-release dateline sentence,
+    else the letter's "we are pleased to inform…" sentence, else the annexure's
+    description of the work, else a descriptive "Sub:" line. OCR junk is skipped."""
+    clean = _normalize_pdf_text(pdf_text or "")
+    cands = []
+    m = _DATELINE_RE.search(clean)
+    if m:
+        cands.append(m.group(1))
+    m = _INFORM_RE.search(clean[:6000]) or _INFORM_LOOSE_RE.search(clean[:6000])
+    if m and re.search(r"order|contract|award|acceptance|intent|work|project|supply", m.group(1), re.I):
+        cands.append(m.group(1))
+    if purpose and len(purpose) >= 20 and not _GENERIC_PURPOSE.fullmatch(purpose.strip()):
+        cands.append(purpose)
+    subj = _SUBJECT_BOILER.sub("", re.sub(r"\s+", " ", subject or "")).strip(" .:-–")
+    # a subject extracted without spaces ("Intimationregardingmajor…") is unreadable
+    if len(subj) >= 25 and not _GENERIC_SUBJECT.fullmatch(subj) and not re.search(r"[A-Za-z]{22,}", subj):
+        cands.append(subj)
+    for c in cands:
+        lead = _tidy_lead(c)
+        if lead and not _ocr_garbage(lead):
+            return lead
+    return ""
 
 
 def _set_ratio(it: dict, sym: str, category: str, key: str, value: float,
@@ -2291,7 +2489,7 @@ def _to_cancellation(it: dict, history_items: list, hv: float | None, htxt: str)
         it["review_reason"] = f"cancellation matches {len(cands)} earlier orders from {party}"
 
 
-STAGE_CHECK_VERSION = 3
+STAGE_CHECK_VERSION = 4
 
 
 def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
@@ -2305,8 +2503,7 @@ def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
             if it.get("manual") or int(it.get("stage_check_v") or 0) >= STAGE_CHECK_VERSION:
                 continue
             was_capex = it.get("category_override") == "Capex"
-            if not (was_capex or it.get("stage_override") in {"L1 / Awaiting Award", "Letter of Intent", "Preferred Bidder"}
-                    or it.get("value_source") == "gemini_pdf" or it.get("needs_review")):
+            if not (was_capex or it.get("category") == "Order"):
                 continue
             pdf = _download_pdf_bytes(session, it.get("link", ""))
             if not pdf:
@@ -2322,8 +2519,32 @@ def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
                 it["event_type"], it["stage"] = "Order Award", "Awarded"
                 changed += 1
             if not was_capex and it.get("category") == "Order":
+                # Fields carried in by the old lifecycle merge may belong to another
+                # order. Keep them only if this filing's own PDF/summary supports them.
+                own = f"{chk.get('_text_all', '')} {it.get('text', '')}".lower()
+                cust = str(it.get("order_from") or "")
+                ctoks = [t for t in re.findall(r"[a-z][a-z0-9]{3,}", cust.lower()) if t not in _LIFECYCLE_BOILER]
+                if ctoks and sum(t in own for t in ctoks) / len(ctoks) < 0.5:
+                    it.pop("order_from", None)
+                    changed += 1
+                v = it.get("order_value_cr")
+                if v is not None and it.get("order_value_role") not in {"annual_x_tenure", "band_min", "annual"}:
+                    plain = own.replace(",", "")
+                    # crore figure as printed ("72.77") or as full rupees ("21,57,48,840" -> "2157…")
+                    forms = {f"{float(v):g}", f"{float(v):.2f}", str(int(round(float(v) * 100)))}
+                    if not any(f in plain for f in forms):
+                        for k in ("order_value_cr", "order_value_text", "order_value_role", "value_source",
+                                  "order_to_market_cap_pct", "order_to_ttm_sales_pct", "local_value_cr",
+                                  "order_summary", "ai_checked", "order_check_v"):
+                            it.pop(k, None)          # order check will redo this row
+                        changed += 1
                 if _apply_band(it, chk):
                     changed += 1
+                if not it.get("order_summary") and not _nse_text_is_informative(it.get("text", "")):
+                    lead = _local_order_lead(chk.get("_text_all", ""), chk.get("subject", ""), it.get("order_purpose") or "")
+                    if lead:
+                        it["order_summary"] = lead
+                        changed += 1
                 av, lv = it.get("order_value_cr"), it.get("local_value_cr")
                 if it.get("needs_review") and av is not None and (
                         _ai_value_in_head(float(av), chk)
@@ -2435,6 +2656,10 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                 it["value_source"] = "pdf_annexure"
                 _set_ratio(it, sym, "Order", "order_value_cr", lv, market_cap_map, ttm_sales_map)
                 stats["annexure"] = stats.get("annexure", 0) + 1
+            elif chk.get("band_min") is not None and _apply_band(it, chk):
+                it["value_source"] = "pdf_band"
+                _set_ratio(it, sym, "Order", "order_value_cr", it["order_value_cr"], market_cap_map, ttm_sales_map)
+                stats["band"] = stats.get("band", 0) + 1
             elif not chk["value_disclosed"]:
                 for k in ("order_value_cr", "order_value_text", "order_value_role",
                           "order_to_market_cap_pct", "order_to_ttm_sales_pct"):
@@ -2505,6 +2730,11 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                                 it["order_to_ttm_sales_pct"] = round(av / float(ttm) * 100.0, 2)
                         except (TypeError, ValueError):
                             pass
+        if (it.get("category") == "Order" and not it.get("order_summary")
+                and not _nse_text_is_informative(it.get("text", ""))):
+            lead = _local_order_lead(text, chk.get("subject", ""), it.get("order_purpose") or local.get("order_purpose") or "")
+            if lead:
+                it["order_summary"] = lead
         it["order_check_v"] = ORDER_CHECK_VERSION
         it["stage_check_v"] = STAGE_CHECK_VERSION
     stats["queued"] += max(0, len(queue) - stats["checked"])
@@ -2795,7 +3025,11 @@ def main():
     # nominal acquisitions). Without this list the API re-delivers them every run,
     # their PDFs are re-downloaded and they can even consume AI calls again.
     suppressed = {}
-    if isinstance(old_payload, dict) and isinstance(old_payload.get("suppressed"), dict):
+    if isinstance(old_payload, dict) and int(old_payload.get("suppressed_v") or 1) < SUPPRESS_VERSION:
+        # v1 lists were built while boilerplate summaries made different orders look
+        # identical; start fresh so wrongly merged cards come back once.
+        print("  ♻ Suppressed list reset (lifecycle matcher v2) — merged cards will be re-evaluated")
+    elif isinstance(old_payload, dict) and isinstance(old_payload.get("suppressed"), dict):
         _sup_cutoff = (today - timedelta(days=HISTORY_DAYS + 2)).isoformat()
         suppressed = {k: v for k, v in old_payload["suppressed"].items() if str(v)[:10] >= _sup_cutoff}
     if isinstance(old_payload, dict) and isinstance(old_payload.get("data"), dict):
@@ -2832,6 +3066,7 @@ def main():
             if x.get("manual"):
                 cleaned.append(x)
                 continue
+            x["text"] = _fix_rupee(x.get("text", ""))      # stored rows saved before the fix
             cat = classify(x.get("subject", ""), x.get("text", ""))
             if (not cat and x.get("category") and len(x.get("text") or "") >= TEXT_MAX
                     and not is_explicit_noise(x.get("subject", ""), x.get("text", ""))):
@@ -2871,6 +3106,8 @@ def main():
                     _o = next((y for y in history.get(sym, []) if y.get("id") == x["cancels"]), None)
                     if _o and _o.get("order_value_cr") is not None:
                         x["amount_cr"] = _o["order_value_cr"]
+            if x.get("order_summary") and _ocr_garbage(x["order_summary"]):
+                x.pop("order_summary", None)       # OCR junk from a scanned PDF; card falls back to NSE text
             # Decisions made by the PDF order check survive the daily re-tagging.
             if x.get("event_type_override"):
                 x["event_type"] = x["event_type_override"]
@@ -2997,6 +3234,7 @@ def main():
 
     payload = {
         "suppressed": suppressed,
+        "suppressed_v": SUPPRESS_VERSION,
         "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
         "source": source,
         "data": history,
