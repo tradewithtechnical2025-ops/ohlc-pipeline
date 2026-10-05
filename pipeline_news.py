@@ -1159,9 +1159,13 @@ def _bse_extra_candidate_kind(it: dict, calendar: dict, bse_symbol_map: dict | N
         return None
     if is_noise(it):
         return None   # trading window, 74(5), scrutinizer, ESOP... never worth a fetch
-    if _NON_STATEMENT_DESC_RE.search(f"{it.get('title', '')} {it.get('summary', '')}"):
-        return None   # investor presentation / press release / transcript — never the Reg 33 statement
     sym = ((bse_symbol_map or {}).get(code, code) or "").upper()
+    if _NON_STATEMENT_DESC_RE.search(f"{it.get('title', '')} {it.get('summary', '')}"):
+        # Never a numbers source — but a presentation from a company reporting
+        # today is the best source of highlights/commentary for its card.
+        if _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", ""))):
+            return "narrative"
+        return None
     if _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", ""))):
         return "calendar"
     text = f"{it.get('title', '')} {it.get('summary', '')}"
@@ -1244,7 +1248,8 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
 All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
 
 
-async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str, pdf_bytes: bytes = None):
+async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str, pdf_bytes: bytes = None,
+                                 system_prompt: str = None):
     """Calls Gemini to extract structured financial data from the PDF's
     extracted text AND (when provided) the raw PDF itself, sent as a
     native document part — Gemini reads PDFs directly (including
@@ -1272,7 +1277,7 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
     if not GEMINI_API_KEY:
         return None
     try:
-        parts = [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:60000]}]
+        parts = [{"text": (system_prompt or _AI_EXTRACT_SYSTEM_PROMPT) + "\n\n" + text[:60000]}]
         if pdf_bytes:
             parts.append({"inline_data": {"mime_type": "application/pdf",
                                            "data": base64.b64encode(pdf_bytes).decode()}})
@@ -1438,14 +1443,11 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     # "CAVAIBHAVGATTANI_05102026160805_Outcome_of_Board_Meeting.pdf" for
     # STEAMHOUSE). Cover letters write it several ways:
     #   "NSE Symbol: X" / "Symbol: X (NSE)" / "National Stock Exchange ... Symbol: X"
-    m_sym = (re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&\-]{2,20})\b", text, re.IGNORECASE)
-             or re.search(r"Symbol\s*[:\-]\s*([A-Z0-9&\-]{2,20})\s*\(\s*NSE\s*\)", text, re.IGNORECASE)
-             or re.search(r"National\s+Stock\s+Exchange[\s\S]{0,600}?Symbol\s*[:\-]\s*([A-Z0-9&\-]{2,20})\b",
-                          text, re.IGNORECASE))
+    text_sym = _symbol_from_text(text)
     if symbol_override:
         symbol = symbol_override
-    elif m_sym:
-        symbol = m_sym.group(1).upper()
+    elif text_sym:
+        symbol = text_sym
     elif fname_symbol:
         symbol = fname_symbol
     else:
@@ -1598,6 +1600,62 @@ _NON_STATEMENT_DESC_RE = re.compile(
     r"investors?['’]?\s+presentation|earnings\s+presentation|analysts?\s+(?:meet|presentation)|"
     r"press\s+release|media\s+release|transcript|earnings\s+call|conference\s+call",
     re.IGNORECASE)
+
+
+def _symbol_from_text(text: str):
+    """NSE symbol declared in a cover letter, in any of the common layouts:
+    "NSE Symbol: X" / "Symbol: X (NSE)" / "National Stock Exchange ... Symbol: X"."""
+    m = (re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&\-]{2,20})\b", text or "", re.IGNORECASE)
+         or re.search(r"Symbol\s*[:\-]\s*([A-Z0-9&\-]{2,20})\s*\(\s*NSE\s*\)", text or "", re.IGNORECASE)
+         or re.search(r"National\s+Stock\s+Exchange[\s\S]{0,600}?Symbol\s*[:\-]\s*([A-Z0-9&\-]{2,20})\b",
+                      text or "", re.IGNORECASE))
+    return m.group(1).upper() if m else None
+
+
+_NARR_PERIOD_RE = re.compile(
+    r"(?:quarter|half[\s-]?year|period|year)[\s\S]{0,60}?ended(?:\s+on)?\s+(?:the\s+)?"
+    r"(\d{1,2}(?:st|nd|rd|th)?[./\-\s]+(?:\d{1,2}|[A-Za-z]{3,9})[./\-\s,]+\d{4}|[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})",
+    re.IGNORECASE)
+_NARR_QFY_RE = re.compile(r"\bQ([1-4])\s*[-']?\s*FY\s*'?(\d{2,4})\b", re.IGNORECASE)
+
+
+def _narrative_period_end(text: str):
+    """Quarter-end ('YYYY-MM-DD') a presentation/press release is about, from
+    its cover letter ("...for the quarter ended June 30, 2026") or, failing
+    that, its title ("Q1 FY27"). None if neither is unambiguous."""
+    head = re.sub(r"\s+", " ", (text or "")[:6000])
+    m = _NARR_PERIOD_RE.search(head)
+    if m:
+        raw = re.sub(r"(\d)(st|nd|rd|th)", r"\1", m.group(1)).replace(",", " ")
+        raw = re.sub(r"[./\-]", " ", raw)
+        raw = re.sub(r"\s+", " ", raw).strip()
+        for fmt in ("%d %m %Y", "%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y"):
+            try:
+                return datetime.strptime(raw, fmt).date().isoformat()
+            except ValueError:
+                pass
+    qs = {(int(q), int(fy[-2:])) for q, fy in _NARR_QFY_RE.findall(head)}
+    if len(qs) == 1:
+        q, fy = qs.pop()
+        fy_end = 2000 + fy
+        return {1: f"{fy_end-1}-06-30", 2: f"{fy_end-1}-09-30", 3: f"{fy_end-1}-12-31", 4: f"{fy_end}-03-31"}[q]
+    return None
+
+
+_AI_NARRATIVE_PROMPT = """You are given an Indian listed company's investor/earnings presentation or press release (extracted text, and usually the PDF itself). The company's official results statement has ALREADY been captured separately — you are ONLY extracting the narrative.
+
+Return ONLY valid JSON (no markdown) exactly in this shape:
+{
+  "period_end": "YYYY-MM-DD" or null,
+  "key_highlights": [string, ...] or [],
+  "management_commentary": string or null
+}
+
+Rules:
+- period_end: the quarter-end date the document's results discussion is about (e.g. "Q1 FY27" or "quarter ended June 30, 2026" -> "2026-06-30").
+- key_highlights: 2-5 short, specific, numbers-first strings about THAT quarter (growth, margins, volumes, one-offs, notable business developments). Copy every figure exactly as the document states it, with its unit; never compute, round or convert numbers yourself. Prefer Consolidated figures when both are shown. No promotional adjectives.
+- management_commentary: 1-3 sentence plain summary of management's own commentary/outlook, or null if there is none. Ignore disclaimers and safe-harbour boilerplate.
+- Use only information present in the document. Do not invent anything."""
 
 
 def _is_non_statement_doc(text: str) -> bool:
@@ -2292,49 +2350,6 @@ def _group_parsed_results(parsed_new: list) -> list:
     return [groups[k] for k in order]
 
 
-async def _update_results_by_symbol(client: httpx.AsyncClient, parsed_all: list, quarters_to_keep: int = 8):
-    """Maintains a per-symbol store of each company's most recent quarters
-    of parsed results (Standalone and Consolidated tracked separately),
-    independent of nse_results_detailed.json's global 1000-item rolling
-    cap. That cap is shared across EVERY company combined — during a busy
-    results season, a company's own 2nd/3rd/4th-most-recent quarter can
-    get evicted by the sheer volume of OTHER companies filing, well before
-    4 quarters have actually passed for that company. This file keeps at
-    least `quarters_to_keep` quarters per symbol+nature no matter how much
-    unrelated filing volume happens elsewhere, so a stock's own quarterly
-    history/AI-summary stays reliably available (e.g. for a per-stock
-    "past 4 quarters" view on the frontend)."""
-    if not parsed_all:
-        return
-    existing = await r2_get(client, "nse_results_by_symbol.json")
-    store = (existing or {}).get("symbols", {})
-
-    touched = set()
-    for r in parsed_all:
-        meta = r.get("meta", {}) or {}
-        symbol = meta.get("symbol")
-        nature = meta.get("standalone_consolidated") or "Standalone"
-        period_end = (r.get("quarter") or {}).get("period_end")
-        if not symbol or not period_end:
-            continue
-        touched.add(symbol)
-        sym_entry = store.setdefault(symbol, {})
-        nature_list = sym_entry.setdefault(nature, [])
-        # Replace any existing entry for the same quarter (a refiled/
-        # updated result) rather than duplicating it, then keep only the
-        # most recent `quarters_to_keep` by period_end.
-        nature_list[:] = [q for q in nature_list if (q.get("quarter") or {}).get("period_end") != period_end]
-        nature_list.append(r)
-        nature_list.sort(key=lambda q: (q.get("quarter") or {}).get("period_end") or "", reverse=True)
-        sym_entry[nature] = nature_list[:quarters_to_keep]
-
-    if touched:
-        payload = {"updated_at": datetime.now(timezone.utc).isoformat(), "symbols": store}
-        await r2_put(client, "nse_results_by_symbol.json", payload)
-        print(f"  ✓ nse_results_by_symbol.json: updated {len(touched)} symbol(s), "
-              f"keeping up to {quarters_to_keep} quarters each")
-
-
 async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict],
                                   fundamentals: dict | None, bse_pdf_items: list[dict] | None = None,
                                   bse_symbol_map: dict | None = None) -> dict | None:
@@ -2471,6 +2486,25 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         # different quarters and essentially never report the identical
         # revenue figure to the rupee, so treat an exact match as implausible
         # rather than coincidental.
+        # P&L identity: TI - TE + associates - exceptional = PBT. A gap means the
+        # extraction mixed layouts (e.g. presentation "Total Expenses" without
+        # Finance + D&A -> double-counted OPM: Steamhouse Q1 FY27). Records the
+        # current code already re-extracted and flagged as an unexplained
+        # mismatch are NOT retried again (that needs a human look, not AI).
+        flags = meta.get("quality_flags") or []
+        already_flagged = any("pnl_identity_mismatch" in f for f in flags)
+        ti, te, pbt_v = q.get("total_income"), q.get("total_expenses"), q.get("pbt")
+        if ti is None and revenue is not None and q.get("other_income") is not None:
+            ti = revenue + q["other_income"]
+        if ti is not None and te is not None and pbt_v is not None and not already_flagged:
+            adj = (q.get("exceptional_items") or 0) - (q.get("share_of_associates") or 0)
+            if abs(ti - te - pbt_v - adj) > max(1e5, 0.005 * abs(ti)):
+                return True
+        # OP and OPM must describe the same thing.
+        op_v, opm_v = q.get("operating_profit"), q.get("opm")
+        if op_v is not None and opm_v is not None and revenue:
+            if abs(op_v / revenue - opm_v) > 0.002:
+                return True
         qf = it.get("qoq_fundamentals") or {}
         yf = it.get("yoy_fundamentals") or {}
         for field in ("total_income_prior", "sales_prior"):
@@ -2697,9 +2731,16 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
             it["_pre_content"] = content
             it["_pre_text"] = text
-            if _is_non_statement_doc(text):
+            if _is_non_statement_doc(text) or it.get("_narrative"):
                 it["_pre_non_statement"] = True
-                return it   # no result key: must never supersede the real statement
+                # No RESULT key (must never supersede the real statement) —
+                # only a (symbol, period) key used to attach its narrative.
+                sym = _pdf_probable_symbol(it, bse_symbol_map) if it.get("_exchange") == "BSE" else None
+                sym = sym or _symbol_from_text(text) or _pdf_probable_symbol(it, bse_symbol_map)
+                period = _narrative_period_end(text)
+                if sym and period:
+                    it["_pre_narr_key"] = (sym.upper(), period)
+                return it
             heads = _pdf_find_heading_candidates(text)
             natures = {h[2] for h in heads}
             if len(natures) != 1:
@@ -2740,6 +2781,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             return it
 
     new_dupe_links = []  # persisted so skipped copies never re-enter a later run
+    narrative_candidates = []  # presentations / press releases: highlights + commentary only
 
     # Normalize the already-stored business keys once.  A newly published PDF
     # can have a brand-new URL while still representing the exact same
@@ -2751,18 +2793,23 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 (period or "").strip(),
                 (nature or "").strip().lower())
 
+    # Records queued for REPROCESS_STALE_RESULTS must not count as "already
+    # stored" here — otherwise their own key blocks them before AI and the
+    # reprocess run silently does nothing.
     existing_pre_keys = {
         _norm_result_key(_result_key(r)) for r in existing_items
         if _result_key(r)[0] and _result_key(r)[1] and _result_key(r)[2]
+        and r.get("link") not in incomplete_pdf_links
     }
 
     if singleton_pdf:
         singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
-        non_stmt = [it["link"] for it in singleton_pdf if it.get("_pre_non_statement")]
+        non_stmt = [it for it in singleton_pdf if it.get("_pre_non_statement")]
         if non_stmt:
-            new_dupe_links.extend(non_stmt)
+            narrative_candidates.extend(non_stmt)
             singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_non_statement")]
-            print(f"  ⏭ {len(non_stmt)} investor presentation / press release PDF(s) skipped BEFORE AI")
+            print(f"  ⏭ {len(non_stmt)} investor presentation / press release PDF(s) kept out of numbers "
+                  f"extraction (narrative-only)")
 
         # Different URL, but an already-stored result business key: mark this
         # link processed and stop before AI.  Ambiguous/unkeyed PDFs are left
@@ -2816,7 +2863,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         checked_items = list(await asyncio.gather(*(_preflight_pdf(it) for it in group_items)))
         non_stmt = [it for it in checked_items if it.get("_pre_non_statement")]
         if non_stmt:
-            new_dupe_links.extend(it["link"] for it in non_stmt)
+            narrative_candidates.extend(non_stmt)
             checked_items = [it for it in checked_items if not it.get("_pre_non_statement")]
             if not checked_items:
                 return None
@@ -2857,6 +2904,58 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     pdf_results = list(group_results) + list(singleton_results)
     parsed_all = [r for r in xbrl_results if r] + [r for r in pdf_results if r]
     print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf)} successfully")
+
+    # ── Narrative-only enrichment from presentations / press releases ──
+    # Numbers ALWAYS come from the Reg 33 statement. A presentation for the
+    # same symbol+quarter may only fill key_highlights / management_commentary
+    # where the statement record has none. Prefer Consolidated, then records
+    # parsed this run (they replace stored ones of the same key below).
+    if narrative_candidates:
+        target_by_key = {}
+        ordered = ([(r, True) for r in parsed_all] + [(r, False) for r in existing_items])
+        ordered.sort(key=lambda x: (not (x[0].get("meta", {}).get("standalone_consolidated") or "")
+                                    .strip().lower().startswith("cons"), not x[1]))
+        for rec, _fresh in ordered:
+            m_, q_ = rec.get("meta") or {}, rec.get("quarter") or {}
+            k = ((m_.get("symbol") or "").upper(), q_.get("period_end"))
+            if k[0] and k[1]:
+                target_by_key.setdefault(k, rec)
+        n_merged = 0
+        for it in narrative_candidates:
+            fname = it["link"].split("/")[-1]
+            key = it.get("_pre_narr_key")
+            if not key:
+                new_dupe_links.append(it["link"])   # can't be matched to any result, ever
+                continue
+            rec = target_by_key.get(key)
+            if rec is None:
+                failed_links.append(it["link"])     # statement not stored yet — retry (soft give-up)
+                continue
+            if rec.get("key_highlights") and rec.get("management_commentary"):
+                new_dupe_links.append(it["link"])   # nothing left to fill
+                continue
+            narr = await _ai_extract_financials(client, it.get("_pre_text") or "", fname,
+                                                it.get("_pre_content"), system_prompt=_AI_NARRATIVE_PROMPT)
+            if not narr:
+                failed_links.append(it["link"])
+                continue
+            new_dupe_links.append(it["link"])
+            if narr.get("period_end") and narr["period_end"] != key[1]:
+                print(f"    · [{fname}] narrative is for {narr['period_end']}, not {key[1]} — ignored")
+                continue
+            changed = False
+            hl = [h for h in (narr.get("key_highlights") or []) if isinstance(h, str) and h.strip()]
+            if hl and not rec.get("key_highlights"):
+                rec["key_highlights"] = hl[:5]
+                changed = True
+            if narr.get("management_commentary") and not rec.get("management_commentary"):
+                rec["management_commentary"] = narr["management_commentary"]
+                changed = True
+            if changed:
+                rec.setdefault("meta", {})["narrative_source"] = it["link"]
+                n_merged += 1
+        if n_merged:
+            print(f"  📝 Highlights/commentary attached to {n_merged} result(s) from presentations / press releases")
 
     if new_dupe_links:
         all_dupe_links = list(known_dupe_links | set(new_dupe_links))[-5000:]  # cap growth
@@ -3074,11 +3173,6 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     keep_older = max(0, 1000 - len(parsed_new))
     merged = parsed_new + older_existing[:keep_older]
     merged.sort(key=_effective_ts, reverse=True)
-
-    # Include the freshly XBRL-merged records too, so the per-symbol
-    # store's copy of this quarter also gets the corrected numbers rather
-    # than staying stale.
-    await _update_results_by_symbol(client, refiled + parsed_new + xbrl_merged_records)
 
     return make_payload(merged)
 
@@ -3299,6 +3393,9 @@ async def run():
             kind = _bse_extra_candidate_kind(it, calendar_payload, bse_symbol_map)
             if kind == "calendar":
                 it["_cal_fallback"] = True
+            elif kind == "narrative":
+                it["_cal_fallback"] = True   # soft give-up window, same as calendar items
+                it["_narrative"] = True
             elif kind == "loose":
                 it["_loose"] = True
             else:
