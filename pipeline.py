@@ -3046,7 +3046,31 @@ def _dash_ad_line(all_data, sessions=20):
         run += net[day]; out.append(run)
     return out
 
-def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, stages_raw, cls_map=None):
+def _dash_ipos(ipo_raw):
+    """IPOs listing from today up to the next two trading days.
+    ep_scan runs after market close, so the extra day keeps tomorrow's listings
+    visible when the dashboard is opened the next morning; the widget labels
+    Today / Tomorrow from the viewer's own date."""
+    d = date.fromisoformat(today_ist())
+    window, cur = [d.isoformat()], d
+    while len(window) < 3:
+        cur += timedelta(days=1)
+        if is_trading_day(cur.isoformat()): window.append(cur.isoformat())
+    lo, hi = window[0], window[-1]
+    out = []
+    for x in (ipo_raw or {}).get("ipos") or []:
+        ld = x.get("listing_date") or ""
+        if not (lo <= ld <= hi): continue
+        out.append({"sym": x.get("symbol") or "", "name": x.get("name") or "", "type": x.get("issue_type"),
+                    "listing": ld, "ex": x.get("listing_exchange"), "band": x.get("price_band"),
+                    "price": x.get("cut_off_price") or x.get("max_price"), "subsX": x.get("subscription_x"),
+                    "sizeCr": x.get("issue_size_cr"), "listPrice": x.get("listing_price"),
+                    "gainPct": x.get("listing_gain_pct"), "id": x.get("id")})
+    out.sort(key=lambda r: (r["listing"], r["type"] != "regular", r["sym"]))
+    return out
+
+def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, stages_raw, cls_map=None,
+                        ipo_raw=None):
     by_sym = {r["symbol"]: r for r in feed if r.get("symbol")}
     cls_map = cls_map or {}
 
@@ -3160,6 +3184,7 @@ def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, st
         "industryRankHistory": hist,
         "breadth": breadth,
         "stages": {"updated": (stages_raw or {}).get("updated"), "counts": counts, "stocks": stocks},
+        "ipos": _dash_ipos(ipo_raw),
     }
 
 
@@ -3645,17 +3670,20 @@ async def run_ep_scan() -> None:
             }
 
             # dash_summary.json for dashboard.html (previous file keeps the industry rank history)
-            dash_prev, dash_stages = await asyncio.gather(
+            dash_prev, dash_stages, dash_ipo = await asyncio.gather(
                 r2_download(client, "dash_summary.json"),
                 r2_download(client, "weinstein_stage_analysis.json"),
+                r2_download(client, "ipo_data.json"),
                 return_exceptions=True)
             dash_summary = _build_dash_summary(
                 screener_feed, all_data, result_calendar, market_data_date,
                 dash_prev if isinstance(dash_prev, dict) else {},
                 dash_stages if isinstance(dash_stages, dict) else {},
-                cls_map_ep)
+                cls_map_ep,
+                dash_ipo if isinstance(dash_ipo, dict) else {})
             log.info(f"dash_summary: {dash_summary['highs52Count']} 52W highs, {len(dash_summary['volShockers'])} vol shockers, "
-                     f"{len(dash_summary['sectors'])} sectors, {len(dash_summary['industries'])} industries")
+                     f"{len(dash_summary['sectors'])} sectors, {len(dash_summary['industries'])} industries, "
+                     f"{len(dash_summary['ipos'])} IPO listings")
 
             await asyncio.gather(
                 upload_str_with_manifest(client, r2_upload, "dash_summary.json", json.dumps(dash_summary),
