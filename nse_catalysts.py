@@ -2851,22 +2851,33 @@ def process_corp_actions(session, history: dict, limit: int = CA_CHECK_BATCH) ->
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Per-symbol 3-year event archive (for chart markers)
-#   cat_hist_<SYMBOL>.json  → {"symbol", "updated", "events": [compact event, ...]}
-#   cat_hist__index.json    → {SYMBOL: {"h": hash of its 20-day window, "n", "last"}}
+# Per-symbol 3-year event archive (for chart markers), in the R2 folder eventhistory/
+#   eventhistory/<SYMBOL>.json  → {"symbol", "updated", "events": [compact event, ...]}
+#   eventhistory/_index.json    → {SYMBOL: {"h": hash of its 20-day window, "n", "last"}}
+# (Older runs wrote cat_hist_<SYMBOL>.json / cat_hist__index.json at the bucket root;
+#  those are read once per symbol as a migration source and never written again.)
 # The rolling 20-day file stays small; charts fetch one symbol's archive on demand.
 # Inside the 20-day window the archive mirrors the live file (so fixes, merges and
 # removals carry over); older events are frozen and kept for ARCHIVE_YEARS.
 # ─────────────────────────────────────────────────────────────────────────────
 
 ARCHIVE_YEARS = 3
-ARCHIVE_PREFIX = "cat_hist_"
-ARCHIVE_INDEX = "cat_hist__index.json"
+ARCHIVE_DIR = "eventhistory"
+ARCHIVE_INDEX = f"{ARCHIVE_DIR}/_index.json"
+LEGACY_ARCHIVE_PREFIX = "cat_hist_"          # migration source only
 ARCHIVE_BATCH = int(os.environ.get("ARCHIVE_BATCH", "200"))   # symbol files written per run
 
 
+def _archive_slug(symbol: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "_", str(symbol).upper())
+
+
 def archive_key(symbol: str) -> str:
-    return ARCHIVE_PREFIX + re.sub(r"[^A-Z0-9]", "_", str(symbol).upper()) + ".json"
+    return f"{ARCHIVE_DIR}/{_archive_slug(symbol)}.json"
+
+
+def legacy_archive_key(symbol: str) -> str:
+    return LEGACY_ARCHIVE_PREFIX + _archive_slug(symbol) + ".json"
 
 
 def _compact_event(it: dict) -> dict:
@@ -2917,6 +2928,10 @@ def update_symbol_archives(session, history: dict, suppressed: dict, today: date
             continue
         key = archive_key(sym)
         ok, arch = _r2_get_json_strict(session, key)
+        if ok and arch is None:
+            # First write into eventhistory/ for this symbol: carry over the frozen
+            # (older than the live window) events from the old root-level file.
+            ok, arch = _r2_get_json_strict(session, legacy_archive_key(sym))
         if not ok:
             failed += 1
             continue
@@ -2936,9 +2951,42 @@ def update_symbol_archives(session, history: dict, suppressed: dict, today: date
             continue
         index[sym] = {"h": h, "n": len(events), "last": events[0].get("dt", "") if events else ""}
         written += 1
-    if written:
+    # One-time migration of symbols that only exist in the OLD root-level archive
+    # (no event in the live 20-day window, so the loop above never touches them).
+    # Uses whatever is left of this run's write budget; continues on later runs.
+    migrated = 0
+    if written < ARCHIVE_BATCH:
+        ok_l, legacy_index = _r2_get_json_strict(session, LEGACY_ARCHIVE_PREFIX + "_index.json")
+        if ok_l and isinstance(legacy_index, dict):
+            for sym in sorted(legacy_index):
+                if sym in index:
+                    continue
+                if written + migrated >= ARCHIVE_BATCH:
+                    pending += 1
+                    continue
+                ok, arch = _r2_get_json_strict(session, legacy_archive_key(sym))
+                if not ok:
+                    failed += 1
+                    continue
+                events = [e for e in ((arch or {}).get("events") or [])
+                          if e.get("id") not in suppressed and str(e.get("dt", ""))[:10] >= arch_cut]
+                events.sort(key=lambda e: e.get("dt", ""), reverse=True)
+                try:
+                    if events:
+                        _r2_put_json(session, archive_key(sym),
+                                     {"symbol": sym, "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                      "events": events}, quiet=True)
+                except Exception as e:
+                    print(f"  ⚠ Archive migrate {sym} failed ({e})")
+                    failed += 1
+                    continue
+                index[sym] = {"h": (legacy_index.get(sym) or {}).get("h", ""), "n": len(events),
+                              "last": events[0].get("dt", "") if events else ""}
+                migrated += 1
+    if written or migrated:
         _r2_put_json(session, ARCHIVE_INDEX, index, quiet=True)
-    print(f"  📚 Symbol archive → written={written}, pending={pending}, failed={failed}, symbols={len(index)}")
+    print(f"  📚 Symbol archive ({ARCHIVE_DIR}/) → written={written}, migrated={migrated}, "
+          f"pending={pending}, failed={failed}, symbols={len(index)}")
 
 
 def _build_materiality_maps(classification_payload, fundamentals_payload):
