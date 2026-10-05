@@ -5,6 +5,10 @@ on:
       mode:
         description: 'fast = news+insider only, full = IPO bhi'
         default: 'fast'
+      reprocess_stale:
+        description: 'Galat/stale results dobara extract karo (Gemini calls lagenge)'
+        type: boolean
+        default: false
 jobs:
   run-pipelines:
     runs-on: ubuntu-latest
@@ -33,6 +37,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_RESULTS_CHAT_ID: ${{ secrets.TELEGRAM_RESULTS_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          REPROCESS_STALE_RESULTS: ${{ inputs.reprocess_stale && '1' || '0' }}
       - name: Run IPO scan
         if: ${{ github.event.inputs.mode == 'full' }}
         env:
