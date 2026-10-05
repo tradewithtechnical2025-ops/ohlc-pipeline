@@ -1,3166 +1,3061 @@
-import asyncio
-import base64
-import calendar
-import json
-import os
+"""
+nse_catalysts.py
+Pulls NSE corporate announcements, keeps a trader-focused set of material
+events, drops routine exchange/compliance noise at the backend, and stores them
+per symbol so the frontend can show WHY an event may matter.
+
+Sources, in order:
+  1. www.nseindia.com/api/corporate-announcements  (JSON, has the symbol, supports
+     a date range so missed runs are back-filled; needs the primed NSE session)
+  2. Online_announcements.xml RSS                   (latest ~day only, no symbol;
+     company name is mapped to a symbol via EQUITY_L.csv)
+
+Output (R2, flat key):
+  nse_catalysts.json → {"updated": iso, "data": {SYMBOL: [item, ...]}}
+  item = {id, dt, react_date, session, category, subject, text, link}
+    react_date = the trading day on which the market could first react
+                 (same day before 15:30 IST, next trading day after it).
+    session    = BH (before 09:15) | IH (market hours) | AH (after 15:30 or holiday)
+                 same codes ep.html already uses for results.
+"""
+
+import csv
+import io
 import re
-import time
-from datetime import datetime, timedelta, timezone
-import feedparser
-import httpx
+import os
+import json
+import base64
+import xml.etree.ElementTree as ET
+from datetime import date, datetime, time as dtime, timedelta
 
-# ── Telegram notify ──
-try:
-    from telegram_notify import send_message
-except ImportError:
-    def send_message(text, silent=False, chat_id=""): pass
+API_URL   = "https://www.nseindia.com/api/corporate-announcements"
+RSS_URL   = "https://www.nseindia.com/content/RSS/Online_announcements.xml"
+EQUITY_L  = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
-# Separate channel for financial-results alerts, so they don't mix with
-# pipeline status notifications in the main TELEGRAM_CHAT_ID channel.
-# Boss needs to create this channel and set the secret once.
-TELEGRAM_RESULTS_CHAT_ID = os.environ.get("TELEGRAM_RESULTS_CHAT_ID", "")
+HISTORY_DAYS = 20          # TEST MODE: keep/fetch only the last 20 calendar days
+TEXT_MAX     = 300         # exchange summary is enough; the PDF link has the rest
+BACKFILL_PDF_BATCH = 10    # max never-opened history PDFs parsed per run (local parser, no AI)
+BACKFILL_MAX_ATTEMPTS = 3  # failed downloads retried on later runs before giving up
 
-# Used for AI-assisted PDF financial-results extraction. This is now the
-# ONLY extraction path for PDFs (regex fallback removed) — if this isn't
-# set, PDF result parsing simply doesn't run (see parse_financial_results_pdf).
-# Gemini instead of Claude specifically because the free tier needs no card
-# on file (vs Anthropic billing, which hit setup friction) — same system
-# prompt/schema either way, this just swaps which API answers it. Model name
-# drifts periodically as Google renames/retires versions (already hit once
-# this project) — check https://aistudio.google.com/app/apikey if this
-# starts 404ing.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-AI_PDF_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+MARKET_OPEN  = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
 
-WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
+# ─────────────────────────────────────────────────────────────────────────────
+# Classification
+# Checked top to bottom; first match wins. SUBJECT is matched first because it
+# is the exchange's own category; TEXT (the one-line summary) is only used for
+# vague subjects like "Press Release" / "General Updates" / "Updates".
+# ─────────────────────────────────────────────────────────────────────────────
 
-# XBRL processing — permanently OFF. This pipeline now runs PDF/AI-extraction
-# only (see parse_financial_results_pdf / _ai_extract_financials). XBRL used
-# to serve two purposes — (1) confirming/correcting PDF-sourced numbers in
-# place, and (2) a fallback for results with no PDF record at all — but both
-# are now redundant: the site's main data API re-pulls and corrects every
-# stock's fundamentals the next day regardless, so XBRL's same-day accuracy
-# bump isn't worth the extra fetch/parse work or the added latency (XBRL
-# filings routinely land well after the board-outcome PDF). This also means
-# BSE, which has no XBRL feed at all in this pipeline, is handled by the
-# exact same PDF path as NSE — one extraction path instead of two.
-# (Earlier note, kept for context: naively re-enabling full XBRL once
-# caused it to silently overwrite PDF/AI records — losing key_highlights/
-# management_commentary/segment_breakup, which XBRL never carries — and to
-# re-flood Telegram with a backlog of "new" XBRL items. If XBRL is ever
-# revisited, reintroduce it as fallback-only + confirm-in-place, not a
-# blanket overwrite.)
-PDF_ONLY_MODE = True
-WORKER_TOKEN = os.environ["WORKER_TOKEN"]
-UP_HEADERS = {
-    "X-Secret-Token": WORKER_TOKEN,
-    "Content-Type": "application/json"
-}
-DL_HEADERS = {
-    "X-Secret-Token": WORKER_TOKEN,
-    "Cache-Control": "no-cache",
-}
+_IGNORE_SUBJECT = re.compile(
+    r"trading window|declaration of nav|shareholders meeting|newspaper publication|"
+    r"investor presentation|analyst|institutional investor|board meeting intimation|"
+    r"regulation 51|regulation 57|amendment to aoa|notice of shareholders|credit rating|"
+    r"movement in units|noc/no dues|corrigendum",
+    re.I)
 
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml, text/xml, */*",
-}
+# Hard noise: reject before any PDF/AI work.
+_BACKEND_NOISE = re.compile(
+    r"news verification|exchange has sought clarification|clarification.*(?:price|volume)|"
+    r"spurt in (?:price|volume)|significant movement in (?:the )?price|movement in (?:the )?price|"
+    r"inter[- ]se transfer.*promoter|promoter.*inter[- ]se transfer|regulation 10\(6\)",
+    re.I)
 
-# Feed definitions: (source_key, label, rss_url)
-FEEDS = [
-    # NSE Official
-    ("nse_results",       "NSE Financial Results",  "https://nsearchives.nseindia.com/content/RSS/Integrated_Filing_Financials.xml"),
-    ("nse_announcements", "NSE Announcements",       "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml"),
-    ("nse_board",         "NSE Board Meetings",      "https://nsearchives.nseindia.com/content/RSS/Board_Meetings.xml"),
-    ("nse_corp_actions",  "NSE Corporate Actions",   "https://nsearchives.nseindia.com/content/RSS/Corporate_action.xml"),
-    # Market News
-    ("et_markets",   "Economic Times Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
-    ("mint_markets", "LiveMint Markets",        "https://www.livemint.com/rss/markets"),
-    ("bs_finance",   "Business Standard Finance", "https://www.business-standard.com/rss/finance-103.rss"),
-    # BSE Official — general corporate-announcements feed, NOT the dedicated
-    # "Latest FINANCIAL RESULTS" feed (Comp_Resultsnew.aspx). Deliberate
-    # choice: the dedicated feed is BSE's XBRL-backed feed and lands
-    # noticeably later (confirmed directly: AUGMONT's results PDF hit this
-    # general feed at 19:52 IST vs 20:21 IST on the XBRL feed) — same
-    # speed-over-confirmation tradeoff already made for NSE (PDF_ONLY_MODE),
-    # so only this faster, noisier feed is polled; the XBRL feed is skipped
-    # entirely rather than used as a fallback/confirmation source.
-    ("bse_announcements", "BSE Corporate Announcements", "https://beta.bseindia.com/data/xml/announcements.xml"),
-]
+# Professional-service appointments are routine. Do NOT use a blanket
+# 'appointment/resignation' rule: CEO/MD/CFO/WTD/director changes may be material.
+_ROUTINE_PROFESSIONAL = re.compile(
+    r"(?:appointment|re-appointment|reappointment).*"
+    r"(?:statutory auditor|secretarial auditor|internal auditor|cost auditor|scrutinizer|"
+    r"chartered accountant|\bca firm\b)|"
+    r"(?:statutory auditor|secretarial auditor|internal auditor|cost auditor|scrutinizer).*"
+    r"(?:appointment|re-appointment|reappointment)", re.I)
 
-# source_key(s) -> R2 output file
-# Single key = individual file, list = merged file
-OUTPUT_MAP = {
-    "nse_results_feed.json":   ["nse_results"],
-    "nse_announcements.json":  ["nse_announcements"],
-    "nse_board_meetings.json": ["nse_board"],
-    "nse_corp_actions.json":   ["nse_corp_actions"],
-    "market_news.json":        ["et_markets", "mint_markets", "bs_finance"],
-    "bse_announcements.json":  ["bse_announcements"],
-}
+# SAST/promoter-shareholding disclosures are not acquisitions by the listed company.
+_SAST_NOISE = re.compile(
+    r"disclosure.*regulation\s*(?:10\s*\(?[56]\)?|29|31)\s*\(?[12]?\)?|"
+    r"regulation\s*(?:10\s*\(?[56]\)?|29\s*\(?2\)?|31)|"
+    r"substantial acquisition of shares and takeovers[^.]{0,35}regulations|\bsast\b", re.I)
+_PROMOTER_MPS_SALE = re.compile(
+    r"sale of (?:equity )?shares by (?:a )?promoter.*(?:open market|minimum public shareholding)|"
+    r"promoter.*(?:minimum public shareholding|\bmps\b)", re.I)
 
+# Incorporating/funding one's own subsidiary is not an external acquisition catalyst.
+_SUBSIDIARY_INCORPORATION = re.compile(
+    r"incorporation of (?:a |an |one or more |[a-z0-9 -]+ )?(?:wholly owned |step[- ]down )?subsidiar(?:y|ies)|"
+    r"incorporat(?:e|ed|ion).*\b(?:wos|wholly[- ]owned subsidiar(?:y|ies)|step[- ]down subsidiar(?:y|ies))\b", re.I)
+_INTERNAL_SUB_INVESTMENT = re.compile(
+    r"(?:additional )?(?:investment|invested).*?(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b)|"
+    r"(?:subscription|subscribe|subscribed).*?(?:rights issue|equity shares|share capital|preference shares|warrants).*?(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b)|"
+    r"(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b).*?(?:rights issue|additional investment|capital infusion|subscription|subscribe|subscribed)|"
+    r"(?:investment|invested) (?:in|into)?.*?(?:wholly[- ]owned subsidiar(?:y|ies)|\bwos\b)", re.I)
 
-# Summary patterns to drop (routine regulatory noise, not news)
-NOISE_PATTERNS = [
-    "Net Asset Value",
-]
+# Batch-1 precision rules: acquisition/divestment/strategic agreement.
+# These are deliberately summary-text rules so obvious exchange disclosures are
+# resolved before any PDF enrichment.
+_ACQ_ROUTINE_INTERNAL = re.compile(
+    r"(?:acquisition|acquire|subscription|investment).*?(?:equity shares|share capital|rights issue).*?"
+    r"(?:wholly[- ]owned subsidiary|\bwos\b)|"
+    r"(?:wholly[- ]owned subsidiary|\bwos\b).*?(?:acquisition|acquire|subscription|investment).*?"
+    r"(?:equity shares|share capital|rights issue)|"
+    r"apportionment of (?:the )?cost of acquisition", re.I)
+_ACQ_DILUTION = re.compile(
+    r"dilution of (?:the )?(?:company['’ ]s )?shareholding|non[- ]participation in (?:the )?rights issue|"
+    r"shareholding.*(?:has been|is|was|will be|stands)\s+(?:reduced|diluted)|ceased to be .*subsidiary", re.I)
+_STRATEGIC_TO_ORDER = re.compile(
+    r"\bdeal win\b|(?:agreement|partnership).*?(?:customer contract|customer win|order awarded)", re.I)
+_STRATEGIC_TO_DIVEST = re.compile(
+    r"(?:mou|agreement).*?(?:sale of entire|sale of .*stake|sale of .*shareholding|disinvestment)|"
+    r"extinguishment of .*shares.*(?:buyback|joint venture)", re.I)
+_JV_STRATEGIC = re.compile(
+    r"(?:investment|equity investment|subscription).*?(?:joint venture|\bjv\b)|"
+    r"(?:joint venture|\bjv\b).*?(?:investment|equity investment|subscription|incorporation)", re.I)
 
-# |SUBJECT: tag values to drop — routine compliance/regulatory boilerplate,
-# not actionable for trading. Matched case-insensitively against the exact
-# subject text (regex so "Disclosure"/"Intimation" prefix variants both hit).
-NOISE_SUBJECT_PATTERNS = [
-    # NOTE: "Updates" / "General Updates" are NOT blanket-dropped any more —
-    # NSE files real news under them too (plant inaugurations, supply
-    # agreements, fund-raises, bonus record dates). See _GENERIC_UPDATE_*.
-    r"^copy of newspaper publication$",
-    r"^certificate under sebi \(depositories and participants\) regulations, 2018$",
-    r"^quarterly compliance report on corporate governance",
-    r"^structural digital database$",
-    r"^(disclosure|intimation) under regulation (27\(2\)|13\(3\)|7\(1\)|6\(1\)|50\(1\)|51|52\(4\))$",
-    r"^board meeting intimation$",  # future-dated notice only; "Outcome of Board Meeting" kept (actual results)
-    r"^(notice of )?shareholders? meetings?(-xbrl)?$",  # AGM/EGM/postal ballot voting outcomes — not trading-actionable (covers both the plain-feed and XBRL-tagged variants)
-    r"^allotment of securities$",   # routine NCD/ESOP allotment filings
-    r"^change in directors?/kmp/smp/auditor/rta$",  # routine KMP/auditor/RTA administrative changes
-    r"^change in director\(s\)$",                   # routine board-composition filings (not MD/CEO-level)
-    r"^appointment$",                                # generic appointment notices (KMP/company secretary level)
-    r"^cessation$",                                  # generic cessation notices (KMP/director resignations)
-    r"^options to purchase securities$",             # ESOP/stock benefit grants — compliance filing, not trading-actionable
-    r"^analysts?/institutional investor meet/con\. call updates$",  # analyst meet schedule/outcome/transcript — routine, very high frequency
-    r"^analyst/investor meet para a-xbrl$",                          # XBRL-tagged variant of the same analyst-meet noise
-    r"^confirmation of redemption/payment of interest and principal$",  # debt-segment coupon/CP redemption confirmations
-    r"^noc/no dues certificate/consent/permission$",                 # debenture-trustee NOCs (Piramal: ~45 copies in one feed)
-    r"^record date updates$",                                        # debt/CP record dates (equity "Record Date" is kept)
-    r"^movement in units$",                                          # MF/SIF unit movement undertakings
-    r"^annual disclosure$",                                          # trust/large-entity annual compliance disclosure
-    r"^change in auditors?$",                                        # mostly secretarial/internal auditor rotations
-    r"^alteration of capital and fund raising-xbrl$",                # XBRL twin of "Allotment of Securities"
-]
-_NOISE_SUBJECT_RE = re.compile("|".join(NOISE_SUBJECT_PATTERNS), re.IGNORECASE)
+# Routine completion/allotment after an already-announced raise is not a new catalyst.
+_ROUTINE_ALLOTMENT = re.compile(
+    r"allotment of (?:equity shares|shares|securities).*pursuant to (?:a )?(?:preferential|rights|qip)|"
+    r"allotted .*securities.*preferential issue|conversion of .*warrants.*(?:equity shares|preferential)",
+    re.I)
 
-_SUBJECT_TAG_RE = re.compile(r"\|SUBJECT:\s*(.+)$")
+# Administrative dividend/buyback paperwork and duplicate communications.
+_ROUTINE_CORP_ACTION = re.compile(
+    r"(?:tds|kyc|non[- ]?compliant).*dividend|withholding of .*dividend|"
+    r"dividend.*(?:tds|kyc|non[- ]?compliant)|non[- ]credit of dividend|"
+    r"(?:agm|annual general meeting).*approval of dividend|approval of dividend.*(?:agm|annual general meeting)|"
+    r"clarification.*valuation methodology.*preferential issue|"
+    r"dispatch.*(?:buyback|rights)|trading approval.*(?:bonus|split|rights|preferential)|"
+    r"record date.*dividend|dividend.*record date|"
+    r"(?:payment|credit|remittance).*dividend|dividend.*(?:payment|credit|remittance)|"
+    # PSU press releases about handing the dividend cheque to the Government.
+    r"\bpa(?:ys|id|ying)\b.{0,60}dividend.{0,40}(?:government|\bgoi\b|president of india|ministry)|"
+    r"dividend (?:cheque|warrant).{0,60}(?:government|\bgoi\b|minister|ministry)", re.I)
 
-# Routine compliance filings matched ANYWHERE in the text (not exact-subject)
-# — NSE subjects come in many prefix/suffix variants ("Compliances-...",
-# "...-XBRL", "Closure of Trading Window" vs "Trading Window"), and BSE's
-# feed has no SUBJECT tag at all, just a free-text description like
-# "Announcement under Regulation 30 (LODR)-Closure of Trading Window".
-# Applied only to exchange feeds (nse_*/bse_*), never to market news, and
-# only to the published announcement JSONs — the results-PDF pipeline reads
-# result_map directly, so nothing here can hide a results filing.
-NOISE_CONTAINS_PATTERNS = [
-    r"trading\s+window",                                        # insider-trading window closure/opening
-    r"(loss|misplace\w*)\s+of\s+(share\s+)?certificates?",      # lost share certificates
-    r"duplicate[\s\-]+(share[\s\-]+)?certificates?",
-    r"reg(ulation)?\.?\s*74\s*\(\s*5\s*\)",                     # SEBI DP Reg 74(5) certificate
-    r"reg(ulation)?\.?\s*39\s*\(\s*3\s*\)",                     # Reg 39(3) lost-certificate intimation
-    r"reg(ulation)?\.?\s*76\b|reconciliation\s+of\s+share\s+capital",  # share-capital audit report
-    r"newspaper\s+(publication|advertisement|advt)",
-    r"annual\s+secretarial\s+compliance",
-    r"business\s+responsibility\s+(and|&)\s+sustainability|\bBRSR\b",
-    r"scrutini[sz]er'?s?\s+report",
-    r"investor\s+(complaints|grievances?)",
-    r"compliance\s+certificate",
-    r"(employee\s+stock\s+option|\bESOP\b|\bESOS\b|\bESPS\b)",
-    r"registrar\s+(and|&)\s+(share\s+)?transfer\s+agent|\bRTA\b",
-]
-_NOISE_CONTAINS_RE = re.compile("|".join(NOISE_CONTAINS_PATTERNS), re.IGNORECASE)
+# Insolvency/proceeding steps that do not change the economic state of the case.
+_CIRP_PROCEDURAL = re.compile(
+    r"(?:prior |post[- ]facto )?intimation.*(?:(?:coc|committee of creditors).*meeting|meeting.*(?:coc|committee of creditors))|"
+    r"(?:outcome|voting results?).*(?:(?:coc|committee of creditors).*meeting|meeting.*(?:coc|committee of creditors))|"
+    r"appointment of (?:the )?(?:irp|rp|resolution professional)|"
+    r"interim resolution professional.*(?:performing|functions)|"
+    r"cirp.*trading window|trading window.*cirp", re.I)
 
+# Some NSE CIRP summaries are completely generic; the filing filename/link carries
+# the procedural meaning.  These patterns are intentionally narrow and are used
+# only for Negative/CIRP rows, never as a global subject filter.
+_CIRP_PROCEDURAL_ITEM = re.compile(
+    r"(?:coc|committee[ _-]?of[ _-]?creditors).{0,40}(?:meeting|outcome|voting)|"
+    r"(?:meeting|outcome|voting).{0,40}(?:coc|committee[ _-]?of[ _-]?creditors)|"
+    r"appointment.{0,30}(?:irp|rp|resolution[ _-]?professional)|"
+    r"(?:irp|rp|resolution[ _-]?professional).{0,30}appointment|"
+    r"trading[ _-]?window|vacation[ _-]?(?:of[ _-]?)?(?:office|director)|"
+    # Shareholder-meeting paperwork filed under the CIRP subject (notice,
+    # proceedings, voting results, e-voting, book closure, postal ballot).
+    r"(?:annual|extra[ _-]?ordinary)[ _-]?general[ _-]?meeting|\b[ae]gm\b|"
+    r"e[ _-]?voting|book[ _-]?closure|postal[ _-]?ballot", re.I)
 
-# "Updates" / "General Updates" subjects: dropped only when the free text is
-# either empty boilerplate ("X has informed the Exchange about General
-# Updates") or clearly routine. Anything with real content is kept.
-_GENERIC_UPDATE_SUBJECT_RE = re.compile(r"^(general\s+)?updates?$", re.IGNORECASE)
-_GENERIC_UPDATE_TEXT_RE = re.compile(
-    r"^(.{0,120}?has\s+informed\s+the\s+exchange\s+(about|regarding)\s+)?(general\s+)?updates?\.?$",
-    re.IGNORECASE,
-)
-_UPDATE_NOISE_RE = re.compile(
-    r"annual\s+general\s+meeting|\bAGM\b|insider\s+trading|regulation\s+7\s*\(\s*2|"
-    r"special\s+window|annual\s+report|analyst|institutional\s+investor",
-    re.IGNORECASE,
-)
-# NSE's Integrated-filing XBRL twins (…/corporate/xbrl/…xml) duplicate a PDF
-# filed alongside, and their description is only "X has informed the
-# Exchange about <subject>" — no content of their own.
-_NSE_XBRL_LINK_RE = re.compile(r"/corporate/xbrl/[^/]+\.xml$", re.IGNORECASE)
+_CIRP_MATERIAL = re.compile(
+    r"(?:cirp|insolvency).*(?:admit(?:ted|sion)?|initiat(?:ed|ion)|commenc(?:ed|ement))|"
+    r"resolution plan.*(?:approved|rejected|dismissed|accepted)|"
+    r"(?:nclt|nclat).*(?:approved|rejected|sanctioned|dismissed|liquidation)|"
+    r"liquidation.*(?:ordered|order|approved)|"
+    r"(?:settlement|withdrawal|termination).*(?:cirp|insolvency)|"
+    r"(?:cirp|insolvency).*(?:settlement|withdrawal|termination)", re.I)
 
-
-def _truncate_keep_subject(raw: str, limit: int = 300) -> str:
-    """Truncate to `limit` chars but never cut off the trailing |SUBJECT: tag
-    — every subject-based filter depends on it, and NSE descriptions longer
-    than 300 chars (spurt-in-volume replies, earnings-call notices, revised
-    annual reports) used to lose it and slip past all of them."""
-    if len(raw) <= limit:
-        return raw
-    idx = raw.rfind("|SUBJECT:")
-    if idx == -1:
-        return raw[:limit]
-    tag = raw[idx:]
-    head_room = max(0, limit - len(tag) - 4)
-    return raw[:head_room].rstrip() + "... " + tag
-
-
-def is_noise(item: dict) -> bool:
-    summary = item.get("summary", "")
-    if any(p in summary for p in NOISE_PATTERNS):
-        return True
-    m = _SUBJECT_TAG_RE.search(summary)
-    subject = m.group(1).strip() if m else ""
-    if subject and _NOISE_SUBJECT_RE.match(subject):
-        return True
-    sk = item.get("source_key", "")
-    if not sk.startswith(("nse_", "bse_")):
+def _is_cirp_procedural_item(item: dict) -> bool:
+    """Drop only clearly administrative CIRP filings; material case milestones win."""
+    subject = str(item.get("subject") or "")
+    text = str(item.get("text") or "")
+    link = str(item.get("link") or "")
+    both = f"{subject} {text} {link}"
+    if not re.search(r"corporate insolvency resolution process|\bcirp\b|insolvency", both, re.I):
         return False
+    if _CIRP_MATERIAL.search(both):
+        return False
+    return bool(_CIRP_PROCEDURAL.search(both) or _CIRP_PROCEDURAL_ITEM.search(both))
 
-    if sk.startswith("nse_") and _NSE_XBRL_LINK_RE.search(item.get("link", "") or ""):
-        return True
+# Scheme notices/reports are procedural; retain approvals, NCLT orders, effective dates,
+# record dates and implementation/completion milestones.
+_SCHEME_PROCEDURAL = re.compile(
+    r"board meeting.*(?:scheduled|to consider).*(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:audit committee|independent directors?).*report.*(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:notice|convening).*(?:shareholders?|creditors?).*meeting.*(?:scheme|merger|demerger)|"
+    r"(?:hearing date|date of hearing).*?(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:petition|second motion petition).*(?:admitted|admission)|"
+    r"(?:filing|submission).*?(?:petition|application).*?(?:scheme|merger|demerger|amalgamation)|"
+    r"(?:scheme|merger|demerger|amalgamation).*?(?:filing|submission).*?(?:petition|application)|"
+    # NSE summaries of court-convened meeting notices often omit the word "scheme"
+    # and only say the meeting is being held per the NCLT's order.
+    r"(?=.*(?:shareholders?|creditors?))(?:notice|convening).{0,60}meeting.*?"
+    r"(?:nclt|nclat|national company law|tribunal|hon['’]?ble)", re.I)
 
-    # NSE: check the SUBJECT tag (the free text is often a generic "X has
-    # informed the Exchange..." sentence). BSE: no tag, so title + text.
-    haystack = subject if m else f"{item.get('title', '')} {summary}"
-    if _NOISE_CONTAINS_RE.search(haystack):
-        return True
+# A court/tribunal/authority order is a legal event, never a business order win.
+# Allows up to four words between "order from/of" and the forum name
+# (e.g. "Order from Hon'ble Delhi High Court").
+_JUDICIAL_ORDER = re.compile(
+    r"\border(?:s)?\s+(?:of|from|by|passed by|issued by|dated\s+\S+\s+(?:of|from|by))\s+(?:the\s+)?"
+    r"(?:[\w.'’()-]+\s+){0,4}?"
+    r"(?:hon['’]?ble|honourable|nclt|nclat|national company law|"
+    r"(?:high|supreme|district|commercial|sessions) court|court\b|"
+    r"(?:securities )?appellate tribunal|arbitral tribunal|tribunal|\bitat\b|\bcestat\b|\bdrt\b|\bdrat\b|"
+    r"consumer (?:forum|commission)|competition commission|\bcci\b)", re.I)
+# A court can also be a customer (e.g. an IT/services contract from a court registry).
+# Explicit procurement wording overrides the judicial reading.
+_JUDICIAL_ORDER_BUSINESS = re.compile(
+    r"awarding of order|bagging|letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|"
+    r"supply order|\bfor (?:the )?(?:supply|design|construction|installation|development|provision|"
+    r"implementation|maintenance)\b|\b(?:it|software|consulting) services\b|\bservices? contract\b", re.I)
 
-    if subject and _GENERIC_UPDATE_SUBJECT_RE.match(subject):
-        text = summary[:m.start()].strip()
-        if (not text or _GENERIC_UPDATE_TEXT_RE.match(text)
-                or _NOISE_CONTAINS_RE.search(text) or _UPDATE_NOISE_RE.search(text)):
-            return True
-    return False
+# Only explicit senior executive changes are catalysts. NSE's generic subjects such as
+# "Resignation of Director/KMP/SMP" are intentionally NOT enough on their own;
+# otherwise hundreds of routine personnel filings enter the feed.
+_MANAGEMENT_CHANGE = re.compile(
+    r"(?:appointment|appointed|resignation|resigned|cessation|retirement|vacation of office).*?"
+    r"(?:chief executive officer|\bceo\b|managing director|\bmd\b|chief financial officer|\bcfo\b|"
+    r"whole[- ]time director|whole time director)|"
+    r"(?:chief executive officer|\bceo\b|managing director|\bmd\b|chief financial officer|\bcfo\b|"
+    r"whole[- ]time director|whole time director).*?"
+    r"(?:appointment|appointed|resignation|resigned|cessation|retirement|vacation of office)", re.I)
+_REGULATORY_GRANT = re.compile(
+    r"(?:grant|receipt|received|obtained|renewal).*?(?:licen[cs]e|registration|regulatory approval|certificate of registration)|"
+    r"(?:licen[cs]e|registration|regulatory approval|certificate of registration).*?(?:granted|received|obtained|renewed)", re.I)
+
+# Batch-3 precision: distinguish genuine regulatory grants from adverse licence actions
+# and routine exchange/administrative approvals. Adverse action always wins.
+_REGULATORY_ADVERSE = re.compile(
+    r"(?:suspension|suspended|cancel(?:lation|led)|revocation|revoked|withdrawal|withdrawn|surrender).*?"
+    r"(?:licen[cs]e|registration|regulatory approval|certificate)|"
+    r"(?:licen[cs]e|registration|regulatory approval|certificate).*?"
+    r"(?:suspension|suspended|cancel(?:lation|led)|revocation|revoked|withdrawal|withdrawn|surrender)", re.I)
+_REGULATORY_ROUTINE = re.compile(
+    r"(?:in[- ]principle|trading|listing) approval.*?(?:shares|securities|allotment|esop|bonus|rights|preferential)|"
+    r"approval.*?(?:listing|trading).*?(?:shares|securities|allotment)|"
+    r"exchange approval.*?(?:allotment|listing|trading)|"
+    r"cancel(?:lation|led).*?(?:employee stock options?|esop)|"
+    r"(?:employee stock options?|esop).*?cancel(?:lation|led)", re.I)
+
+_NEGATIVE = re.compile(
+    r"insolvency|\bcirp\b|default in interest|default in principal|show cause|"
+    r"pendency of any litigation|pendency of litigation|actions? (initiated|taken)|"
+    r"orders? passed|fire incident|\bfire\b|penalty|search and seizure|\braid\b|"
+    r"fraud|suspension of|liquidation|resolution plan (?:rejected|dismissed)", re.I)
+_ADVERSE_TAX_ORDER = re.compile(
+    r"(?:receipt of |received )?(?:an? )?order from .*?(?:income tax|gst|tax authority)|"
+    r"(?:income tax|gst|tax authority).*?(?:demand|penalty|order|show cause)", re.I)
+
+_DEBT = re.compile(r"non.?convertible|debenture|\bncds?\b|commercial paper|\bbonds?\b|\bisin\b", re.I)
+_RESULTS = re.compile(r"financial results?|audited results|unaudited results", re.I)
+
+_ORDER = re.compile(
+    r"orders?/contracts?|awarding of order|bagging|receiv(?:e|ed|ing) (?:an? )?order|"
+    r"supply order|work order|purchase order|order (?:received|awarded|secured)|"
+    r"letter of (?:intent|award|acceptance)|\bloa\b|\bloi\b|notification of award|"
+    r"order wins?|\border (?:of|for|from|worth|valued)\b|\bmandate\b|deals? worth|"
+    r"contract (?:award|awarded|of|for|from|worth)|\bl1\b|first lowest|lowest bidder|preferred bidder",
+    re.I)
+_ORDER_PRE_BID = re.compile(
+    r"bid submitted|submission of bid|tender participation|participat(?:e|ion).*tender|"
+    r"expression of interest|\beoi\b|pre[- ]qualification|technical bid qualified", re.I)
+_ORDER_CANCEL = re.compile(
+    r"(?:order|contract|letter of (?:award|acceptance|intent)|\blo[ai]\b).*(?:cancelled|canceled|terminated|withdrawn|annulled|short[- ]?closed)|"
+    r"(?:cancell?ation|termination|withdrawal|annulment|short[- ]?closure).*(?:order|contract|letter of (?:award|acceptance|intent)|\blo[ai]\b)", re.I)
+
+_ACQUISITION = re.compile(
+    r"acquisition|acquir(?:e|ed|ing)|purchase of .*stake|purchase of .*business|"
+    r"purchase of .*assets?|stake acquisition|completion of acquisition|"
+    r"purchase .*equity shares|definitive agreement.*acquir", re.I)
+_DIVESTMENT = re.compile(
+    r"sale or disposal|divestment|disinvestment|sale of .*stake|sale of .*shareholding|"
+    r"transfer of (?:the )?entire equity|ceased to be .*subsidiary|sale of surplus land|"
+    r"asset monetisation|asset monetization|business sale|sale of undertaking", re.I)
+_SCHEME = re.compile(
+    r"scheme of arrangement|amalgamation|merger|demerger|scheme .*implemented|"
+    r"restructuring pursuant to .*scheme", re.I)
+_STRATEGIC_AGREEMENT = re.compile(
+    r"intellectual property license|licen[cs]e agreement|strategic (?:agreement|partnership|collaboration)|"
+    r"joint venture|\bjv\b|memorandum of understanding|\bmou\b|technical collaboration|"
+    r"manufacturing agreement|distribution agreement|technology agreement|"
+    r"port operations agreement|hotel management agreement", re.I)
+_CORP_ACTION = re.compile(
+    r"buy ?back|bonus|stock split|sub-division|rights issue|qualified institutional|\bqip\b|"
+    r"fund rais|preferential issue|dividend", re.I)
+
+_VAGUE_SUBJECT = re.compile(r"press release|general updates|^updates$|disclosure of material issue|agreements?", re.I)
 
 
-def dedup_items(items: list[dict]) -> list[dict]:
-    """
-    Dedup by link + title + summary, NOT published.
-    NSE re-publishes the same announcement with updated timestamps (NTPC type)
-    — those are duplicates. But NAV updates share one generic link with
-    different summaries — those are distinct and must be kept.
-    Items must be sorted newest-first before calling, so latest published wins.
-    """
-    seen = set()
-    out = []
-    for it in items:
-        key = (it.get("link", ""), it.get("title", ""), it.get("summary", ""))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
+def _event_meta(subject: str, text: str, category: str) -> dict:
+    """Cheap deterministic event type/stage hints for frontend and dedupe work."""
+    both = f"{subject or ''} {text or ''}"
+    out = {}
+    if category == "Order":
+        if re.search(r"\bl1\b|first lowest|lowest bidder|preferred bidder", both, re.I):
+            out.update(event_type="L1 Bidder", stage="L1 / Awaiting Award")
+        elif re.search(r"letter of intent|\bloi\b", both, re.I) and not re.search(
+                r"letter of award|letter of acceptance|\bloa\b|work order|purchase order", both, re.I):
+            out.update(event_type="Order Award", stage="Letter of Intent")
+        elif re.search(
+                r"letter of award|letter of acceptance|\bloa\b|awarded|bagging/receiving|bagging|"
+                r"awarding of order|notification of award|order received|work order|purchase order|"
+                r"supply order|contract win|receipt of (?:an? )?order|receiv(?:e|ed|es|ing) (?:an? )?order|"
+                r"secured (?:an? |the )?(?:order|contract)|order (?:of|for|from|worth|valued)\b|"
+                r"contract (?:of|for|from|worth)\b|orders? wins?", both, re.I):
+            out.update(event_type="Order Award", stage="Awarded")
+    elif category == "Acquisition":
+        out["event_type"] = "Acquisition"
+        if re.search(r"completed|completion|acquired", both, re.I): out["stage"] = "Completed"
+        elif re.search(r"definitive agreement|agreement signed|entered into.*agreement", both, re.I): out["stage"] = "Agreement Signed"
+        elif re.search(r"approved|board.*approval", both, re.I): out["stage"] = "Approved"
+        else: out["stage"] = "Announced"
+    elif category == "Divestment" and is_voluntary_group_closure(subject, text):
+        out["event_type"] = "Subsidiary Closure"
+        out["stage"] = ("Dissolved" if re.search(r"\bdissolved\b|dissolution order|struck off|stands? closed", both, re.I)
+                        else "Voluntary Liquidation")
+    elif category == "Divestment":
+        out["event_type"] = "Divestment"
+        if re.search(r"extension|extended|delay", both, re.I): out["stage"] = "Completion Delayed/Extended"
+        elif re.search(r"completed|completion|ceased to be", both, re.I): out["stage"] = "Completed"
+        elif re.search(r"agreement|approved", both, re.I): out["stage"] = "Approved / Agreement"
+        else: out["stage"] = "Announced"
+    elif category == "Scheme of Arrangement":
+        if re.search(r"demerger|hive[- ]?off", both, re.I): out["event_type"] = "Demerger"
+        elif re.search(r"merger|amalgamation", both, re.I): out["event_type"] = "Merger"
+        else: out["event_type"] = "Scheme of Arrangement"
+        if re.search(r"effective date|became effective|implemented|fully implemented|completed", both, re.I): out["stage"] = "Effective / Completed"
+        elif re.search(r"nclt.*(?:approved|approval)|(?:approved|sanctioned).*nclt", both, re.I): out["stage"] = "NCLT Approved"
+        elif re.search(r"record date", both, re.I): out["stage"] = "Record Date"
+        elif re.search(r"observation letter|no[- ]?objection|\bnoc\b", both, re.I): out["stage"] = "Exchange NOC"
+        elif re.search(r"approved|outcome of board meeting", both, re.I): out["stage"] = "Board Approved"
+    elif category == "Strategic Agreement":
+        if re.search(r"joint venture|\bjv\b", both, re.I): out["event_type"] = "Joint Venture"
+        elif re.search(r"licen[cs]e|intellectual property", both, re.I): out["event_type"] = "IP / Licence Agreement"
+        else: out["event_type"] = "Strategic Agreement"
+        if re.search(r"non[- ]binding", both, re.I): out["stage"] = "Non-Binding MoU"
+        elif re.search(r"definitive|executed|entered into|signed", both, re.I): out["stage"] = "Definitive / Signed"
+        elif re.search(r"memorandum of understanding|\bmou\b", both, re.I): out["stage"] = "MoU"
+    elif category == "Corporate Action":
+        if re.search(r"buy ?back", both, re.I): out["event_type"] = "Buyback"
+        elif re.search(r"bonus", both, re.I): out["event_type"] = "Bonus"
+        elif re.search(r"stock split|sub-division", both, re.I): out["event_type"] = "Stock Split"
+        elif re.search(r"rights issue", both, re.I): out["event_type"] = "Rights Issue"
+        elif re.search(r"qualified institutional|\bqip\b", both, re.I): out["event_type"] = "QIP"
+        elif re.search(r"preferential issue", both, re.I): out["event_type"] = "Preferential Issue"
+        elif re.search(r"dividend", both, re.I): out["event_type"] = "Dividend"
+        else: out["event_type"] = "Corporate Action"
+        if re.search(r"\bclos(?:ed|ure)\b|completed|completion", both, re.I): out["stage"] = "Completed"
+        elif re.search(r"record date", both, re.I): out["stage"] = "Record Date"
+        elif re.search(r"allot(?:ted|ment)", both, re.I): out["stage"] = "Allotment"
+        elif re.search(r"\brecommend(?:ed|s|ation)?\b|subject to (?:the )?(?:approval|consent) of (?:the )?(?:shareholders|members)", both, re.I):
+            out["stage"] = "Board Recommended"     # shareholder approval still pending
+        elif re.search(r"approved|approval|outcome of board meeting", both, re.I): out["stage"] = "Approved"
+        else: out["stage"] = "Announced"
+    elif category == "Regulatory Approval":
+        out["event_type"] = "Regulatory Approval"
+        if re.search(r"renewal|renewed", both, re.I): out["stage"] = "Renewed"
+        elif re.search(r"grant|granted|receipt|received|obtained|certificate of registration", both, re.I): out["stage"] = "Granted / Received"
+        else: out["stage"] = "Approved"
+    elif category == "Management Change":
+        out["event_type"] = "Management Change"
+        if re.search(r"resignation|resigned|cessation|retirement|vacation of office", both, re.I): out["stage"] = "Exit"
+        elif re.search(r"appointment|appointed|reappointment|re-appointed", both, re.I): out["stage"] = "Appointment"
     return out
 
 
-async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url: str, retries_per_domain: int = 2) -> tuple[str, list[dict], bool]:
-    # Fallback to the legacy archives.nseindia.com domain if the primary
-    # nsearchives.nseindia.com domain fails all its attempts — GitHub Actions
-    # runner IPs have been seen getting ReadTimeout consistently on the
-    # primary domain while working fine from a regular browser, suggesting
-    # IP-level throttling/WAF specific to that subdomain. Same URL path is
-    # assumed to exist on the legacy domain.
-    urls_to_try = [url]
-    if "nsearchives.nseindia.com" in url:
-        urls_to_try.append(url.replace("nsearchives.nseindia.com", "archives.nseindia.com"))
-
-    last_exc = None
-    got_empty_after_all_retries = False
-    v = int(time.time() // 300)  # 5-min cache-buster bucket
-
-    for domain_idx, base_url in enumerate(urls_to_try):
-        sep = "&" if "?" in base_url else "?"
-        cache_busted_url = f"{base_url}{sep}v={v}"
-        domain_label = base_url.split("/")[2]
-        is_last_domain = domain_idx == len(urls_to_try) - 1
-
-        for attempt in range(retries_per_domain):
-            is_last_attempt = is_last_domain and attempt == retries_per_domain - 1
-            try:
-                r = await client.get(cache_busted_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
-                r.raise_for_status()
-                feed = feedparser.parse(r.content)
-                items = []
-                IST = timezone(timedelta(hours=5, minutes=30))
-                for entry in feed.entries:
-
-                    # Epoch timestamp for reliable cross-source sorting
-                    ts = 0
-                    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
-                    if parsed:
-                        try:
-                            ts = calendar.timegm(parsed)
-                        except Exception:
-                            ts = 0
-                    if not ts:
-                        # NSE's own feeds (results, board meetings, corp actions)
-                        # use a non-standard "DD-Mon-YYYY HH:MM:SS" IST string
-                        # with no weekday/timezone, which feedparser's RFC822/
-                        # ISO parsers silently fail on (published_parsed stays
-                        # None) — parse it manually instead of falling back to 0,
-                        # which broke newest-first sort/1000-cap truncation and
-                        # made every item look equally "new".
-                        raw = entry.get("published", "") or entry.get("updated", "")
-                        try:
-                            dt = datetime.strptime(raw.strip(), "%d-%b-%Y %H:%M:%S").replace(tzinfo=IST)
-                            ts = int(dt.astimezone(timezone.utc).timestamp())
-                        except Exception:
-                            ts = 0
-
-                    items.append({
-                        "source":       label,
-                        "source_key":   source_key,
-                        "title":        entry.get("title", "").strip(),
-                        "link":         entry.get("link", ""),
-                        "published":    entry.get("published", ""),
-                        "published_ts": ts,
-                        "summary":      _truncate_keep_subject(entry.get("summary", entry.get("description", "")).strip()),
-                        # Optional richer fields — only Business Standard's
-                        # feed populates these right now (media:content for
-                        # an article thumbnail, bs:source for the wire/
-                        # agency attribution e.g. "Press Trust of India" or
-                        # "Bloomberg"). Other sources simply leave these
-                        # blank; the frontend treats them as optional.
-                        "image":        (entry.get("media_content") or [{}])[0].get("url", ""),
-                        "author":       entry.get("bs_source", "") or entry.get("author", ""),
-                        # BSE's announcements feed tags each item with its
-                        # numeric scrip code via a non-standard <scripcode>
-                        # element; feedparser exposes unrecognized flat tags
-                        # as plain entry attributes. Empty for every other
-                        # feed (NSE, news) since they don't have this tag.
-                        "scripcode":    (entry.get("scripcode") or "").strip(),
-                    })
-
-                # NSE occasionally serves a transient empty-but-200 response
-                # (confirmed: same feed returned 0 items one run, 20 the next,
-                # no other change) — retry before accepting zero as final.
-                if not items:
-                    if not is_last_attempt:
-                        print(f"  ⚠ {label} ({domain_label}): got 0 items, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
-                        await asyncio.sleep(2 ** attempt)
-                        continue
-                    # Exhausted every attempt on every domain and still empty.
-                    # For these high-volume feeds a genuine zero is implausible
-                    # — treat as failure (not success) so callers preserve
-                    # existing R2 data rather than overwrite it with [].
-                    got_empty_after_all_retries = True
-                    break
-
-                if domain_idx > 0:
-                    print(f"  ⚠ {label}: fell back to {domain_label}")
-                print(f"  ✓ {label}: {len(items)} items")
-                return source_key, items, True
-            except Exception as e:
-                last_exc = e
-                if not is_last_attempt:
-                    print(f"  ⚠ {label} ({domain_label}): {type(e).__name__}: {e or '(no message)'}, retry {attempt+1}/{retries_per_domain} in {2**attempt}s")
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-                print(f"  ⚠ {label} ({domain_label}): exhausted retries — {type(e).__name__}: {e or '(no message)'}")
-
-    if got_empty_after_all_retries:
-        print(f"  ✗ {label}: got 0 items on every attempt across {len(urls_to_try)} domain(s) — "
-              f"treating as failure (implausible for this feed), keeping existing data")
-    else:
-        print(f"  ✗ {label}: {type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc or '(no message)'} (tried {len(urls_to_try)} domain(s))")
-    return source_key, [], False
+def is_explicit_noise(subject: str, text: str) -> bool:
+    """True when a backend noise rule positively matches (results, SAST, CIRP/scheme
+    paperwork, routine allotments, debt, ignored subjects, ...)."""
+    subject = (subject or "").strip()
+    text = (text or "").strip()
+    both = f"{subject} {text}"
+    if _RESULTS.search(both) or (re.search(r"outcome of board meeting", subject, re.I) and _RESULTS.search(text)):
+        return True
+    if (_BACKEND_NOISE.search(both) or _ROUTINE_PROFESSIONAL.search(both) or
+            _ROUTINE_ALLOTMENT.search(both) or _ROUTINE_CORP_ACTION.search(both) or
+            _SAST_NOISE.search(both) or _PROMOTER_MPS_SALE.search(both) or
+            _SUBSIDIARY_INCORPORATION.search(both) or _INTERNAL_SUB_INVESTMENT.search(both) or
+            _CIRP_PROCEDURAL.search(both) or _SCHEME_PROCEDURAL.search(both) or
+            _REGULATORY_ROUTINE.search(both)):
+        return True
+    return bool(_IGNORE_SUBJECT.search(subject) or _DEBT.search(both))
 
 
-async def r2_get(client: httpx.AsyncClient, filename: str):
-    # Cache-bust every call. Without this, the Worker/Cloudflare edge can
-    # serve a stale cached response for this exact URL — which silently
-    # breaks the new-vs-already-processed dedup in build_results_detailed()
-    # (a stale/empty read makes every filing look "new" again on the very
-    # next run, even minutes after the previous run's upload succeeded).
+# A group entity the company chooses to wind up while solvent is a restructuring
+# decision (Divestment), not distress. Forced insolvency stays Negative.
+_VOLUNTARY_CLOSURE = re.compile(
+    r"(?:voluntary|solvent|members['’]?\s+voluntary)\s+(?:solvent\s+)?(?:liquidation|winding[- ]?up|dissolution|closure)|"
+    r"\bstrik(?:e|ing)[- ]?off\b|struck off|"
+    r"(?:closure|winding[- ]?up|dissolution|deregistration|liquidation) of (?:the |its |our )?"
+    r"(?:(?:wholly[- ]owned|foreign|overseas|step[- ]down|material|german|us|uk)\s+)*subsidiar", re.I)
+_GROUP_ENTITY = re.compile(r"subsidiar|step[- ]down|joint venture|\bjv\b|associate compan|\bgmbh\b|\bllc\b|\bpte\b|\bb\.?v\.?\b|\bs\.?a\.?\b|\binc\.?\b", re.I)
+_FORCED_INSOLVENCY = re.compile(r"\bcirp\b|corporate insolvency resolution|compulsory (?:liquidation|winding)|"
+                                r"section\s*(?:7|9|10)\b|petition (?:filed )?by (?:the )?(?:financial|operational) creditor", re.I)
+
+
+def is_voluntary_group_closure(subject: str, text: str) -> bool:
+    both = f"{subject or ''} {text or ''}"
+    return bool(_VOLUNTARY_CLOSURE.search(both) and _GROUP_ENTITY.search(both)
+                and not _FORCED_INSOLVENCY.search(both))
+
+
+def classify(subject: str, text: str) -> str | None:
+    """Trader-focused catalyst category, or None when the event should not be stored."""
+    subject = (subject or "").strip()
+    text = (text or "").strip()
+    both = f"{subject} {text}"
+
+    if is_explicit_noise(subject, text):
+        return None
+
+    if is_voluntary_group_closure(subject, text):
+        return "Divestment"
+
+    # Batch-3: adverse licence/registration action must beat the broad NSE subject
+    # "granting/withdrawal/surrender/cancellation/suspension". Only an explicit
+    # positive grant/receipt/renewal is a Regulatory Approval catalyst.
+    # NSE's subject taxonomy itself contains the words withdrawal/cancellation/
+    # suspension even for a positive receipt. Prefer the actual announcement text
+    # when it explicitly says a licence/registration was granted or received.
+    if _REGULATORY_GRANT.search(text) and not _REGULATORY_ADVERSE.search(text):
+        return "Regulatory Approval"
+    if _REGULATORY_ADVERSE.search(text):
+        return "Negative"
+    if _REGULATORY_GRANT.search(both):
+        return "Regulatory Approval"
+    if _REGULATORY_ADVERSE.search(both):
+        return "Negative"
+    if _MANAGEMENT_CHANGE.search(both):
+        return "Management Change"
+
+    # A substantive merger/demerger/amalgamation/NCLT scheme filing must beat the
+    # broad Negative phrase "order(s) passed". Procedural scheme noise was already
+    # rejected above by _SCHEME_PROCEDURAL.
+    if _SCHEME.search(both) and re.search(r"(?:scheme|merger|demerger|amalgamation|nclt|nclat)", both, re.I):
+        return "Scheme of Arrangement"
+
+    # A court/tribunal order (NCLAT, High Court, ITAT, ...) is a legal outcome.
+    # Route it to Negative so the litigation parser can tag it adverse or relief;
+    # without this, "Order from ... Tribunal" matched _ORDER as a business win.
+    if _JUDICIAL_ORDER.search(both) and not _JUDICIAL_ORDER_BUSINESS.search(both):
+        return "Negative"
+
+    # Cancellation/termination of an order is adverse, never a fresh Order win.
+    if _ORDER_CANCEL.search(both) or _ADVERSE_TAX_ORDER.search(both):
+        return "Negative"
+    if _NEGATIVE.search(both):
+        return "Negative"
+
+    # An explicit acquisition of customer contracts/business/assets remains an
+    # Acquisition even though the acquired object contains the word "contract".
+    if _ACQUISITION.search(both) and re.search(r"acquir(?:e|ed|ing).*?(?:customer contracts?|business|assets?)", both, re.I):
+        return "Acquisition"
+
+    # Do not promote mere tender participation into an Order catalyst.
+    if _ORDER_PRE_BID.search(both):
+        return None
+    if _ORDER.search(both):
+        return "Order"
+
+    # Batch-1 cross-category resolution.  Economic substance beats NSE's broad
+    # Acquisition/Agreement subject labels.
+    if _ACQ_DILUTION.search(both) or _STRATEGIC_TO_DIVEST.search(both):
+        return "Divestment"
+    if _STRATEGIC_TO_ORDER.search(both):
+        return "Order"
+    if _JV_STRATEGIC.search(both):
+        return "Strategic Agreement"
+    if _ACQ_ROUTINE_INTERNAL.search(both):
+        return None
+
+    # Divestment is checked before acquisition so JV dilution/business-sale text
+    # containing the counterparty's word 'acquire' is not mislabeled Acquisition.
+    if _DIVESTMENT.search(both):
+        return "Divestment"
+    if _SCHEME.search(both):
+        return "Scheme of Arrangement"
+    if _STRATEGIC_AGREEMENT.search(both):
+        return "Strategic Agreement"
+    if _ACQUISITION.search(both):
+        return "Acquisition"
+    if _CORP_ACTION.search(both):
+        return "Corporate Action"
+
+    if _VAGUE_SUBJECT.search(subject):
+        return None
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Timing: which session could first react to the filing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def react_info(dt: datetime, is_trading_day, next_trading_day) -> tuple[str, str]:
+    d, t = dt.date(), dt.time()
+    if not is_trading_day(d):
+        return next_trading_day(d).isoformat(), "AH"
+    if t < MARKET_OPEN:
+        return d.isoformat(), "BH"
+    if t < MARKET_CLOSE:
+        return d.isoformat(), "IH"
+    return next_trading_day(d).isoformat(), "AH"
+
+
+def _parse_dt(s: str) -> datetime | None:
+    s = (s or "").strip()
+    for f in ("%d-%b-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d-%b-%Y %H:%M", "%d-%m-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(s, f)
+        except ValueError:
+            continue
+    return None
+
+
+_RUPEE_FIXES = (
+    # UTF-8 "₹" decoded as cp1252
+    (re.compile(r"â‚¹"), "₹"),
+    # NSE summaries sometimes carry the rupee as "¥" or as the old Rupee-font backtick.
+    # Only when an Indian unit follows, so a genuine yen amount is left alone.
+    (re.compile(r"[¥`]\s*(?=[\d,]+(?:\.\d+)?\s*(?:lakh\s+)?(?:crores?|cr\b|lakhs?|lacs?))", re.I), "₹"),
+)
+
+
+def _fix_rupee(text: str) -> str:
+    for pat, rep_ in _RUPEE_FIXES:
+        text = pat.sub(rep_, text or "")
+    return text
+
+
+def _make_item(symbol, dt, subject, text, link, is_trading_day, next_trading_day):
+    text = _fix_rupee(text)
+    subject = _fix_rupee(subject)
+    category = classify(subject, text)
+    if not category or not symbol or not dt:
+        return None
+    rd, sess = react_info(dt, is_trading_day, next_trading_day)
+    text = re.sub(r"\s+", " ", text or "").strip()
+    item = {
+        "id":         f"{dt.strftime('%Y%m%d%H%M%S')}|{subject[:40]}|{(link or '')[-60:]}",
+        "dt":         dt.isoformat(timespec="seconds"),
+        "react_date": rd,
+        "session":    sess,
+        "category":   category,
+        "subject":    subject.strip(),
+        "text":       text[:TEXT_MAX],
+        "link":       link or "",
+    }
+    item.update(_event_meta(subject, text, category))
+    return item
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Order PDF enrichment: local parser first, Gemini only when local extraction is insufficient
+# Only genuinely new Order catalysts are opened. On a clean/rebuild run, only
+# today's Order PDFs are enriched so historical backfill remains fast. Gemini is
+# never called for non-Order catalysts. Market cap is intentionally NOT requested
+# from Gemini because it is market data, not a filing fact.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_MONEY_RE = re.compile(
+    r"(?:(?:₹|rs\.?|inr)\s*)?([0-9][0-9,]*(?:\.\d+)?)\s*"
+    r"(crores?|cr\.?|lakhs?|lacs?|millions?|mn\.?|billions?|bn\.?)",
+    re.I,
+)
+_ORDER_CONTEXT_RE = re.compile(
+    r"order|contract|letter of award|letter of acceptance|letter of intent|\bloa?\b|"
+    r"work order|purchase order|supply order|notification of award|mandate|awarded|bagged|won|wins",
+    re.I,
+)
+
+# Local money extraction must be conservative.  These phrases commonly occur in
+# explanatory classification tables and are NOT transaction values.
+_MONEY_RANGE_NOISE_RE = re.compile(
+    r"(?:up to|above|below|less than|more than|between)\s*(?:₹|rs\.?|inr)?\s*[0-9][0-9,.]*\s*(?:crores?|cr\.?)|"
+    r"[0-9][0-9,.]*\s*(?:crores?|cr\.?)\s*(?:to|[-–—])\s*(?:₹|rs\.?|inr)?\s*[0-9][0-9,.]*\s*(?:crores?|cr\.?)|"
+    r"project classification|significant orders|large orders|mega orders|ultra[- ]?mega orders",
+    re.I,
+)
+
+_STRONG_MONEY_CONTEXT_RE = re.compile(
+    r"consideration|purchase price|transaction value|order value|contract value|broad consideration|"
+    r"issue size|fund ?raise|penalty|fine|demand|claim amount|amount payable|investment of|project cost|"
+    r"aggregate consideration|total consideration|sale value|buyback size|"
+    # Narrative order totals: "orders totaling Rs 250.78 crores",
+    # "wins new orders of Rs. 1,303 crores", "order worth ₹44 crore".
+    # Must sit directly on the word order/contract, so "order book of Rs X"
+    # or "YTD order intake of Rs X" do not qualify.
+    r"(?:orders?|contracts?)\s+(?:totall?ing|aggregating(?:\s+to)?|amounting\s+to|worth|valued\s+at|"
+    r"of\s+(?:approx\.?\s+|approximately\s+|about\s+)?(?:₹|rs\.?|inr))",
+    re.I,
+)
+
+def _has_inr_marker(raw: str, context: str) -> bool:
+    """True only when the amount is explicitly INR/Rupee denominated nearby."""
+    raw = raw or ""
+    context = context or ""
+    if re.search(r"(?:₹|\brs\.?\b|\binr\b|rupees?)", raw, re.I):
+        return True
+    # Allow a currency heading immediately around a tabular value.
+    return bool(re.search(r"(?:₹|\brs\.?\b|\binr\b|rupees?).{0,45}$", context[:max(0, len(context)//2)], re.I))
+
+def _money_candidate_is_safe(raw: str, context: str, *, standardized_row: bool = False) -> bool:
+    if _MONEY_RANGE_NOISE_RE.search(context or ""):
+        return False
+    unit_m = re.search(r"(crores?|cr\.?|lakhs?|lacs?|millions?|mn\.?|billions?|bn\.?)", raw or "", re.I)
+    unit = (unit_m.group(1).lower().replace('.', '') if unit_m else "")
+    # Never convert a bare million/billion amount: currency may be USD/EUR/etc.
+    if unit.startswith(("million", "billion")) or unit in {"mn", "bn"}:
+        return _has_inr_marker(raw, context) and bool(_STRONG_MONEY_CONTEXT_RE.search(context or ""))
+    # Generic catalyst parsing requires explicit rupee/INR denomination.
+    if not standardized_row and not _has_inr_marker(raw, context):
+        return False
+    # Even with currency, reject isolated amounts without transaction context.
+    return standardized_row or bool(_STRONG_MONEY_CONTEXT_RE.search(context or ""))
+
+
+def _money_to_cr(number: str, unit: str) -> float | None:
     try:
-        v = int(time.time())
+        value = float(number.replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    u = unit.lower().replace(".", "")
+    if u.startswith("cr") or u.startswith("crore"):
+        return round(value, 4)
+    if u.startswith("lakh") or u.startswith("lac"):
+        return round(value / 100.0, 4)
+    if u.startswith("million") or u == "mn":
+        return round(value / 10.0, 4)
+    if u.startswith("billion") or u == "bn":
+        return round(value * 100.0, 4)
+    return None
+
+
+def _extract_pdf_text(session, url: str) -> str:
+    if not url or url == "-" or not url.lower().split("?", 1)[0].endswith(".pdf"):
+        return ""
+    try:
+        from pypdf import PdfReader
+        r = session.get(url, timeout=40)
+        r.raise_for_status()
+        reader = PdfReader(io.BytesIO(r.content))
+        return "\n".join((p.extract_text() or "") for p in reader.pages[:12])
+    except Exception as e:
+        print(f"  ⚠ PDF detail extraction failed for {url.rsplit('/', 1)[-1]} ({e})")
+        return ""
+
+
+def _normalize_pdf_text(text: str) -> str:
+    """Normalize common pypdf spacing artifacts without using OCR/AI."""
+    s = re.sub(r"\s+", " ", text or " ").strip()
+    # CFF/Type1 PDFs can emit decimals one glyph at a time: "75 . 9 6".
+    s = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", s)
+    # Join only runs of single glyph-split digits ("7 5 . 9 6" -> "75.96").
+    # The old rule also glued a year to the next row number ("2027 7." -> "20277").
+    s = re.sub(r"(?<![\d,.])\d(?:\s\d)+(?![\d,])", lambda m: m.group(0).replace(" ", ""), s)
+    # Clean punctuation/hyphen spacing created by line-oriented extraction.
+    s = re.sub(r"\s+([,.;:])", r"\1", s)
+    # Thousand separators split by line wrapping inside an amount:
+    # "Rs 7, 600 crores" was read as "600 crores". Only repaired right after a
+    # currency marker so ordinary lists like "1, 2, 3" are untouched.
+    _amt = re.compile(r"((?:₹|rs\.?|inr)\s*\d{1,3}(?:,\d{2,3})*),\s+(?=\d{2,3}\b)", re.I)
+    while True:
+        s2 = _amt.sub(r"\1,", s)
+        if s2 == s:
+            break
+        s = s2
+    s = re.sub(r"\bN\s*-\s*Type\b", "N-Type", s, flags=re.I)
+    s = re.sub(r"\bGlass\s*-\s*to\s*-\s*Glass\b", "Glass-to-Glass", s, flags=re.I)
+    return s
+
+
+def _clean_field(v: str, max_len: int = 350) -> str:
+    v = re.sub(r"\s+", " ", v or "").strip(" :-;|\t\r\n")
+    v = re.sub(r"\s+([,.;:])", r"\1", v)
+    # Never let signature/footer prose leak into a table value.
+    v = re.split(r"\b(?:This is for your information|Yours faithfully|Thanking you)\b", v,
+                 maxsplit=1, flags=re.I)[0]
+    return v[:max_len].strip(" :-;|")
+
+
+def _table_items(clean: str) -> dict[int, str]:
+    """Return numbered SEBI disclosure rows (1..9), bounded by the next row."""
+    hits = list(re.finditer(r"(?<!\d)\b([1-9])\.\s+", clean))
+    rows = {}
+    for i, m in enumerate(hits):
+        n = int(m.group(1))
+        if n in rows:
+            continue
+        end = hits[i + 1].start() if i + 1 < len(hits) else len(clean)
+        rows[n] = clean[m.end():end].strip()
+    return rows
+
+
+def _yes_no_answer(row: str) -> bool | None:
+    """Answer of a SEBI Yes/No row. The question itself contains "If yes ...",
+    so only the text after the question ("arm's length" / last '?') counts."""
+    if not row:
+        return None
+    m = None
+    for m in re.finditer(r"arm['’`s ]*\s*length[\"'”’.;:\s]*|\?", row, re.I):
+        pass
+    ans = row[m.end():] if m else row
+    ans = ans.strip(" .:;-\"'”’")
+    if not ans:
+        return None
+    if re.match(r"(?:no\b|nil\b|none\b|n\.?\s?a\.?\b|not applicable|not interested|does not|do not|is not|are not|not a\b|not fall)", ans, re.I):
+        return False
+    if re.match(r"yes\b", ans, re.I):
+        return True
+    if re.search(r"\b(?:does|do|is|are|shall|would) not\b.{0,40}related party|not (?:a )?related party|not fall", ans, re.I):
+        return False
+    return None
+
+
+def _row_answer(row: str, label_pattern: str, max_len: int = 400) -> str:
+    if not row:
+        return ""
+    m = re.search(label_pattern, row, re.I)
+    if not m:
+        return ""
+    return _clean_field(row[m.end():], max_len)
+
+
+def _order_amount_role_score(raw: str, context: str) -> tuple[int, str]:
+    """Rank an INR amount by semantic role: headline total > component."""
+    c = (context or "").lower()
+    # Component labels are usually immediately adjacent to their amount. Check
+    # them first in this deliberately tight context window.
+    if re.search(r"transferable\s+development\s+rights|\btdr\b|land\s+premium|free\s+sale\s+land|"
+                 r"security\s+deposit|performance\s+(?:bank\s+)?guarantee|\bpbg\b|advance\s+payment|"
+                 r"retention\s+money|liquidated\s+damages|component|portion|tranche", c):
+        return -5, "component"
+    if re.search(r"total\s+(?:development|project|contract|order)\s+(?:cost|value)|"
+                 r"aggregate\s+(?:order|contract|project)\s+value|total\s+consideration|"
+                 r"overall\s+(?:project|order|contract)\s+(?:cost|value)|broad\s+consideration|"
+                 r"size\s+of\s+(?:the\s+)?(?:order|contract)", c):
+        return 8, "total"
+    if re.search(r"order\s+value|contract\s+value|value\s+of\s+(?:the\s+)?(?:order|contract)|"
+                 r"project\s+cost|work\s+order\s+value|loa\s+value", c):
+        return 6, "headline"
+    return 1, "unspecified"
+
+
+def _nearest_role_context(scope: str, start: int, end: int, radius: int = 70) -> str:
+    """Use a tighter window for role detection so a nearby component label does
+    not inherit 'total project value' language from another amount in the row."""
+    lo, hi = max(0, start - radius), min(len(scope), end + radius)
+    return scope[lo:hi]
+
+
+def _extract_order_details(text: str) -> dict:
+    clean = _normalize_pdf_text(text)
+    if not clean:
+        return {}
+
+    rows = _table_items(clean)
+
+    entity = _row_answer(
+        rows.get(1, ""),
+        r"name of (?:the )?entity awarding (?:the )?order\(s\)/\s*contract\(s\)",
+    )
+    terms = _row_answer(
+        rows.get(2, ""),
+        r"significant terms and conditions of order\(s\)/\s*contract\(s\) awarded in brief",
+    )
+    nature = _row_answer(
+        rows.get(4, ""),
+        r"nature of order\(s\)\s*/\s*contract\(s\)",
+    )
+    # Prefer a descriptive terms row, but ignore generic boilerplate.
+    _generic = re.compile(r"(?:as per\b.*|general (?:contract|condition)s?\b.*|standard (?:terms|conditions)\b.*|"
+                          r"one[- ]time|letter of (?:award|acceptance|intent)|n\.?a\.?|not applicable|epc|supply|works?)\.?", re.I)
+    if terms and not _generic.fullmatch(terms.strip()):
+        purpose = terms
+    elif nature and not _generic.fullmatch(nature.strip()):
+        purpose = nature
+    else:
+        purpose = ""
+
+    execution = _row_answer(
+        rows.get(6, ""),
+        r"time period by which (?:the )?order\(s\)\s*/?\s*contract\(s\) is to be executed",
+    )
+
+    if execution:
+        # Stop at the next SEBI row if the table boundary was missed.
+        execution = re.split(r"\s*(?:\b\d\.\s*)?(?:broad (?:commercial )?consideration|whether the|"
+                             r"name of the entity)", execution, maxsplit=1, flags=re.I)[0].strip(" .;")
+        if re.search(r"\b(?:19|20)\d{3,}\b", execution) or len(execution) < 3:
+            execution = ""
+
+    order_type = ""
+    # Row 5 is the cleanest standardized domestic/international field.
+    row5 = rows.get(5, "")
+    tm = re.search(r"whether domestic or international\s+(domestic|international)\b", row5, re.I)
+    if not tm:
+        tm = re.search(r"\b(domestic|international)\b", row5, re.I)
+    if not tm:
+        row3 = rows.get(3, "")
+        tm = re.search(r"\b(domestic|international)(?:\s+entit(?:y|ies))?\b\s*$", row3, re.I)
+    if tm:
+        order_type = tm.group(1).title()
+
+    # Row 9 specifically answers the related-party question. Do not search the
+    # whole PDF because unrelated Yes/No answers create false positives.
+    related_party = _yes_no_answer(rows.get(9, ""))
+
+    # Prefer row 7 (Broad consideration / size) for monetary value. This avoids
+    # unrelated amounts elsewhere in the filing. Fall back to contextual scan.
+    money_scopes = []
+    if rows.get(7):
+        money_scopes.append((rows[7], 2))
+    money_scopes.append((clean, 0))
+    candidates = []
+    for scope, scope_score in money_scopes:
+        for m in _MONEY_RE.finditer(scope):
+            lo, hi = max(0, m.start() - 220), min(len(scope), m.end() + 220)
+            context = scope[lo:hi]
+            strong = bool(re.search(
+                r"order value|total order value|broad consideration|size of (?:the )?order|"
+                r"order\(s\)/contract\(s\)|contract value|value of (?:the )?(?:order|contract)",
+                context, re.I,
+            ))
+            if scope_score == 0 and not strong and not _ORDER_CONTEXT_RE.search(context):
+                continue
+            raw = m.group(0).strip()
+            # Row 7 is NSE's standardized consideration/size row, so a bare
+            # "Crore" value is acceptable there. Elsewhere require explicit
+            # INR/Rupee denomination + strong order-value context.
+            if not _money_candidate_is_safe(raw, context, standardized_row=(scope_score == 2)):
+                continue
+            value_cr = _money_to_cr(m.group(1), m.group(2))
+            if value_cr is not None and value_cr > 0:
+                role_context = _nearest_role_context(scope, m.start(), m.end())
+                role_score, role = _order_amount_role_score(raw, role_context)
+                # v4.1: component economics (TDR, land premium, PBG, advance,
+                # tranche, etc.) must never populate the headline order_value_cr.
+                # If no total/headline candidate exists, leave order_value_cr blank.
+                if role == "component":
+                    continue
+                candidates.append((scope_score, role_score, (1 if strong else 0), value_cr, raw, context, role))
+        if candidates and scope_score == 2:
+            # Row 7 is authoritative, but it can contain both a total and its
+            # components. Keep all row-7 candidates and rank by semantic role.
+            break
+
+    out = {}
+    if candidates:
+        # Standardized row first, then semantic role, then strong context.
+        # Amount size is only the final tie-breaker.
+        _, _, _, value_cr, raw, context, role = max(candidates, key=lambda x: (x[0], x[1], x[2], x[3]))
+        out.update({
+            "order_value_cr": value_cr,
+            "order_value_text": raw,
+            "order_value_role": role,
+            "detail_excerpt": _clean_field(context, 500),
+        })
+    if entity:
+        out["order_from"] = entity
+    if purpose:
+        out["order_purpose"] = purpose
+    if order_type:
+        out["order_type"] = order_type
+    if execution:
+        out["execution_period"] = execution
+    if related_party is not None:
+        out["related_party"] = related_party
+    if out:
+        out["detail_source"] = "pdf_local"
+    return out
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_ORDER_MODEL = os.environ.get("GEMINI_ORDER_MODEL", os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")).strip()
+# Extraction needs little reasoning; thinking tokens bill at the output rate.
+# Set GEMINI_THINKING_LEVEL="" to send no thinking config at all.
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip()
+AI_ORDER_BATCH = int(os.environ.get("AI_ORDER_BATCH", "10"))     # max Gemini calls per run
+AI_ORDER_MAX_ATTEMPTS = 2       # failed AI calls per row before giving up
+AI_AGREE_TOL = 0.05             # local vs AI within 5% = confirmed
+_GEMINI_RATE_LIMITED = False
+
+_ORDER_AI_PROMPT = r"""
+Read this Indian listed company's order/contract announcement PDF. Return ONLY this JSON, nothing else:
+{"value_cr": number|null, "value_basis": "total"|"annual"|"not_disclosed", "tenure_years": number|null, "customer": string|null, "summary": string|null}
+Rules:
+- value_cr: the order/contract value in INR crore (convert rupees/lakh). If only a foreign currency is given, use the INR equivalent stated in the PDF, else null. If several orders, use the stated aggregate.
+- Ignore order book, YTD order intake, revenue, turnover and market cap figures.
+- value_basis "annual" when the PDF gives a yearly revenue/tariff for a multi-year period; then value_cr is the yearly figure and tenure_years the period. Otherwise tenure_years is null.
+- customer: name of the entity that awarded the order; null if withheld.
+- summary: one factual sentence under 25 words saying what work and for whom. No opinions.
+""".strip()
+
+
+def _download_pdf_bytes(session, url: str) -> bytes:
+    if not url or url == "-" or not url.lower().split("?", 1)[0].endswith(".pdf"):
+        return b""
+    try:
+        r = session.get(url, timeout=45)
+        r.raise_for_status()
+        data = r.content
+        if not data.startswith(b"%PDF"):
+            return b""
+        return data
+    except Exception as e:
+        print(f"  ⚠ PDF download failed for {url.rsplit('/', 1)[-1]} ({e})")
+        return b""
+
+
+def _extract_pdf_text_bytes(pdf_bytes: bytes) -> str:
+    if not pdf_bytes:
+        return ""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        return "\n".join((p.extract_text() or "") for p in reader.pages[:12])
+    except Exception:
+        return ""
+
+
+def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict:
+    if not GEMINI_API_KEY or not pdf_bytes:
+        return {}
+    try:
+        payload = {
+            "contents": [{"parts": [
+                {"text": _ORDER_AI_PROMPT},
+                {"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(pdf_bytes).decode("ascii")}},
+            ]}],
+            "generationConfig": {
+                "temperature": 0.05,
+                "maxOutputTokens": 1024,   # JSON is ~100 tokens; cap includes thinking
+                "responseMimeType": "application/json",
+            },
+        }
+        global _GEMINI_RATE_LIMITED
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{GEMINI_ORDER_MODEL}:generateContent?key={GEMINI_API_KEY}")
+        if GEMINI_THINKING_LEVEL:
+            payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+        r = session.post(url, json=payload, timeout=120)
+        if r.status_code == 400 and "thinkingConfig" in payload["generationConfig"]:
+            # Model does not accept this thinking setting; retry with its default.
+            payload["generationConfig"].pop("thinkingConfig", None)
+            r = session.post(url, json=payload, timeout=120)
+        if r.status_code == 429:
+            _GEMINI_RATE_LIMITED = True
+            print(f"    · [{filename}] Gemini skipped: quota/rate limit")
+            return {}
+        r.raise_for_status()
+        data = r.json()
+        candidates = data.get("candidates") or []
+        if not candidates:
+            return {}
+        raw = "".join(p.get("text", "") for p in candidates[0].get("content", {}).get("parts", []))
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.I | re.M).strip()
+        obj = json.loads(raw)
+        if not isinstance(obj, dict):
+            return {}
+
+        out = {}
+        try:
+            v = obj.get("value_cr")
+            v = float(v) if v is not None else None
+            if v is not None and 0 < v < 10_000_000:
+                out["order_value_cr"] = round(v, 4)
+        except (TypeError, ValueError):
+            pass
+        basis = str(obj.get("value_basis") or "").lower()
+        if basis in {"total", "annual", "not_disclosed"}:
+            out["value_basis"] = basis
+        try:
+            t = obj.get("tenure_years")
+            t = float(t) if t is not None else None
+            if t and 0 < t <= 50:
+                out["tenure_years"] = t
+        except (TypeError, ValueError):
+            pass
+        for src, dst in (("customer", "order_from"), ("summary", "order_summary")):
+            v = obj.get(src)
+            if isinstance(v, str) and v.strip() and v.strip().lower() not in {"null", "none", "n/a"}:
+                out[dst] = v.strip()[:300]
+        if out:
+            out["detail_source"] = "gemini_pdf"
+        return out
+    except Exception as e:
+        print(f"    · [{filename}] Gemini extraction failed ({e})")
+        return {}
+
+
+def _extract_money_candidates(clean: str) -> list[tuple[float, str, str]]:
+    """Return plausible disclosed monetary amounts as (crore, raw, context)."""
+    out = []
+    for m in _MONEY_RE.finditer(clean or ""):
+        value = _money_to_cr(m.group(1), m.group(2))
+        if value is None or value <= 0:
+            continue
+        lo, hi = max(0, m.start() - 180), min(len(clean), m.end() + 220)
+        raw = m.group(0).strip()
+        context = _clean_field(clean[lo:hi], 520)
+        if not _money_candidate_is_safe(raw, context, standardized_row=False):
+            continue
+        out.append((value, raw, context))
+    return out
+
+
+def _best_money(clean: str, context_re: str = "") -> tuple[float | None, str, str]:
+    candidates = _extract_money_candidates(clean)
+    if not candidates:
+        return None, "", ""
+    if context_re:
+        contextual = [x for x in candidates if re.search(context_re, x[2], re.I)]
+        if not contextual:
+            return None, "", ""
+        candidates = contextual
+    # Largest amount is used only after currency + context validation.
+    value, raw, context = max(candidates, key=lambda x: x[0])
+    return value, raw, context
+
+
+def _extract_local_catalyst_details(category: str, text: str) -> dict:
+    """Conservative non-AI parser for material catalyst PDFs.
+
+    Only stores fields that can be recovered directly from machine-readable text.
+    Missing/ambiguous facts are intentionally left blank.
+    """
+    clean = _normalize_pdf_text(text)
+    if not clean:
+        return {}
+    out = {}
+
+    if category == "Order":
+        return _extract_order_details(clean)
+
+    if category == "Acquisition":
+        value, raw, _ = _best_money(clean, r"consideration|purchase price|transaction value|acquisition|acquir")
+        if value is not None:
+            out["transaction_value_cr"] = value
+            out["transaction_value_text"] = raw
+        pct = re.search(r"(?:acquir(?:e|ed|ing)|purchase|stake|shareholding)[^.%]{0,120}?([0-9]+(?:\.[0-9]+)?)\s*%", clean, re.I)
+        if not pct:
+            pct = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%[^.]{0,100}?(?:stake|shareholding|equity)", clean, re.I)
+        if pct:
+            out["stake_acquired_pct"] = float(pct.group(1))
+        post = re.search(r"(?:post[- ]?(?:acquisition|transaction)|after (?:the )?acquisition)[^.%]{0,120}?([0-9]+(?:\.[0-9]+)?)\s*%", clean, re.I)
+        if post:
+            out["post_transaction_stake_pct"] = float(post.group(1))
+        target = re.search(r"(?:acquisition of|acquire(?:d|s|ing)?(?: up to)?(?: an?)?(?: additional)?(?: \d+(?:\.\d+)?\s*%)?(?: equity shares? in| stake in)?)\s+([A-Z][A-Za-z0-9&.,'()\- ]{2,100}?)(?=\s+(?:for|from|through|by|at|pursuant|vide|which|,|\())", clean)
+        if target:
+            out["target"] = _clean_field(target.group(1), 120)
+
+    elif category == "Divestment":
+        value, raw, _ = _best_money(clean, r"consideration|sale value|transaction value|sale|disposal|divest")
+        if value is not None:
+            out["transaction_value_cr"] = value
+            out["transaction_value_text"] = raw
+        pct = re.search(r"(?:sale|sell|sold|disposal|divestment|transfer)[^.%]{0,130}?([0-9]+(?:\.[0-9]+)?)\s*%", clean, re.I)
+        if pct:
+            out["stake_sold_pct"] = float(pct.group(1))
+        buyer = re.search(r"(?:buyer|purchaser|transferee)\s*[:\-]?\s*([A-Z][A-Za-z0-9&.,'()\- ]{2,120}?)(?=\s{2,}|\.|;|,\s*(?:for|at|pursuant))", clean, re.I)
+        if buyer:
+            out["buyer"] = _clean_field(buyer.group(1), 120)
+
+    elif category == "Negative":
+        # Negative parser v1.3: precision-first.  Determine event semantics before
+        # selecting money so project values / facilities / historical references
+        # cannot become the primary adverse amount.
+        relief = bool(re.search(
+            r"(?:set aside|quashed|demand (?:has been |was )?(?:deleted|dropped|withdrawn)|"
+            r"appeal (?:has been )?allowed|in favour of (?:the )?company|no (?:further )?liability|"
+            r"proceedings? (?:has been |were )?(?:dropped|closed)|penalty (?:has been )?(?:waived|deleted))",
+            clean, re.I))
+        # "Set aside" is only a relief when what was set aside was AGAINST the company.
+        # If an award in its favour was set aside, or the company says it will
+        # appeal / challenge, the outcome is adverse.
+        adverse = bool(re.search(
+            r"set aside (?:the |an? )?(?:arbitral |arbitration )?award|award[^.]{0,120}?(?:is|was|has been|were|stands?) set aside|"
+            r"strong case to challenge|(?:preferring|prefer|filing|file) an? (?:appeal|appropriate petition|review petition|special leave)|"
+            r"intends? to (?:appeal|challenge)|taking appropriate legal steps",
+            clean, re.I))
+        if adverse:
+            relief = False
+        tax_ctx = re.search(r"\bgst\b(?!\s*(?:in|no\.?|number|:)?\s*\d)|income[- ]tax|tax demand|taxation|\bitat\b|assessment order|customs duty", clean, re.I)
+
+        if re.search(r"\b(?:sfio|serious fraud investigation office)\b", clean, re.I):
+            out["negative_type"] = "SFIO Investigation"
+            out["negative_stage"] = "Investigation / Notice"
+        elif re.search(r"\b(?:enforcement directorate|\bed\b|cbi|central bureau of investigation)\b", clean, re.I):
+            out["negative_type"] = "Regulatory Investigation"
+            out["negative_stage"] = "Investigation / Notice"
+        elif relief and tax_ctx:
+            out["negative_type"] = "Tax / Litigation Relief"
+            out["negative_stage"] = "Relief / Set Aside"
+        elif relief and re.search(r"litigation|dispute|court|tribunal|arbitrat", clean, re.I):
+            out["negative_type"] = "Litigation Relief"
+            out["negative_stage"] = "Relief / Favourable Outcome"
+        elif re.search(r"arbitrat(?:ion|or|ral)|arbitral award", clean, re.I):
+            out["negative_type"] = "Litigation / Arbitration"
+            out["negative_stage"] = ("Adverse Order" if adverse else
+                                     "Award / Order" if re.search(r"award|order", clean, re.I) else "Update")
+        elif re.search(r"show[ -]?cause", clean, re.I):
+            out["negative_type"] = "Show Cause Notice"
+            out["negative_stage"] = "Notice"
+        elif re.search(r"\b(?:gst|income tax|tax authority|tax demand|assessment order)\b", clean, re.I):
+            out["negative_type"] = "Tax / GST"
+            out["negative_stage"] = "Demand / Order" if re.search(r"demand|order", clean, re.I) else "Notice"
+        elif re.search(r"penalty|\bfine\b", clean, re.I):
+            out["negative_type"] = "Penalty / Fine"
+            out["negative_stage"] = "Order / Penalty"
+        elif re.search(r"litigation|dispute|court|tribunal", clean, re.I):
+            out["negative_type"] = "Litigation / Dispute"
+            out["negative_stage"] = "Update"
+        elif re.search(r"search and seizure|\braid\b", clean, re.I):
+            out["negative_type"] = "Search / Raid"
+            out["negative_stage"] = "Investigation"
+        elif re.search(r"fire|accident|shutdown|plant closure", clean, re.I):
+            out["negative_type"] = "Operational Incident"
+            out["negative_stage"] = "Incident"
+        elif re.search(r"liquidation", clean, re.I):
+            out["negative_type"] = "Insolvency / Liquidation"
+            out["negative_stage"] = "Liquidation"
+        elif re.search(r"resolution plan", clean, re.I):
+            out["negative_type"] = "Insolvency / Resolution Plan"
+            out["negative_stage"] = "Decision"
+        elif re.search(r"\bcirp\b|insolvency", clean, re.I):
+            out["negative_type"] = "Insolvency / CIRP"
+            out["negative_stage"] = "Material Update"
+
+        # Role-aware money extraction.  A candidate is accepted only when its local
+        # context describes an adverse monetary role; generic project/facility/
+        # transaction values are ignored.
+        candidates = _extract_money_candidates(clean)
+        reject_role = re.compile(r"project (?:cost|value)|development cost|contract value|order value|"
+                                 r"credit facility|loan facility|secured facility|charge (?:created|amount)|"
+                                 r"turnover|revenue|net worth|share capital|consideration", re.I)
+        role_hits = {"tax_demand": [], "penalty": [], "interest": [], "award": [], "claim": []}
+
+        # v1.2: assign a monetary role only when the role is explicitly attached
+        # to that amount. This prevents one figure from being copied into tax,
+        # penalty and interest merely because those words occur later in a paragraph.
+        def _explicit_money_role(raw: str, context: str, role: str) -> bool:
+            eraw = re.escape(raw)
+            if role == "tax_demand":
+                pats = [
+                    rf"(?:tax (?:demand|liability)|demand(?:ed|ing)? (?:tax|liability)|demand raised)[^.;:]{{0,55}}{eraw}",
+                    rf"{eraw}[^.;:]{{0,28}}(?:tax )?demand\b",
+                ]
+            elif role == "penalty":
+                pats = [
+                    rf"(?:penalty|fine|penal amount)(?:\s+(?:of|amounting to|aggregating to|is|:|-))?[^.;:]{{0,35}}{eraw}",
+                ]
+            elif role == "interest":
+                pats = [
+                    rf"interest(?:\s+(?:of|amounting to|aggregating to|is|:|-))[^.;:]{{0,30}}{eraw}",
+                ]
+            elif role == "award":
+                pats = [
+                    rf"(?:arbitral award|arbitration|compensation|damages|award(?:ed)? amount)[^.;:]{{0,90}}{eraw}",
+                    rf"{eraw}[^.;:]{{0,90}}(?:arbitral award|awarded by|compensation|damages)",
+                ]
+            else:  # claim / general litigation exposure
+                pats = [
+                    rf"(?:claim|dispute|litigation|show[ -]?cause|notice)[^.;:]{{0,90}}{eraw}",
+                    rf"{eraw}[^.;:]{{0,55}}(?:claim|dispute|litigation)",
+                ]
+            return any(re.search(pat, context, re.I | re.S) for pat in pats)
+
+        for cand in candidates:
+            value, raw, context = cand
+            if reject_role.search(context) and not re.search(r"penalty|tax demand|demand raised|arbitral award|compensation|damages", context, re.I):
+                continue
+            for role in role_hits:
+                if _explicit_money_role(raw, context, role):
+                    role_hits[role].append(cand)
+
+        def _pick(role):
+            vals = role_hits.get(role) or []
+            return max(vals, key=lambda x: x[0]) if vals else None
+
+        tax = _pick("tax_demand")
+        pen = _pick("penalty")
+        intr = _pick("interest")
+        award = _pick("award")
+        claim = _pick("claim")
+        if tax:
+            out["tax_demand_cr"], out["tax_demand_text"] = tax[0], tax[1]
+        if pen:
+            out["penalty_cr"], out["penalty_text"] = pen[0], pen[1]
+        if intr:
+            out["interest_cr"], out["interest_text"] = intr[0], intr[1]
+        if award:
+            out["award_amount_cr"], out["award_amount_text"] = award[0], award[1]
+
+        # v1.3: a favourable order may refer to the historical demand/claim that
+        # has just been set aside. Keep that amount only as a lifecycle reference;
+        # it is not a current adverse exposure and must not populate amount_cr.
+        if relief and candidates:
+            relief_candidates = [c for c in candidates if re.search(
+                r"set aside|quashed|deleted|dropped|withdrawn|appeal.{0,30}allowed|previously upheld|tax demand|demand",
+                c[2], re.I | re.S)]
+            if relief_candidates:
+                ref = max(relief_candidates, key=lambda x: x[0])
+                out["relief_reference_cr"] = ref[0]
+                out["relief_reference_text"] = ref[1]
+
+        # Primary amount represents the principal adverse exposure, not a sum that
+        # could double-count overlapping disclosures. Keep separate role fields too.
+        primary = None
+        if out.get("negative_type") == "Litigation / Arbitration":
+            primary = award or claim
+        elif out.get("negative_type") in {"Tax / GST", "Show Cause Notice"}:
+            primary = tax or pen or claim
+        elif out.get("negative_type") == "Penalty / Fine":
+            primary = pen or tax or claim
+        elif out.get("negative_type") not in {"Tax / Litigation Relief", "Litigation Relief", "Insolvency / CIRP", "Insolvency / Resolution Plan", "Insolvency / Liquidation"}:
+            primary = claim or pen or tax or award
+        if primary:
+            out["amount_cr"], out["amount_text"], out["amount_context"] = primary
+
+        # Total exposure is emitted only when distinct tax + penalty amounts can be
+        # identified. Interest is intentionally excluded because it is often open-ended.
+        if tax and pen and abs(tax[0] - pen[0]) > 1e-9:
+            out["total_exposure_cr"] = round(tax[0] + pen[0], 6)
+        elif tax and pen and re.search(r"tax liability.{0,80}penalty|demand.{0,80}penalty", clean, re.I | re.S):
+            # Same numerical amount can legitimately apply once as tax and once as penalty.
+            out["total_exposure_cr"] = round(tax[0] + pen[0], 6)
+
+        # Authority is whitelist/context based.  Never save fragments such as
+        # 'Transcript', 'Letter', 'BSE Limited P', or arbitrary prose.
+        auth_patterns = [
+            r"Serious Fraud Investigation Office(?: \(SFIO\))?", r"Enforcement Directorate(?: \(ED\))?",
+            r"Central Bureau of Investigation(?: \(CBI\))?", r"Securities and Exchange Board of India(?: \(SEBI\))?",
+            r"Reserve Bank of India(?: \(RBI\))?", r"National Stock Exchange of India(?: Limited)?", r"BSE Limited",
+            r"Income Tax Appellate Tribunal(?: \(ITAT\))?", r"Income Tax Department", r"National Faceless Assessment (?:Unit|Centre)",
+            r"(?:Additional |Assistant |Joint |Deputy )?Commissioner(?: of Income Tax|,? CGST(?: & Central Excise)?| of GST)?",
+            r"(?:CGST|SGST|GST) (?:Department|Authority|Officer|Commissionerate)",
+            r"National Company Law Tribunal(?: \(NCLT\))?", r"National Company Law Appellate Tribunal(?: \(NCLAT\))?",
+            r"Regional Provident Fund Commissioner(?: \(RPFC\))?",
+        ]
+        # Every filing names SEBI's regulations and is addressed to NSE/BSE; those
+        # mentions are boilerplate, not the authority that acted.
+        auth_text = re.sub(
+            r"securities and exchange board of india\s*\((?:listing|prohibition|substantial|issue|share based|delisting)[^)]{0,120}\)\s*(?:regulations?)?(?:,?\s*\d{4})?|"
+            r"sebi\s*\((?:listing|lodr|prohibition|substantial|issue|pit)[^)]{0,120}\)\s*(?:regulations?)?(?:,?\s*\d{4})?|"
+            r"sebi (?:master )?circular[^.;]{0,120}", " ", clean, flags=re.I)
+        exch_action = re.compile(
+            r"(?:penalty|fine\b|show cause notice)[^.]{0,40}?(?:imposed|levied|issued)?\s*by\s+(?:the\s+)?"
+            r"(?:national stock exchange|\bnse\b|bse limited|\bbse\b)|"
+            r"(?:national stock exchange|\bnse\b|bse limited|\bbse\b)[^.]{0,60}"
+            r"(?:imposed|levied|has fined|issued|initiated|suspended)", re.I)
+        found_auth = []
+        for pat in auth_patterns:
+            if re.search(r"Stock Exchange|BSE", pat) and not exch_action.search(auth_text):
+                continue
+            m = re.search(pat, auth_text, re.I)
+            if m:
+                val = _clean_field(m.group(0), 120)
+                if val.lower() not in {x.lower() for x in found_auth}:
+                    found_auth.append(val)
+        if found_auth:
+            out["authority"] = "; ".join(found_auth[:2])
+
+    elif category == "Strategic Agreement":
+        value, raw, _ = _best_money(clean, r"investment|project|agreement|consideration|contract|value")
+        if value is not None:
+            out["agreement_value_cr"] = value
+            out["agreement_value_text"] = raw
+        if re.search(r"non[- ]binding", clean, re.I):
+            out["binding_status"] = "Non-Binding"
+        elif re.search(r"definitive agreement|binding agreement|executed.*agreement|agreement.*executed", clean, re.I):
+            out["binding_status"] = "Binding / Definitive"
+        cp = re.search(r"(?:agreement|mou|memorandum of understanding|collaboration|partnership)\s+(?:with|between)\s+([A-Z][A-Za-z0-9&.,'()\- ]{2,120}?)(?=\.|;|,\s*(?:for|to|and))", clean, re.I)
+        if cp:
+            out["counterparty"] = _clean_field(cp.group(1), 120)
+
+    elif category == "Scheme of Arrangement":
+        if re.search(r"demerger|hive[- ]?off", clean, re.I):
+            out["scheme_type"] = "Demerger"
+        elif re.search(r"merger|amalgamation", clean, re.I):
+            out["scheme_type"] = "Merger / Amalgamation"
+        eff = re.search(r"(?:effective date|appointed date|record date)\s*(?:is|shall be|:|-)?\s*([0-3]?\d[\-/ ][A-Za-z0-9\-/ ]{4,20})", clean, re.I)
+        if eff:
+            out["scheme_date_text"] = _clean_field(eff.group(1), 40)
+
+    elif category == "Corporate Action":
+        # A dividend/bonus/split PDF can contain large unrelated rupee figures
+        # (paid-up capital, turnover, reserves, etc.).  Only fund-raise / buyback
+        # style actions are allowed to populate issue_value_* fields.
+        ca_head = clean[:2500]
+        value_action = bool(re.search(
+            r"\b(?:qip|qualified institutional placement|preferential issue|rights issue|buyback|fund ?raise|fundraising)\b",
+            ca_head, re.I
+        ))
+        if value_action:
+            value, raw, _ = _best_money(clean, r"issue size|fund raise|fundraise|qip|preferential|buyback|rights issue|consideration")
+            if value is not None:
+                out["issue_value_cr"] = value
+                out["issue_value_text"] = raw
+        ratio = re.search(r"(?:bonus|ratio|rights)[^\d]{0,50}(\d+)\s*[:/]\s*(\d+)", clean, re.I)
+        if ratio:
+            out["ratio"] = f"{ratio.group(1)}:{ratio.group(2)}"
+        price = re.search(r"(?:issue price|floor price|buyback price)[^₹RsINR0-9]{0,30}(?:₹|Rs\.?|INR)?\s*([0-9][0-9,]*(?:\.\d+)?)", clean, re.I)
+        if price:
+            out["price_per_security"] = float(price.group(1).replace(',', ''))
+
+    if out:
+        out["detail_source"] = "local_pdf"
+    return out
+
+
+def _is_non_binding_mou(it: dict, details: dict | None = None) -> bool:
+    status = str((details or {}).get("binding_status") or it.get("binding_status") or "")
+    if re.search(r"non[- ]?binding", status, re.I):
+        return True
+    both = f"{it.get('subject', '')} {it.get('text', '')}"
+    return bool(re.search(r"memorandum of understanding|\bmou\b", both, re.I)
+                and not re.search(r"definitive|binding agreement", both, re.I))
+
+
+def _apply_materiality_ratios(it: dict, category: str, details: dict,
+                               market_cap_map: dict | None, ttm_sales_map: dict | None) -> None:
+    symbol = str(it.get("_lookup_symbol") or it.get("symbol") or "").strip().upper()
+    if not symbol:
+        return
+    mcap = (market_cap_map or {}).get(symbol)
+    ttm = (ttm_sales_map or {}).get(symbol)
+    value_key = {
+        "Order": "order_value_cr",
+        "Acquisition": "transaction_value_cr",
+        "Divestment": "transaction_value_cr",
+        "Negative": "amount_cr",
+        "Strategic Agreement": "agreement_value_cr",
+        "Corporate Action": "issue_value_cr",
+    }.get(category)
+    if not value_key or details.get(value_key) is None:
+        return
+    if category == "Strategic Agreement" and _is_non_binding_mou(it, details):
+        # A non-binding MoU value (often the company's own capex pledge to a
+        # state government) is not revenue; a % of market cap misleads.
+        return
+    try:
+        value = float(details[value_key])
+        prefix = {
+            "Order": "order", "Acquisition": "transaction", "Divestment": "transaction",
+            "Negative": "amount", "Strategic Agreement": "agreement", "Corporate Action": "issue"
+        }[category]
+        if mcap is not None and float(mcap) > 0:
+            it[f"{prefix}_to_market_cap_pct"] = round(value / float(mcap) * 100.0, 2)
+        if category == "Order" and ttm is not None and float(ttm) > 0:
+            it["order_to_ttm_sales_pct"] = round(value / float(ttm) * 100.0, 2)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+
+
+def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: date,
+                       initial_build: bool = False, market_cap_map: dict | None = None,
+                       ttm_sales_map: dict | None = None) -> tuple[int, int]:
+    """PDF enrichment with NO AI/API calls.
+
+    New catalysts are checked immediately. Existing history can be backfilled in
+    controlled batches by the caller; failed/scan-only PDFs are marked checked so
+    they are not downloaded repeatedly.
+    """
+    supported = {"Order", "Acquisition", "Divestment", "Negative",
+                 "Strategic Agreement", "Scheme of Arrangement", "Corporate Action"}
+    checked = enriched = values_found = 0
+    for items in new_items.values():
+        for it in items:
+            cat = it.get("category")
+            if cat not in supported or it.get("id") in existing_ids:
+                continue
+            if initial_build and str(it.get("dt", ""))[:10] != today.isoformat():
+                continue
+            checked += 1
+            pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
+            if not pdf_bytes:
+                it["local_pdf_checked"] = True
+                continue
+            pdf_text = _extract_pdf_text_bytes(pdf_bytes)
+            details = _extract_local_catalyst_details(cat, pdf_text)
+            it["local_pdf_checked"] = True
+            it["local_parser_version"] = 4.1
+            if details:
+                it.update(details)
+                _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
+                enriched += 1
+                if any(k.endswith("_cr") for k in details):
+                    values_found += 1
+    if initial_build:
+        print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
+    print(f"  ✓ Local PDF enrichment v4.1 → checked={checked}, details_found={enriched}, value_found={values_found}")
+    return checked, enriched
+
+
+
+def backfill_local_history(session, history: dict, market_cap_map: dict | None = None,
+                           ttm_sales_map: dict | None = None,
+                           limit: int = BACKFILL_PDF_BATCH) -> tuple[int, int, int]:
+    """Open PDFs of stored catalysts that were never checked, newest first.
+
+    enrich_local_pdfs() only sees fresh rows (and only today's rows on a
+    rebuild), and revalidate_local_history() only reparses rows that were
+    already checked. Rows that slipped past both would stay unenriched for
+    ever; this drains that backlog `limit` PDFs per run with the local parser.
+    Gemini, manual and already-enriched rows are never touched.
+    """
+    supported = {"Order", "Acquisition", "Divestment", "Negative",
+                 "Strategic Agreement", "Scheme of Arrangement", "Corporate Action"}
+    pending = []
+    for sym, items in history.items():
+        for it in items:
+            if (it.get("manual") or it.get("local_pdf_checked") or it.get("detail_source")
+                    or it.get("category") not in supported):
+                continue
+            pending.append((it.get("dt", ""), sym, it))
+    if not pending:
+        return 0, 0, 0
+    # Never-tried rows first (newest first), then earlier failures, so one
+    # unreachable PDF cannot block the queue for BACKFILL_MAX_ATTEMPTS runs.
+    pending.sort(key=lambda t: t[0], reverse=True)
+    pending.sort(key=lambda t: int(t[2].get("local_pdf_attempts") or 0))
+
+    checked = enriched = values = 0
+    consecutive_fail = 0
+    for _dt, sym, it in pending[:max(0, limit)]:
+        if consecutive_fail >= 3:
+            # Session is probably blocked/throttled; stop and try again next run.
+            print("  ⚠ History PDF backfill paused after 3 consecutive download failures")
+            break
+        cat = it["category"]
+        link = it.get("link", "")
+        checked += 1
+        pdf_bytes = _download_pdf_bytes(session, link)
+        if not pdf_bytes:
+            is_pdf_link = bool(link) and link.lower().split("?", 1)[0].endswith(".pdf")
+            attempts = int(it.get("local_pdf_attempts") or 0) + 1
+            if not is_pdf_link or attempts >= BACKFILL_MAX_ATTEMPTS:
+                # Nothing to open, or repeatedly unreachable: stop retrying.
+                it.pop("local_pdf_attempts", None)
+                it["local_pdf_checked"] = True
+            else:
+                it["local_pdf_attempts"] = attempts
+            if is_pdf_link:
+                consecutive_fail += 1
+            continue
+        consecutive_fail = 0
+        details = _extract_local_catalyst_details(cat, _extract_pdf_text_bytes(pdf_bytes))
+        it.pop("local_pdf_attempts", None)
+        it["local_pdf_checked"] = True
+        it["local_parser_version"] = 4.1
+        if cat == "Negative":
+            it["negative_parser_version"] = NEG_PARSER_VERSION
+        if details:
+            it.update(details)
+            it["_lookup_symbol"] = str(sym).strip().upper()
+            _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
+            it.pop("_lookup_symbol", None)
+            enriched += 1
+            if any(k.endswith("_cr") and v is not None for k, v in details.items()):
+                values += 1
+    remaining = sum(1 for _d, _s, x in pending if not x.get("local_pdf_checked"))
+    print(f"  📥 History PDF backfill → checked={checked}, details_found={enriched}, "
+          f"value_found={values}, remaining={remaining}")
+    return checked, enriched, values
+
+
+_LOCAL_ENRICHMENT_FIELDS = {
+    "order_value_cr", "order_value_text", "order_value_role", "company_share_of_order_cr",
+    "transaction_value_cr", "transaction_value_text", "stake_acquired_pct",
+    "post_transaction_stake_pct", "target", "stake_sold_pct", "buyer",
+    "amount_cr", "amount_text", "amount_context", "authority",
+    "negative_type", "negative_stage", "tax_demand_cr", "tax_demand_text",
+    "penalty_cr", "penalty_text", "interest_cr", "interest_text",
+    "award_amount_cr", "award_amount_text", "total_exposure_cr",
+    "agreement_value_cr", "agreement_value_text", "binding_status", "counterparty",
+    "scheme_type", "scheme_date_text", "issue_value_cr", "issue_value_text",
+    "ratio", "price_per_security", "detail_excerpt",
+    "order_to_market_cap_pct", "order_to_ttm_sales_pct",
+    "transaction_to_market_cap_pct", "amount_to_market_cap_pct",
+    "agreement_to_market_cap_pct", "issue_to_market_cap_pct",
+}
+
+
+def _clear_local_enrichment(item: dict) -> None:
+    """Remove only fields owned by the local parser; preserve NSE/event metadata."""
+    for key in _LOCAL_ENRICHMENT_FIELDS:
+        item.pop(key, None)
+    if item.get("detail_source") in {"local_pdf", "pdf_local"}:
+        item.pop("detail_source", None)
+
+
+def revalidate_local_history(session, history: dict, market_cap_map: dict | None = None,
+                             ttm_sales_map: dict | None = None) -> tuple[int, int, int]:
+    """One-time v4.1 reparse/normalization of local-PDF enrichment.
+
+    Old v1/v2 values may have been merged forward even after the parser became
+    stricter.  Every locally enriched historical row is therefore reparsed once
+    with v4.1.  The version marker prevents repeat downloads on later runs.
+    Gemini/manual enrichment is never touched.
+    """
+    checked = changed = values = 0
+    supported = {"Order", "Acquisition", "Divestment",
+                 "Strategic Agreement", "Scheme of Arrangement", "Corporate Action"}
+    for sym, items in history.items():
+        for it in items:
+            if it.get("manual") or it.get("category") not in supported:
+                continue
+            source = it.get("detail_source")
+            if source not in {None, "local_pdf", "pdf_local"}:
+                continue
+            if not it.get("local_pdf_checked") and source not in {"local_pdf", "pdf_local"}:
+                continue
+            if float(it.get("local_parser_version") or 0) >= 4.1:
+                continue
+
+            checked += 1
+            before = {k: it.get(k) for k in _LOCAL_ENRICHMENT_FIELDS if k in it}
+            pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
+            _clear_local_enrichment(it)
+            it["local_pdf_checked"] = True
+            it["local_parser_version"] = 4.1
+
+            if pdf_bytes:
+                pdf_text = _extract_pdf_text_bytes(pdf_bytes)
+                details = _extract_local_catalyst_details(it.get("category"), pdf_text)
+                if details:
+                    it.update(details)
+                    it["_lookup_symbol"] = str(sym).strip().upper()
+                    _apply_materiality_ratios(it, it.get("category"), details,
+                                              market_cap_map, ttm_sales_map)
+                    it.pop("_lookup_symbol", None)
+                    if any(k.endswith("_cr") for k in details):
+                        values += 1
+
+            after = {k: it.get(k) for k in _LOCAL_ENRICHMENT_FIELDS if k in it}
+            if before != after:
+                changed += 1
+
+    if checked:
+        print(f"  ♻ Local PDF v4.1 history revalidation → checked={checked}, changed={changed}, value_found={values}")
+    return checked, changed, values
+
+
+NEG_PARSER_VERSION = 1.5        # 1.5: adverse set-aside (award against company), GSTIN not tax, exchange authority only when it acted
+NEG_REVALIDATE_BATCH = int(os.environ.get("NEG_REVALIDATE_BATCH", "40"))
+
+
+def revalidate_negative_history(session, history: dict, market_cap_map: dict | None = None) -> tuple[int, int, int]:
+    """One-time local Negative v1.3 refresh. Other v4.1 category parsers stay frozen."""
+    checked = changed = values = 0
+    for sym, items in history.items():
+        for it in items:
+            if it.get("manual") or it.get("category") != "Negative":
+                continue
+            try:
+                neg_ver = float(it.get("negative_parser_version") or 0)
+            except (TypeError, ValueError):
+                neg_ver = 0.0
+            if neg_ver >= NEG_PARSER_VERSION:
+                continue
+            if it.get("negative_type") == "Order Cancellation" or it.get("cancels") or it.get("category_override") == "Negative":
+                it["negative_parser_version"] = NEG_PARSER_VERSION   # set by the order check
+                continue
+            if checked >= NEG_REVALIDATE_BATCH:
+                break
+            checked += 1
+            neg_fields = ("amount_cr", "amount_text", "amount_context", "authority", "negative_type", "negative_stage",
+                          "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
+                          "interest_cr", "interest_text", "award_amount_cr", "award_amount_text",
+                          "total_exposure_cr", "relief_reference_cr", "relief_reference_text", "amount_to_market_cap_pct")
+            before = {k: it.get(k) for k in neg_fields if k in it}
+            pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
+            it["negative_parser_version"] = NEG_PARSER_VERSION
+            if not pdf_bytes:
+                continue
+            details = _extract_local_catalyst_details("Negative", _extract_pdf_text_bytes(pdf_bytes))
+            if details:
+                # Replace only Negative-owned local fields; do not touch other category enrichment.
+                for k in neg_fields:
+                    it.pop(k, None)
+                it.update(details)
+                it["_lookup_symbol"] = str(sym).strip().upper()
+                _apply_materiality_ratios(it, "Negative", details, market_cap_map, None)
+                it.pop("_lookup_symbol", None)
+                if details.get("amount_cr") is not None:
+                    values += 1
+            after = {k: it.get(k) for k in neg_fields if k in it}
+            if before != after:
+                changed += 1
+    if checked:
+        print(f"  ♻ Negative local history v{NEG_PARSER_VERSION} → checked={checked}, changed={changed}, value_found={values}")
+    return checked, changed, values
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Source 1: NSE JSON API
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_api(session, start: date, end: date, is_trading_day, next_trading_day) -> dict:
+    """
+    Returns {symbol: [items]}. Raises on HTTP / parse failure so the caller can
+    fall back to RSS. Field names are read defensively: NSE has renamed keys
+    before (desc / subject, attchmntText / text).
+    """
+    params = {"index": "equities",
+              "from_date": start.strftime("%d-%m-%Y"),
+              "to_date":   end.strftime("%d-%m-%Y")}
+    headers = {"Accept": "application/json, text/plain, */*",
+               "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-announcements"}
+    r = session.get(API_URL, params=params, headers=headers, timeout=45)
+    r.raise_for_status()
+    payload = r.json()
+    rows = payload.get("data", []) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise RuntimeError(f"unexpected API payload type: {type(rows).__name__}")
+
+    out, kept = {}, 0
+    for row in rows:
+        sym  = (row.get("symbol") or "").strip().upper()
+        subj = row.get("desc") or row.get("subject") or ""
+        text = row.get("attchmntText") or row.get("text") or ""
+        dt   = _parse_dt(row.get("an_dt") or row.get("sort_date") or row.get("dt") or "")
+        link = row.get("attchmntFile") or ""
+        item = _make_item(sym, dt, subj, text, link, is_trading_day, next_trading_day)
+        if item:
+            out.setdefault(sym, []).append(item)
+            kept += 1
+    print(f"  ✓ corporate-announcements API → {len(rows)} rows, {kept} catalyst items "
+          f"({start} → {end})")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Source 2: RSS + EQUITY_L name → symbol map
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NAME_STOP = re.compile(r"\b(the|limited|ltd|india|private|pvt|company|co|corporation|corp)\b")
+
+def norm_name(name: str) -> str:
+    n = (name or "").lower().replace("&", " and ")
+    n = re.sub(r"[^a-z0-9 ]", " ", n)
+    n = _NAME_STOP.sub(" ", n)
+    return re.sub(r"\s+", " ", n).strip()
+
+
+def fetch_name_map(session) -> dict:
+    r = session.get(EQUITY_L, timeout=30)
+    r.raise_for_status()
+    text = r.content.decode("utf-8-sig")
+    m = {}
+    for row in csv.DictReader(io.StringIO(text)):
+        row = {k.strip().upper(): (v or "").strip() for k, v in row.items() if k}
+        sym, name = row.get("SYMBOL"), row.get("NAME OF COMPANY")
+        if sym and name:
+            m[norm_name(name)] = sym
+    print(f"  ✓ EQUITY_L.csv → {len(m)} names")
+    return m
+
+
+def parse_rss(xml_text: str, name_map: dict, is_trading_day, next_trading_day) -> tuple[dict, int]:
+    """Returns ({symbol: [items]}, unmapped_count)."""
+    root = ET.fromstring(xml_text)
+    out, unmapped = {}, 0
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        desc  = (it.findtext("description") or "").strip()
+        link  = (it.findtext("link") or "").strip()
+        dt    = _parse_dt(it.findtext("pubDate") or "")
+        text, _, subj = desc.partition("|SUBJECT:")
+        if not subj:
+            subj, text = desc, ""
+        if classify(subj, text) is None:
+            continue
+        sym = name_map.get(norm_name(title))
+        if not sym:
+            unmapped += 1       # mutual-fund NAVs, debt-only issuers, SME names etc.
+            continue
+        item = _make_item(sym, dt, subj, text, link, is_trading_day, next_trading_day)
+        if item:
+            out.setdefault(sym, []).append(item)
+    return out, unmapped
+
+
+def fetch_rss(session, is_trading_day, next_trading_day) -> dict:
+    name_map = fetch_name_map(session)
+    r = session.get(RSS_URL, headers={"Accept": "application/rss+xml, application/xml, */*"}, timeout=30)
+    r.raise_for_status()
+    out, unmapped = parse_rss(r.text, name_map, is_trading_day, next_trading_day)
+    n = sum(len(v) for v in out.values())
+    print(f"  ✓ RSS → {n} catalyst items ({unmapped} catalyst-looking items had no symbol match)")
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point + history merge
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_catalysts(session, today: date, lookback_days: int,
+                    is_trading_day, next_trading_day) -> tuple[dict, str]:
+    """Tries the API first, then RSS. Returns (items_by_symbol, source_name)."""
+    start = today - timedelta(days=lookback_days)
+    try:
+        return fetch_api(session, start, today, is_trading_day, next_trading_day), "api"
+    except Exception as e:
+        print(f"  ⚠ corporate-announcements API failed ({e}) — falling back to RSS")
+    return fetch_rss(session, is_trading_day, next_trading_day), "rss"
+
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Negative metadata hygiene (v1.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NEGATIVE_OWNED_FIELDS = (
+    "negative_parser_version", "negative_type", "negative_stage",
+    "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
+    "interest_cr", "interest_text", "award_amount_cr", "award_amount_text",
+    "total_exposure_cr", "relief_reference_cr", "relief_reference_text",
+    "amount_cr", "amount_text", "amount_context", "amount_to_market_cap_pct", "authority",
+)
+
+def scrub_negative_metadata_from_nonnegative(data: dict) -> int:
+    """Remove Negative-owned parser fields from every non-Negative row, including
+    rows that were reclassified on an earlier run and therefore do not change
+    category during today's historical cleanup.
+    """
+    changed = 0
+    for items in data.values():
+        for it in items:
+            if it.get("category") == "Negative":
+                continue
+            touched = False
+            for key in _NEGATIVE_OWNED_FIELDS:
+                if key in it:
+                    it.pop(key, None)
+                    touched = True
+            if touched and it.get("detail_source") in {"local_pdf", "pdf_local"}:
+                it.pop("detail_source", None)
+            if touched:
+                changed += 1
+    return changed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Negative adverse -> relief lifecycle consolidation (v1.3)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _negative_money_markers(item: dict) -> set[str]:
+    vals = set()
+    for key in ("amount_cr", "tax_demand_cr", "penalty_cr", "award_amount_cr", "relief_reference_cr"):
+        try:
+            if item.get(key) is not None:
+                vals.add(f"{float(item[key]):.3f}")
+        except Exception:
+            pass
+    raw = f"{item.get('text','')} {item.get('amount_text','')} {item.get('tax_demand_text','')}".replace(",", "")
+    for m in re.finditer(r"(?:rs\.?|₹|inr)\s*(\d+(?:\.\d+)?)\s*(crore|crores|cr\b|million|mn\b|lakh|lakhs)", raw, re.I):
+        try:
+            unit = m.group(2).lower()
+            v = float(m.group(1))
+            if unit.startswith("million") or unit == "mn": v /= 10.0
+            elif unit.startswith("lakh"): v /= 100.0
+            vals.add(f"{v:.3f}")
+        except Exception:
+            pass
+    return vals
+
+def consolidate_negative_relief_lifecycles(data: dict) -> int:
+    """Collapse an earlier adverse tax/litigation card when a later filing
+    clearly records relief/set-aside for the same monetary matter. Conservative:
+    same symbol, <=20 days, and a shared explicit monetary marker are required.
+    """
+    removed = 0
+    relief_types = {"Tax / Litigation Relief", "Litigation Relief"}
+    for sym in list(data):
+        items = sorted(data[sym], key=lambda x: x.get("dt", ""), reverse=True)
+        drop = set()
+        for i, newer in enumerate(items):
+            if newer.get("category") != "Negative" or newer.get("negative_type") not in relief_types:
+                continue
+            nm = _negative_money_markers(newer)
+            if not nm:
+                continue
+            try:
+                nd = datetime.fromisoformat(str(newer.get("dt", "")).replace("Z", "+00:00")).date()
+            except Exception:
+                continue
+            for j in range(i + 1, len(items)):
+                older = items[j]
+                if older.get("category") != "Negative" or older.get("negative_type") in relief_types:
+                    continue
+                try:
+                    od = datetime.fromisoformat(str(older.get("dt", "")).replace("Z", "+00:00")).date()
+                except Exception:
+                    continue
+                if (nd - od).days > 20:
+                    break
+                if nm & _negative_money_markers(older):
+                    drop.add(j)
+        if drop:
+            data[sym] = [x for j, x in enumerate(items) if j not in drop]
+            removed += len(drop)
+    return removed
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conservative lifecycle consolidation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_LIFECYCLE_CATEGORIES = {
+    "Order", "Acquisition", "Divestment", "Scheme of Arrangement",
+    "Strategic Agreement", "Corporate Action", "Regulatory Approval",
+}
+
+_LIFECYCLE_STOP = {
+    "limited", "company", "exchange", "informed", "regarding", "about", "under",
+    "pursuant", "regulation", "sebi", "listing", "obligations", "disclosure",
+    "requirements", "general", "updates", "update", "press", "release", "outcome",
+    "board", "meeting", "held", "dated", "the", "and", "for", "with", "from",
+    "that", "this", "has", "have", "its", "their", "private", "ltd",
+}
+
+def _life_tokens(item: dict) -> set[str]:
+    raw = f"{item.get('subject','')} {item.get('text','')}".lower()
+    raw = re.sub(r"https?://\S+", " ", raw)
+    toks = set(re.findall(r"[a-z][a-z0-9]{2,}", raw))
+    return {t for t in toks if t not in _LIFECYCLE_STOP}
+
+def _money_markers(item: dict) -> set[str]:
+    raw = f"{item.get('text','')} {item.get('order_value_text','')}".lower().replace(",", "")
+    vals = set()
+    for m in re.finditer(r"(?:rs\.?|₹|inr)?\s*(\d+(?:\.\d+)?)\s*(?:crore|crores|cr\b)", raw, re.I):
+        try:
+            vals.add(f"{float(m.group(1)):.2f}")
+        except Exception:
+            pass
+    if item.get("order_value_cr") is not None:
+        try: vals.add(f"{float(item['order_value_cr']):.2f}")
+        except Exception: pass
+    return vals
+
+def _life_similarity(a: dict, b: dict) -> float:
+    ta, tb = _life_tokens(a), _life_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta | tb))
+
+def _same_lifecycle(a: dict, b: dict) -> bool:
+    cat = a.get("category")
+    if cat != b.get("category") or cat not in _LIFECYCLE_CATEGORIES:
+        return False
+    try:
+        da = datetime.fromisoformat(str(a.get("dt", "")).replace("Z", "+00:00"))
+        db = datetime.fromisoformat(str(b.get("dt", "")).replace("Z", "+00:00"))
+        gap = abs((da.date() - db.date()).days)
+    except Exception:
+        gap = 999
+    if gap > 14:
+        return False
+
+    sim = _life_similarity(a, b)
+    ma, mb = _money_markers(a), _money_markers(b)
+
+    # Orders are especially collision-prone: same value (L1 -> award) or very
+    # strong project/customer wording is required. Different order values never merge.
+    if cat == "Order":
+        if ma and mb and not (ma & mb):
+            return False
+        return bool(ma & mb) or sim >= 0.62
+
+    # Scheme filings often use generic exchange boilerplate; same-symbol filings
+    # close in time are consolidated only when their meaningful wording overlaps.
+    if cat == "Scheme of Arrangement":
+        return sim >= 0.30
+
+    # Capital-action duplicates (Outcome + QIP/Preferential/Buyback etc.) are
+    # normally filed minutes apart. Restrict the looser rule to the same day.
+    if cat == "Corporate Action":
+        return (gap == 0 and sim >= 0.22) or sim >= 0.58
+
+    # Regulatory grants/renewals can be duplicated by exchange filings, but do not
+    # merge different licences merely because the company is the same.
+    if cat == "Regulatory Approval":
+        return (gap == 0 and sim >= 0.45) or sim >= 0.70
+
+    # Acquisition/divestment/strategic-agreement lifecycle updates normally repeat
+    # the target/counterparty/project name, so require meaningful token overlap.
+    return sim >= 0.42
+
+_STAGE_RANK = {
+    "L1 / Awaiting Award": 10, "Announced": 10, "MoU": 10, "Non-Binding MoU": 5,
+    "Approved": 20, "Board Approved": 20, "Approved / Agreement": 25, "Allotment": 35,
+    "Agreement Signed": 30, "Definitive / Signed": 30, "Exchange NOC": 35,
+    "Awarded": 40, "NCLT Approved": 45, "Record Date": 50,
+    "Completion Delayed/Extended": 55, "Effective / Completed": 60, "Completed": 60,
+}
+
+def _lifecycle_winner(a: dict, b: dict) -> tuple[dict, dict]:
+    ra = _STAGE_RANK.get(a.get("stage"), 0)
+    rb = _STAGE_RANK.get(b.get("stage"), 0)
+    if ra != rb:
+        return (a, b) if ra > rb else (b, a)
+    return (a, b) if str(a.get("dt", "")) >= str(b.get("dt", "")) else (b, a)
+
+def _carry_enrichment(winner: dict, loser: dict) -> None:
+    """Keep useful structured facts when a later lifecycle filing is terse."""
+    protected = {"id", "dt", "react_date", "session", "category", "subject", "text", "link", "event_type", "stage"}
+    for k, v in loser.items():
+        if k not in protected and k not in winner and v not in (None, "", [], {}):
+            winner[k] = v
+
+def consolidate_lifecycles(data: dict) -> int:
+    """Conservatively collapse duplicate stages of the same underlying event per symbol.
+
+    Returns the number of cards removed. Manual rows are never consolidated.
+    """
+    removed = 0
+    for sym in list(data):
+        items = sorted(data[sym], key=lambda x: x.get("dt", ""), reverse=True)
+        kept = []
+        for item in items:
+            if item.get("manual") or item.get("category") not in _LIFECYCLE_CATEGORIES:
+                kept.append(item)
+                continue
+            hit = None
+            for i, prev in enumerate(kept):
+                if prev.get("manual"):
+                    continue
+                if _same_lifecycle(item, prev):
+                    hit = i
+                    break
+            if hit is None:
+                kept.append(item)
+                continue
+            winner, loser = _lifecycle_winner(item, kept[hit])
+            _carry_enrichment(winner, loser)
+            kept[hit] = winner
+            removed += 1
+        kept.sort(key=lambda x: x.get("dt", ""), reverse=True)
+        data[sym] = kept
+        if not kept:
+            del data[sym]
+    return removed
+
+
+def merge_catalysts(hist: dict, new: dict, today: date, keep_days: int = HISTORY_DAYS) -> int:
+    """
+    hist/new: {symbol: [items]}. Dedupes on item id, keeps each symbol's list
+    newest-first, drops items older than keep_days. Returns count added.
+    Manual edits (items with "manual": true) are never dropped or overwritten.
+    """
+    cutoff = (today - timedelta(days=keep_days)).isoformat()
+    added = 0
+    for sym, items in new.items():
+        cur = hist.setdefault(sym, [])
+        ids = {x.get("id") for x in cur}
+        for it in items:
+            if it["id"] not in ids:
+                cur.append(it)
+                ids.add(it["id"])
+                added += 1
+    for sym in list(hist):
+        hist[sym] = [x for x in hist[sym] if x.get("manual") or x.get("dt", "")[:10] >= cutoff]
+        hist[sym].sort(key=lambda x: x.get("dt", ""), reverse=True)
+        if not hist[sym]:
+            del hist[sym]
+    return added
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Standalone runner
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_session():
+    """Create and prime a browser-like NSE session."""
+    import requests
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/",
+    })
+    # NSE's API normally expects cookies from the home page. Failure to prime
+    # is non-fatal because fetch_catalysts() can still fall back to RSS.
+    try:
+        s.get("https://www.nseindia.com/", timeout=20)
+    except Exception as e:
+        print(f"  ⚠ NSE session prime failed ({e}) — API will be tried anyway")
+    return s
+
+
+def _load_nse_holidays(session, year: int) -> set[date]:
+    """Best-effort NSE CM holiday calendar; weekdays are the safe fallback."""
+    holidays = set()
+    try:
+        r = session.get(
+            "https://www.nseindia.com/api/holiday-master?type=trading",
+            headers={"Accept": "application/json, text/plain, */*",
+                     "Referer": "https://www.nseindia.com/resources/exchange-communication-holidays"},
+            timeout=30,
+        )
+        r.raise_for_status()
+        payload = r.json()
+        rows = payload.get("CM", []) if isinstance(payload, dict) else []
+        for row in rows:
+            raw = str(row.get("tradingDate") or row.get("date") or "").strip()
+            for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%Y-%m-%d"):
+                try:
+                    d = datetime.strptime(raw, fmt).date()
+                    if d.year in (year, year + 1):
+                        holidays.add(d)
+                    break
+                except ValueError:
+                    pass
+        print(f"  ✓ NSE holiday calendar → {len(holidays)} CM holiday(s) loaded")
+    except Exception as e:
+        print(f"  ⚠ NSE holiday calendar unavailable ({e}) — using Mon-Fri fallback")
+    return holidays
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NSE headline cross-check (no AI)
+# The exchange summary often states the value outright ("wins orders of Rs 1,303
+# crores"). It fills gaps where the PDF parser found nothing, and overrides PDF
+# values that are clearly the wrong number (YTD intake, combined announcements,
+# only the first of several work orders).
+# ─────────────────────────────────────────────────────────────────────────────
+
+_HEADLINE_AMOUNT_RE = re.compile(
+    r"(?:₹|rs\.?|inr)\s*([0-9][0-9,]*(?:\.\d+)?)\s*(lakh crores?|crores?|cr\b\.?|lakhs?|lacs?)", re.I)
+# Amounts in these contexts are not the value of this filing.
+_HEADLINE_SKIP_CONTEXT = re.compile(
+    r"order ?book|order intake|\bytd\b|year[- ]to[- ]date|till date|so far|cumulative|"
+    r"turnover|revenue|market cap|net worth|paid[- ]up|authori[sz]ed capital|dividend", re.I)
+_HEADLINE_VALUE_KEY = {
+    "Order": ("order_value_cr", "order_value_text", "order_value_role"),
+    "Acquisition": ("transaction_value_cr", "transaction_value_text", None),
+    "Divestment": ("transaction_value_cr", "transaction_value_text", None),
+    "Strategic Agreement": ("agreement_value_cr", "agreement_value_text", None),
+    "Corporate Action": ("issue_value_cr", "issue_value_text", None),
+}
+# Only fund-raising corporate actions have an issue size worth showing.
+_HEADLINE_CA_TYPES = {"QIP", "Rights Issue", "Preferential Issue", "Buyback", "Corporate Action"}
+HEADLINE_OVERRIDE_DIFF = 0.15      # >15% apart = different number, not rounding/GST
+NOMINAL_ACQ_MAX_CR = 1.0           # shell/SPV purchases for a few lakh are not catalysts
+NOMINAL_ACQ_MAX_MCAP_PCT = 0.1
+
+
+def _headline_value(text: str) -> tuple[float | None, str]:
+    """First clean ₹ amount in the NSE summary, in crore."""
+    import html as _html
+    t = _html.unescape(text or "")
+    for m in _HEADLINE_AMOUNT_RE.finditer(t):
+        before = t[max(0, m.start() - 45):m.start()]
+        if _HEADLINE_SKIP_CONTEXT.search(before):
+            continue
+        try:
+            n = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        u = m.group(2).lower()
+        cr = n * 1e5 if u.startswith("lakh cr") else n if u.startswith("cr") else n / 100.0
+        if cr <= 0:
+            continue
+        return round(cr, 4), m.group(0).strip()
+    return None, ""
+
+
+def apply_headline_quality(history: dict, market_cap_map: dict | None = None,
+                           ttm_sales_map: dict | None = None) -> tuple[int, int, int]:
+    """Fill/override values from the NSE headline and drop nominal acquisitions.
+
+    Idempotent: once a row carries the headline value, later runs see no
+    difference. The replaced PDF figure is kept as pdf_value_cr for audit.
+    Manual rows are never touched; Gemini values are filled but not overridden.
+    """
+    filled = overridden = dropped = 0
+    for sym in list(history):
+        kept = []
+        for it in history[sym]:
+            if it.get("manual"):
+                kept.append(it)
+                continue
+            cat = it.get("category")
+            # Re-strip ratios that should not exist (e.g. non-binding MoU).
+            if cat == "Strategic Agreement" and _is_non_binding_mou(it):
+                it.pop("agreement_to_market_cap_pct", None)
+
+            keys = _HEADLINE_VALUE_KEY.get(cat)
+            if keys and not (cat == "Corporate Action" and it.get("event_type") not in _HEADLINE_CA_TYPES):
+                vkey, tkey, rkey = keys
+                hv, htxt = _headline_value(it.get("text", ""))
+                cur = it.get(vkey)
+                if hv is not None:
+                    change = False
+                    if cur is None:
+                        change = True
+                        filled += 1
+                    elif (it.get("detail_source") not in {"gemini_pdf", "gemini"}
+                          and it.get("value_source") != "gemini_pdf"):
+                        try:
+                            curf = float(cur)
+                        except (TypeError, ValueError):
+                            curf = None
+                        if curf and abs(hv - curf) / max(hv, curf) > HEADLINE_OVERRIDE_DIFF:
+                            role = str(it.get(rkey) or "") if rkey else ""
+                            # PDF "total" rows are trusted unless the headline is the
+                            # bigger aggregate (several work orders in one filing).
+                            if role != "total" or hv > curf:
+                                change = True
+                                overridden += 1
+                                it.setdefault("pdf_value_cr", curf)
+                    if change:
+                        it[vkey] = hv
+                        it[tkey] = htxt
+                        if rkey:
+                            it[rkey] = "headline"
+                        it["value_source"] = "nse_headline"
+                        for k in list(it):
+                            if k.endswith("_to_market_cap_pct") or k == "order_to_ttm_sales_pct":
+                                it.pop(k, None)
+                        it["_lookup_symbol"] = str(sym).strip().upper()
+                        _apply_materiality_ratios(it, cat, {vkey: hv, "binding_status": it.get("binding_status")},
+                                                  market_cap_map, ttm_sales_map)
+                        it.pop("_lookup_symbol", None)
+
+            if cat == "Acquisition":
+                v = it.get("transaction_value_cr")
+                pct = it.get("transaction_to_market_cap_pct")
+                if (isinstance(v, (int, float)) and v < NOMINAL_ACQ_MAX_CR and
+                        (pct is None or pct < NOMINAL_ACQ_MAX_MCAP_PCT)):
+                    dropped += 1
+                    continue
+            kept.append(it)
+        if kept:
+            history[sym] = kept
+        else:
+            del history[sym]
+    if filled or overridden or dropped:
+        print(f"  🧾 Headline cross-check → filled={filled}, overridden={overridden}, "
+              f"nominal_acquisitions_dropped={dropped}")
+    return filled, overridden, dropped
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Order check pipeline (heading → PDF type check → AI only when needed)
+#   1. Value from the heading (NSE summary or the PDF "Sub:" line) — free.
+#   2. Local PDF check: is this really an order RECEIVED? Placed orders go to
+#      Capex, cancellations to Negative, L1 / Preferred Bidder / LoI fix stage.
+#   3. AI only for confirmed orders whose value is not in the heading but is
+#      disclosed somewhere in the PDF. AI returns 5 small fields.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ANNEXURE_VALUE_ROW = re.compile(
+    r"broad (?:commercial )?consideration|size of the order|value of (?:the )?(?:order|contract)|contract value|"
+    r"converted value in inr", re.I)
+ORDER_CHECK_BATCH = int(os.environ.get("ORDER_CHECK_BATCH", "25"))   # PDFs opened per run
+ORDER_CHECK_VERSION = 1
+MINING_LEASE_CATEGORY = "Order"    # set to "Capex" to move mining-lease bids out of Orders
+
+_SUBJECT_LINE_RE = re.compile(
+    r"\bsub(?:ject)?\s*[:.\-–]\s*(.{10,600}?)(?=\bdear\b|\bref(?:erence)?\s*[:.]|\brespected\b|\bpursuant\b|\bin accordance\b|$)",
+    re.I)
+_HEAD_REGION_CHARS = 2500
+_CANCEL_RE = re.compile(
+    r"(?:cancell?ation|cancell?ed|terminat(?:ion|ed)|withdraw(?:al|n)|annul(?:led|ment)|short[- ]?clos(?:ure|ed))"
+    r"\W+(?:\w+\W+){0,6}?(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|order|contract)|"
+    r"(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|order|contract)"
+    r"\W+(?:\w+\W+){0,6}?(?:cancell?ed|terminated|withdrawn|annulled|short[- ]?closed)", re.I)
+_PLACED_STRONG_RE = re.compile(
+    r"placement of (?:the )?(?:purchase |work )?order on|(?:placed|awarded) (?:the |an? )?(?:purchase |work )?(?:order|contract) (?:on|to) m/?s|"
+    r"approv\w* (?:for |the )?(?:placing|placement|award) of (?:the )?(?:purchase |work )?order", re.I)
+_PLACED_RE = re.compile(
+    r"name of (?:the )?entity to (?:which|whom) (?:the )?order|placement of (?:the )?(?:purchase |work )?order on|"
+    r"(?:placed|awarded) (?:the |an? )?(?:purchase |work )?(?:order|contract) (?:on|to) m/?s", re.I)
+_L1_RE = re.compile(
+    r"(?:declared|emerged|stood|ranked|been|is|as)\s+(?:as\s+)?(?:the\s+)?(?:l[- ]?1|lowest)\b(?!\s*(?:position|pipeline|order\s*book))|"
+    r"\bl[- ]?1\s*(?:bidder|stage|bid)\b|lowest (?:evaluated )?bidder|first lowest", re.I)
+_PREF_BIDDER_RE = re.compile(r"preferred bidder", re.I)
+_MINING_RE = re.compile(r"mining lease|mineral block|composite licen[cs]e|limestone block|coal block", re.I)
+_LOI_RE = re.compile(r"letter of intent|\bloi\b", re.I)
+_FIRM_AWARD_RE = re.compile(r"letter of (?:award|acceptance)|\bloa\b|work order|purchase order|agreement (?:signed|executed)|contract (?:signed|executed)", re.I)
+_ANY_AMOUNT_RE = re.compile(
+    r"(?:₹|rs\.?|inr|usd|us\$|eur|€|sgd|aed|gbp|£|\$)\s*[0-9]|[0-9][0-9,.]*\s*(?:crores?|lakhs?|lacs?)\b|"
+    r"[0-9][0-9,.]*\s*(?:million|billion)\s*(?:us\s*dollars?|usd|dollars?)", re.I)
+_QTY_RE = re.compile(r"\b\d[\d,.]*\s*(?:GW|MWh|MWp|MW|TPH)\b(?:\s*/\s*\d[\d,.]*\s*(?:GWh|MWh))?")
+_BAND_RE = re.compile(
+    r"(?:major|significant|large|mega|big|sizeable|ultra[- ]mega)\W{0,3}(?:order)?\W{0,3}(?:indicates?|means?|denotes?|refers? to|is defined as|classification)"
+    r"[^.]{0,80}?(?:(?:over|above|exceeding|more than|greater than|upwards of)\s*(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr)"
+    r"|(?:between|from|range of)\s*(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr)?\s*(?:and|to|-|–)\s*(?:₹|rs\.?|inr)?\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr))",
+    re.I)
+_ANNUAL_RE = re.compile(r"per annum|yearly revenue|annual(?:ly)? revenue|revenue per year|per year for|p\.a\.", re.I)
+_VENDOR_RE = re.compile(r"entity to (?:which|whom).{0,60}?awarded\s*[;:]?\s*(.{3,90}?)(?=\s+(?:b\s*\.|2\s*\.|\(ii\)|whether)(?:\s|$))", re.I)
+_CANCEL_PARTY_RE = re.compile(r"(?:received |awarded |issued )?(?:from|by)\s+((?:[A-Z][\w&.,'()-]*\s?){1,6})", re.M)
+
+
+def _pdf_subject(text: str) -> str:
+    clean = _normalize_pdf_text(text)
+    m = _SUBJECT_LINE_RE.search(clean[:4000])
+    return m.group(1).strip() if m else ""
+
+
+def _order_doc_check(pdf_text: str, nse_text: str) -> dict:
+    """Free, local classification of an order filing. Never calls AI."""
+    clean = _normalize_pdf_text(pdf_text or "")
+    subject = _pdf_subject(pdf_text or "")
+    head = f"{nse_text or ''} {subject} {clean[:_HEAD_REGION_CHARS]}"
+    out = {"subject": subject}
+    if _CANCEL_RE.search(f"{nse_text or ''} {subject}") or _CANCEL_RE.search(clean[:1200]):
+        out["doc_type"] = "cancellation"
+    elif _PLACED_STRONG_RE.search(head) or (
+            # Annexure label alone is ambiguous (some recipients name themselves there),
+            # so it needs a named vendor and must not be a "Bagging/Receiving" filing.
+            _PLACED_RE.search(clean) and _VENDOR_RE.search(clean)
+            and not re.search(r"bagging|receiv", nse_text or "", re.I)):
+        out["doc_type"] = "placed"
+    else:
+        out["doc_type"] = "received"
+        if _PREF_BIDDER_RE.search(head):
+            out["stage"] = "Preferred Bidder"
+            out["event_type"] = "Mining Lease" if _MINING_RE.search(clean) else "Order Award"
+        elif _L1_RE.search(head):
+            out["stage"], out["event_type"] = "L1 / Awaiting Award", "L1 Bidder"
+        elif _LOI_RE.search(head) and not _FIRM_AWARD_RE.search(head):
+            out["stage"], out["event_type"] = "Letter of Intent", "Order Award"
+    out["value_disclosed"] = bool(_ANY_AMOUNT_RE.search(clean))
+    q = _QTY_RE.search(head) or _QTY_RE.search(clean)
+    if q:
+        out["quantity"] = q.group(0)
+    out["annual"] = bool(_ANNUAL_RE.search(clean))
+    b = _BAND_RE.search(clean)
+    if b:
+        lo = b.group(1) or b.group(2)
+        out["band_min"] = float(lo.replace(",", ""))
+        if b.group(3):
+            out["band_max"] = float(b.group(3).replace(",", ""))
+    out["_head"] = head[:1500]
+    return out
+
+
+def _apply_band(it: dict, chk: dict) -> bool:
+    """Company only disclosed a size band: show it as a band, never as an exact value."""
+    lo = chk.get("band_min")
+    if lo is None:
+        return False
+    v = it.get("order_value_cr")
+    if v is not None and not (abs(v - lo) < 0.01 or (chk.get("band_max") and abs(v - chk["band_max"]) < 0.01)):
+        return False          # an exact value was disclosed elsewhere; keep it
+    it["order_value_cr"] = lo
+    it["order_value_role"] = "band_min"
+    hi = chk.get("band_max")
+    it["order_value_text"] = (f"₹{lo:,.0f}–{hi:,.0f} Cr (company band)" if hi else f"Over ₹{lo:,.0f} Cr (company band)")
+    return True
+
+
+def _ai_value_in_head(av: float, chk: dict) -> bool:
+    """True when the AI's figure is printed in the title/subject area, i.e. the filing's headline number."""
+    head = chk.get("_head", "")
+    for m in re.finditer(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d+)?)\s*(?:crores?|cr)", head, re.I):
+        try:
+            if abs(float(m.group(1).replace(",", "")) - av) < 0.01:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _set_ratio(it: dict, sym: str, category: str, key: str, value: float,
+               market_cap_map: dict | None, ttm_sales_map: dict | None) -> None:
+    for k in [k for k in it if k.endswith("_to_market_cap_pct") or k == "order_to_ttm_sales_pct"]:
+        it.pop(k, None)
+    it["_lookup_symbol"] = str(sym).strip().upper()
+    _apply_materiality_ratios(it, category, {key: value}, market_cap_map, ttm_sales_map)
+    it.pop("_lookup_symbol", None)
+
+
+_ORDER_OWNED = ("order_value_cr", "order_value_text", "order_value_role", "order_from", "order_purpose",
+                "order_type", "execution_period", "related_party", "order_summary", "detail_excerpt",
+                "order_to_market_cap_pct", "order_to_ttm_sales_pct", "company_share_of_order_cr")
+
+
+def _to_capex(it: dict, sym: str, chk: dict, local: dict, hv: float | None, htxt: str,
+              market_cap_map: dict | None) -> None:
+    clean_vendor = ""
+    m = _VENDOR_RE.search(_normalize_pdf_text(chk.get("_text", "")))
+    if m:
+        clean_vendor = _clean_field(m.group(1), 120)
+    value = hv if hv is not None else local.get("order_value_cr", it.get("order_value_cr"))
+    vtxt = htxt or local.get("order_value_text") or it.get("order_value_text")
+    purpose = local.get("order_purpose") or it.get("order_purpose")
+    for k in _ORDER_OWNED:
+        it.pop(k, None)
+    it["category_override"] = "Capex"
+    it["category"] = "Capex"
+    it["event_type_override"] = it["event_type"] = "Order Placed"
+    it["stage_override"] = it["stage"] = ("Board Approved" if re.search(r"board of directors|board meeting|approval of the board", chk.get("subject", "") + " " + _normalize_pdf_text(chk.get("_text", ""))[:1500], re.I)
+                                          else "Placed")
+    if value is not None:
+        it["capex_value_cr"] = value
+        if vtxt:
+            it["capex_value_text"] = vtxt
+        mcap = (market_cap_map or {}).get(str(sym).strip().upper())
+        try:
+            if mcap and float(mcap) > 0:
+                it["capex_to_market_cap_pct"] = round(float(value) / float(mcap) * 100.0, 2)
+        except (TypeError, ValueError):
+            pass
+    if clean_vendor:
+        it["vendor"] = clean_vendor
+    if purpose:
+        it["capex_purpose"] = purpose
+
+
+def _to_cancellation(it: dict, history_items: list, hv: float | None, htxt: str) -> None:
+    for k in _ORDER_OWNED:
+        it.pop(k, None)
+    it["category_override"] = it["category"] = "Negative"
+    it["negative_type"] = "Order Cancellation"
+    it["negative_stage"] = "Cancelled"
+    it["negative_parser_version"] = NEG_PARSER_VERSION   # keep the Negative PDF parser from relabelling it
+    it.pop("event_type", None); it.pop("stage", None)
+    if hv is not None:
+        it["amount_cr"], it["amount_text"] = hv, htxt
+    # Link to the award it cancels: same symbol, earlier Order card, same counterparty.
+    m = _CANCEL_PARTY_RE.search(it.get("text", ""))
+    party = m.group(1).strip(" .,") if m else ""
+    if len(party) < 4:
+        return
+    cands = [x for x in history_items if x is not it and x.get("category") == "Order"
+             and x.get("dt", "") < it.get("dt", "")
+             and party.lower() in f"{x.get('text', '')} {x.get('order_from', '')}".lower()]
+    if len(cands) == 1:
+        c = cands[0]
+        c["stage_override"] = c["stage"] = "Cancelled"
+        c["cancelled_by"] = it.get("id")
+        it["cancels"] = c.get("id")
+        if it.get("amount_cr") is None and c.get("order_value_cr") is not None:
+            it["amount_cr"] = c["order_value_cr"]
+    elif len(cands) > 1:
+        it["needs_review"] = True
+        it["review_reason"] = f"cancellation matches {len(cands)} earlier orders from {party}"
+
+
+STAGE_CHECK_VERSION = 3
+
+
+def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
+    """Re-run only the PDF type check on rows whose stage/category the first
+    order-check version changed (L1 / LoI / Preferred Bidder / Capex)."""
+    checked = changed = 0
+    for sym, items in history.items():
+        for it in items:
+            if checked >= limit:
+                break
+            if it.get("manual") or int(it.get("stage_check_v") or 0) >= STAGE_CHECK_VERSION:
+                continue
+            was_capex = it.get("category_override") == "Capex"
+            if not (was_capex or it.get("stage_override") in {"L1 / Awaiting Award", "Letter of Intent", "Preferred Bidder"}
+                    or it.get("value_source") == "gemini_pdf" or it.get("needs_review")):
+                continue
+            pdf = _download_pdf_bytes(session, it.get("link", ""))
+            if not pdf:
+                continue
+            checked += 1
+            chk = _order_doc_check(_extract_pdf_text_bytes(pdf), it.get("text", ""))
+            if was_capex and chk["doc_type"] != "placed":
+                # Back to a received order; value/customer come from the next order check.
+                for k in ("category_override", "event_type_override", "stage_override", "capex_value_cr",
+                          "capex_value_text", "capex_to_market_cap_pct", "vendor", "capex_purpose", "order_check_v"):
+                    it.pop(k, None)
+                it["category"] = "Order"
+                it["event_type"], it["stage"] = "Order Award", "Awarded"
+                changed += 1
+            if not was_capex and it.get("category") == "Order":
+                if _apply_band(it, chk):
+                    changed += 1
+                av, lv = it.get("order_value_cr"), it.get("local_value_cr")
+                if it.get("needs_review") and av is not None and (
+                        _ai_value_in_head(float(av), chk)
+                        or (lv is not None and any(x is not it and x.get("order_value_cr") is not None
+                                                   and abs(float(x["order_value_cr"]) - float(lv)) < 0.01
+                                                   for x in items))):
+                    it.pop("needs_review", None); it.pop("review_reason", None)
+                    changed += 1
+            if was_capex and chk["doc_type"] == "placed":
+                pass
+            elif not was_capex:
+                new_stage = chk.get("stage") or "Awarded"
+                new_type = chk.get("event_type") or "Order Award"
+                if new_stage != it.get("stage"):
+                    it["stage_override"] = it["stage"] = new_stage
+                    it["event_type_override"] = it["event_type"] = new_type
+                    changed += 1
+            it["stage_check_v"] = STAGE_CHECK_VERSION
+    if checked:
+        print(f"  🔁 Stage re-check → checked={checked}, changed={changed}")
+
+
+def process_orders(session, history: dict, market_cap_map: dict | None = None,
+                   ttm_sales_map: dict | None = None, pdf_limit: int = ORDER_CHECK_BATCH,
+                   ai_limit: int = AI_ORDER_BATCH) -> dict:
+    """Run the order check once per row (marker order_check_v)."""
+    global _GEMINI_RATE_LIMITED
+    _GEMINI_RATE_LIMITED = False
+    stats = dict(checked=0, heading=0, ai=0, capex=0, cancelled=0, not_disclosed=0, stage_fixed=0, queued=0)
+    queue = []
+    for sym, items in history.items():
+        for it in items:
+            if it.get("manual") or int(it.get("order_check_v") or 0) >= ORDER_CHECK_VERSION:
+                continue
+            cat = it.get("category")
+            is_cancel_neg = cat == "Negative" and _ORDER_CANCEL.search(f"{it.get('subject', '')} {it.get('text', '')}")
+            if cat == "Order" or is_cancel_neg:
+                queue.append((it.get("dt", ""), sym, it))
+    queue.sort(key=lambda t: t[0], reverse=True)
+    ai_sent = 0
+    for _dt, sym, it in queue:
+        if stats["checked"] >= pdf_limit:
+            break
+        pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
+        if not pdf_bytes:
+            continue      # retried next run; unreachable links are handled by backfill
+        stats["checked"] += 1
+        text = _extract_pdf_text_bytes(pdf_bytes)
+        chk = _order_doc_check(text, it.get("text", ""))
+        chk["_text"] = text
+        if it.get("category") == "Negative":
+            chk["doc_type"] = "cancellation"
+
+        # Heading value: NSE summary first, then the PDF "Sub:" line.
+        hv, htxt = _headline_value(it.get("text", ""))
+        hsrc = "nse_headline"
+        if hv is None:
+            hv, htxt = _headline_value(chk.get("subject", ""))
+            hsrc = "pdf_subject"
+
+        # Fresh local parse with the fixed parser (gemini/manual values are kept).
+        local = {}
+        if it.get("detail_source") not in {"gemini_pdf", "gemini"}:
+            local = _extract_order_details(text)
+
+        if chk["doc_type"] == "cancellation":
+            _to_cancellation(it, history.get(sym, []), hv, htxt)
+            stats["cancelled"] += 1
+        elif chk["doc_type"] == "placed":
+            _to_capex(it, sym, chk, local, hv, htxt, market_cap_map)
+            stats["capex"] += 1
+        else:
+            if local:
+                for k in ("order_from", "order_purpose", "order_type", "execution_period", "related_party"):
+                    it.pop(k, None)
+                for k in ("order_from", "order_purpose", "order_type", "execution_period", "related_party"):
+                    if local.get(k) not in (None, ""):
+                        it[k] = local[k]
+            if chk.get("stage"):
+                it["stage_override"] = it["stage"] = chk["stage"]
+                it["event_type_override"] = it["event_type"] = chk["event_type"]
+                if chk.get("event_type") == "Mining Lease" and MINING_LEASE_CATEGORY != "Order":
+                    it["category_override"] = it["category"] = MINING_LEASE_CATEGORY
+                stats["stage_fixed"] += 1
+            if not it.get("event_type"):
+                # Generic press-release wording left it untagged; the PDF says it is an order.
+                it["event_type_override"] = it["event_type"] = "Order Award"
+                it["stage_override"] = it["stage"] = it.get("stage") or "Awarded"
+            if chk.get("quantity") and not it.get("quantity_or_capacity"):
+                it["quantity_or_capacity"] = chk["quantity"]
+
+            if hv is not None and not chk["annual"]:
+                it["order_value_cr"], it["order_value_text"] = hv, htxt
+                it["order_value_role"] = "headline"
+                it["value_source"] = hsrc
+                lv = local.get("order_value_cr")
+                if lv and abs(lv - hv) / max(lv, hv) > HEADLINE_OVERRIDE_DIFF:
+                    it["local_value_cr"] = lv      # audit only; heading wins
+                _set_ratio(it, sym, "Order", "order_value_cr", hv, market_cap_map, ttm_sales_map)
+                stats["heading"] += 1
+            elif (local.get("order_value_cr") is not None and not chk["annual"]
+                  and (local.get("order_value_role") == "total"
+                       or re.search(r"converted value in inr|inr equivalent", local.get("detail_excerpt") or "", re.I))
+                  and _ANNEXURE_VALUE_ROW.search(local.get("detail_excerpt") or "")):
+                # Value read from the SEBI annexure consideration row: reliable, no AI needed.
+                lv = local["order_value_cr"]
+                it["order_value_cr"], it["order_value_text"] = lv, local.get("order_value_text")
+                it["order_value_role"] = "total"
+                it["value_source"] = "pdf_annexure"
+                _set_ratio(it, sym, "Order", "order_value_cr", lv, market_cap_map, ttm_sales_map)
+                stats["annexure"] = stats.get("annexure", 0) + 1
+            elif not chk["value_disclosed"]:
+                for k in ("order_value_cr", "order_value_text", "order_value_role",
+                          "order_to_market_cap_pct", "order_to_ttm_sales_pct"):
+                    it.pop(k, None)
+                it["value_disclosed"] = False
+                stats["not_disclosed"] += 1
+            else:
+                # Value is somewhere in the PDF but not in the heading -> AI.
+                if not GEMINI_API_KEY or ai_sent >= ai_limit or _GEMINI_RATE_LIMITED:
+                    if local.get("order_value_cr") is not None and it.get("order_value_cr") is None:
+                        it["order_value_cr"] = local["order_value_cr"]
+                        it["order_value_text"] = local.get("order_value_text")
+                        it["order_value_role"] = local.get("order_value_role")
+                        _set_ratio(it, sym, "Order", "order_value_cr", local["order_value_cr"],
+                                   market_cap_map, ttm_sales_map)
+                    stats["queued"] += 1
+                    continue          # no marker: AI retried on a later run
+                ai_sent += 1
+                ai = _gemini_order_details(session, pdf_bytes, it.get("link", "").rsplit("/", 1)[-1])
+                if _GEMINI_RATE_LIMITED:
+                    stats["queued"] += 1
+                    continue
+                stats["ai"] += 1
+                it["ai_checked"] = True
+                for k in ("order_from", "order_summary"):
+                    if ai.get(k):
+                        it[k] = ai[k]
+                av, basis = ai.get("order_value_cr"), ai.get("value_basis")
+                if basis == "not_disclosed" or av is None:
+                    if av is None and local.get("order_value_cr") is not None:
+                        av, basis = local["order_value_cr"], "total"
+                    else:
+                        it["value_disclosed"] = False
+                if av is not None:
+                    lv = local.get("order_value_cr")
+                    if basis == "annual":
+                        tenure = ai.get("tenure_years")
+                        it["annual_value_cr"] = av
+                        if tenure:
+                            it["tenure_years"] = tenure
+                            it["order_value_cr"] = round(av * tenure, 2)
+                            it["order_value_role"] = "annual_x_tenure"
+                        else:
+                            it["order_value_cr"] = av
+                            it["order_value_role"] = "annual"
+                        it["order_value_text"] = f"₹{av} Cr per year" + (f" × {tenure:g} yrs" if tenure else "")
+                    else:
+                        it["order_value_cr"], it["order_value_role"] = av, "ai"
+                        it["order_value_text"] = f"₹{av} Cr"
+                        if lv and abs(lv - av) / max(lv, av) > AI_AGREE_TOL:
+                            it["local_value_cr"] = lv
+                            other_card = any(x is not it and x.get("order_value_cr") is not None
+                                             and abs(float(x["order_value_cr"]) - lv) < 0.01
+                                             for x in history.get(sym, []))
+                            # Local picked an earlier order's figure ("in continuation to our letter…")
+                            # or a YTD/order-book number while AI matches the headline: AI is right.
+                            if not (other_card or _ai_value_in_head(av, chk)):
+                                it["needs_review"] = True
+                                it["review_reason"] = "AI and PDF table disagree"
+                    it["value_source"] = "gemini_pdf"
+                    _apply_band(it, chk)
+                    _set_ratio(it, sym, "Order", "order_value_cr", it["order_value_cr"],
+                               market_cap_map, ttm_sales_map)
+                    if basis == "annual" and ttm_sales_map:
+                        ttm = ttm_sales_map.get(str(sym).strip().upper())
+                        try:
+                            if ttm and float(ttm) > 0:     # annuity: yearly revenue vs yearly sales
+                                it["order_to_ttm_sales_pct"] = round(av / float(ttm) * 100.0, 2)
+                        except (TypeError, ValueError):
+                            pass
+        it["order_check_v"] = ORDER_CHECK_VERSION
+        it["stage_check_v"] = STAGE_CHECK_VERSION
+    stats["queued"] += max(0, len(queue) - stats["checked"])
+    print("  🔎 Order check → " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    return stats
+
+
+def _r2_get_json(session, filename: str):
+    import os
+    import time
+    worker_url = os.environ["WORKER_URL"].rstrip("/")
+    token = os.environ["WORKER_TOKEN"]
+    try:
         sep = "&" if "?" in filename else "?"
-        r = await client.get(f"{WORKER_URL}/{filename}{sep}v={v}", headers=DL_HEADERS, timeout=30)
+        r = session.get(
+            f"{worker_url}/{filename}{sep}v={int(time.time())}",
+            headers={"X-Secret-Token": token, "Cache-Control": "no-cache"},
+            timeout=30,
+        )
         if r.status_code == 404:
             return None
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        print(f"  ⚠ r2_get({filename}) failed: {e}")
+        print(f"  ⚠ R2 read {filename} failed ({e}) — starting with empty history")
         return None
 
 
-async def _load_bse_symbol_map(client: httpx.AsyncClient) -> dict:
-    """bse_code -> canonical `symbol` (classification.json's own field —
-    an NSE ticker like 'AUGMONT' for dual-listed stocks, or the numeric
-    bse_code itself for BSE-only stocks, matching that file's existing
-    convention). First entry wins on the rare duplicate bse_code (4 seen
-    in a 2,391-row sample) rather than erroring the whole map build."""
-    payload = await r2_get(client, "classification.json")
-    rows = payload if isinstance(payload, list) else (payload or {}).get("items") or []
-    m = {}
-    for row in rows:
-        code = (row.get("bse_code") or "").strip()
-        sym = row.get("symbol")
-        if code and sym and code not in m:
-            m[code] = sym
-    print(f"  ✓ classification.json: {len(m)} bse_code -> symbol mapping(s) loaded")
-    return m
+def _r2_get_json_strict(session, filename: str) -> tuple[bool, object]:
+    """(ok, data). 404 -> (True, None). Any other failure -> (False, None), so callers
+    never mistake a network glitch for an empty file and overwrite real history."""
+    import time
+    worker_url = os.environ["WORKER_URL"].rstrip("/")
+    token = os.environ["WORKER_TOKEN"]
+    try:
+        r = session.get(f"{worker_url}/{filename}?v={int(time.time())}",
+                        headers={"X-Secret-Token": token, "Cache-Control": "no-cache"}, timeout=30)
+        if r.status_code == 404:
+            return True, None
+        r.raise_for_status()
+        return True, r.json()
+    except Exception as e:
+        print(f"  ⚠ R2 read {filename} failed ({e})")
+        return False, None
 
 
-async def r2_put(client: httpx.AsyncClient, filename: str, data: dict):
-    body = json.dumps(data, ensure_ascii=False).encode()
-    r = await client.post(
-        f"{WORKER_URL}?file={filename}",
-        headers=UP_HEADERS,
-        content=body,
-        timeout=120
+def _r2_put_json(session, filename: str, payload: dict, quiet: bool = False):
+    import json
+    import os
+    worker_url = os.environ["WORKER_URL"].rstrip("/")
+    token = os.environ["WORKER_TOKEN"]
+    r = session.post(
+        f"{worker_url}?file={filename}",
+        headers={"X-Secret-Token": token, "Content-Type": "application/json"},
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        timeout=120,
     )
     r.raise_for_status()
-    print(f"✓ Uploaded {filename}")
+    if not quiet:
+        print(f"  ✓ Uploaded {filename}")
 
 
-def make_payload(items: list[dict]) -> dict:
-    return {
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "count": len(items),
-        "items": items
-    }
+# ─────────────────────────────────────────────────────────────────────────────
+# Corporate Action PDF check (no AI)
+# NSE's summary often says "approved" while the PDF says the board only
+# RECOMMENDED it, subject to shareholder approval (postal ballot / EGM). The
+# stage comes from the PDF; credit and record dates are captured when stated.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CA_CHECK_BATCH = int(os.environ.get("CA_CHECK_BATCH", "20"))
+CA_CHECK_VERSION = 1
+_DATE_TXT = r"(?:[A-Z][a-z]+\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Z][a-z]+,?\s+\d{4}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4})"
+_CA_SH_APPROVED = re.compile(r"(?:approved|passed)\s+by\s+(?:the\s+)?(?:shareholders|members)|requisite majority|result[s]? of (?:the )?(?:postal ballot|e-?voting|egm)", re.I)
+_CA_SH_PENDING = re.compile(r"subject to (?:the )?(?:approval|consent) of (?:the )?(?:shareholders|members)|\brecommend(?:ed|s)?\b[^.]{0,80}(?:bonus|issu|split|sub-division)|draft postal ballot notice|convening (?:an? )?(?:extra[- ]?ordinary general meeting|egm)", re.I)
+_CA_CREDIT = re.compile(r"(?:credited|dispatched|allot(?:ted|ment)).{0,200}?on or before\s+(" + _DATE_TXT + r")", re.I)
+_CA_RECORD = re.compile(r"record date[^.]{0,60}?(?:is|as|fixed as|fixed|be|:)\s*(?:on\s+)?(?:[A-Z][a-z]+day,?\s+)?(" + _DATE_TXT + r")", re.I)
 
 
-# ─────────────────────────────────────────────────────────────────────────
-# Financial Results XBRL parsing (in-capmkt / IFIndAs taxonomy)
-#
-# Context IDs (e.g. "OneD", "FourD") are NOT standardized across filers —
-# they're arbitrary labels chosen by whatever software generated the filing.
-# We classify every context by its actual period span instead of trusting
-# the ID: ~80-100 days -> quarter, ~350-380 days -> year, instant -> balance
-# sheet date. Contexts with a dimensional <scenario> (related-party tables,
-# other-expenses breakdowns etc.) are skipped — those aren't primary P&L
-# figures. If a filing lacks annual or YoY-comparison data, we simply don't
-# populate that field rather than guessing.
-# ─────────────────────────────────────────────────────────────────────────
-
-XBRL_LINK_RE = re.compile(r"/corporate/xbrl/.*\.xml$", re.IGNORECASE)
-
-# XBRL filenames embed a DDMMYYYYHHMMSS submission timestamp, e.g.
-# INTEGRATED_FILING_INDAS_1699505_22072026062423_WEB.xml -> 22072026062423.
-# This is far more reliable than the RSS entry's published_ts (which has
-# been observed to come through as 0 for this feed) for deciding which of
-# two filings for the same symbol+quarter+nature is the newer one.
-_XBRL_FILENAME_TS_RE = re.compile(r"_(\d{14})_WEB\.xml$", re.IGNORECASE)
-# Generic fallback: NSE embeds a DDMMYYYYHHMMSS submission timestamp in
-# virtually every corporate filing filename regardless of file type
-# (XBRL .xml, PDF outcome letters, etc) — e.g. "KAYA_03082026160711_..." or
-# "BLUEJET_03082026124851_FinalUpload.pdf". Used when the file isn't XBRL.
-_GENERIC_FILENAME_TS_RE = re.compile(r"_(\d{14})_")
-
-
-def _filing_ts(link: str) -> str:
-    m = _XBRL_FILENAME_TS_RE.search(link or "")
-    if m:
-        return m.group(1)
-    m = _GENERIC_FILENAME_TS_RE.search(link or "")
-    return m.group(1) if m else ""
-
-
-_IST = timezone(timedelta(hours=5, minutes=30))
-
-
-def _effective_ts(it: dict) -> int:
-    """Sort key for merging/capping nse_results_detailed.json. Prefers the
-    RSS published_ts, but falls back to the filename-embedded submission
-    timestamp when published_ts is 0 — which every record parsed before the
-    published_ts date-parsing fix has. Without this fallback, a large batch
-    of same-valued (0) timestamps makes the merge sort a no-op, so newly
-    parsed+notified items can get silently dropped by the 1000-item cap
-    truncation before ever being persisted (they were already sent to
-    Telegram, but never actually saved) — causing the exact same filings to
-    look "new" again on the next run and get re-notified forever."""
-    ts = it.get("published_ts", 0)
-    if ts:
-        return ts
-    fts = _filing_ts(it.get("link", ""))
-    if fts:
-        try:
-            dt = datetime.strptime(fts, "%d%m%Y%H%M%S").replace(tzinfo=_IST)
-            return int(dt.astimezone(timezone.utc).timestamp())
-        except ValueError:
-            pass
-    return 0
-
-_XBRL_FIELD_MAP = {
-    "RevenueFromOperations":                                              "revenue",
-    "OtherIncome":                                                        "other_income",
-    "Income":                                                             "total_income",
-    "Expenses":                                                           "total_expenses",
-    "ProfitBeforeExceptionalItemsAndTax":                                 "pbt_before_exceptional",
-    "ExceptionalItemsBeforeTax":                                          "exceptional_items",
-    "ProfitBeforeTax":                                                    "pbt",
-    "CurrentTax":                                                         "current_tax",
-    "DeferredTax":                                                        "deferred_tax",
-    "TaxExpense":                                                         "tax_expense",
-    "ProfitLossForPeriod":                                                "pat",
-    "ComprehensiveIncomeForThePeriod":                                    "comprehensive_income",
-    "PaidUpValueOfEquityShareCapital":                                    "paidup_equity_capital",
-    "FaceValueOfEquityShareCapital":                                      "face_value",
-    "BasicEarningsLossPerShareFromContinuingAndDiscontinuedOperations":   "eps_basic",
-    "DilutedEarningsLossPerShareFromContinuingAndDiscontinuedOperations": "eps_diluted",
-    "DisclosureOfNotesOnFinancialResultsExplanatoryTextBlock":            "notes_raw",
-}
-
-# Phrases NSE filers commonly use to flag that this period isn't a fair
-# YoY comparison (business transfers, discontinued ops, restructuring,
-# scheme of arrangement, etc). Matched case-insensitively against the
-# filing's own notes text — if the company itself says it, we surface it
-# rather than silently showing a misleading % change.
-_NOT_COMPARABLE_RE = re.compile(
-    r"not\s+compar(e|able)|not\s+directly\s+compar|results?\s+(are|is)\s+not\s+compar",
-    re.IGNORECASE,
-)
-
-_XBRL_META_TAGS = {
-    "ScripCode":                                          "scrip_code",
-    "Symbol":                                             "symbol",
-    "NameOfTheCompany":                                   "company_name",
-    "DateOfBoardMeetingWhenFinancialResultsWereApproved": "board_meeting_date",
-    "TypeOfReportingPeriod":                               "period_type",
-    "ReportingQuarter":                                    "quarter_label",
-    "WhetherResultsAreAuditedOrUnaudited":                 "audited",
-    "NatureOfReportStandaloneConsolidated":                "standalone_consolidated",
-}
-
-
-def _xbrl_localname(tag: str) -> str:
-    return tag.split("}", 1)[1] if "}" in tag else tag
-
-
-def _xbrl_parse_date(s):
-    try:
-        return datetime.strptime(s.strip(), "%Y-%m-%d").date()
-    except (ValueError, AttributeError, TypeError):
-        return None
-
-
-def _xbrl_classify_contexts(root) -> dict:
-    ctx_info = {}
-    for ctx in root.iter():
-        if _xbrl_localname(ctx.tag) != "context":
-            continue
-        cid = ctx.get("id")
-        has_scenario = any(_xbrl_localname(child.tag) == "scenario" for child in ctx)
-
-        period = next((c for c in ctx if _xbrl_localname(c.tag) == "period"), None)
-        if period is None:
-            continue
-
-        instant_el = start_el = end_el = None
-        for p in period:
-            ln = _xbrl_localname(p.tag)
-            if ln == "instant":
-                instant_el = p
-            elif ln == "startDate":
-                start_el = p
-            elif ln == "endDate":
-                end_el = p
-
-        if instant_el is not None:
-            d = _xbrl_parse_date(instant_el.text)
-            ctx_info[cid] = {"type": "instant", "start": None, "end": d,
-                              "days": None, "has_scenario": has_scenario}
-        elif start_el is not None and end_el is not None:
-            s, e = _xbrl_parse_date(start_el.text), _xbrl_parse_date(end_el.text)
-            days = (e - s).days if (s and e) else None
-            ctx_info[cid] = {"type": "duration", "start": s, "end": e,
-                              "days": days, "has_scenario": has_scenario}
-    return ctx_info
-
-
-def _xbrl_bucket(days):
-    if days is None:
-        return None
-    if 75 <= days <= 100:
-        return "quarter"
-    if 175 <= days <= 190:
-        return "half_year"
-    if 350 <= days <= 380:
-        return "year"
-    return None
-
-
-def _process_notes(period_dict: dict, max_notes_chars: int = 600) -> None:
-    """
-    Mutates period_dict in place: pops the raw notes text, cleans it, checks
-    for a company-stated "not comparable" caveat (common when a business
-    segment was transferred/discontinued — e.g. Paytm's Q1 FY27 standalone
-    revenue after moving its offline merchant business to a subsidiary),
-    and stores a short excerpt + boolean flag plus a truncated general note.
-    Scans the FULL text for the caveat before truncating, so a disclaimer
-    buried deep in a long notes block isn't missed.
-    """
-    raw = period_dict.pop("notes_raw", None)
-    if not raw or not isinstance(raw, str):
-        return
-
-    cleaned = re.sub(r"<br\s*/?>", " ", raw)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-    m = _NOT_COMPARABLE_RE.search(cleaned)
-    if m:
-        # grab the sentence containing the match for a short, useful excerpt
-        start = cleaned.rfind(".", 0, m.start()) + 1
-        end = cleaned.find(".", m.end())
-        end = end + 1 if end != -1 else min(len(cleaned), m.end() + 200)
-        excerpt = cleaned[start:end].strip()
-        period_dict["yoy_caution"] = True
-        period_dict["yoy_caution_note"] = excerpt[:400]
-
-    if cleaned:
-        period_dict["notes"] = cleaned[:max_notes_chars] + ("…" if len(cleaned) > max_notes_chars else "")
-
-
-def _opm_value(revenue, total_expenses, finance_costs=None, depreciation=None):
-    """
-    Operating margin as a decimal fraction, EBITDA-style:
-    (Revenue from Ops - (Total Expenses - Finance Costs - Depreciation)) / Revenue.
-    The filing's "Total expenses" line INCLUDES finance costs and D&A, so
-    (revenue - total_expenses) alone is an EBIT-style margin and understates
-    OPM heavily for capex-heavy companies (e.g. ESDS Q1 FY27: 26.2% vs the
-    correct 41.9%). Returns (opm, basis) where basis is "ebitda" when both
-    add-backs were available, else "ebit" (fallback, old formula) so callers
-    never compare margins computed on different bases.
-    """
-    if not revenue or total_expenses is None:
-        return None, None
-    if finance_costs is not None and depreciation is not None:
-        op_exp = total_expenses - finance_costs - depreciation
-        return round((revenue - op_exp) / revenue, 4), "ebitda"
-    return round((revenue - total_expenses) / revenue, 4), "ebit"
-
-
-def _compute_opm(period_dict: dict) -> None:
-    """
-    Mutates period_dict in place, adding 'opm' as a decimal fraction (e.g.
-    0.241 = 24.1%) plus 'opm_basis' ("ebitda" or "ebit") — see _opm_value().
-    """
-    opm, basis = _opm_value(period_dict.get("revenue"), period_dict.get("total_expenses"),
-                            period_dict.get("finance_costs"), period_dict.get("depreciation"))
-    if opm is not None:
-        period_dict["opm"] = opm
-        period_dict["opm_basis"] = basis
-
-
-def parse_financial_results_xbrl(xml_bytes: bytes) -> dict:
-    """Parses raw XBRL bytes into {meta, quarter, year, yoy_comparison}."""
-    from xml.etree import ElementTree as ET
-
-    root = ET.fromstring(xml_bytes)
-    ctx_info = _xbrl_classify_contexts(root)
-
-    buckets = {"quarter": [], "half_year": [], "year": [], "instant": []}
-    for cid, info in ctx_info.items():
-        if info["has_scenario"]:
-            continue
-        if info["type"] == "instant":
-            buckets["instant"].append(cid)
-        else:
-            b = _xbrl_bucket(info["days"])
-            if b:
-                buckets[b].append(cid)
-
-    for b in ("quarter", "half_year", "year", "instant"):
-        buckets[b].sort(key=lambda cid: ctx_info[cid]["end"], reverse=True)
-
-    facts_by_ctx = {}
-    for el in root.iter():
-        ln = _xbrl_localname(el.tag)
-        cref = el.get("contextRef")
-        if cref is None:
-            continue
-        facts_by_ctx.setdefault(cref, {})[ln] = el.text
-
-    def extract(cid, tag_map):
-        if cid is None or cid not in facts_by_ctx:
-            return {}
-        raw = facts_by_ctx[cid]
-        out = {}
-        for xbrl_tag, field in tag_map.items():
-            if xbrl_tag in raw and raw[xbrl_tag] is not None:
-                val = raw[xbrl_tag]
-                try:
-                    out[field] = float(val)
-                except ValueError:
-                    out[field] = val
-        return out
-
-    meta_cid = buckets["quarter"][0] if buckets["quarter"] else (
-        buckets["year"][0] if buckets["year"] else None)
-    result = {"meta": extract(meta_cid, _XBRL_META_TAGS)}
-
-    if buckets["quarter"]:
-        cur_q = buckets["quarter"][0]
-        result["quarter"] = extract(cur_q, _XBRL_FIELD_MAP)
-        result["quarter"]["period_end"] = ctx_info[cur_q]["end"].isoformat()
-        result["quarter"]["period_start"] = ctx_info[cur_q]["start"].isoformat()
-        _process_notes(result["quarter"])
-        _compute_opm(result["quarter"])
-
-        cur_start = ctx_info[cur_q]["start"]
-        for cid in buckets["quarter"][1:]:
-            other_start = ctx_info[cid]["start"]
-            if other_start and cur_start and abs((cur_start - other_start).days - 365) <= 20:
-                yoy = extract(cid, _XBRL_FIELD_MAP)
-                if yoy:
-                    yoy["period_end"] = ctx_info[cid]["end"].isoformat()
-                    _compute_opm(yoy)
-                    result["yoy_comparison"] = yoy
+def process_corp_actions(session, history: dict, limit: int = CA_CHECK_BATCH) -> None:
+    checked = changed = 0
+    for sym, items in history.items():
+        for it in items:
+            if checked >= limit:
                 break
-
-    if buckets["year"]:
-        cur_y = buckets["year"][0]
-        result["year"] = extract(cur_y, _XBRL_FIELD_MAP)
-        result["year"]["period_end"] = ctx_info[cur_y]["end"].isoformat()
-        result["year"]["period_start"] = ctx_info[cur_y]["start"].isoformat()
-        _process_notes(result["year"])
-        _compute_opm(result["year"])
-
-    return result
-
-
-FUNDAMENTALS_FILE = "fundamentals_summary.json"
-
-# ── PDF fast-path parsing (Outcome of Board Meeting) ────────────────────
-# NSE's XBRL filing for a result often lands noticeably later than the
-# "Outcome of Board Meeting" PDF for the same result (the PDF is filed the
-# moment the board approves it; XBRL is a separate, slower submission).
-#
-# Extraction is AI-only (Gemini) — see parse_financial_results_pdf. A cheap
-# regex heading pre-check (still using the pattern set below) decides
-# whether a PDF is even worth sending to the AI at all, to avoid burning an
-# API call on the majority of "Outcome of Board Meeting" PDFs that are
-# actually governance/KMP-only notices with no results table.
-
-# SUBJECT tag phrasings NSE/filers use for a PDF that MIGHT contain a
-# results table. "Outcome of Board Meeting" is the most common, but some
-# filings are tagged directly with a results-flavoured subject instead
-# (e.g. "Financial Results", "Results for the Quarter", "Un-Audited
-# Financial Results") — without matching those too, such a PDF would never
-# even get downloaded, let alone reach the heading/AI check. Being broad
-# here is safe: a false-positive match still has to clear the in-PDF
-# heading check (_pdf_find_heading_candidates) before an AI call is made,
-# so casting a wider net at this stage costs at most a wasted PDF fetch,
-# never a wasted AI call.
-_PDF_SUBJECT_PATTERNS = [
-    r"outcome of board meeting",
-    r"financial results?",
-    r"results? for the (?:quarter|year|half.?year)",
-    r"(?:un-?)?audited financial results?",
-    r"integrated filing[\s\S]{0,20}financial",
-]
-_PDF_SUBJECT_RE = re.compile("|".join(_PDF_SUBJECT_PATTERNS), re.IGNORECASE)
-# Candidate heading patterns, tried in this priority order:
-#   1. "Statement of Standalone/Consolidated ... Financial Results" (most specific)
-#   2. "Standalone/Consolidated ... Financial Results" without the "Statement of" prefix
-#   3. Bare "(Un)Audited Financial Results for the Quarter/Year" with NO
-#      Standalone/Consolidated qualifier at all — some single-entity filers
-#      (no subsidiaries) omit it entirely (confirmed: MSWIL's actual table
-#      heading was "UNAUDITED FINANCIAL RESULTS FOR THE QUARTER ENDED..."
-#      with no qualifier word anywhere nearby). Defaults to "Standalone".
-# All three commonly ALSO match inside the auditor's review-report cover
-# letter ("...reviewed the accompanying Statement of Standalone unaudited
-# financial results...") which precedes the real table in these PDFs —
-# that boilerplate sentence is excluded via _PDF_BOILERPLATE_PRECEDE_RE
-# rather than by pattern alone, since the wording is otherwise identical.
-_PDF_HEADING_PATTERNS = [
-    re.compile(r"Statement of (Standalone|Consolidated)[\s\S]{0,80}?Financial Results", re.IGNORECASE),
-    # Order A: "...Standalone Unaudited Financial Results..." (qualifier before audited-word)
-    re.compile(r"(Standalone|Consolidated)[\s\S]{0,20}?(?:Un-?)?[Aa]udited[\s\S]{0,10}?Financial Results", re.IGNORECASE),
-    # Order B: "...Unaudited Standalone Financial Results..." (audited-word before qualifier —
-    # NSE's actual real-world ordering, confirmed from a live filing: "STATEMENT OF UNAUDITED
-    # STANDALONE FINANCIAL RESULTS..."). Order A above does NOT catch this — the audited-word
-    # comes before, not after, Standalone/Consolidated, so this tier is required separately.
-    re.compile(r"(?:Un-?)?[Aa]udited[\s\S]{0,10}?(Standalone|Consolidated)[\s\S]{0,20}?Financial Results", re.IGNORECASE),
-    re.compile(r"(?:Un-?)?[Aa]udited Financial Results\s+for\s+the\s+(?:Quarter|Year)", re.IGNORECASE),
-]
-# Boilerplate lead-in phrases that precede a heading-like match inside the
-# auditor's review report cover letter rather than the actual results
-# table — e.g. "...reviewed the accompanying Statement of unaudited
-# financial results..." or "...the accompanying Statement of Standalone...".
-# Checked against the ~40 chars immediately before the match.
-_PDF_BOILERPLATE_PRECEDE_RE = re.compile(r"(accompanying|reviewed)[\s\S]{0,15}$", re.IGNORECASE)
-_PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
-
-
-# ── Whitespace-squashed fallback ──
-# The tiers above assume clean single-spaced text with a Standalone/
-# Consolidated or (Un)audited qualifier in the heading. Two real-world cases
-# break that (confirmed on DEEPA_28092026132415_bmoutcome.pdf):
-#   • Scanned PDFs with an embedded OCR layer split words mid-token
-#     ("Financia l Results", "naud ited Financi al Re ults"), and
-#     pdfplumber's layout=True mode pads extra spaces inside a line — so
-#     literal single spaces in the patterns above never match.
-#   • Single-entity filers whose table heading is simply "Statement of
-#     Financial Results for the quarter ended ..." — no qualifier and no
-#     audited-word, so none of the four tiers apply.
-# This fallback deletes ALL whitespace and matches against the squashed
-# text, so OCR word-splits and layout padding stop mattering. Only used when
-# the primary tiers find nothing; a false positive costs one AI call, which
-# the AI's own is_results_table check then rejects.
-_PDF_SQUASHED_HEADING_RE = re.compile(
-    r"statementof(?:the)?(?:un-?)?(?:audited)?(?:standalone|consolidated)?(?:un-?)?(?:audited)?"
-    r"financialresults?(?:for|of)(?:the)?(?:quarter|year|half|period|ninemonths|threemonths|sixmonths)"
-    r"|(?:un-?)?audited(?:standalone|consolidated)?financialresults?for(?:the)?"
-    r"(?:quarter|year|half|period|ninemonths|threemonths|sixmonths)",
-    re.IGNORECASE,
-)
-_PDF_SQUASHED_BOILERPLATE_RE = re.compile(r"(accompanying|reviewed)[a-z]{0,12}$", re.IGNORECASE)
-
-
-def _pdf_squashed_heading_candidates(text: str):
-    """Fallback for _pdf_find_heading_candidates — see _PDF_SQUASHED_HEADING_RE.
-    Positions are in squashed-text coordinates (callers only test truthiness)."""
-    squashed = re.sub(r"\s+", "", text)
-    out = []
-    for m in _PDF_SQUASHED_HEADING_RE.finditer(squashed):
-        if _PDF_SQUASHED_BOILERPLATE_RE.search(squashed[max(0, m.start() - 30):m.start()]):
-            continue
-        g = m.group(0).lower()
-        nature = "Consolidated" if "consolidated" in g else "Standalone"
-        out.append((m.start(), m.end(), nature))
-    return out
-
-
-def _pdf_find_heading_candidates(text: str):
-    """Returns [(start, end, nature)] for every non-boilerplate heading-like
-    match across all three pattern tiers, sorted by position. `nature` is
-    "Standalone" or "Consolidated" (defaulting to "Standalone" when the
-    matched pattern has no qualifier group, i.e. tier 3).
-
-    Used as a cheap pre-check before calling the AI — if this returns
-    empty, the PDF is (almost certainly) a governance/KMP-only outcome
-    letter with no actual results table, so we skip the AI call entirely."""
-    candidates = []
-    for pat in _PDF_HEADING_PATTERNS:
-        for m in pat.finditer(text):
-            pre = text[max(0, m.start() - 40):m.start()]
-            if _PDF_BOILERPLATE_PRECEDE_RE.search(pre):
+            if (it.get("manual") or it.get("category") != "Corporate Action"
+                    or int(it.get("ca_check_v") or 0) >= CA_CHECK_VERSION
+                    or it.get("event_type") in {"Dividend"}):
                 continue
-            nature = "Standalone"
-            if m.groups() and m.group(1) and m.group(1).lower() in ("standalone", "consolidated"):
-                nature = m.group(1).capitalize()
-            candidates.append((m.start(), m.end(), nature))
-    # de-dup near-identical positions across pattern tiers (same real
-    # heading can match more than one tier's pattern)
-    candidates.sort(key=lambda c: c[0])
-    deduped = []
-    for c in candidates:
-        if deduped and c[0] - deduped[-1][0] < 20:
-            continue
-        deduped.append(c)
-    if not deduped:
-        deduped = _pdf_squashed_heading_candidates(text)
-    return deduped
-
-
-# Some "Outcome of Board Meeting" PDFs are about something OTHER than
-# quarterly financial results entirely (NCD/debenture issuance, other
-# fundraising, share allotment) — NSE tags these with the exact same
-# generic SUBJECT as a genuine results filing, so the subject tag alone
-# can't tell them apart. These phrases in the free-text part of the
-# summary (before the |SUBJECT: tag) are strong signals the underlying
-# PDF is NOT a results filing, so we exclude them from ever entering
-# nse_results_pdf_feed.json — without this, they show up as bare
-# "RESULT" cards with no financial data (their PDF genuinely has no
-# results table for the heading-check/AI to find, so they'd always stay
-# unparsed clutter in the Results tab).
-_PDF_NON_RESULT_PATTERNS = [
-    r"non.?convertible debentures?",
-    r"\bNCDs?\b",
-    r"issuance of .*(debentures?|securities)",
-    r"allotment of (equity )?shares?",
-    r"raising funds? through",
-]
-_PDF_NON_RESULT_RE = re.compile("|".join(_PDF_NON_RESULT_PATTERNS), re.IGNORECASE)
-
-# Strong announcement-level evidence that the attached PDF really is a
-# financial-results filing. NSE's archive filename prefix is NOT guaranteed
-# to equal the current trading symbol (e.g. Pranav Constructions files as
-# PCPL_... while the NSE symbol/result-calendar entry is PRANAV). In those
-# cases a filename-symbol calendar hard gate would incorrectly drop a genuine
-# result. This detector is deliberately strict: generic "Outcome of Board
-# Meeting" does NOT match; the free-text must explicitly say financial results
-# were submitted/approved/considered or identify audited/unaudited financial
-# results for a reporting period.
-_PDF_EXPLICIT_RESULT_RE = re.compile(
-    r"(?:has\s+submitted.{0,120}?financial\s+results?|"
-    r"(?:approved|considered|adopted|taken\s+on\s+record).{0,120}?financial\s+results?|"
-    r"(?:unaudited|un-audited|audited|standalone|consolidated).{0,100}?financial\s+results?|"
-    r"financial\s+results?.{0,100}?(?:period|quarter|year|half[\s-]?year|nine\s+months?|six\s+months?|three\s+months?)\s+ended)",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _has_explicit_financial_results_text(it: dict) -> bool:
-    """True only when NSE announcement free-text explicitly confirms results.
-
-    The SUBJECT tag is intentionally excluded because a generic subject such as
-    'Outcome of Board Meeting' is not proof of a results filing.
-    """
-    summary = it.get("summary", "") or ""
-    free_text = summary.split("|SUBJECT:", 1)[0].strip()
-    return bool(_PDF_EXPLICIT_RESULT_RE.search(free_text))
-
-
-def _extract_filename_symbol(link: str) -> str:
-    """Best-effort NSE symbol/scrip-code guess from a filing's own filename
-    prefix (e.g. 'SKYWAYS_17092026...pdf' -> 'SKYWAYS') — used to cross-
-    check a candidate announcement against result_calendar.json without
-    needing to download and parse the PDF itself just to find out."""
-    fname = link.rsplit("/", 1)[-1]
-    m = _PDF_FILENAME_TS_RE.match(fname)
-    if m:
-        return m.group(1).upper()
-    return ""
-
-
-def _pdf_probable_symbol(it: dict, bse_symbol_map: dict | None) -> str:
-    """Best-effort symbol for a PDF candidate WITHOUT downloading/AI-parsing
-    it — NSE's filename embeds it directly; BSE's <scripcode> resolves via
-    classification.json. Used only to spot "the same result filed on both
-    exchanges" before spending an AI call on both copies (see the
-    cross-exchange dedup block in build_results_detailed) — a miss here
-    just means no dedup for that item, not a correctness problem, so this
-    stays best-effort rather than failing loudly."""
-    if it.get("_exchange") == "BSE":
-        code = it.get("scripcode", "")
-        return ((bse_symbol_map or {}).get(code, code) or "").upper()
-    return _extract_filename_symbol(it.get("link", ""))
-
-
-def _pdf_date_bucket(it: dict):
-    """Coarse same-IST-day bucket from published_ts, for grouping same-day
-    cross-exchange filings of the same result. None if published_ts is
-    unavailable (item is simply left out of that grouping, not dropped)."""
-    ts = it.get("published_ts", 0)
-    if not ts:
-        return None
-    return datetime.fromtimestamp(ts, tz=_IST).date().isoformat()
-
-
-def _in_result_calendar(symbol: str, calendar: dict, item_link: str, explicit_date: str = None) -> bool:
-    """True if `symbol` appears in result_calendar.json for the filing's
-    own date, or the day before/after (the predicted calendar date and the
-    actual filing date can be a day off). Fails OPEN — if the calendar is
-    empty/unavailable, or we can't confidently extract a symbol or date
-    from this item, the item is allowed through rather than silently
-    hidden, since a broken filter is worse than an occasional false
-    positive.
-
-    The date normally comes from the filing's own NSE-style embedded
-    filename timestamp (_filing_ts). explicit_date ('YYYY-MM-DD') is for
-    sources whose filenames carry no such timestamp — BSE's GUID
-    filenames — where the caller instead supplies the item's own RSS
-    pubDate (see _bse_fallback_date)."""
-    if not calendar or not symbol:
-        return True
-    if explicit_date:
-        try:
-            d = datetime.strptime(explicit_date, "%Y-%m-%d").date()
-        except ValueError:
-            return True
-    else:
-        fts = _filing_ts(item_link)
-        if not fts:
-            return True
-        try:
-            d = datetime.strptime(fts, "%d%m%Y%H%M%S").date()
-        except ValueError:
-            return True
-    for delta in (-1, 0, 1):
-        day = (d + timedelta(days=delta)).isoformat()
-        if symbol in (calendar.get(day) or []):
-            return True
-    return False
-
-
-def _is_board_outcome_pdf(it: dict) -> bool:
-    link = it.get("link", "")
-    if not link.lower().endswith(".pdf"):
-        return False
-    summary = it.get("summary", "")
-    m = _SUBJECT_TAG_RE.search(summary)
-    if not (m and _PDF_SUBJECT_RE.search(m.group(1))):
-        return False
-    free_text = summary.split("|SUBJECT:")[0]
-    if _PDF_NON_RESULT_RE.search(free_text):
-        return False
-    return True
-
-
-# BSE's announcements feed has no |SUBJECT: tag (that's an NSE-only
-# convention) — its <description> is a single free-text sentence, so
-# detection has to work off that text directly. Matched against real
-# examples: "Unaudited standalone and consolidated financial results of
-# the Company for the quarter ended 30th June 2026." (results PDF) vs.
-# "Outcome of the Board Meeting held on today... is enclosed herewith."
-# (board-outcome PDF with no numbers) and "Announcement under Regulation
-# 30 (LODR) - Press Release" / "- Investor Presentation" (no numbers) —
-# only the first pattern should pass.
-_BSE_RESULT_DESC_RE = re.compile(
-    r"(unaudited|audited)\s+(standalone|consolidated|standalone\s+and\s+consolidated).{0,100}?"
-    r"financial\s+results.{0,100}?(quarter|year|half[\s-]?year)\s+ended",
-    re.IGNORECASE,
-)
-
-
-def _is_bse_results_pdf(it: dict) -> bool:
-    link = it.get("link", "")
-    if not link.lower().endswith(".pdf"):
-        return False
-    if not it.get("scripcode"):
-        return False  # can't be identified without a scrip code
-    return bool(_BSE_RESULT_DESC_RE.search(it.get("summary", "") or ""))
-
-
-def _bse_fallback_date(published: str):
-    """BSE's own pubDate ('21-Sep-2026 19:52:08', IST, no filename
-    timestamp to fall back on) converted to the 'YYYY-MM-DD' board_meeting_date
-    shape _build_result_from_ai expects. Returns None on any parse failure
-    (caller treats that as 'can't build a dedup key', same as NSE's missing-
-    filename-timestamp case)."""
-    try:
-        return datetime.strptime((published or "").strip(), "%d-%b-%Y %H:%M:%S").strftime("%Y-%m-%d")
-    except ValueError:
-        return None
-
-
-def _dedup_bse_by_link(items: list[dict]) -> list[dict]:
-    """BSE cross-posts the exact SAME filing (identical PDF link) once per
-    scrip code a company has listed on the exchange — a company with many
-    debt instruments gets the announcement repeated once per NCD, not just
-    once for its equity (confirmed directly: Infrastructure Leasing &
-    Financial Services' single revised-FY19 filing appeared under 21
-    different scrip codes in one feed poll). dedup_items()'s (link, title,
-    summary) key can't catch this since BSE's <title> embeds the scrip
-    code (e.g. "...Ltd (958047)" vs "...Ltd (957962)"), so every copy
-    looks like a distinct item and — left unfiltered — becomes 21 separate
-    AI-parsed "results" and 21 Telegram messages for one document. Expects
-    items already sorted newest-first (same convention as dedup_items);
-    collapses to the first (most recent) occurrence per link."""
-    seen_links = set()
-    out = []
-    for it in items:
-        link = it.get("link", "")
-        if link in seen_links:
-            continue
-        seen_links.add(link)
-        out.append(it)
-    return out
-
-
-# ── Results-PDF candidate widening (calendar + generic board-outcome) ──────
-# BSE/NSE descriptions are often just "Outcome of the Board Meeting" or
-# "As per attachment" even when the PDF carries the quarterly results
-# (confirmed: Hindusthan Insulators, 3 Oct 2026). Two extra ways a PDF can
-# become a candidate; the real filter for both is the cheap heading
-# pre-check inside parse_financial_results_pdf (no Gemini call unless the
-# PDF text actually has a "Financial Results" heading):
-#   1. CALENDAR: the symbol is on result_calendar.json for the filing date
-#      (+/- 1 day) -> check its PDF no matter what the description says.
-#   2. LOOSE (BSE only): generic "Outcome of Board Meeting" text, symbol not
-#      necessarily on the calendar (surprise / short-notice results).
-# Items carry a flag (_cal_fallback / _loose) so build_results_detailed can
-# (a) accept them, and (b) give up on them sooner than on strict results.
-BSE_PDF_FEED_CAP = 3000          # bse_results_pdf_feed.json (was 500)
-SOFT_GIVE_UP_ATTEMPTS = 4        # retry cap for calendar/loose fallback items
-_GENERIC_OUTCOME_RE = re.compile(r"outcome\s+of\s+(the\s+)?board\s+meeting", re.IGNORECASE)
-
-
-def _on_calendar_strict(symbol: str, calendar: dict, iso_date: str) -> bool:
-    """Unlike _in_result_calendar this does NOT fail open: unknown symbol,
-    unknown date or empty calendar -> False. Used only to ADD candidates."""
-    if not symbol or not calendar or not iso_date:
-        return False
-    try:
-        d = datetime.strptime(iso_date, "%Y-%m-%d").date()
-    except ValueError:
-        return False
-    return any(symbol in (calendar.get((d + timedelta(days=k)).isoformat()) or []) for k in (-1, 0, 1))
-
-
-def _nse_on_calendar_strict(link: str, calendar: dict) -> bool:
-    fts = _filing_ts(link)
-    if not fts:
-        return False
-    try:
-        iso = datetime.strptime(fts, "%d%m%Y%H%M%S").date().isoformat()
-    except ValueError:
-        return False
-    return _on_calendar_strict(_extract_filename_symbol(link), calendar, iso)
-
-
-def _bse_extra_candidate_kind(it: dict, calendar: dict, bse_symbol_map: dict | None):
-    """For a BSE item that failed _is_bse_results_pdf: 'calendar', 'loose' or None."""
-    link = it.get("link", "")
-    code = it.get("scripcode", "")
-    if not link.lower().endswith(".pdf") or not code:
-        return None
-    if is_noise(it):
-        return None   # trading window, 74(5), scrutinizer, ESOP... never worth a fetch
-    sym = ((bse_symbol_map or {}).get(code, code) or "").upper()
-    if _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", ""))):
-        return "calendar"
-    text = f"{it.get('title', '')} {it.get('summary', '')}"
-    if _GENERIC_OUTCOME_RE.search(text) and not _PDF_NON_RESULT_RE.search(text):
-        return "loose"
-    return None
-
-
-def _pdf_quarter_label(period_end_iso: str):
-    try:
-        d = datetime.strptime(period_end_iso, "%Y-%m-%d")
-    except (ValueError, TypeError):
-        return None
-    if d.month in (4, 5, 6):
-        q, fy_end = 1, d.year + 1
-    elif d.month in (7, 8, 9):
-        q, fy_end = 2, d.year + 1
-    elif d.month in (10, 11, 12):
-        q, fy_end = 3, d.year + 1
-    else:
-        q, fy_end = 4, d.year
-    return f"Q{q} FY{str(fy_end)[-2:]}"
-
-
-_AI_EXTRACT_SYSTEM_PROMPT = """You extract structured financial data from an NSE-listed Indian company's quarterly results outcome PDF. You are given the extracted plain text of the document AND, usually, the actual PDF document itself.
-
-The extracted text can be genuinely UNRELIABLE for the numbers table specifically — for scanned or lower-quality PDFs, text extraction has been observed to corrupt digits outright (e.g. "406.95" extracted as "40695" with the decimal point silently dropped, or "436.33" garbled into an unrelated "13635"), not just misalign columns. When the PDF document itself is provided, treat it as the authoritative source for every number in the main results table — read the table directly from the PDF the way a person would, rather than trusting the extracted text's digits. Use the extracted text mainly for things that are awkward to re-derive from the PDF alone (confirming labels, locating which page has the table) and as a fallback only when no PDF is provided at all.
-
-Your job:
-1. Determine if this document contains an actual quarterly financial results TABLE (the "Statement of Standalone/Consolidated Financial Results" with line items like Revenue, Expenses, Profit, EPS). If it's only a cover letter, merger intimation, KMP change notice, AGM notice, or similar with no such table, set is_results_table to false and leave other fields null.
-2. Indian results filings very often show BOTH Standalone and Consolidated tables — usually as two SEPARATE tables further apart in the document, not side by side. SEARCH THE ENTIRE TEXT for a table explicitly labeled "Consolidated" before concluding only Standalone exists — don't stop at the first table you see. If a genuine Consolidated table exists, use it throughout (every field below, don't mix bases). Only use Standalone if no Consolidated table is present at all. Record which one you used in "basis" — this field is REQUIRED, never omit it.
-3. Extract values ONLY from the MAIN results table's own rows — never from a subsidiary/joint-venture footnote, a segment-wise breakdown table, or the auditor's report's boilerplate sentences, even if they mention similar words ("total income", "net profit") with numbers nearby. The main table is the one with the full standard line-item structure (Revenue, Expenses, Profit before tax, Tax expense, Profit for the period, EPS).
-4. Use the CURRENT quarter column only (the most recent quarter, i.e. the first/leftmost data column — NOT a prior-year or prior-quarter comparative column) for the "current" object.
-5. Report the unit the table itself states (look for "₹ in Crore", "Rs in Crores", "₹ in Million", "₹ in Lakh"/"₹ in Lakhs"/"Rs. in Lacs"/"Rs. in Lac" — "Lac"/"Lacs" is a very common alternate spelling of Lakh in Indian filings, treat it identically — or similar near the table header) — if genuinely no unit statement exists anywhere, use "Crore" as the default (NSE's most common convention).
-6. Ignore any numbers inside formula references like "(3+4)" or "[3-4]" next to line-item labels — those are row-number citations, not data.
-7. Also extract the prior-quarter (immediately preceding quarter, "QoQ") and same-quarter-last-year ("YoY") values for revenue, total_income, total_expenses, PAT, EPS, finance_costs and depreciation if visible as separate columns in the same main table, plus each comparison column's period-end date. Revenue, total_income and total_expenses comparative columns get missed more often than PAT/EPS — the standard NSE quarterly table always has ALL FOUR columns (current quarter, immediately-preceding quarter, same quarter last year, full year) on the SAME rows as the current-quarter figures, so for EVERY row where you found a current-quarter value, actively look at that same row's other columns for the comparative figures too rather than only checking for PAT/EPS comparatives. total_expenses specifically matters even though it isn't shown in the final display on its own — it's what the operating-profit and operating-margin comparisons are computed from downstream, so a missing prior-period total_expenses silently blanks out those comparisons even when revenue/PAT/EPS comparatives are otherwise complete.
-8. Extract the quarter-end date (the date this result is FOR, e.g. "quarter ended June 30, 2026" -> "2026-06-30").
-9. "pat" MUST be the figure the filing's own reported EPS is actually derived from (usually "Profit attributable to Owners/Shareholders of the Company" — NOT a larger "total" figure that also includes non-controlling/minority interest, if the filing distinguishes between the two). Cross-check: PAT divided by shares outstanding should roughly reconcile to the reported EPS.
-10. finance_costs and depreciation are separate P&L line items (usually "Finance Costs" and "Depreciation and Amortisation Expense") — extract them if the table shows them; the caller computes EBITDA from these, don't compute it yourself.
-11. Segment-wise revenue is usually in its own table/note (often titled "Segment Information" or "Segment Revenue") — look for it actively rather than only checking the main P&L; most listed operating companies with multiple business lines report this. Omit segment_breakup entirely if the company doesn't report segments.
-12. management_commentary: 1-3 sentence summary of any outlook/commentary/guidance mentioned in the document (not the standard boilerplate disclaimers), or null if there's none.
-13. key_highlights: 2-5 short, specific, numbers-first strings on the most notable things about this result (big beats/misses, one-off items, margin changes, notable segment performance) — omit if nothing stands out beyond the raw numbers already captured.
-14. board_meeting_outcome: brief note on any OTHER board decisions mentioned (dividend, bonus, other corporate actions), or null if there's nothing beyond the results approval itself.
-
-Return ONLY valid JSON (no markdown fences, no other text) matching exactly this schema:
-{
-  "is_results_table": true or false,
-  "basis": "Standalone" or "Consolidated" or null,
-  "unit": "Crore" or "Million" or "Lakh" or null,
-  "period_end": "YYYY-MM-DD" or null,
-  "current": {
-    "revenue": number or null,
-    "other_income": number or null,
-    "total_income": number or null,
-    "total_expenses": number or null,
-    "finance_costs": number or null,
-    "depreciation": number or null,
-    "pbt": number or null,
-    "tax_expense": number or null,
-    "pat": number or null,
-    "comprehensive_income": number or null,
-    "eps_basic": number or null,
-    "eps_diluted": number or null
-  },
-  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
-  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
-  "segment_breakup": [{"segment": string, "revenue": number}] or omitted,
-  "management_commentary": string or null,
-  "key_highlights": [string, ...] or omitted,
-  "board_meeting_outcome": string or null
-}
-
-All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
-
-
-async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str, pdf_bytes: bytes = None):
-    """Calls Gemini to extract structured financial data from the PDF's
-    extracted text AND (when provided) the raw PDF itself, sent as a
-    native document part — Gemini reads PDFs directly (including
-    rendering each page internally), so there's no need to pre-render
-    pages to images ourselves; the raw bytes are simpler and, for a
-    normal-sized results PDF, a smaller payload too. Returns the parsed
-    JSON dict, or None if the API isn't configured, the call fails, or
-    the response doesn't parse as valid JSON. Caller is responsible for
-    unit-scaling and sanity checks.
-
-    The PDF matters because pdfplumber's text extraction can come out
-    genuinely GARBLED for scanned/image-quality filings — not just
-    misaligned columns, but wrong digits entirely (confirmed directly:
-    one filing's "406.95" extracted as "40695" with the decimal point
-    gone, "436.33" as "13635", "Unaudited" as "Cnaudited"). No amount of
-    prompt tuning fixes an AI reading from already-corrupted input text —
-    giving it the actual PDF lets it read the table visually, the same
-    way a person would, sidestepping that text-layer corruption entirely
-    for the numbers that actually matter.
-
-    Same _AI_EXTRACT_SYSTEM_PROMPT and same output schema as the old
-    Claude-based version — _build_result_from_ai() downstream needs no
-    changes. Gemini has no separate system-prompt slot in this endpoint,
-    so the instructions are prepended to the single user turn instead."""
-    if not GEMINI_API_KEY:
-        return None
-    try:
-        parts = [{"text": _AI_EXTRACT_SYSTEM_PROMPT + "\n\n" + text[:60000]}]
-        if pdf_bytes:
-            parts.append({"inline_data": {"mime_type": "application/pdf",
-                                           "data": base64.b64encode(pdf_bytes).decode()}})
-
-        r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
-            json={
-                # Matches the known-working browser-based RHP extractor's
-                # request shape exactly (same model, same generationConfig,
-                # same 60000-char text cap) — that tool reliably gets clean
-                # JSON back from this model. An earlier attempt here added
-                # a "thinkingConfig": {"thinkingBudget": 0} field that
-                # isn't present in the working reference at all; every
-                # response after adding it came back truncated a few
-                # hundred characters into the JSON regardless of how high
-                # maxOutputTokens was raised, so that field (not the token
-                # budget) was almost certainly the actual cause — removed.
-                "contents": [{"parts": parts}],
-                "generationConfig": {
-                    "temperature": 0.05,
-                    "maxOutputTokens": 8192,
-                    "responseMimeType": "application/json",
-                },
-            },
-            timeout=90,
-        )
-        if r.status_code == 429:
-            print(f"    · [{fname_dbg}] AI extraction skipped: Gemini quota/rate limit hit")
-            return None
-        r.raise_for_status()
-        data = r.json()
-        candidates = data.get("candidates") or []
-        if not candidates or "content" not in candidates[0]:
-            print(f"    · [{fname_dbg}] AI extraction: unexpected Gemini response shape")
-            return None
-        finish_reason = candidates[0].get("finishReason", "")
-        parts = candidates[0]["content"].get("parts") or []
-        raw_text = "".join(p.get("text", "") for p in parts).strip()
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.MULTILINE).strip()
-        try:
-            # strict=False allows literal control characters (unescaped raw
-            # newlines/tabs) inside JSON string values without raising —
-            # Gemini occasionally emits a raw newline inside a multi-line
-            # text field (e.g. management_commentary) instead of the
-            # JSON-escaped \n, which under strict (default) parsing
-            # surfaces as a confusing "Unterminated string starting at..."
-            # error even though the response is otherwise well-formed.
-            parsed = json.loads(cleaned, strict=False)
-        except json.JSONDecodeError as je:
-            # Surface finishReason on a parse failure — "MAX_TOKENS" here
-            # means the response was genuinely cut off mid-JSON (budget
-            # exhausted, likely by internal thinking tokens), vs "STOP"
-            # meaning the model finished normally but emitted malformed
-            # JSON — the two need different fixes, so don't conflate them.
-            print(f"    · [{fname_dbg}] AI JSON parse failed ({je}); finishReason={finish_reason or 'unknown'}, "
-                  f"response length={len(raw_text)} chars")
-            return None
-        return parsed
-    except Exception as e:
-        print(f"    · [{fname_dbg}] AI extraction failed: {type(e).__name__}: {e}")
-        return None
-
-
-def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = "",
-                           scrip_code: str = None, fallback_board_meeting_date: str = None,
-                           symbol_override: str = None, exchange: str = "NSE", preextracted_text: str = None):
-    """Converts the AI extraction's JSON into the {meta, quarter,
-    qoq_fundamentals, yoy_fundamentals} shape used throughout the pipeline —
-    plus segment_breakup / management_commentary / key_highlights /
-    board_meeting_outcome as additional top-level keys when the AI found
-    them (not every filing has these; XBRL parsing never populates them,
-    so downstream code that doesn't know about them just won't see the
-    keys — no other function needs to change).
-    Applies unit scaling and a total_income reconciliation sanity check.
-    Returns None if the AI result fails basic validation (missing
-    revenue+PAT, bad date, unmatched filename).
-
-    scrip_code / fallback_board_meeting_date / symbol_override / exchange
-    exist for BSE: unlike NSE, a BSE filing's own filename is a random GUID
-    with no embedded symbol or timestamp, and its PDF text won't contain
-    "NSE Symbol: ...". Passing these lets the caller supply, from the RSS
-    item itself, what NSE filings otherwise let this function derive from
-    the filename alone. All four are no-ops for NSE (left as None/"NSE"),
-    so NSE's existing filename-derived behavior is unchanged."""
-    cur = ai.get("current") or {}
-    nature = ai.get("basis") or "Standalone"
-    unit_word = (ai.get("unit") or "Crore").lower()
-    if unit_word.startswith("million"):
-        unit_multiplier = 1e6
-    elif unit_word.startswith("lakh"):
-        unit_multiplier = 1e5
-    else:
-        unit_multiplier = 1e7  # Crore, NSE's default convention
-
-    def scale(v):
-        return v * unit_multiplier if isinstance(v, (int, float)) else None
-
-    revenue = scale(cur.get("revenue"))
-    other_income = scale(cur.get("other_income"))
-    total_income = scale(cur.get("total_income"))
-    total_expenses = scale(cur.get("total_expenses"))
-    finance_costs = scale(cur.get("finance_costs"))
-    depreciation = scale(cur.get("depreciation"))
-    pbt = scale(cur.get("pbt"))
-    tax_expense = scale(cur.get("tax_expense"))
-    pat = scale(cur.get("pat"))
-    comprehensive = scale(cur.get("comprehensive_income"))
-    eps_basic = cur.get("eps_basic")      # per-share rupee amount — never scaled
-    eps_diluted = cur.get("eps_diluted")
-
-    # EBITDA = PBT + Finance Costs + Depreciation (no Other Income subtraction,
-    # matching the convention validated against several real filings' own stated
-    # EBITDA — not company-defined "Adjusted EBITDA", which can differ). Only
-    # computed when the filing's table actually broke out both line items.
-    ebitda = (pbt + finance_costs + depreciation) if (pbt is not None and finance_costs is not None and depreciation is not None) else None
-
-    if revenue is None and pat is None:
-        print(f"    · [{fname_dbg}] AI returned is_results_table=true but no revenue/PAT — treating as invalid")
-        return None
-
-    # Total Income must equal Revenue + Other Income by definition. Even AI
-    # extraction can occasionally pick up a stray number from a notes/
-    # segment sub-table, so this stays as defense-in-depth.
-    if revenue is not None and other_income is not None and total_income is not None:
-        expected = revenue + other_income
-        if abs(expected - total_income) > max(1e7, 0.02 * abs(expected)):
-            print(f"    · [{fname_dbg}] AI total_income sanity check failed: ₹{total_income/1e7:.2f} Cr, "
-                  f"but revenue+other_income = ₹{expected/1e7:.2f} Cr — using computed value")
-            total_income = round(expected, 2)
-
-    period_end = ai.get("period_end")
-    if not period_end:
-        print(f"    · [{fname_dbg}] AI result missing period_end — can't build dedup key")
-        return None
-    try:
-        datetime.strptime(period_end, "%Y-%m-%d")
-    except (ValueError, TypeError):
-        print(f"    · [{fname_dbg}] AI returned invalid period_end format: {period_end!r}")
-        return None
-
-    fname = link.rsplit("/", 1)[-1]
-    m_fn = _PDF_FILENAME_TS_RE.match(fname)
-    if m_fn:
-        board_meeting_date = f"{m_fn.group(4)}-{m_fn.group(3)}-{m_fn.group(2)}"
-        fname_symbol = m_fn.group(1)
-    elif fallback_board_meeting_date:
-        board_meeting_date = fallback_board_meeting_date
-        fname_symbol = None
-    else:
-        print(f"    · [{fname_dbg}] no filename timestamp and no fallback date supplied — can't build dedup key")
-        return None
-
-    m_sym = re.search(r"NSE\s+Symbol\s*:?\s*\n?\s*([A-Z0-9&]+)", text, re.IGNORECASE)
-    if symbol_override:
-        symbol = symbol_override
-    elif m_sym:
-        symbol = m_sym.group(1).upper()
-    elif fname_symbol:
-        symbol = fname_symbol
-    else:
-        print(f"    · [{fname_dbg}] no symbol in filing text, filename, or override — skipping")
-        return None
-
-    m_aud = re.search(r"\((Unaudited|Audited)\)", text, re.IGNORECASE)
-    audited = m_aud.group(1).capitalize() if m_aud else None
-
-    first_line = text.strip().split("\n", 1)[0].strip()
-    company_name = rss_title.strip() if rss_title and rss_title.strip() else (
-        first_line if first_line and len(first_line) < 80 else symbol)
-
-    quarter = {
-        "revenue": revenue, "other_income": other_income, "total_income": total_income,
-        "total_expenses": total_expenses, "finance_costs": finance_costs, "depreciation": depreciation,
-        "pbt": pbt, "tax_expense": tax_expense, "pat": pat, "ebitda": ebitda,
-        "comprehensive_income": comprehensive, "eps_basic": eps_basic, "eps_diluted": eps_diluted,
-        "period_end": period_end,
-    }
-    _compute_opm(quarter)
-
-    result = {
-        "meta": {
-            "symbol": symbol,
-            "company_name": company_name,
-            "board_meeting_date": board_meeting_date,
-            "standalone_consolidated": nature,
-            "audited": audited,
-            "quarter_label": _pdf_quarter_label(period_end),
-            "scrip_code": scrip_code,
-            "exchange": exchange,
-            "source": "pdf",
-            "extraction_method": "ai",
-        },
-        "quarter": quarter,
-    }
-
-    # Narrative/extra fields the AI schema captures that XBRL doesn't —
-    # attached only when present so callers that don't know about them yet
-    # (Telegram formatting, R2 schema) are unaffected.
-    if ai.get("segment_breakup"):
-        # Scale each segment's revenue the same way every other rupee
-        # figure above is scaled (Crore/Million/Lakh -> raw rupees) — the
-        # AI reports these in the filing's stated unit just like revenue/
-        # PAT/etc, so leaving them unscaled would make segment numbers
-        # ~1e5-1e7x smaller than everything else downstream expects
-        # (_fmt_cr divides by 1e7 assuming raw rupees).
-        result["segment_breakup"] = [
-            {"segment": s.get("segment"), "revenue": scale(s.get("revenue"))}
-            for s in ai["segment_breakup"] if isinstance(s, dict) and s.get("segment")
-        ]
-    if ai.get("management_commentary"):
-        result["management_commentary"] = ai["management_commentary"]
-    if ai.get("key_highlights"):
-        result["key_highlights"] = ai["key_highlights"]
-    if ai.get("board_meeting_outcome"):
-        result["board_meeting_outcome"] = ai["board_meeting_outcome"]
-
-    qoq = ai.get("qoq_prior") or {}
-    yoy = ai.get("yoy_prior") or {}
-    qoq_prior = {
-        "revenue": scale(qoq.get("revenue")), "total_income": scale(qoq.get("total_income")),
-        "pat": scale(qoq.get("pat")), "eps_basic": qoq.get("eps_basic"),
-        "total_expenses": scale(qoq.get("total_expenses")),
-        "finance_costs": scale(qoq.get("finance_costs")), "depreciation": scale(qoq.get("depreciation")),
-    }
-    yoy_prior = {
-        "revenue": scale(yoy.get("revenue")), "total_income": scale(yoy.get("total_income")),
-        "pat": scale(yoy.get("pat")), "eps_basic": yoy.get("eps_basic"),
-        "total_expenses": scale(yoy.get("total_expenses")),
-        "finance_costs": scale(yoy.get("finance_costs")), "depreciation": scale(yoy.get("depreciation")),
-    }
-    qoq_header = _quarter_header(qoq.get("period_end")) if qoq.get("period_end") else None
-    yoy_header = _quarter_header(yoy.get("period_end")) if yoy.get("period_end") else None
-    qoq_fund = _pdf_comparison(quarter, qoq_prior, qoq_header, "qoq")
-    yoy_fund = _pdf_comparison(quarter, yoy_prior, yoy_header, "yoy")
-    if qoq_fund:
-        result["qoq_fundamentals"] = qoq_fund
-    if yoy_fund:
-        result["yoy_fundamentals"] = yoy_fund
-
-    return result
-
-
-def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
-    """Builds a comparison dict (sales_prior/sales_{suffix}_pct, pat_...,
-    eps_..., opm_...) computed directly from the PDF's own comparative
-    column via the AI extraction — this is the filing's own reported
-    comparative figure, which is more precise than a separate fundamentals
-    database lookup. basis="reported" flags this as sourced from the
-    filing itself."""
-    if not prior_header or not any(v is not None for v in prior.values()):
-        return None
-    out = {"basis": "reported", "basis_verified": True, "prior_header": prior_header}
-    field_map = {"revenue": "sales", "total_income": "total_income", "pat": "pat", "eps_basic": "eps"}
-    got_any = False
-    for cur_field, out_field in field_map.items():
-        cur_v, prior_v = cur.get(cur_field), prior.get(cur_field)
-        if cur_v is not None and prior_v is not None and prior_v != 0:
-            out[f"{out_field}_prior"] = prior_v
-            out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
-            got_any = True
-    # Compute both sides on the SAME basis: if either period is missing its
-    # finance_costs/depreciation add-backs, fall back to the EBIT-style
-    # formula for both, so the pp delta never mixes two margin definitions.
-    both_ebitda = all(d.get(k) is not None for d in (cur, prior) for k in ("finance_costs", "depreciation"))
-    fc_dep = lambda d: (d.get("finance_costs"), d.get("depreciation")) if both_ebitda else (None, None)
-    prior_opm, _ = _opm_value(prior.get("revenue"), prior.get("total_expenses"), *fc_dep(prior))
-    cur_opm, _ = _opm_value(cur.get("revenue"), cur.get("total_expenses"), *fc_dep(cur))
-    if cur_opm is not None and prior_opm is not None:
-        out["opm_prior"] = round(prior_opm * 100, 2)
-        out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
-        got_any = True
-    return out if got_any else None
-
-
-async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = "",
-                                       scrip_code: str = None, fallback_board_meeting_date: str = None,
-                                       symbol_override: str = None, exchange: str = "NSE",
-                                       preextracted_text: str | None = None):
-    """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
-    {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
-    flow through the same grouping/dedup/Telegram code.
-
-    AI-ONLY extraction (no regex fallback):
-      1. Extract text via pdfplumber.
-      2. Cheap regex heading pre-check (_pdf_find_heading_candidates) — if
-         no non-boilerplate 'Financial Results' heading is found at all,
-         this is (almost certainly) a governance/KMP-only outcome letter
-         with no results table, so we skip the AI call entirely rather than
-         spending an API call on it.
-      3. Only if a heading candidate exists do we call Gemini
-         (_ai_extract_financials) to actually extract the numbers. If the
-         AI call is unavailable (no GEMINI_API_KEY), fails, says
-         is_results_table=false, or its result fails validation, we
-         return None — there is no regex-based numeric fallback anymore.
-
-    rss_title is the company name straight from the NSE RSS feed's own
-    <title> element (e.g. "Uno Minda Limited") — used as company_name
-    instead of guessing from the PDF's first line, which was confirmed
-    unreliable (grabbed dates, website URLs, reference numbers, or
-    name+address as if they were the company name).
-    """
-    import pdfplumber
-    import io as _io
-
-    fname_dbg = link.rsplit("/", 1)[-1]
-
-    if preextracted_text is not None:
-        text = preextracted_text
-    else:
-        try:
-            with pdfplumber.open(_io.BytesIO(content)) as pdf:
-                text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
-        except Exception as e:
-            print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
-            return None
-    if not text.strip():
-        print(f"    · [{fname_dbg}] extracted text is empty (likely a scanned/image-only PDF)")
-        return None
-
-    # ── Cheap pre-check BEFORE spending an AI call ──
-    # Most "Outcome of Board Meeting" PDFs are governance/KMP-only (no
-    # results table) — no point burning a Gemini call on those.
-    if not _pdf_find_heading_candidates(text):
-        print(f"    · [{fname_dbg}] no 'Financial Results' heading found — not a results PDF, skipping AI call")
-        return None
-
-    # ── AI extraction (sole extraction path — no regex fallback) ──
-    # Send the FULL extracted PDF text (not a truncated head-of-document
-    # slice) — Gemini flash's context window comfortably fits an entire
-    # results PDF, and truncating to a fixed prefix was clipping the actual
-    # table on filings with a long cover letter/auditor's report ahead of
-    # it. _ai_extract_financials still applies its own generous safety cap
-    # for the rare pathologically long document. The raw PDF (`content`,
-    # already in memory from the fetch) is sent alongside the text and
-    # takes priority for the actual numbers — Gemini reads PDFs natively,
-    # so there's no need to pre-render pages to images ourselves.
-    ai = await _ai_extract_financials(client, text, fname_dbg, content)
-    if not ai:
-        if not GEMINI_API_KEY:
-            print(f"    · [{fname_dbg}] skipping — GEMINI_API_KEY not set")
-        else:
-            print(f"    · [{fname_dbg}] AI extraction failed or returned unparseable data — skipping")
-        return None
-    if not ai.get("is_results_table"):
-        print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
-        return None
-
-    result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title,
-                                    scrip_code=scrip_code, fallback_board_meeting_date=fallback_board_meeting_date,
-                                    symbol_override=symbol_override, exchange=exchange)
-    if not result:
-        print(f"    · [{fname_dbg}] AI result failed validation (missing revenue/PAT, bad date, or filename mismatch) — skipping")
-    return result
-
-
-async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
-    """Same retry/backoff/cache-bust profile as fetch_xbrl_bytes — NSE's
-    archive host shows the same flakiness for PDFs as for XBRL."""
-    sep = "&" if "?" in url else "?"
-    for attempt in range(retries):
-        fetch_url = url if attempt == 0 else f"{url}{sep}_cb={int(time.time() * 1000)}{attempt}"
-        try:
-            r = await client.get(fetch_url, headers=BROWSER_HEADERS, timeout=30, follow_redirects=True)
-            if r.status_code == 404:
-                return None
-            if r.status_code in (403, 429, 502, 503, 504):
-                if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt + 1)
-                    continue
-                r.raise_for_status()
-            r.raise_for_status()
-            return r.content
-        except httpx.HTTPStatusError:
-            raise
-        except Exception as e:
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt + 1)
+            pdf = _download_pdf_bytes(session, it.get("link", ""))
+            if not pdf:
                 continue
-            raise RuntimeError(str(e))
-    return None
-
-
-def _quarter_header(iso_date: str):
-    """'2026-06-30' -> 'Jun 2026' (matches fundamentals_summary.json's quarter header format)."""
-    try:
-        d = datetime.strptime(iso_date, "%Y-%m-%d")
-        return d.strftime("%b %Y")
-    except (ValueError, TypeError):
-        return None
-
-
-def _fundamentals_basis(symbol: str, xbrl_nature: str, fundamentals: dict):
-    """Returns (stock_dict, basis_label) if fundamentals_summary.json's stype
-    for this symbol matches the XBRL filing's own standalone/consolidated
-    nature, else (None, None) — see _compare_to_fundamentals docstring for
-    why we refuse to guess across a basis mismatch.
-
-    Checks the primary stype first, then the dual-tracked alt series
-    (quarters_alt/stype_alt — added July 2026 to pipeline_fundamentals_prod.py)
-    before giving up. The primary pick is a strict-recency tie-break that
-    favours Consolidated on a tie even when Standalone is equally current,
-    so a Standalone XBRL filing would otherwise never match even though the
-    data exists in fundamentals — quarters_alt is where fundamentals stores
-    that "lost" tie-break series.
-    """
-    if not fundamentals or not symbol:
-        return None, None
-    stock = fundamentals.get(symbol.upper())
-    if not stock:
-        return None, None
-    basis_map = {"c": "consolidated", "s": "standalone"}
-    nature = (xbrl_nature or "").strip().lower()
-
-    stype = (stock.get("stype") or "").strip().lower()
-    if stype in basis_map and basis_map[stype] == nature:
-        return stock, basis_map[stype]
-
-    stype_alt = (stock.get("stype_alt") or "").strip().lower()
-    if stype_alt in basis_map and basis_map[stype_alt] == nature and stock.get("quarters_alt"):
-        # Shim: reuse _compare_to_fundamentals' existing stock["quarters"]
-        # lookup by presenting quarters_alt under that same key.
-        alt_stock = dict(stock)
-        alt_stock["quarters"] = stock["quarters_alt"]
-        return alt_stock, basis_map[stype_alt]
-
-    return None, None
-
-
-def _compare_to_fundamentals(stock: dict, basis: str, xbrl_quarter: dict, prior_header: str, suffix: str):
-    """
-    Shared comparison logic for both YoY and QoQ: looks up `prior_header`
-    in the stock's fundamentals quarters, and computes % change for
-    Revenue/PAT/EPS against the XBRL-parsed current quarter (xbrl_quarter)
-    — not against fundamentals' own current-quarter figure, which usually
-    isn't there yet (fundamentals lags the live XBRL feed).
-
-    suffix distinguishes the output field names ("yoy" -> sales_yoy_pct,
-    "qoq" -> sales_qoq_pct) so both can coexist in the same result dict.
-    """
-    if not xbrl_quarter or not prior_header:
-        return None
-    quarters = stock.get("quarters") or []
-    by_header = {q.get("header"): q for q in quarters if q.get("header")}
-    prior_q = by_header.get(prior_header)
-    if not prior_q:
-        return None
-
-    out = {"basis": basis, "basis_verified": True, "prior_header": prior_header}
-    field_map = {"revenue": "sales", "pat": "pat", "eps_basic": "eps"}
-    got_any = False
-    for xbrl_field, fund_field in field_map.items():
-        cur_v = xbrl_quarter.get(xbrl_field)
-        prior_v = prior_q.get(fund_field)
-        if cur_v is not None and prior_v is not None and prior_v != 0:
-            out[f"{fund_field}_prior"] = prior_v
-            out[f"{fund_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
-            got_any = True
-
-    # OPM — percentage-POINT change, not relative % change. A margin is
-    # already a percentage, so "OPM 24.1% (+1.8pp)" is what's meaningful,
-    # not "OPM changed by +8.1%" (relative change of a percentage is
-    # confusing to read). fundamentals' own 'opm' field is a decimal
-    # fraction (e.g. 0.223), same convention as xbrl_quarter['opm'].
-    cur_opm = xbrl_quarter.get("opm")
-    prior_opm = prior_q.get("opm")
-    if cur_opm is not None and prior_opm is not None:
-        out["opm_prior"] = round(prior_opm * 100, 2)
-        out[f"opm_{suffix}_pp"] = round((cur_opm - prior_opm) * 100, 2)
-        got_any = True
-
-    return out if got_any else None
-
-
-def _yoy_fundamentals(symbol: str, period_end_iso: str, xbrl_quarter: dict, xbrl_nature: str, fundamentals: dict):
-    """
-    Fallback YoY using the fundamentals database when the XBRL filing itself
-    didn't tag a prior-year-same-quarter context (common — many filers only
-    tag the current period). Only needs fundamentals' PRIOR-year quarter —
-    the current quarter's figures come from the XBRL we already parsed.
-
-    BASIS CHECK: fundamentals_summary.json tags each stock's series with
-    `stype` ("c"=Consolidated, "s"=Standalone). We only compute YoY when
-    this matches the XBRL filing's own NatureOfReportStandaloneConsolidated
-    — Standalone vs Consolidated PAT/Revenue can differ by 15-20%+ for the
-    same company/quarter (seen directly: Paytm standalone PAT ₹185cr vs
-    consolidated ₹220cr, same quarter), so comparing across a basis
-    mismatch would produce a misleading % change. On mismatch or missing
-    stype, we skip rather than guess.
-    """
-    stock, basis = _fundamentals_basis(symbol, xbrl_nature, fundamentals)
-    if not stock:
-        return None
-    cur_header = _quarter_header(period_end_iso)
-    if not cur_header:
-        return None
-    try:
-        cur_month, cur_year = cur_header.split()
-        prior_header = f"{cur_month} {int(cur_year) - 1}"
-    except ValueError:
-        return None
-    return _compare_to_fundamentals(stock, basis, xbrl_quarter, prior_header, "yoy")
-
-
-def _qoq_fundamentals(symbol: str, xbrl_quarter: dict, xbrl_nature: str, fundamentals: dict):
-    """
-    QoQ (immediately-preceding quarter) comparison. XBRL filings essentially
-    never tag the prior quarter as a context (unlike prior-year, which some
-    filers do), so this is fundamentals-only — no XBRL-native equivalent to
-    check first, unlike YoY. Prior quarter is derived from the current
-    quarter's own period_start (one day earlier = prior quarter's end date),
-    which is exact rather than assuming a fixed calendar-quarter cycle.
-    """
-    if not xbrl_quarter:
-        return None
-    stock, basis = _fundamentals_basis(symbol, xbrl_nature, fundamentals)
-    if not stock:
-        return None
-    period_start = xbrl_quarter.get("period_start")
-    if not period_start:
-        return None
-    try:
-        start_date = datetime.strptime(period_start, "%Y-%m-%d").date()
-    except ValueError:
-        return None
-    prior_end = start_date - timedelta(days=1)
-    prior_header = prior_end.strftime("%b %Y")
-    return _compare_to_fundamentals(stock, basis, xbrl_quarter, prior_header, "qoq")
-
-
-XBRL_HEADERS = {
-    **BROWSER_HEADERS,
-    "Accept": "application/xml, text/xml, */*",
-    "Referer": "https://www.nseindia.com/",
-}
-
-
-async def fetch_xbrl_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
-    """Fetch raw XBRL bytes with backoff on 403/502/503/504/network errors.
-
-    403s on this host tend to be a CDN-edge-cached negative response tied to
-    the exact URL (the file itself is fine — a request from a different
-    edge/POP returns 200), not a real per-IP block. So after the first 403
-    we retry with a cache-busting query param so the CDN can't serve the
-    same cached 403 again — it's forced to treat it as a fresh URL."""
-    sep = "&" if "?" in url else "?"
-    for attempt in range(retries):
-        fetch_url = url if attempt == 0 else f"{url}{sep}_cb={int(time.time() * 1000)}{attempt}"
-        try:
-            r = await client.get(fetch_url, headers=XBRL_HEADERS, timeout=30, follow_redirects=True)
-            if r.status_code == 404:
-                return None
-            if r.status_code in (403, 429, 502, 503, 504):
-                if attempt < retries - 1:
-                    await asyncio.sleep(2 ** attempt + 1)
-                    continue
-                r.raise_for_status()
-            r.raise_for_status()
-            return r.content
-        except httpx.HTTPStatusError:
-            raise
-        except Exception as e:
-            if attempt < retries - 1:
-                await asyncio.sleep(2 ** attempt + 1)
-                continue
-            raise RuntimeError(str(e))
-    return None
-
-
-def _fmt_cr(val):
-    """Formats a raw rupee value as ₹X.XX Cr for Telegram messages."""
-    if val is None:
-        return "—"
-    try:
-        return f"₹{val / 1e7:,.2f} Cr"
-    except (TypeError, ZeroDivisionError):
-        return "—"
-
-
-def _shorten_quarter_header(h):
-    """'Mar 2026' -> \"Mar'26\" — compact month+2-digit-year label so the
-    monospace comparison table's column headers stay narrow, matching the
-    abbreviated style financial-data aggregator sites commonly use."""
-    if not h:
-        return None
-    parts = h.split()
-    if len(parts) != 2 or len(parts[1]) < 2:
-        return h
-    mon, yr = parts
-    return f"{mon}'{yr[-2:]}"
-
-
-def _fmt_table_num(val, decimals=1):
-    """Compact number for a monospace table cell — no ₹ symbol (keeps
-    columns narrow enough to line up on a phone screen), '-' for missing."""
-    if val is None:
-        return "-"
-    try:
-        return f"{val:,.{decimals}f}"
-    except (TypeError, ValueError):
-        return "-"
-
-
-def _fmt_table_pct(val, decimals=1):
-    if val is None:
-        return "-"
-    try:
-        return f"{'+' if val >= 0 else ''}{val:.{decimals}f}%"
-    except (TypeError, ValueError):
-        return "-"
-
-
-def _fmt_table_pp(val, decimals=1):
-    """Percentage-POINT delta for the OPM row — a margin is already a
-    percentage, so its change should read as '+1.8pp', not a relative %
-    change of the percentage itself."""
-    if val is None:
-        return "-"
-    try:
-        return f"{'+' if val >= 0 else ''}{val:.{decimals}f}pp"
-    except (TypeError, ValueError):
-        return "-"
-
-
-def _telegram_fin_table(parsed: dict) -> list:
-    """Builds a compact multi-column comparison table — Metric rows
-    (Sales/PAT/EPS/OPM%) x QoQ/YoY/Current/QoQ-prior/YoY-prior columns —
-    as a Telegram <pre> monospace block. Mirrors the row-x-column layout
-    financial-data aggregator apps (e.g. Earnings Pulse) use; Telegram
-    messages can't render a real HTML table, so this is plain fixed-width
-    text instead. Returns [] if there's no prior-period data to compare
-    against at all (nothing to build a table from)."""
-    q = parsed.get("quarter", {})
-    revenue = q.get("revenue")
-    total_income = q.get("total_income")
-    # "Sales" = Revenue from Operations (excludes Other Income), matching
-    # screener/aggregator convention. Total Income only as a fallback.
-    cur_rev = revenue if revenue is not None else total_income
-    cur_pat = q.get("pat")
-    cur_eps = q.get("eps_basic")
-    cur_opm = round(q["opm"] * 100, 1) if q.get("opm") is not None else None
-    cur_header = _shorten_quarter_header(_quarter_header(q.get("period_end"))) or "Cur"
-
-    qf = parsed.get("qoq_fundamentals") or {}
-    yoy_native = parsed.get("yoy_comparison")
-    yf = parsed.get("yoy_fundamentals") or {}
-
-    def _pick(ti_key, sales_key, source):
-        sv = source.get(sales_key)
-        return sv if sv is not None else source.get(ti_key)
-
-    qoq_rev = _pick("total_income_prior", "sales_prior", qf)
-    qoq_rev_pct = qf.get("sales_qoq_pct")
-    if qoq_rev_pct is None:
-        qoq_rev_pct = qf.get("total_income_qoq_pct")
-    qoq_pat = qf.get("pat_prior")
-    qoq_pat_pct = qf.get("pat_qoq_pct")
-    qoq_eps = qf.get("eps_prior")
-    qoq_opm = qf.get("opm_prior")
-    qoq_opm_pp = qf.get("opm_qoq_pp")
-    qoq_header = _shorten_quarter_header(qf.get("prior_header"))
-
-    if yoy_native:
-        # Native XBRL-tagged prior-year context — doesn't carry a
-        # comparative EPS figure, unlike the AI/fundamentals paths.
-        yoy_rev = yoy_native.get("revenue")
-        if yoy_rev is None:
-            yoy_rev = yoy_native.get("total_income")
-        yoy_pat = yoy_native.get("pat")
-        yoy_opm = round(yoy_native["opm"] * 100, 1) if yoy_native.get("opm") is not None else None
-        yoy_opm_pp = round((cur_opm - yoy_opm), 1) if (cur_opm is not None and yoy_opm is not None) else None
-        yoy_eps = None
-        yoy_rev_pct = yoy_pat_pct = None  # computed generically below from the raw values
-        yoy_header = _shorten_quarter_header(_quarter_header(yoy_native.get("period_end")))
-    else:
-        yoy_rev = _pick("total_income_prior", "sales_prior", yf)
-        yoy_rev_pct = yf.get("sales_yoy_pct")
-        if yoy_rev_pct is None:
-            yoy_rev_pct = yf.get("total_income_yoy_pct")
-        yoy_pat = yf.get("pat_prior")
-        yoy_pat_pct = yf.get("pat_yoy_pct")
-        yoy_eps = yf.get("eps_prior")
-        yoy_opm = yf.get("opm_prior")
-        yoy_opm_pp = yf.get("opm_yoy_pp")
-        yoy_header = _shorten_quarter_header(yf.get("prior_header"))
-
-    if not qf and not yf and not yoy_native:
-        return []  # nothing to compare against — a table would be all dashes
-
-    # Sales/PAT are raw rupees on the `quarter`/fundamentals dicts — scale
-    # to ₹Cr (÷1e7) for the table, same convention _fmt_cr uses everywhere
-    # else. EPS/OPM are already in their natural display units.
-    def _cr(v):
-        return v / 1e7 if v is not None else None
-
-    rows = [
-        ("Sales", _cr(cur_rev), _cr(qoq_rev), qoq_rev_pct, _cr(yoy_rev), yoy_rev_pct, 1, "pct"),
-        ("PAT",   _cr(cur_pat), _cr(qoq_pat), qoq_pat_pct, _cr(yoy_pat), yoy_pat_pct, 1, "pct"),
-        ("EPS",   cur_eps,      qoq_eps,      None,        yoy_eps,      None,        2, "pct"),
-        ("OPM%",  cur_opm,      qoq_opm,      qoq_opm_pp,  yoy_opm,      yoy_opm_pp,  1, "pp"),
-    ]
-
-    hdr_cur = cur_header or "Cur"
-    hdr_qoq = qoq_header or "-"
-    hdr_yoy = yoy_header or "-"
-    header = f"{'Metric':<7}{'QoQ':>8}{'YoY':>8}{hdr_cur:>9}{hdr_qoq:>9}{hdr_yoy:>9}"
-    lines = [f"<pre>{header}"]
-    for label, cur, qprior, qdelta, yprior, ydelta, dec, delta_kind in rows:
-        # Sales/PAT/OPM already have a precomputed delta; EPS doesn't carry
-        # one upstream, so derive a plain % change here from the prior value.
-        if delta_kind == "pct":
-            if qdelta is None and cur is not None and qprior is not None and qprior != 0:
-                qdelta = (cur - qprior) / abs(qprior) * 100
-            if ydelta is None and cur is not None and yprior is not None and yprior != 0:
-                ydelta = (cur - yprior) / abs(yprior) * 100
-            fmt_delta = _fmt_table_pct
-        else:
-            fmt_delta = _fmt_table_pp
-        row = (f"{label:<7}{fmt_delta(qdelta):>8}{fmt_delta(ydelta):>8}"
-               f"{_fmt_table_num(cur, dec):>9}{_fmt_table_num(qprior, dec):>9}{_fmt_table_num(yprior, dec):>9}")
-        lines.append(row)
-    lines.append("</pre>")
-    lines.append("<i>Sales/PAT in ₹Cr</i>")
-    return lines
-
-
-def _telegram_basis_block(parsed: dict) -> list:
-    """Builds the financial comparison block for ONE basis (Standalone or
-    Consolidated). No header/company-name lines — those are built once by
-    the caller so two bases for the same company share a single message."""
-    q = parsed.get("quarter", {})
-    revenue = q.get("revenue")
-    total_income = q.get("total_income")
-    rev_display = revenue if revenue is not None else total_income
-    pat = q.get("pat")
-    pat_emoji = "🟢" if (pat is not None and pat >= 0) else ("🔴" if pat is not None else "")
-    cur_header = _quarter_header(q.get("period_end")) or ""
-
-    table = _telegram_fin_table(parsed)
-    if table:
-        lines = list(table)
-    else:
-        # No prior-period data at all (e.g. a company's first-ever result,
-        # or fundamentals lookup failed) — fall back to a plain current-
-        # quarter summary rather than sending an empty/dash-only table.
-        lines = [f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>"]
-        lines.append(f"Rev: <b>{_fmt_cr(rev_display)}</b>")
-        lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
-        if q.get("eps_basic") is not None:
-            lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
-
-    if q.get("yoy_caution"):
-        lines.append("")
-        lines.append("⚠️ Company notes: results may not be YoY comparable")
-
-    # ── AI-extracted narrative fields (segment breakup, commentary,
-    # highlights, other board decisions) — these come only from the AI
-    # PDF-extraction path (XBRL parsing never populates them), so most
-    # existing/XBRL-sourced records simply won't have these keys and these
-    # blocks are silently skipped for them.
-    segs = parsed.get("segment_breakup")
-    if segs:
-        lines.append("")
-        lines.append("<b>📦 Segment Revenue</b>")
-        for s in segs:
-            seg_name = s.get("segment")
-            seg_rev = s.get("revenue")
-            if seg_name and seg_rev is not None:
-                lines.append(f"{seg_name}: {_fmt_cr(seg_rev)}")
-
-    highlights = parsed.get("key_highlights")
-    if highlights:
-        lines.append("")
-        lines.append("<b>✨ Key Highlights</b>")
-        for h in highlights:
-            lines.append(f"• {h}")
-
-    commentary = parsed.get("management_commentary")
-    if commentary:
-        lines.append("")
-        lines.append("<b>🗣️ Management Commentary</b>")
-        lines.append(commentary)
-
-    board_outcome = parsed.get("board_meeting_outcome")
-    if board_outcome:
-        lines.append("")
-        lines.append("<b>🏛️ Other Board Decisions</b>")
-        lines.append(board_outcome)
-
-    return lines
-
-
-def _telegram_result_message(group) -> str:
-    """
-    Builds ONE Telegram message for a company's result. `group` is either a
-    single parsed dict (one basis filed) or a list of 1-2 parsed dicts
-    (Standalone + Consolidated for the same company/quarter) — grouped by
-    _group_parsed_results() before this is called, so the two bases always
-    arrive in the same message instead of as separate messages that other
-    companies' results can get interleaved between.
-    """
-    items = group if isinstance(group, list) else [group]
-    items = sorted(items, key=lambda p: 0 if (p.get("meta", {}).get("standalone_consolidated") == "Consolidated") else 1)
-
-    first_meta = items[0].get("meta", {})
-    company = first_meta.get("company_name") or items[0].get("title") or "Unknown"
-    quarter_label = first_meta.get("quarter_label") or ""
-    audited = first_meta.get("audited") or ""
-    board_date = first_meta.get("board_meeting_date")
-
-    lines = [f"📊 <b>{company}</b>"]
-    tag_bits = [b for b in (quarter_label, audited) if b]
-    if tag_bits:
-        lines.append(" · ".join(tag_bits))
-    if board_date:
-        lines.append(f"Result Date: {board_date}")
-
-    for i, parsed in enumerate(items):
-        nature = parsed.get("meta", {}).get("standalone_consolidated") or ""
-        lines.append("")
-        if nature:
-            lines.append(f"━━ <b>{nature.upper()}</b> ━━")
-        lines += _telegram_basis_block(parsed)
-
-    msg = "\n".join(lines)
-    # Telegram's hard cap is 4096 chars per message. The narrative fields
-    # (segment breakup, highlights, commentary, board outcome — especially
-    # doubled up across Standalone + Consolidated in one message) can push
-    # past that on a verbose filing. Truncate defensively rather than let
-    # the send fail outright; the full data is still in
-    # nse_results_detailed.json regardless of what fits in the alert.
-    TELEGRAM_MAX_CHARS = 4000
-    if len(msg) > TELEGRAM_MAX_CHARS:
-        msg = msg[:TELEGRAM_MAX_CHARS].rsplit("\n", 1)[0] + "\n\n…(truncated, see full data on the site)"
-    return msg
-
-
-def _merge_xbrl_into_pdf_record(existing: dict, xbrl_parsed: dict) -> dict:
-    """When XBRL data arrives for a result the PDF fast-path already
-    covered, update just the NUMERIC fields with XBRL's officially-tagged
-    figures (more authoritative than an AI read of the PDF), while
-    preserving every narrative field the PDF/AI extraction found
-    (key_highlights, management_commentary, segment_breakup,
-    board_meeting_outcome) — XBRL parsing never produces those at all, so
-    a blanket overwrite (the earlier design) would silently delete them.
-    No Telegram notification follows this: the person was already
-    notified when the PDF-based result first came in — this just quietly
-    corrects/confirms the numbers in place."""
-    merged = dict(existing)
-    merged_quarter = dict(existing.get("quarter") or {})
-    xbrl_quarter = xbrl_parsed.get("quarter") or {}
-
-    NUMERIC_FIELDS = ("revenue", "other_income", "total_income", "total_expenses",
-                       "pbt", "tax_expense", "pat", "comprehensive_income",
-                       "eps_basic", "eps_diluted")
-    changed_fields = []
-    for f in NUMERIC_FIELDS:
-        xv = xbrl_quarter.get(f)
-        if xv is not None and xv != merged_quarter.get(f):
-            changed_fields.append(f)
-            merged_quarter[f] = xv
-
-    if changed_fields:
-        _compute_opm(merged_quarter)  # keep opm consistent with any updated revenue/expenses
-    merged["quarter"] = merged_quarter
-
-    # If XBRL tagged its own prior-year context, refresh yoy_fundamentals'
-    # absolute figures from it (more authoritative than the AI's read of
-    # the PDF's own comparative column) — never touches qoq_fundamentals
-    # (XBRL essentially never tags QoQ) or any narrative field.
-    yoy_native = xbrl_parsed.get("yoy_comparison")
-    if yoy_native:
-        yf = dict(existing.get("yoy_fundamentals") or {})
-        cur = merged_quarter
-        prior_ti = yoy_native.get("total_income")
-        if prior_ti is not None:
-            yf["total_income_prior"] = prior_ti
-            if cur.get("total_income") is not None and prior_ti != 0:
-                yf["total_income_yoy_pct"] = round((cur["total_income"] - prior_ti) / abs(prior_ti) * 100, 2)
-        prior_pat = yoy_native.get("pat")
-        if prior_pat is not None:
-            yf["pat_prior"] = prior_pat
-            if cur.get("pat") is not None and prior_pat != 0:
-                yf["pat_yoy_pct"] = round((cur["pat"] - prior_pat) / abs(prior_pat) * 100, 2)
-        prior_eps = yoy_native.get("eps_basic")
-        if prior_eps is not None:
-            yf["eps_prior"] = prior_eps
-            if cur.get("eps_basic") is not None and prior_eps != 0:
-                yf["eps_yoy_pct"] = round((cur["eps_basic"] - prior_eps) / abs(prior_eps) * 100, 2)
-        if yoy_native.get("opm") is not None and cur.get("opm") is not None:
-            yf["opm_prior"] = round(yoy_native["opm"] * 100, 2)
-            yf["opm_yoy_pp"] = round((cur["opm"] - yoy_native["opm"]) * 100, 2)
-        yf["basis"] = "xbrl_tagged"
-        yf["basis_verified"] = True
-        merged["yoy_fundamentals"] = yf
-
-    if changed_fields:
-        sym = (existing.get("meta", {}) or {}).get("symbol")
-        print(f"    · XBRL confirmed/updated {len(changed_fields)} field(s) for {sym}: "
-              f"{', '.join(changed_fields)} (narrative preserved, no Telegram resend)")
-    return merged
-
-
-def _group_parsed_results(parsed_new: list) -> list:
-    """
-    Groups newly-parsed results by company+quarter (scrip_code +
-    board_meeting_date + quarter period_end) so Standalone and Consolidated
-    filings for the same result — which arrive as two separate XBRL files —
-    get sent as ONE Telegram message instead of two, which previously let
-    other companies' messages land in between them.
-    """
-    groups = {}
-    order = []
-    for p in parsed_new:
-        meta = p.get("meta", {})
-        q = p.get("quarter", {})
-        key = (meta.get("scrip_code") or meta.get("symbol"), meta.get("board_meeting_date"), q.get("period_end"))
-        if key not in groups:
-            groups[key] = []
-            order.append(key)
-        groups[key].append(p)
-    return [groups[k] for k in order]
-
-
-async def _update_results_by_symbol(client: httpx.AsyncClient, parsed_all: list, quarters_to_keep: int = 8):
-    """Maintains a per-symbol store of each company's most recent quarters
-    of parsed results (Standalone and Consolidated tracked separately),
-    independent of nse_results_detailed.json's global 1000-item rolling
-    cap. That cap is shared across EVERY company combined — during a busy
-    results season, a company's own 2nd/3rd/4th-most-recent quarter can
-    get evicted by the sheer volume of OTHER companies filing, well before
-    4 quarters have actually passed for that company. This file keeps at
-    least `quarters_to_keep` quarters per symbol+nature no matter how much
-    unrelated filing volume happens elsewhere, so a stock's own quarterly
-    history/AI-summary stays reliably available (e.g. for a per-stock
-    "past 4 quarters" view on the frontend)."""
-    if not parsed_all:
+            checked += 1
+            clean = _normalize_pdf_text(_extract_pdf_text_bytes(pdf))
+            before = (it.get("stage"), it.get("credit_by"), it.get("record_date"))
+            m = _CA_RECORD.search(clean)
+            if m:
+                it["record_date"] = m.group(1)
+            m = _CA_CREDIT.search(clean)
+            if m:
+                it["credit_by"] = m.group(1)
+            # Never move a later stage (record date / allotment / completed) backwards.
+            if it.get("stage") in {None, "", "Announced", "Approved", "Board Recommended"}:
+                if _CA_SH_APPROVED.search(clean):
+                    it["stage_override"] = it["stage"] = "Shareholders Approved"
+                elif _CA_SH_PENDING.search(clean):
+                    it["stage_override"] = it["stage"] = "Board Recommended"
+                if it.get("record_date"):
+                    it["stage_override"] = it["stage"] = "Record Date"
+            it["ca_check_v"] = CA_CHECK_VERSION
+            if (it.get("stage"), it.get("credit_by"), it.get("record_date")) != before:
+                changed += 1
+    if checked:
+        print(f"  🏷 Corporate action check → checked={checked}, changed={changed}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-symbol 3-year event archive (for chart markers)
+#   cat_hist_<SYMBOL>.json  → {"symbol", "updated", "events": [compact event, ...]}
+#   cat_hist__index.json    → {SYMBOL: {"h": hash of its 20-day window, "n", "last"}}
+# The rolling 20-day file stays small; charts fetch one symbol's archive on demand.
+# Inside the 20-day window the archive mirrors the live file (so fixes, merges and
+# removals carry over); older events are frozen and kept for ARCHIVE_YEARS.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARCHIVE_YEARS = 3
+ARCHIVE_PREFIX = "cat_hist_"
+ARCHIVE_INDEX = "cat_hist__index.json"
+ARCHIVE_BATCH = int(os.environ.get("ARCHIVE_BATCH", "200"))   # symbol files written per run
+
+
+def archive_key(symbol: str) -> str:
+    return ARCHIVE_PREFIX + re.sub(r"[^A-Z0-9]", "_", str(symbol).upper()) + ".json"
+
+
+def _compact_event(it: dict) -> dict:
+    """Only what a chart marker and its tooltip need."""
+    cat = it.get("category")
+    relief = cat == "Negative" and re.search(r"relief|favourable|set aside|quashed|in favour",
+                                              f"{it.get('negative_type', '')} {it.get('negative_stage', '')}", re.I)
+    value = next((it.get(k) for k in ("order_value_cr", "capex_value_cr", "transaction_value_cr", "issue_value_cr",
+                                      "total_exposure_cr", "amount_cr", "agreement_value_cr")
+                  if it.get(k) is not None), None)
+    mcap = next((it.get(k) for k in ("order_to_market_cap_pct", "capex_to_market_cap_pct",
+                                     "transaction_to_market_cap_pct", "amount_to_market_cap_pct",
+                                     "agreement_to_market_cap_pct", "issue_to_market_cap_pct")
+                 if it.get(k) is not None), None)
+    summary = it.get("order_summary") or it.get("event_summary") or re.sub(
+        r"^.{0,120}?\bhas\s+informed\s+the\s+exchange\s+(?:about|regarding|that)\s+", "", it.get("text") or "", flags=re.I)
+    out = {
+        "id": it.get("id"), "dt": it.get("dt"), "react_date": it.get("react_date"), "session": it.get("session"),
+        "category": "Relief" if relief else cat,
+        "type": it.get("negative_type") if cat == "Negative" else it.get("event_type"),
+        "stage": it.get("negative_stage") if cat == "Negative" else it.get("stage"),
+        "value_cr": value, "mcap_pct": mcap, "ttm_pct": it.get("order_to_ttm_sales_pct"),
+        "ratio": it.get("ratio"), "customer": it.get("order_from") or it.get("vendor"),
+        "record_date": it.get("record_date"), "credit_by": it.get("credit_by"),
+        "summary": (summary or "")[:220], "link": it.get("link"),
+    }
+    return {k: v for k, v in out.items() if v not in (None, "")}
+
+
+def update_symbol_archives(session, history: dict, suppressed: dict, today: date) -> None:
+    import hashlib
+    ok, index = _r2_get_json_strict(session, ARCHIVE_INDEX)
+    if not ok:
+        print("  ⚠ Archive skipped this run (index unreadable)")
         return
-    existing = await r2_get(client, "nse_results_by_symbol.json")
-    store = (existing or {}).get("symbols", {})
-
-    touched = set()
-    for r in parsed_all:
-        meta = r.get("meta", {}) or {}
-        symbol = meta.get("symbol")
-        nature = meta.get("standalone_consolidated") or "Standalone"
-        period_end = (r.get("quarter") or {}).get("period_end")
-        if not symbol or not period_end:
+    index = index if isinstance(index, dict) else {}
+    win_cut = (today - timedelta(days=HISTORY_DAYS)).isoformat()
+    arch_cut = (today - timedelta(days=365 * ARCHIVE_YEARS + 1)).isoformat()
+    written = failed = pending = 0
+    for sym in sorted(history):
+        compact = sorted((_compact_event(x) for x in history[sym] if x.get("id")),
+                         key=lambda e: e.get("dt", ""), reverse=True)
+        h = hashlib.sha1(json.dumps(compact, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        if (index.get(sym) or {}).get("h") == h:
             continue
-        touched.add(symbol)
-        sym_entry = store.setdefault(symbol, {})
-        nature_list = sym_entry.setdefault(nature, [])
-        # Replace any existing entry for the same quarter (a refiled/
-        # updated result) rather than duplicating it, then keep only the
-        # most recent `quarters_to_keep` by period_end.
-        nature_list[:] = [q for q in nature_list if (q.get("quarter") or {}).get("period_end") != period_end]
-        nature_list.append(r)
-        nature_list.sort(key=lambda q: (q.get("quarter") or {}).get("period_end") or "", reverse=True)
-        sym_entry[nature] = nature_list[:quarters_to_keep]
-
-    if touched:
-        payload = {"updated_at": datetime.now(timezone.utc).isoformat(), "symbols": store}
-        await r2_put(client, "nse_results_by_symbol.json", payload)
-        print(f"  ✓ nse_results_by_symbol.json: updated {len(touched)} symbol(s), "
-              f"keeping up to {quarters_to_keep} quarters each")
-
-
-async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict],
-                                  fundamentals: dict | None, bse_pdf_items: list[dict] | None = None,
-                                  bse_symbol_map: dict | None = None) -> dict | None:
-    """
-    Builds/updates nse_results_detailed.json from a single source:
-      - "Outcome of Board Meeting" / financial-results PDFs (board_items,
-        nse_board_meetings.json) — usually available immediately, AI-extracted
-        (see parse_financial_results_pdf). XBRL is permanently off (see
-        PDF_ONLY_MODE at top of file); results_items is accepted for
-        signature compatibility but yields no items while that flag is on.
-    Same symbol+quarter+nature dedup key as before, so a re-filed PDF for
-    the same result updates the existing record in place (see the "refiled"
-    handling below) instead of creating a duplicate.
-    Only processes links not already present (idempotent across runs —
-    avoids re-fetching ~150+ files every poll).
-    """
-    xbrl_items = [it for it in results_items if XBRL_LINK_RE.search(it.get("link", ""))]
-    pdf_items = [it for it in board_items if _is_board_outcome_pdf(it) or it.get("_cal_fallback")]
-
-    # BSE candidates (already pre-filtered by _is_bse_results_pdf before
-    # this function is called) are tagged _exchange="BSE" so process_pdf
-    # below knows to pass scrip_code/date/symbol overrides instead of
-    # relying on NSE's filename convention. bse_symbol_map resolves each
-    # scrip_code to the platform's canonical symbol (see
-    # _load_bse_symbol_map); a code with no mapping entry falls back to
-    # using the scrip_code itself as the symbol — same convention
-    # classification.json already uses for BSE-only stocks — rather than
-    # silently dropping the result.
-    for it in (bse_pdf_items or []):
-        it["_exchange"] = "BSE"
-    pdf_items = pdf_items + list(bse_pdf_items or [])
-
-    if not xbrl_items and not pdf_items:
-        print("  ⚠ No XBRL or board-outcome-PDF results items — skipping detail parse")
-        return None
-
-    existing = await r2_get(client, "nse_results_detailed.json")
-    existing_items = (existing or {}).get("items", [])
-
-    def _basis_key(it):
-        """(symbol, period_end) — ignores standalone/consolidated nature,
-        used to find the Standalone/Consolidated counterpart of a result."""
-        meta = it.get("meta", {}) or {}
-        quarter = it.get("quarter", {}) or {}
-        return (meta.get("symbol"), quarter.get("period_end"))
-
-    # Consolidated preferred over Standalone: retroactive cleanup. NSE
-    # often files Standalone and Consolidated as two SEPARATE PDF documents
-    # (different filenames/links, sometimes even different runs) rather
-    # than two tables in one PDF, so they can end up stored as two
-    # independent records for the same symbol+quarter. Consolidated is
-    # what's wanted; Standalone should only ever persist as a fallback when
-    # no Consolidated result exists at all for that company+quarter — drop
-    # any Standalone record that already has a Consolidated counterpart
-    # sitting in the existing data, regardless of whether anything new is
-    # being parsed this run.
-    _existing_consolidated_keys = {
-        _basis_key(it) for it in existing_items
-        if (it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "consolidated"
-        and _basis_key(it)[0]
-    }
-    if _existing_consolidated_keys:
-        _before = len(existing_items)
-        existing_items = [
-            it for it in existing_items
-            if not ((it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
-                    and _basis_key(it) in _existing_consolidated_keys)
-        ]
-        _removed = _before - len(existing_items)
-        if _removed:
-            print(f"  🗑 Removed {_removed} previously-stored Standalone record(s) already superseded "
-                  f"by an existing Consolidated result (Consolidated preferred)")
-
-    existing_links = {it.get("link") for it in existing_items}
-
-    def _result_key(it):
-        """Business key for a result: same company + same quarter + same
-        standalone/consolidated nature = the same underlying result, even if
-        NSE re-files it under a brand-new XBRL link (corrections, resubmissions,
-        or just a re-publish — same root cause as the NTPC-type re-publishing
-        the general feed dedup already works around), or if it was first seen
-        as a fast-path PDF and is now confirmed by the authoritative XBRL."""
-        meta = it.get("meta", {}) or {}
-        quarter = it.get("quarter", {}) or {}
-        return (meta.get("symbol"), quarter.get("period_end"), meta.get("standalone_consolidated"))
-
-    # index existing items by business key so a re-filed result (or a later
-    # XBRL confirming an earlier fast-path PDF) updates the existing record
-    # in place instead of appending a lookalike duplicate
-    existing_by_key = {_result_key(it): idx for idx, it in enumerate(existing_items) if _result_key(it)[0]}
-
-    # XBRL processing is permanently off (module-level PDF_ONLY_MODE — see
-    # top of file). Next-day fundamentals API corrects anything the PDF
-    # fast-path gets wrong, so XBRL confirmation isn't needed.
-    if PDF_ONLY_MODE:
-        xbrl_items = []
-
-    # Existing PDF-sourced records are treated as reprocess-eligible (even
-    # though their link is already present) when they show signs of being
-    # stale/wrong rather than genuinely complete — this lets extraction
-    # improvements (new label regex, the AI extractor, unit-scaling fixes)
-    # go back and correct records already sitting on R2 with bad data.
-    # Confirmed real cases that motivated each check below:
-    #   - GODREJPROP/DDEL/MSWIL: pat/pbt were null (missing entirely)
-    #   - GODREJPROP/DDEL/UNOMINDA: pat/pbt were non-null but UNSCALED
-    #     (e.g. revenue=506.17 instead of ~5,061,700,000) — a null-only
-    #     check would never catch these, since they "look" complete
-    #   - UNOMINDA: eps_basic=511.0 (should be ~5.11) — a decimal/scale bug
-    #     unrelated to the Crore-vs-rupee issue but equally implausible
-    # Only applies to source=="pdf" — XBRL-sourced records are authoritative.
-    def _looks_stale_or_wrong(it):
-        meta = it.get("meta", {}) or {}
-        if meta.get("source") != "pdf":
-            return False
-        q = it.get("quarter", {}) or {}
-        pat, pbt = q.get("pat"), q.get("pbt")
-        if pat is None and pbt is None:
-            return True
-        revenue = q.get("revenue")
-        if revenue is not None and 0 < abs(revenue) < 1e6:
-            return True  # implausibly small for raw rupees — almost certainly unscaled Crore/Million data
-        for eps_field in ("eps_basic", "eps_diluted"):
-            eps_v = q.get(eps_field)
-            if eps_v is not None and abs(eps_v) > 1000:
-                return True  # no real NSE-listed company's quarterly EPS is in the thousands
-        if "extraction_method" not in meta:
-            return True  # pre-dates this tracking — provenance/quality unknown, worth a fresh attempt
-        # QoQ-prior and YoY-prior total_income/revenue being EXACTLY equal is
-        # a strong signal of a column-misalignment extraction bug — the AI
-        # duplicated one comparison column's value into both slots instead of
-        # reading Mar-quarter and same-quarter-last-year separately (seen
-        # directly: Skyways' qoq/yoy total_income_prior both landed on the
-        # same figure). A real company's QoQ and YoY prior periods are
-        # different quarters and essentially never report the identical
-        # revenue figure to the rupee, so treat an exact match as implausible
-        # rather than coincidental.
-        qf = it.get("qoq_fundamentals") or {}
-        yf = it.get("yoy_fundamentals") or {}
-        for field in ("total_income_prior", "sales_prior"):
-            qv, yv = qf.get(field), yf.get(field)
-            if qv is not None and yv is not None and qv == yv:
-                return True
-        return False
-
-    # Do NOT automatically re-run already-successfully-stored PDF links.
-    # Earlier versions deliberately retried records that looked stale/incomplete,
-    # but that makes a completed result re-enter the "new PDF" batch on every
-    # poll and can burn Gemini calls even when there are no new results.
-    # Reprocessing is now opt-in for maintenance/backfills only.
-    reprocess_stale = os.environ.get("REPROCESS_STALE_RESULTS", "0").strip().lower() in ("1", "true", "yes")
-    incomplete_pdf_links = ({it.get("link") for it in existing_items if _looks_stale_or_wrong(it)}
-                            if reprocess_stale else set())
-    if incomplete_pdf_links:
-        print(f"  ↻ REPROCESS_STALE_RESULTS enabled: retrying {len(incomplete_pdf_links)} "
-              f"existing stale/incomplete PDF record(s)")
-
-    new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
-    new_pdf = [it for it in pdf_items if it["link"] not in existing_links or it["link"] in incomplete_pdf_links]
-
-    # Give-up tracking: NSE's WAF blocks some specific filing URLs
-    # persistently for GitHub Actions' IP/pattern (confirmed: the same file
-    # is fetchable from elsewhere, so this isn't a transient/cache issue —
-    # it just never succeeds from this runner). Without this, an
-    # unfetchable filing gets retried every single run forever since a
-    # failure never lands it in existing_links. GIVE_UP_ATTEMPTS caps that:
-    # after ~7.5h of retrying (15 runs x 30min), stop hammering it and flag
-    # it for manual attention instead.
-    GIVE_UP_ATTEMPTS = 15
-    failures_payload = await r2_get(client, "nse_xbrl_failures.json")
-    failures = (failures_payload or {}).get("links", {})
-    # Calendar/loose fallback PDFs are mostly governance letters with no results
-    # heading (a deterministic "no" every run) -> stop retrying them sooner.
-    soft_links = {it["link"] for it in pdf_items if it.get("_cal_fallback") or it.get("_loose")}
-    given_up_links = {link for link, e in failures.items()
-                      if e.get("attempts", 0) >= (SOFT_GIVE_UP_ATTEMPTS if link in soft_links else GIVE_UP_ATTEMPTS)}
-    if given_up_links:
-        before_xbrl, before_pdf = len(new_xbrl), len(new_pdf)
-        new_xbrl = [it for it in new_xbrl if it["link"] not in given_up_links]
-        new_pdf = [it for it in new_pdf if it["link"] not in given_up_links]
-        skipped = (before_xbrl - len(new_xbrl)) + (before_pdf - len(new_pdf))
-        if skipped:
-            print(f"  ⏭ Skipping {skipped} filing(s) given up after {GIVE_UP_ATTEMPTS}+ failed "
-                  f"attempts (see nse_xbrl_failures.json)")
-
-    if not new_xbrl and not new_pdf:
-        print("  ✓ nse_results_detailed: no new filings to parse")
-        return None
-
-    # Cross-exchange dedup: the same result is very often filed on BOTH NSE
-    # and BSE the same day (confirmed directly: AUGMONT's board-outcome PDF
-    # hit NSE and BSE within ~30 min of each other). Without this, both
-    # copies would independently reach process_pdf() and each burn a
-    # separate Gemini call on what is, functionally, the same numbers —
-    # wasted API spend, and pure luck which one's extraction quality wins.
-    # Grouped by (probable_symbol, same-IST-day) using ONLY pre-parse info
-    # (NSE's filename, BSE's scrip_code -> classification.json) — cheap,
-    # no download needed.
-    #
-    # Groups are NOT resolved into a blind "keep earliest, skip the rest"
-    # split here — that would permanently discard the other exchange's
-    # copy even if the earliest one turns out to fail AI extraction
-    # (a bad scan, an unusual layout, etc.), losing the result entirely
-    # until the WAF-style give-up window or a manual look. Instead each
-    # group is walked in published-time order by process_pdf_group()
-    # below: try the earliest copy; only if it actually parses do the
-    # remaining copies get skipped (and only THEN persisted into
-    # bse_nse_duplicate_links.json, so future runs don't re-fetch them
-    # either). If it fails, the next-earliest copy is tried immediately,
-    # same run — no result is dropped as long as at least one exchange's
-    # copy is extractable.
-    dupe_payload = await r2_get(client, "bse_nse_duplicate_links.json")
-    known_dupe_links = set((dupe_payload or {}).get("links", []))
-    before_dupe = len(new_pdf)
-    new_pdf = [it for it in new_pdf if it["link"] not in known_dupe_links]
-    if before_dupe != len(new_pdf):
-        print(f"  ⏭ Skipping {before_dupe - len(new_pdf)} PDF(s) already known cross-exchange duplicates")
-
-    pdf_groups = {}
-    for it in new_pdf:
-        sym = _pdf_probable_symbol(it, bse_symbol_map)
-        bucket = _pdf_date_bucket(it)
-        if not sym or not bucket:
-            continue  # can't group without both — left alone, processed normally
-        pdf_groups.setdefault((sym, bucket), []).append(it)
-
-    # Only a genuine cross-exchange duplicate — same symbol, same day, and
-    # at most ONE item per exchange — gets the "try one, skip the rest"
-    # treatment below. A bucket with 2+ items from the SAME exchange
-    # (confirmed directly: SYMBIOTEC's Q1 FY27 filed Standalone AND
-    # Consolidated as two separate NSE PDFs the same day, landing in the
-    # same (symbol, date) bucket alongside its one BSE copy) is a sign of
-    # genuinely distinct filings, not one result on two feeds — collapsing
-    # that bucket would silently keep whichever nature happened to parse
-    # first and permanently discard the other (in this exact run, that
-    # meant losing the Consolidated result — worse than doing nothing).
-    # Those buckets are left to normal independent parsing instead, same
-    # as before this feature existed, so the existing "Consolidated
-    # preferred over Standalone" cleanup (elsewhere in this function)
-    # still gets a Consolidated record to prefer.
-    clean_groups = {}
-    for key, items in pdf_groups.items():
-        if len(items) < 2:
+        if written >= ARCHIVE_BATCH:
+            pending += 1
             continue
-        exchanges = [it.get("_exchange", "NSE") for it in items]
-        if len(exchanges) == len(set(exchanges)):
-            clean_groups[key] = sorted(items, key=lambda x: x.get("published_ts", 0))
-        # else: mixed same-exchange filings in this bucket — leave every
-        # item in it out of clean_groups so they fall through to
-        # singleton_pdf below and get parsed independently, as before.
-    pdf_groups = clean_groups
-    grouped_links = {it["link"] for group in pdf_groups.values() for it in group}
-    singleton_pdf = [it for it in new_pdf if it["link"] not in grouped_links]
-
-    if not new_xbrl and not new_pdf:
-        print("  ✓ nse_results_detailed: no new filings to parse")
-        return None
-
-    print(f"  Parsing {len(new_xbrl)} new XBRL + {len(new_pdf)} new PDF result filing(s) "
-          f"({len(pdf_groups)} cross-exchange group(s), {len(singleton_pdf)} single-exchange)...")
-    sem = asyncio.Semaphore(3)  # be polite to nsearchives.nseindia.com
-    failed_links = []
-
-    def _attach_fundamentals(parsed):
-        if "yoy_comparison" not in parsed and "yoy_fundamentals" not in parsed and parsed.get("quarter", {}).get("period_end"):
-            symbol = parsed.get("meta", {}).get("symbol")
-            nature = parsed.get("meta", {}).get("standalone_consolidated")
-            yoy_fund = _yoy_fundamentals(symbol, parsed["quarter"]["period_end"], parsed["quarter"], nature, fundamentals)
-            if yoy_fund:
-                parsed["yoy_fundamentals"] = yoy_fund
-        if "qoq_fundamentals" not in parsed and parsed.get("quarter"):
-            symbol = parsed.get("meta", {}).get("symbol")
-            nature = parsed.get("meta", {}).get("standalone_consolidated")
-            qoq_fund = _qoq_fundamentals(symbol, parsed["quarter"], nature, fundamentals)
-            if qoq_fund:
-                parsed["qoq_fundamentals"] = qoq_fund
-
-    async def process_xbrl(it):
-        async with sem:
-            try:
-                content = await fetch_xbrl_bytes(client, it["link"])
-                if not content:
-                    return None
-                parsed = parse_financial_results_xbrl(content)
-                # Require an actual "quarter" bucket — our whole system
-                # (dedup, QoQ/YoY comparisons, the Results tab's card
-                # layout) is built around quarterly figures. A filing that
-                # only has "year" data (some non-Ind-AS taxonomies report
-                # annually with no quarter context) can't be meaningfully
-                # displayed or compared, and previously slipped through as
-                # a symbol-less, quarter-less junk record (seen directly:
-                # Synoptics Technologies' NONINDAS filing).
-                if not parsed.get("quarter"):
-                    return None  # no quarterly data — not useful for this feed, skip silently
-                if not parsed.get("meta", {}).get("symbol"):
-                    return None  # can't be identified/deduped without a symbol — skip
-                parsed["link"] = it["link"]
-                parsed["title"] = it.get("title", "")
-                parsed["published"] = it.get("published", "")
-                parsed["published_ts"] = it.get("published_ts", 0)
-                _attach_fundamentals(parsed)
-                return parsed
-            except Exception as e:
-                print(f"  ⚠ XBRL parse failed for {it['link'].split('/')[-1]}: {e}")
-                failed_links.append(it["link"])
-                return None
-
-    async def process_pdf(it):
-        async with sem:
-            fname = it["link"].split("/")[-1]
-            try:
-                content = it.get("_pre_content") or await fetch_pdf_bytes(client, it["link"])
-                if not content:
-                    print(f"  ⚠ PDF fetch returned empty for {fname}")
-                    failed_links.append(it["link"])
-                    return None
-                if it.get("_exchange") == "BSE":
-                    code = it.get("scripcode", "")
-                    parsed = await parse_financial_results_pdf(
-                        client, content, it["link"], it.get("title", ""),
-                        scrip_code=code,
-                        fallback_board_meeting_date=_bse_fallback_date(it.get("published", "")),
-                        symbol_override=(bse_symbol_map or {}).get(code, code),
-                        exchange="BSE",
-                        preextracted_text=it.get("_pre_text"),
-                    )
-                else:
-                    parsed = await parse_financial_results_pdf(client, content, it["link"], it.get("title", ""),
-                                                              preextracted_text=it.get("_pre_text"))
-                if not parsed:
-                    print(f"  ⚠ PDF parse returned None for {fname} "
-                          f"(no results heading / AI unavailable / AI said not a results table / "
-                          f"AI result failed validation — see parse_financial_results_pdf)")
-                    failed_links.append(it["link"])  # not a results PDF — no point refetching forever
-                    return None
-                parsed["link"] = it["link"]
-                parsed["title"] = it.get("title", "")
-                parsed["published"] = it.get("published", "")
-                parsed["published_ts"] = it.get("published_ts", 0)
-                _attach_fundamentals(parsed)
-                return parsed
-            except Exception as e:
-                print(f"  ⚠ PDF parse failed for {it['link'].split('/')[-1]}: {e}")
-                failed_links.append(it["link"])
-                return None
-
-    # Pre-AI same-run resubmission dedup.  We already need pdfplumber text for
-    # the cheap heading gate, so extract it once here and derive a conservative
-    # key (symbol, reporting period, nature).  Only candidates for which ALL
-    # three parts are unambiguous are collapsed; ambiguous/multi-basis PDFs are
-    # left untouched.  This prevents burning Gemini calls on corrected/re-filed
-    # copies while preserving legitimate Standalone + Consolidated filings.
-    async def _preflight_pdf(it):
-        import pdfplumber
-        import io as _io
+        key = archive_key(sym)
+        ok, arch = _r2_get_json_strict(session, key)
+        if not ok:
+            failed += 1
+            continue
+        cur_ids = {e["id"] for e in compact}
+        old = (arch or {}).get("events") or []
+        # Keep frozen history (older than the live window, younger than 3 years);
+        # inside the window the live file is the truth.
+        kept = [e for e in old if e.get("id") not in cur_ids and e.get("id") not in suppressed
+                and arch_cut <= str(e.get("dt", ""))[:10] < win_cut]
+        events = sorted(kept + compact, key=lambda e: e.get("dt", ""), reverse=True)
         try:
-            content = await fetch_pdf_bytes(client, it["link"])
-            if not content:
-                return it
-            with pdfplumber.open(_io.BytesIO(content)) as pdf:
-                text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
-            it["_pre_content"] = content
-            it["_pre_text"] = text
-            heads = _pdf_find_heading_candidates(text)
-            natures = {h[2] for h in heads}
-            if len(natures) != 1:
-                return it
-            # Look near genuine result headings first; accept only an explicit
-            # period-ended date, never a board-meeting/signature date.
-            windows = [text[h[0]:min(len(text), h[0] + 900)] for h in heads]
-            period_re = re.compile(
-                r"(?:quarter|half[\s-]?year|six\s+months?|nine\s+months?|year|period)"
-                r"[\s\S]{0,180}?ended(?:\s+on)?\s+(?:the\s+)?"
-                r"(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|"
-                r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}|"
-                r"[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})", re.I)
-            raw = None
-            for w in windows:
-                m = period_re.search(w)
-                if m:
-                    raw = m.group(1).strip()
-                    break
-            if not raw:
-                return it
-            dt = None
-            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y",
-                        "%d %B %Y", "%d %b %Y", "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y"):
-                try:
-                    dt = datetime.strptime(raw, fmt)
-                    break
-                except ValueError:
-                    pass
-            if not dt:
-                return it
-            sym = _pdf_probable_symbol(it, bse_symbol_map)
-            if sym:
-                it["_pre_result_key"] = (sym, dt.date().isoformat(), next(iter(natures)))
-            return it
+            _r2_put_json(session, key, {"symbol": sym, "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                        "events": events}, quiet=True)
         except Exception as e:
-            print(f"  ⚠ pre-AI PDF preflight failed for {it['link'].split('/')[-1]}: {type(e).__name__}: {e}")
-            return it
-
-    new_dupe_links = []  # persisted so skipped copies never re-enter a later run
-
-    # Normalize the already-stored business keys once.  A newly published PDF
-    # can have a brand-new URL while still representing the exact same
-    # symbol+period+nature result.  If the cheap local preflight can identify
-    # that key unambiguously, there is no reason to spend another Gemini call.
-    def _norm_result_key(key):
-        sym, period, nature = key
-        return ((sym or "").strip().upper(),
-                (period or "").strip(),
-                (nature or "").strip().lower())
-
-    existing_pre_keys = {
-        _norm_result_key(_result_key(r)) for r in existing_items
-        if _result_key(r)[0] and _result_key(r)[1] and _result_key(r)[2]
-    }
-
-    if singleton_pdf:
-        singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
-
-        # Different URL, but an already-stored result business key: mark this
-        # link processed and stop before AI.  Ambiguous/unkeyed PDFs are left
-        # untouched and continue through the normal parser, so this cannot
-        # silently drop a filing the preflight failed to identify.
-        already_stored_links = []
-        still_needed = []
-        for it in singleton_pdf:
-            key = it.get("_pre_result_key")
-            if key and _norm_result_key(key) in existing_pre_keys:
-                already_stored_links.append(it["link"])
-            else:
-                still_needed.append(it)
-        singleton_pdf = still_needed
-        if already_stored_links:
-            new_dupe_links.extend(already_stored_links)
-            print(f"  ⏭ {len(already_stored_links)} PDF(s) match already-stored "
-                  f"symbol+period+nature — skipped BEFORE AI; marked processed")
-
-        latest = {}
-        unkeyed = []
-        pre_superseded_links = []
-        for it in singleton_pdf:
-            key = it.get("_pre_result_key")
-            if not key:
-                unkeyed.append(it)
-                continue
-            prior = latest.get(key)
-            # published_ts is available for both exchanges and is preferable
-            # here because BSE GUID filenames carry no embedded timestamp.
-            if prior is None or it.get("published_ts", 0) >= prior.get("published_ts", 0):
-                if prior is not None:
-                    pre_superseded_links.append(prior["link"])
-                latest[key] = it
-            else:
-                pre_superseded_links.append(it["link"])
-        pre_superseded = len(pre_superseded_links)
-        singleton_pdf = list(latest.values()) + unkeyed
-        if pre_superseded:
-            # These are deterministic same-result resubmissions. Persist them
-            # in the existing duplicate-link store so they are skipped on all
-            # future runs instead of becoming "new" again.
-            new_dupe_links.extend(pre_superseded_links)
-            print(f"  ⏭ {pre_superseded} same-run resubmission PDF(s) removed BEFORE AI — "
-                  f"Gemini calls saved; marked processed for future runs")
-
-    async def process_pdf_group(sym: str, bucket: str, group_items: list[dict]):
-        # Apply the same already-stored business-key guard to cross-exchange
-        # groups.  Preflight is local (pdfplumber only) and its cached bytes/
-        # text are reused by process_pdf if AI is genuinely needed.
-        checked_items = list(await asyncio.gather(*(_preflight_pdf(it) for it in group_items)))
-        stored_matches = [it for it in checked_items
-                          if it.get("_pre_result_key")
-                          and _norm_result_key(it["_pre_result_key"]) in existing_pre_keys]
-        if stored_matches:
-            # The whole clean group represents one same-symbol/day result.
-            # Persist every copy so none re-enters on a later poll.
-            new_dupe_links.extend(it["link"] for it in checked_items)
-            print(f"  ⏭ {sym} ({bucket}): result already stored — skipping "
-                  f"{len(checked_items)} cross-exchange copy/copies BEFORE AI")
-            return None
-        group_items = checked_items
-        for idx, it in enumerate(group_items):
-            ex = it.get("_exchange", "NSE")
-            result = await process_pdf(it)
-            if result:
-                remaining = group_items[idx + 1:]
-                if remaining:
-                    skipped_exs = ", ".join(sorted({r.get("_exchange", "NSE") for r in remaining}))
-                    print(f"  ⏭ {sym} ({bucket}): {ex}'s copy parsed OK — skipping {len(remaining)} "
-                          f"same-result copy/copies from {skipped_exs} (no AI call spent on them)")
-                    new_dupe_links.extend(r["link"] for r in remaining)
-                return result
-            is_last = idx == len(group_items) - 1
-            print(f"  ⚠ {sym} ({bucket}): {ex}'s copy failed to parse — "
-                  f"{'no more copies to try this run' if is_last else 'trying the next exchange copy now'}")
-        return None  # every copy in the group failed this run — none marked duplicate, all retried next run
-
-    print(f"  AI-stage PDF candidates after pre-dedup: {sum(len(v) for v in pdf_groups.values()) + len(singleton_pdf)}")
-
-    xbrl_results, group_results, singleton_results = await asyncio.gather(
-        asyncio.gather(*(process_xbrl(it) for it in new_xbrl)),
-        asyncio.gather(*(process_pdf_group(sym, bucket, items) for (sym, bucket), items in pdf_groups.items())),
-        asyncio.gather(*(process_pdf(it) for it in singleton_pdf)),
-    )
-    pdf_results = list(group_results) + list(singleton_results)
-    parsed_all = [r for r in xbrl_results if r] + [r for r in pdf_results if r]
-    print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf)} successfully")
-
-    if new_dupe_links:
-        all_dupe_links = list(known_dupe_links | set(new_dupe_links))[-5000:]  # cap growth
-        await r2_put(client, "bse_nse_duplicate_links.json",
-                     {"updated_at": datetime.now(timezone.utc).isoformat(), "links": all_dupe_links})
-
-    if failed_links:
-        now_iso = datetime.now(timezone.utc).isoformat()
-        for link in failed_links:
-            entry = failures.get(link, {"first_failed": now_iso, "attempts": 0})
-            entry["attempts"] += 1
-            entry["last_failed"] = now_iso
-            failures[link] = entry
-        newly_given_up = [link for link in failed_links
-                          if failures[link]["attempts"] == GIVE_UP_ATTEMPTS]
-        if newly_given_up:
-            print(f"  ⚠ {len(newly_given_up)} filing(s) just crossed {GIVE_UP_ATTEMPTS} failed "
-                  f"attempts — giving up on them going forward (nse_xbrl_failures.json)")
-        await r2_put(client, "nse_xbrl_failures.json", {"updated_at": now_iso, "links": failures})
-
-    # Intra-batch dedup: NSE sometimes files the same symbol+quarter+nature
-    # twice within minutes (correction/resubmission) — both can land as
-    # "new" in the SAME run, so the cross-run existing_by_key check below
-    # (built before this run started) can't catch them against each other.
-    # Keep only the latest per key, using the XBRL filename's embedded
-    # submission timestamp (published_ts has been observed as unreliable/0
-    # for this feed).
-    latest_by_key = {}
-    unkeyed = []
-    for r in parsed_all:
-        key = _result_key(r)
-        if not key[0]:
-            unkeyed.append(r)
+            print(f"  ⚠ Archive write {key} failed ({e})")
+            failed += 1
             continue
-        prior = latest_by_key.get(key)
-        if prior is None or _filing_ts(r.get("link", "")) >= _filing_ts(prior.get("link", "")):
-            latest_by_key[key] = r
-    superseded_count = len(parsed_all) - len(latest_by_key) - len(unkeyed)
-    parsed_all = list(latest_by_key.values()) + unkeyed
-    if superseded_count > 0:
-        print(f"  ↺ {superseded_count} superseded within this batch (same-run resubmission) — kept latest only")
+        index[sym] = {"h": h, "n": len(events), "last": events[0].get("dt", "") if events else ""}
+        written += 1
+    if written:
+        _r2_put_json(session, ARCHIVE_INDEX, index, quiet=True)
+    print(f"  📚 Symbol archive → written={written}, pending={pending}, failed={failed}, symbols={len(index)}")
 
-    # Split out re-filed results (same symbol+quarter+nature already notified
-    # under a different link) — refresh their data but don't spam Telegram again.
-    parsed_new = []
-    refiled = []
-    xbrl_merged_records = []
-    for r in parsed_all:
-        key = _result_key(r)
-        r_is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"  # XBRL path never sets meta.source
-        matched = key[0] and key in existing_by_key
-        if matched:
-            idx = existing_by_key[key]
-            existing_rec = existing_items[idx]
-            existing_is_pdf = (existing_rec.get("meta", {}) or {}).get("source") == "pdf"
-            if r_is_xbrl and existing_is_pdf:
-                # XBRL "catching up" to a result the PDF fast-path already
-                # covered — selectively merge just the numeric fields in
-                # place (see _merge_xbrl_into_pdf_record) rather than a
-                # blanket overwrite, so the AI-extracted narrative content
-                # survives. No Telegram resend — the person was already
-                # notified when the PDF result first came in.
-                merged_rec = _merge_xbrl_into_pdf_record(existing_rec, r)
-                existing_items[idx] = merged_rec
-                xbrl_merged_records.append(merged_rec)
-                continue
-            refiled.append(r)
+
+def _build_materiality_maps(classification_payload, fundamentals_payload):
+    """Return symbol -> market cap (₹ cr) and symbol -> TTM sales (₹ cr)."""
+    market_cap_map = {}
+    ttm_sales_map = {}
+
+    # classification.json may be a list, {"data": [...]}, {"stocks": [...]},
+    # or a symbol-keyed dict. Prefer nse_code, then symbol.
+    rows = classification_payload
+    if isinstance(rows, dict):
+        if isinstance(rows.get("data"), list):
+            rows = rows["data"]
+        elif isinstance(rows.get("stocks"), list):
+            rows = rows["stocks"]
+        elif all(isinstance(v, dict) for v in rows.values()):
+            rows = list(rows.values())
         else:
-            parsed_new.append(r)
-    if xbrl_merged_records:
-        print(f"  🔗 {len(xbrl_merged_records)} XBRL result(s) merged into existing PDF record(s) — numbers refreshed, narrative kept, no Telegram resend")
-    if refiled:
-        print(f"  ↻ {len(refiled)} re-filed (already notified earlier) — updating record, skipping Telegram: "
-              f"{', '.join((r.get('meta', {}) or {}).get('symbol') or '?' for r in refiled)}")
-        for r in refiled:
-            existing_items[existing_by_key[_result_key(r)]] = r
+            rows = []
+    if isinstance(rows, list):
+        for x in rows:
+            if not isinstance(x, dict):
+                continue
+            sym = str(x.get("nse_code") or x.get("symbol") or "").strip().upper()
+            try:
+                mcap = float(x.get("market_cap_cr"))
+                if sym and mcap > 0:
+                    market_cap_map[sym] = mcap
+            except (TypeError, ValueError):
+                pass
 
-    # Consolidated preferred over Standalone: forward-looking filter.
-    # Covers both (a) Consolidated already sitting in existing_items while
-    # a new Standalone filing arrives this run, and (b) Standalone and
-    # Consolidated both arriving fresh in the SAME run's batch (the common
-    # case — NSE frequently files both PDFs for the same board meeting
-    # within minutes of each other). Either way, drop the Standalone
-    # record before it can be stored or sent to Telegram — Standalone only
-    # ever survives as a fallback when no Consolidated result exists at
-    # all for that symbol+quarter.
-    #
-    # IMPORTANT: this must run BEFORE the XBRL recency-guard block below,
-    # not after. It used to run after, which meant parsed_new_for_telegram
-    # got built from the pre-filter parsed_new — so a Standalone entry
-    # correctly got dropped from parsed_new/storage here, but the ALREADY-
-    # built parsed_new_for_telegram snapshot still had it, and it kept
-    # getting sent to Telegram on every single run (NSE re-files the same
-    # Standalone XBRL fresh each day, so it never matched an existing key
-    # and never aged out of the 3-day recency guard either) even though it
-    # was being correctly dropped from storage. Confirmed directly via
-    # diagnostic logging: SKYWAYS/ESSARSHPNG/INDLMETER/TEMPSENS all showed
-    # computed_key=(...,'Standalone') with only a 'Consolidated' key on
-    # file — genuinely new-by-key every run, correctly dropped by this
-    # filter, yet still Telegram-sent because of the stale snapshot.
-    consolidated_available = {
-        _basis_key(it) for it in existing_items + parsed_new
-        if (it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "consolidated"
-        and _basis_key(it)[0]
-    }
-    if consolidated_available:
-        before_new = len(parsed_new)
-        dropped_syms = [
-            (r.get("meta", {}) or {}).get("symbol")
-            for r in parsed_new
-            if (r.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
-            and _basis_key(r) in consolidated_available
-        ]
-        parsed_new = [
-            r for r in parsed_new
-            if not ((r.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
-                    and _basis_key(r) in consolidated_available)
-        ]
-        dropped_new_standalone = before_new - len(parsed_new)
-        if dropped_new_standalone:
-            print(f"  ⏸ Dropped {dropped_new_standalone} new Standalone result(s) — Consolidated "
-                  f"already available/arriving for the same symbol+quarter (Consolidated preferred): "
-                  f"{', '.join(dropped_syms)}")
-
-        before_existing = len(existing_items)
-        removed_syms = [
-            (it.get("meta", {}) or {}).get("symbol")
-            for it in existing_items
-            if (it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
-            and _basis_key(it) in consolidated_available
-        ]
-        existing_items = [
-            it for it in existing_items
-            if not ((it.get("meta", {}).get("standalone_consolidated") or "").strip().lower() == "standalone"
-                    and _basis_key(it) in consolidated_available)
-        ]
-        dropped_existing_standalone = before_existing - len(existing_items)
-        if dropped_existing_standalone:
-            print(f"  🗑 Removed {dropped_existing_standalone} previously-stored Standalone record(s) "
-                  f"now superseded by a Consolidated result arriving this run: {', '.join(removed_syms)}")
-
-    # XBRL-sourced NEW results (no PDF record existed at all for this
-    # symbol+quarter — the sole scenario XBRL is meant to fill in) still
-    # get a recency guard before Telegram: re-enabling XBRL after it was
-    # off for a while means whatever backlog of old, never-covered XBRL
-    # filings accumulated in the meantime would otherwise all fire at
-    # once, flooding the channel with results that are old news by now.
-    # Genuinely fresh XBRL-only results (published in roughly the last
-    # couple of days) still notify normally. Runs on the ALREADY
-    # Consolidated-preference-filtered parsed_new (see above) so a
-    # dropped Standalone duplicate can never sneak into this snapshot.
-    XBRL_TELEGRAM_MAX_AGE_SECONDS = 3 * 24 * 60 * 60  # 3 days
-    now_ts = datetime.now(timezone.utc).timestamp()
-    xbrl_backlog_silenced = []
-    still_notify = []
-    for r in parsed_new:
-        is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"
-        if is_xbrl and (now_ts - _effective_ts(r)) > XBRL_TELEGRAM_MAX_AGE_SECONDS:
-            xbrl_backlog_silenced.append((r.get("meta", {}) or {}).get("symbol") or "?")
-            continue
-        still_notify.append(r)
-    if xbrl_backlog_silenced:
-        print(f"  🔇 {len(xbrl_backlog_silenced)} XBRL-only result(s) older than 3 days — storing data, "
-              f"skipping Telegram (backlog, not fresh news): {', '.join(xbrl_backlog_silenced)}")
-    parsed_new_for_telegram = still_notify
-
-    if parsed_new_for_telegram:
-        groups = _group_parsed_results(parsed_new_for_telegram)
-        print(f"  Sending {len(groups)} Telegram message(s) ({len(parsed_new_for_telegram)} filings grouped)...")
-        telegram_syms = [(g[0].get("meta", {}) or {}).get("symbol") for g in groups if g]
-        print(f"    symbols: {', '.join(s for s in telegram_syms if s)}")
-        if not TELEGRAM_RESULTS_CHAT_ID:
-            print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
-                  "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
-                  "Set TELEGRAM_RESULTS_CHAT_ID to send these to a separate channel.")
-        # Sequential with a delay between sends — Telegram's per-chat flood
-        # limit is roughly ~1 msg/sec sustained, but real-world timing
-        # jitter means even a strict 1s gap can trigger 429s during a
-        # heavy burst (e.g. 60+ companies reporting the same evening).
-        # On a 429, back off and retry a few times rather than dropping the
-        # message — a dropped send here is a PERMANENTLY missed
-        # notification, since the filing is still recorded as "already
-        # processed" in nse_results_detailed.json regardless of whether
-        # the Telegram send succeeded.
-        SEND_RETRIES = 4
-        for group in groups:
-            sym = group[0].get("meta", {}).get("symbol") if group else "?"
-            msg = _telegram_result_message(group)
-            for attempt in range(SEND_RETRIES):
+    # fundamentals_summary.json shape: {"updated": ..., "stocks": {SYMBOL: {...}}}
+    stocks = fundamentals_payload.get("stocks", {}) if isinstance(fundamentals_payload, dict) else {}
+    if isinstance(stocks, dict):
+        for key, x in stocks.items():
+            if not isinstance(x, dict):
+                continue
+            sym = str(x.get("symbol") or key or "").strip().upper()
+            quarters = x.get("quarters") or []
+            vals = []
+            for q in quarters[:4]:
+                if not isinstance(q, dict):
+                    continue
                 try:
-                    send_message(msg, chat_id=TELEGRAM_RESULTS_CHAT_ID)
-                    break
-                except Exception as e:
-                    is_last = attempt == SEND_RETRIES - 1
-                    is_rate_limit = "429" in str(e)
-                    if is_last:
-                        print(f"  ⚠ Telegram send failed for {sym} after {SEND_RETRIES} attempts: {e}")
-                        break
-                    wait = (10 if is_rate_limit else 3) * (attempt + 1)
-                    print(f"  ⚠ Telegram send for {sym} failed ({e}), retrying in {wait}s "
-                          f"(attempt {attempt+1}/{SEND_RETRIES})...")
-                    await asyncio.sleep(wait)
-            await asyncio.sleep(2)
+                    sales = float(q.get("sales"))
+                    if sales >= 0:
+                        vals.append(sales)
+                except (TypeError, ValueError):
+                    pass
+            # Require four reported quarters. Source sales are rupees; 1 crore = 1e7 rupees.
+            if sym and len(vals) == 4:
+                ttm_sales_map[sym] = sum(vals) / 1e7
 
-    # Guarantee every item actually parsed/notified THIS run survives the
-    # cap, regardless of its timestamp quality — a bad or zero
-    # published_ts (a known issue, especially for XBRL items) could
-    # otherwise sort a freshly-added record to the bottom and truncate it
-    # out before it's ever persisted, making it look "new" again next run
-    # and re-notifying Telegram forever. Only the OLDER, already-persisted
-    # portion gets trimmed to make room, never this run's new items.
-    new_links = {it.get("link") for it in parsed_new}
-    older_existing = [it for it in existing_items if it.get("link") not in new_links]
-    older_existing.sort(key=_effective_ts, reverse=True)
-    keep_older = max(0, 1000 - len(parsed_new))
-    merged = parsed_new + older_existing[:keep_older]
-    merged.sort(key=_effective_ts, reverse=True)
+    return market_cap_map, ttm_sales_map
 
-    # Include the freshly XBRL-merged records too, so the per-symbol
-    # store's copy of this quarter also gets the corrected numbers rather
-    # than staying stale.
-    await _update_results_by_symbol(client, refiled + parsed_new + xbrl_merged_records)
+def main():
+    import os
 
-    return make_payload(merged)
+    # Fail clearly in GitHub Actions instead of silently doing nothing.
+    for key in ("WORKER_URL", "WORKER_TOKEN"):
+        if not os.environ.get(key):
+            raise RuntimeError(f"Missing required environment variable: {key}")
 
+    today = date.today()
+    print(f"Catalyst scan starting for {today.isoformat()}...")
 
-async def run():
-    now = datetime.now(timezone.utc).isoformat()
-    print(f"Fetching all feeds... [{now}]")
+    nse_session = _build_session()
+    holidays = _load_nse_holidays(nse_session, today.year)
 
-    async with httpx.AsyncClient() as client:
-        # Fetch all feeds concurrently
-        tasks = [fetch_feed(client, sk, label, url) for sk, label, url in FEEDS]
-        results = await asyncio.gather(*tasks)
-        result_map  = {sk: items for sk, items, ok in results}
-        success_map = {sk: ok    for sk, items, ok in results}
+    def is_trading_day(d: date) -> bool:
+        return d.weekday() < 5 and d not in holidays
 
-        uploads = []
-        results_feed_items = []
-        board_meeting_items = []
+    def next_trading_day(d: date) -> date:
+        x = d + timedelta(days=1)
+        while not is_trading_day(x):
+            x += timedelta(days=1)
+        return x
 
-        for filename, source_keys in OUTPUT_MAP.items():
+    # Existing R2 payload shape: {"updated": ..., "data": {SYMBOL: [...]}}
+    # Accept a bare symbol->items dict too, so an older/manual file is not lost.
+    r2_session = _build_session()
+    old_payload = _r2_get_json(r2_session, "nse_catalysts.json") or {}
+    # Cards removed on purpose (lifecycle duplicates, superseded adverse cards,
+    # nominal acquisitions). Without this list the API re-delivers them every run,
+    # their PDFs are re-downloaded and they can even consume AI calls again.
+    suppressed = {}
+    if isinstance(old_payload, dict) and isinstance(old_payload.get("suppressed"), dict):
+        _sup_cutoff = (today - timedelta(days=HISTORY_DAYS + 2)).isoformat()
+        suppressed = {k: v for k, v in old_payload["suppressed"].items() if str(v)[:10] >= _sup_cutoff}
+    if isinstance(old_payload, dict) and isinstance(old_payload.get("data"), dict):
+        history = old_payload["data"]
+    elif isinstance(old_payload, dict):
+        history = old_payload
+    else:
+        history = {}
 
-            failed_sources = [sk for sk in source_keys if not success_map.get(sk, False)]
-            if failed_sources:
-                print(f"  ⚠ {filename}: skipping upload — fetch failed for {failed_sources}, "
-                      f"keeping existing R2 data untouched")
+    # Materiality inputs are read from the same R2 store. They are used only
+    # to calculate the two ratios below; raw market cap / TTM sales are not
+    # duplicated into nse_catalysts.json.
+    classification_payload = _r2_get_json(r2_session, "classification.json") or {}
+    fundamentals_payload = _r2_get_json(r2_session, "fundamentals_summary.json") or {}
+    market_cap_map, ttm_sales_map = _build_materiality_maps(
+        classification_payload, fundamentals_payload
+    )
+    print(f"  ✓ Materiality lookup → market_cap={len(market_cap_map)} symbols, "
+          f"ttm_sales={len(ttm_sales_map)} symbols")
+
+    # Reparse legacy local-PDF fields once with the current strict rules.
+    # This removes stale v1/v2 false values that would otherwise survive merge.
+    revalidate_local_history(r2_session, history, market_cap_map, ttm_sales_map)
+
+    # Re-apply today's backend rules to historical rows as well. This removes
+    # old Results, Other, Clarification/News Verification, routine allotments,
+    # auditor appointments, promoter inter-se transfers and other noise already
+    # present in R2. Manual rows are preserved.
+    removed_noise = 0
+    reclassified = 0
+    for sym in list(history):
+        cleaned = []
+        for x in history[sym]:
+            if x.get("manual"):
+                cleaned.append(x)
                 continue
-
-            # XBRL is permanently off (PDF_ONLY_MODE), so nse_results_feed.json's
-            # accumulated XBRL announcements can never get a parsed detail
-            # record (build_results_detailed skips XBRL entirely), and the
-            # frontend has separately been told to hide this feed from the
-            # Results tab too — nothing reads or benefits from it. Skip
-            # fetching/accumulating/uploading it entirely rather than doing
-            # that work for a file nothing consumes. Existing R2 data is
-            # left untouched (not deleted) so re-enabling XBRL later, if
-            # ever, picks up right where it left off.
-            if filename == "nse_results_feed.json" and PDF_ONLY_MODE:
-                print(f"  ⏭ {filename}: skipping fetch/accumulate — PDF-only mode, nothing consumes this file right now")
+            x["text"] = _fix_rupee(x.get("text", ""))      # stored rows saved before the fix
+            cat = classify(x.get("subject", ""), x.get("text", ""))
+            if (not cat and x.get("category") and len(x.get("text") or "") >= TEXT_MAX
+                    and not is_explicit_noise(x.get("subject", ""), x.get("text", ""))):
+                # Stored text is cut at TEXT_MAX; the keyword that classified this
+                # row at fetch time may lie past the cut. Keep the fetch-time
+                # category unless a noise rule positively matches.
+                cat = x["category"]
+            if x.get("category_override"):
+                cat = x["category_override"]     # set from the PDF, outranks summary text
+            if not cat or _is_cirp_procedural_item(x):
+                removed_noise += 1
                 continue
+            if x.get("category") != cat:
+                old_cat = x.get("category")
+                x["category"] = cat
+                reclassified += 1
+                # v1.2: Negative parser metadata must never leak into a row that
+                # has been deterministically reclassified to another category.
+                if old_cat == "Negative" and cat != "Negative":
+                    for _k in ("negative_parser_version", "negative_type", "negative_stage",
+                               "tax_demand_cr", "tax_demand_text", "penalty_cr", "penalty_text",
+                               "interest_cr", "interest_text", "award_amount_cr", "award_amount_text",
+                               "total_exposure_cr", "amount_cr", "amount_text", "amount_context",
+                               "amount_to_market_cap_pct", "authority"):
+                        x.pop(_k, None)
+                    if x.get("detail_source") in {"local_pdf", "pdf_local"}:
+                        x.pop("detail_source", None)
+            # Refresh deterministic stage/type metadata on retained history.
+            for k in ("event_type", "stage"):
+                x.pop(k, None)
+            x.update(_event_meta(x.get("subject", ""), x.get("text", ""), cat))
+            if cat == "Negative" and (x.get("cancels") or (x.get("category_override") == "Negative"
+                                                         and _ORDER_CANCEL.search(f"{x.get('subject', '')} {x.get('text', '')}"))):
+                x["negative_type"], x["negative_stage"] = "Order Cancellation", "Cancelled"
+                x.pop("authority", None)
+                if x.get("amount_cr") is None and x.get("cancels"):
+                    _o = next((y for y in history.get(sym, []) if y.get("id") == x["cancels"]), None)
+                    if _o and _o.get("order_value_cr") is not None:
+                        x["amount_cr"] = _o["order_value_cr"]
+            # Decisions made by the PDF order check survive the daily re-tagging.
+            if x.get("event_type_override"):
+                x["event_type"] = x["event_type_override"]
+            if x.get("stage_override"):
+                x["stage"] = x["stage_override"]
+            cleaned.append(x)
+        history[sym] = cleaned
+        if not history[sym]:
+            del history[sym]
+    if removed_noise or reclassified:
+        print(f"  🧹 Historical cleanup → removed={removed_noise}, reclassified={reclassified}")
 
-            items = []
-            for sk in source_keys:
-                items.extend(result_map.get(sk, []))
+    stale_negative_scrubbed = scrub_negative_metadata_from_nonnegative(history)
+    if stale_negative_scrubbed:
+        print(f"  🧽 Negative metadata scrub → cleaned={stale_negative_scrubbed} non-Negative card(s)")
 
-            # Newest first (merged sources ke liye zaroori, aur dedup
-            # latest published wala instance rakhta hai)
-            items.sort(key=lambda x: x.get("published_ts", 0), reverse=True)
+    # Negative-only local refresh. This does not alter the frozen v4.1 parsers
+    # for Orders, Acquisition, Corporate Action, etc.
+    revalidate_negative_history(r2_session, history, market_cap_map)
 
-            before = len(items)
-            items = [it for it in items if not is_noise(it)]
-            dropped_noise = before - len(items)
+    existing_ids = {x.get("id") for items in history.values() for x in items if x.get("id")}
+    initial_build = not bool(existing_ids)
 
-            before_dedup = len(items)
-            items = dedup_items(items)
-            dropped_dup = before_dedup - len(items)
+    new_items, source = fetch_catalysts(
+        nse_session, today, HISTORY_DAYS, is_trading_day, next_trading_day
+    )
+    fetched = sum(len(v) for v in new_items.values())
 
-            if dropped_noise or dropped_dup:
-                print(f"  {filename}: -{dropped_noise} noise, -{dropped_dup} dup → {len(items)}")
-
-            if filename == "nse_results_feed.json":
-                # NSE's RSS feed itself only ever shows its latest ~20 items
-                # (confirmed: consistently exactly 20 across runs) — if we
-                # just re-upload that snapshot each time, results scroll out
-                # of the feed (and off the frontend's Results tab) faster
-                # than they can be viewed, especially during results season
-                # when 100+ companies file in an evening. Accumulate against
-                # the existing R2 file instead, same pattern already used
-                # for nse_results_detailed.json.
-                existing_feed = await r2_get(client, "nse_results_feed.json")
-                existing_feed_items = (existing_feed or {}).get("items", [])
-                merged_feed = dedup_items(items + existing_feed_items)
-                merged_feed.sort(key=_effective_ts, reverse=True)
-                merged_feed = merged_feed[:1000]  # same cap as nse_results_detailed.json
-                added = len(merged_feed) - len(existing_feed_items)
-                print(f"  nse_results_feed.json: {len(existing_feed_items)} existing + "
-                      f"{max(added, 0)} new = {len(merged_feed)} (capped at 1000)")
-                items = merged_feed
-                results_feed_items = items
-
-            if filename == "nse_board_meetings.json":
-                board_meeting_items = items
-
-            uploads.append((filename, make_payload(items)))
-
-        # Upload all concurrently
-        print("\nUploading to R2...")
-        upload_tasks = [r2_put(client, fname, payload) for fname, payload in uploads]
-        await asyncio.gather(*upload_tasks)
-
-        # nse_board_meetings.json is just a rolling ~300-item snapshot of the
-        # RSS feed (not accumulated, unlike nse_results_feed.json) — a PDF
-        # "Outcome of Board Meeting" filed early in the day can scroll out
-        # of that window by evening once enough other announcements (KMP
-        # changes, press releases, etc.) push it out, well before it's ever
-        # been detail-parsed. Keep a small dedicated accumulator so PDF
-        # fast-path candidates aren't lost to feed churn, same fix already
-        # applied to nse_results_feed.json for the same underlying reason.
-        # NSE doesn't consistently route "Outcome of Board Meeting" PDFs
-        # through Board_Meetings.xml — some land only in
-        # Online_announcements.xml instead (confirmed: e.g. UNO Minda's
-        # outcome PDF appeared only in nse_announcements this run, with
-        # board_meeting_items empty of it). Use the RAW pre-noise-filtered
-        # fetch of both feeds so a future noise-pattern tweak can't
-        # accidentally hide a real results PDF from this detector.
-        pdf_source_items = result_map.get("nse_board", []) + result_map.get("nse_announcements", [])
-        seen_pdf_links = set()
-        pdf_candidates_now = []
-        for it in pdf_source_items:
-            if not _is_board_outcome_pdf(it):
+    # NSE often gives CIRP filings a generic summary, so use the PDF filename/link
+    # as an additional deterministic signal for clearly procedural fresh rows.
+    fresh_procedural_removed = 0
+    for _sym in list(new_items):
+        _kept = []
+        for _it in new_items[_sym]:
+            if _it.get("category") == "Negative" and _is_cirp_procedural_item(_it):
+                fresh_procedural_removed += 1
                 continue
-            link = it.get("link", "")
-            if link in seen_pdf_links:
-                continue
-            seen_pdf_links.add(link)
-            pdf_candidates_now.append(it)
+            _kept.append(_it)
+        if _kept:
+            new_items[_sym] = _kept
+        else:
+            del new_items[_sym]
+    if fresh_procedural_removed:
+        print(f"  🧹 Fresh CIRP procedural cleanup → removed={fresh_procedural_removed}")
 
-        # Cross-check against result_calendar.json — NSE's own schedule of
-        # which symbols are actually due to declare results on which date.
-        # Many "Outcome of Board Meeting" PDFs are about something other
-        # than quarterly results (NCD issuance, KMP changes, etc.) with a
-        # generic boilerplate summary giving no textual clue either way
-        # (confirmed directly: Anupam Rasayan/Shalibhadra/Shivalic Power/
-        # Pelatro all showed up as bare "RESULT" cards with no financial
-        # data — none of their symbols were actually on the calendar for
-        # that date). This filter is ground-truth rather than a text
-        # heuristic, so it catches cases the earlier NCD/debenture wording
-        # filter can't. Applied to the FULL candidate set (new + already-
-        # stored) so previously-admitted non-results self-heal out on each
-        # run, not just prevented going forward.
-        calendar_payload = await r2_get(client, "result_calendar.json")
-        if not calendar_payload:
-            print("  ⚠ result_calendar.json unavailable — skipping calendar cross-check this run")
-        # Calendar fallback: symbol is due today per result_calendar.json but its
-        # subject/text never says "results" -> still check the PDF itself.
-        if calendar_payload:
-            cal_fb = 0
-            for it in pdf_source_items:
-                link = it.get("link", "")
-                if not link.lower().endswith(".pdf") or link in seen_pdf_links:
-                    continue
-                if is_noise(it) or not _nse_on_calendar_strict(link, calendar_payload):
-                    continue
-                it["_cal_fallback"] = True
-                seen_pdf_links.add(link)
-                pdf_candidates_now.append(it)
-                cal_fb += 1
-            if cal_fb:
-                print(f"  + {cal_fb} NSE PDF(s) added via result_calendar.json (no results wording in subject/text)")
-        existing_pdf_feed = await r2_get(client, "nse_results_pdf_feed.json")
-        existing_pdf_items = (existing_pdf_feed or {}).get("items", [])
-        all_pdf_candidates = dedup_items(pdf_candidates_now + existing_pdf_items)
-
-        before_cal = len(all_pdf_candidates)
-        if calendar_payload:
-            kept_pdf_candidates = []
-            explicit_result_bypass = 0
-            for it in all_pdf_candidates:
-                # Explicit NSE wording is stronger evidence than the archive
-                # filename prefix. The prefix can be an old/internal company
-                # code rather than the live NSE symbol (PCPL -> PRANAV), so do
-                # not let that mismatch suppress a confirmed results filing.
-                if _has_explicit_financial_results_text(it):
-                    kept_pdf_candidates.append(it)
-                    explicit_result_bypass += 1
-                    continue
-
-                # Generic board outcomes still need the calendar guard; this
-                # preserves the existing protection against NCD/KMP/fundraise
-                # PDFs that share the same generic NSE subject.
-                if _in_result_calendar(
-                    _extract_filename_symbol(it.get("link", "")),
-                    calendar_payload,
-                    it.get("link", ""),
-                ):
-                    kept_pdf_candidates.append(it)
-
-            all_pdf_candidates = kept_pdf_candidates
-            dropped_cal = before_cal - len(all_pdf_candidates)
-            if explicit_result_bypass:
-                print(f"  ✓ {explicit_result_bypass} announcement(s) kept by explicit financial-results text "
-                      f"(calendar symbol check bypassed; handles NSE filename/symbol mismatches)")
-            if dropped_cal:
-                print(f"  🗑 {dropped_cal} announcement(s) dropped — no explicit financial-results text and "
-                      f"filename symbol not on result_calendar.json for that date")
-
-        merged_pdf_feed = all_pdf_candidates
-        merged_pdf_feed.sort(key=_effective_ts, reverse=True)
-        merged_pdf_feed = merged_pdf_feed[:500]
-        print(f"  nse_results_pdf_feed.json: {len(existing_pdf_items)} existing + "
-              f"{max(len(merged_pdf_feed) - len(existing_pdf_items), 0)} new = {len(merged_pdf_feed)} (capped at 500)")
-        await r2_put(client, "nse_results_pdf_feed.json", make_payload(merged_pdf_feed))
-
-        # ── BSE results-PDF candidates ──
-        # Same rolling-accumulator pattern as nse_results_pdf_feed.json
-        # above (BSE's feed only ever shows its latest snapshot too), now
-        # with the same result_calendar.json cross-check NSE gets — this
-        # is what catches filings like Infrastructure Leasing & Financial
-        # Services' "revised audited standalone financial results for FY
-        # 2018-19" (a stale NCLT-resolution correction, not a current
-        # quarter, but one that still matches _is_bse_results_pdf's text
-        # pattern): the symbol just isn't on the calendar for that date,
-        # so it's dropped here rather than reaching Telegram/storage as if
-        # it were today's result. bse_symbol_map is loaded first (moved up
-        # from just before build_results_detailed) since resolving each
-        # item's probable symbol is needed for the calendar lookup itself,
-        # not only for later parsing.
-        bse_symbol_map = await _load_bse_symbol_map(client)
-        bse_sorted = _dedup_bse_by_link(
-            sorted(result_map.get("bse_announcements", []), key=lambda x: x.get("published_ts", 0), reverse=True)
-        )
-        bse_candidates_now = [it for it in bse_sorted if _is_bse_results_pdf(it)]
-        # Extra candidates (calendar-listed symbol, or generic board outcome). They
-        # bypass the calendar gate below on purpose - the PDF heading check decides.
-        bse_extra = []
-        for it in bse_sorted:
-            if _is_bse_results_pdf(it):
-                continue
-            kind = _bse_extra_candidate_kind(it, calendar_payload, bse_symbol_map)
-            if kind == "calendar":
-                it["_cal_fallback"] = True
-            elif kind == "loose":
-                it["_loose"] = True
+    suppressed_skipped = 0
+    if suppressed:
+        for _sym in list(new_items):
+            _kept = [it for it in new_items[_sym] if it.get("id") not in suppressed]
+            suppressed_skipped += len(new_items[_sym]) - len(_kept)
+            if _kept:
+                new_items[_sym] = _kept
             else:
-                continue
-            bse_extra.append(it)
-        if bse_extra:
-            print(f"  + {len(bse_extra)} BSE PDF(s) added as extra candidates "
-                  f"({sum(1 for i in bse_extra if i.get('_cal_fallback'))} via calendar, "
-                  f"{sum(1 for i in bse_extra if i.get('_loose'))} generic board-outcome)")
-        if calendar_payload:
-            before_bse_cal = len(bse_candidates_now)
-            bse_candidates_now = [
-                it for it in bse_candidates_now
-                if _in_result_calendar(_pdf_probable_symbol(it, bse_symbol_map), calendar_payload, it.get("link", ""),
-                                        explicit_date=_bse_fallback_date(it.get("published", "")))
-            ]
-            dropped_bse_cal = before_bse_cal - len(bse_candidates_now)
-            if dropped_bse_cal:
-                print(f"  🗑 {dropped_bse_cal} BSE announcement(s) dropped — symbol not on result_calendar.json "
-                      f"for that date (likely a stale/non-current-quarter filing despite matching the results text pattern)")
-        bse_candidates_now = bse_candidates_now + bse_extra
-        existing_bse_feed = await r2_get(client, "bse_results_pdf_feed.json")
-        existing_bse_items = (existing_bse_feed or {}).get("items", [])
-        merged_bse_feed = _dedup_bse_by_link(dedup_items(bse_candidates_now + existing_bse_items))
-        merged_bse_feed.sort(key=_effective_ts, reverse=True)
-        merged_bse_feed = merged_bse_feed[:BSE_PDF_FEED_CAP]
-        print(f"  bse_results_pdf_feed.json: {len(existing_bse_items)} existing + "
-              f"{max(len(merged_bse_feed) - len(existing_bse_items), 0)} new = {len(merged_bse_feed)} (capped at {BSE_PDF_FEED_CAP})")
-        await r2_put(client, "bse_results_pdf_feed.json", make_payload(merged_bse_feed))
+                del new_items[_sym]
+    if suppressed_skipped:
+        print(f"  🚫 Previously removed cards skipped → {suppressed_skipped}")
 
-        # ── Financial results detail (P&L from XBRL / AI-extracted PDF) ──
-        print("\nParsing financial results (PDF-only)...")
-        fundamentals = await r2_get(client, FUNDAMENTALS_FILE)
-        fundamentals_stocks = (fundamentals or {}).get("stocks")
-        if not fundamentals_stocks:
-            print(f"  ⚠ {FUNDAMENTALS_FILE} unavailable — YoY fallback via fundamentals disabled this run")
-        detailed_payload = await build_results_detailed(client, results_feed_items, merged_pdf_feed, fundamentals_stocks,
-                                                          bse_pdf_items=merged_bse_feed, bse_symbol_map=bse_symbol_map)
-        if detailed_payload:
-            await r2_put(client, "nse_results_detailed.json", detailed_payload)
+    # Stamp the group symbol temporarily so enrichment can join to the R2
+    # classification/fundamentals lookups without changing the stored schema.
+    for _sym, _items in new_items.items():
+        for _it in _items:
+            _it["_lookup_symbol"] = str(_sym).strip().upper()
 
-    print("✅ Done")
+    # Local-only PDF enrichment. No Gemini/AI request is made anywhere in this path.
+    enrich_local_pdfs(
+        nse_session, new_items, existing_ids, today, initial_build,
+        market_cap_map, ttm_sales_map
+    )
+    for _items in new_items.values():
+        for _it in _items:
+            if _it.get("category") == "Negative" and _it.get("local_pdf_checked"):
+                _it["negative_parser_version"] = NEG_PARSER_VERSION
+
+    # Internal join key must never be persisted.
+    for _items in new_items.values():
+        for _it in _items:
+            _it.pop("_lookup_symbol", None)
+
+    added = merge_catalysts(history, new_items, today, HISTORY_DAYS)
+    _post_merge = {x.get("id"): x.get("dt", "") for items in history.values() for x in items
+                   if x.get("id") and not x.get("manual")}
+
+    # Drain the never-opened backlog (rows stored before their PDF was checked).
+    # Runs after merge so expired rows are already gone and fresh rows that a
+    # rebuild skipped are included. Uses the primed NSE session like fresh enrichment.
+    backfill_local_history(nse_session, history, market_cap_map, ttm_sales_map)
+
+    # Cross-check values against the NSE headline before lifecycle consolidation,
+    # so merged cards carry the corrected figure.
+    apply_headline_quality(history, market_cap_map, ttm_sales_map)
+
+    # One-time re-check of stages/categories set by the first order-check version.
+    recheck_order_stages(nse_session, history)
+
+    # Order check: heading value → PDF type check → AI only when needed.
+    process_orders(nse_session, history, market_cap_map, ttm_sales_map)
+
+    # Corporate actions: stage (recommended vs shareholder-approved) and dates from the PDF.
+    process_corp_actions(nse_session, history)
+
+    # Defensive final hygiene after merge: no Negative-only metadata may survive
+    # on a card whose final category is something else.
+    scrub_negative_metadata_from_nonnegative(history)
+
+    # Negative v1.3: when a later filing explicitly sets aside / grants relief
+    # on the same monetary matter, suppress the older adverse card.
+    negative_relief_removed = consolidate_negative_relief_lifecycles(history)
+    if negative_relief_removed:
+        print(f"  🔗 Negative relief lifecycle → removed={negative_relief_removed} superseded adverse card(s)")
+
+    # Collapse duplicate lifecycle filings only after old + fresh rows are merged,
+    # so L1 -> award, announced -> completed, and scheme stage updates can meet.
+    lifecycle_removed = consolidate_lifecycles(history)
+    if lifecycle_removed:
+        print(f"  🔗 Lifecycle consolidation → removed={lifecycle_removed} duplicate stage card(s)")
+
+    total = sum(len(v) for v in history.values())
+
+    _final_ids = {x.get("id") for items in history.values() for x in items}
+    _newly_suppressed = {k: v for k, v in _post_merge.items() if k not in _final_ids}
+    suppressed.update(_newly_suppressed)
+    if _newly_suppressed:
+        print(f"  🗂 Suppressed for future runs → +{len(_newly_suppressed)} (total {len(suppressed)})")
+
+    payload = {
+        "suppressed": suppressed,
+        "updated": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source": source,
+        "data": history,
+    }
+    _r2_put_json(r2_session, "nse_catalysts.json", payload)
+
+    # Per-symbol 3-year archive for chart markers. Runs after the main upload so
+    # an archive problem can never block the live file.
+    try:
+        update_symbol_archives(r2_session, history, suppressed, today)
+    except Exception as e:
+        print(f"  ⚠ Symbol archive step failed ({e})")
+
+    print(f"  ✓ Catalyst scan complete: source={source}, fetched={fetched}, "
+          f"new={added}, symbols={len(history)}, stored={total}")
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    main()
