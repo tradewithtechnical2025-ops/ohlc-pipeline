@@ -3021,6 +3021,7 @@ DASH_MIN_TURNOVER = 1_00_00_000 # ₹1 crore average daily turnover, filters out
 DASH_GROUP_MIN = 3              # sectors / industries need at least this many stocks
 DASH_RESULT_DAYS = 7            # results calendar window ahead of today
 DASH_STAGE_LIST_N = 25          # stocks listed per Weinstein stage
+DASH_SKIP_GROUPS = {"", "unclassified", "others", "na", "n/a"}  # group names hidden from sector / industry lists
 
 def _dash_num(v):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
@@ -3045,22 +3046,40 @@ def _dash_ad_line(all_data, sessions=20):
         run += net[day]; out.append(run)
     return out
 
-def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, stages_raw):
+def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, stages_raw, cls_map=None):
     by_sym = {r["symbol"]: r for r in feed if r.get("symbol")}
+    cls_map = cls_map or {}
+
+    def tsym_of(sym, r=None):
+        # readable ticker: BSE-only stocks have numeric codes as `symbol`
+        r = r or by_sym.get(sym) or {}
+        c = cls_map.get(sym) or {}
+        return r.get("trading_symbol") or c.get("trading_symbol") or sym
+
+    def ex_of(sym, r=None):
+        r = r or by_sym.get(sym) or {}
+        return r.get("exchange") or (cls_map.get(sym) or {}).get("exchange") or ""
+
+    def name_of(sym, r=None):
+        r = r or by_sym.get(sym) or {}
+        return r.get("name") or (cls_map.get(sym) or {}).get("name") or tsym_of(sym, r)
     # only stocks that traded in the latest session; stale rows would skew breadth
     live = [r for r in feed if _dash_num(r.get("ltp")) is not None and _dash_num(r.get("pct_ch")) is not None and r.get("date") == as_of]
 
     def lite(r, **extra):
-        return {"sym": r["symbol"], "name": r.get("name", ""), "ltp": r.get("ltp"), "chg": r.get("pct_ch"),
+        sym = r["symbol"]
+        return {"sym": sym, "tsym": tsym_of(sym, r), "ex": ex_of(sym, r), "name": name_of(sym, r),
+                "ltp": r.get("ltp"), "chg": r.get("pct_ch"),
                 "rs": r.get("rs_rating"), "rvol": r.get("rvol"), **extra}
 
-    # 52-week highs, strongest RS first
-    highs = sorted((r for r in live if r.get("new_52wh")), key=lambda r: -(_dash_num(r.get("rs_rating")) or 0))
-
-    # volume shockers: liquid stocks trading far above their 20-day average volume
     def liquid(r):
         av, ltp = _dash_num(r.get("avg_vol20")), _dash_num(r.get("ltp"))
         return av is not None and ltp is not None and av * ltp >= DASH_MIN_TURNOVER
+
+    # 52-week highs, strongest RS first (no liquidity filter)
+    highs = sorted((r for r in live if r.get("new_52wh")), key=lambda r: -(_dash_num(r.get("rs_rating")) or 0))
+
+    # volume shockers: liquid stocks trading far above their 20-day average volume
     shockers = sorted((r for r in live if (_dash_num(r.get("rvol")) or 0) >= DASH_RVOL_MIN and liquid(r)),
                       key=lambda r: -r["rvol"])
 
@@ -3071,15 +3090,16 @@ def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, st
     for d_str in sorted(result_calendar or {}):
         if today_d.isoformat() <= d_str <= end_d:
             for sym in result_calendar[d_str]:
-                results.append({"sym": sym, "name": by_sym.get(sym, {}).get("name", ""), "date": d_str, "when": None})
+                results.append({"sym": sym, "tsym": tsym_of(sym), "ex": ex_of(sym), "name": name_of(sym),
+                                "date": d_str, "when": None})
     results = results[:300]
 
     # sectors and industries
     def groups(field):
         g = {}
         for r in live:
-            k = r.get(field)
-            if k: g.setdefault(k, []).append(r)
+            k = (r.get(field) or "").strip()
+            if k.lower() not in DASH_SKIP_GROUPS: g.setdefault(k, []).append(r)
         return {k: v for k, v in g.items() if len(v) >= DASH_GROUP_MIN}
     sectors = [{"name": k, "chg": round(_dash_median(r["pct_ch"] for r in v), 2),
                 "adv": sum(1 for r in v if r["pct_ch"] > 0), "dec": sum(1 for r in v if r["pct_ch"] < 0)}
@@ -3124,7 +3144,7 @@ def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, st
         for x in sigs:
             if x.get("stage") != n or x.get("symbol") not in by_sym: continue
             r = by_sym[x["symbol"]]
-            rows.append({"sym": x["symbol"], "name": r.get("name", ""), "chg": r.get("pct_ch"),
+            rows.append({"sym": x["symbol"], "tsym": tsym_of(x["symbol"], r), "name": name_of(x["symbol"], r), "chg": r.get("pct_ch"),
                          "rs": r.get("rs_rating"), "weeks": x.get("weeks_in_stage")})
         rows.sort(key=lambda y: -(_dash_num(y["rs"]) or 0))
         stocks[n] = rows[:DASH_STAGE_LIST_N]
@@ -3632,7 +3652,8 @@ async def run_ep_scan() -> None:
             dash_summary = _build_dash_summary(
                 screener_feed, all_data, result_calendar, market_data_date,
                 dash_prev if isinstance(dash_prev, dict) else {},
-                dash_stages if isinstance(dash_stages, dict) else {})
+                dash_stages if isinstance(dash_stages, dict) else {},
+                cls_map_ep)
             log.info(f"dash_summary: {dash_summary['highs52Count']} 52W highs, {len(dash_summary['volShockers'])} vol shockers, "
                      f"{len(dash_summary['sectors'])} sectors, {len(dash_summary['industries'])} industries")
 
