@@ -515,8 +515,19 @@ _RUPEE_FIXES = (
 
 
 def _fix_rupee(text: str) -> str:
+    import html as _html
+    text = text or ""
+    # NSE summaries sometimes carry raw HTML entities ("&#8377;" = ₹, "&amp;").
+    # Two passes cover double-encoded "&amp;#8377;".
+    for _ in range(2):
+        if "&" not in text:
+            break
+        text = _html.unescape(text)
     for pat, rep_ in _RUPEE_FIXES:
-        text = pat.sub(rep_, text or "")
+        text = pat.sub(rep_, text)
+    # "Crores.In addition" -> "Crores. In addition" (missing space after a full stop)
+    text = re.sub(r"(?<=[a-z0-9)])\.(?=[A-Z][a-z]+\b)", ". ", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
 
