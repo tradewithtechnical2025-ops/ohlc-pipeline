@@ -380,6 +380,53 @@ async def r2_get(client: httpx.AsyncClient, filename: str):
         return None
 
 
+# ── Known-symbol registry (filled from classification.json + result_calendar.json) ──
+# NSE archive filenames do NOT reliably carry the symbol: seen uploader names
+# ("CAVAIBHAVGATTANI_..." for STEAMHOUSE) and typos ("RENTMOJO_..." for
+# RENTOMOJO). Symbols are checked against this registry before a record is
+# stored; empty registry (both files unavailable) = no checking at all.
+_SYMBOL_REGISTRY = {"symbols": set(), "by_name": {}}
+_NAME_STOPWORDS = re.compile(r"\b(limited|ltd|private|pvt|the|india|co|company|corporation|corp|inc)\b")
+
+
+def _compact_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", _NAME_STOPWORDS.sub(" ", (name or "").lower()))
+
+
+def _register_symbols(symbols=(), names: dict | None = None):
+    for sym in symbols:
+        if sym:
+            _SYMBOL_REGISTRY["symbols"].add(str(sym).strip().upper())
+    for name, sym in (names or {}).items():
+        key = _compact_name(name)
+        if key and sym:
+            _SYMBOL_REGISTRY["by_name"].setdefault(key, str(sym).strip().upper())
+
+
+def _resolve_symbol(symbol: str, company_name: str, explicit: bool):
+    """(symbol, flag). Known symbol -> unchanged. Unknown symbol coming from a
+    filename/text guess -> corrected when the company name pins down exactly
+    one registered symbol (by name, or a near-identical ticker the name also
+    contains). An explicit override (manual SYMBOL=, BSE map) is never
+    changed, only flagged if unknown."""
+    known = _SYMBOL_REGISTRY["symbols"]
+    sym = (symbol or "").strip().upper()
+    if not known or sym in known:
+        return sym, None
+    if explicit:
+        return sym, "symbol_unverified"
+    cname = _compact_name(company_name)
+    by_name = _SYMBOL_REGISTRY["by_name"].get(cname) if cname else None
+    if by_name and by_name in known:
+        return by_name, f"symbol_corrected:{sym}->{by_name}"
+    import difflib
+    close = difflib.get_close_matches(sym, list(known), n=3, cutoff=0.85)
+    hits = [c for c in close if cname and (c.lower() in cname or cname.startswith(c.lower()[:6]))]
+    if len(hits) == 1:
+        return hits[0], f"symbol_corrected:{sym}->{hits[0]}"
+    return sym, "symbol_unverified"
+
+
 async def _load_bse_symbol_map(client: httpx.AsyncClient) -> dict:
     """bse_code -> canonical `symbol` (classification.json's own field —
     an NSE ticker like 'AUGMONT' for dual-listed stocks, or the numeric
@@ -389,11 +436,20 @@ async def _load_bse_symbol_map(client: httpx.AsyncClient) -> dict:
     payload = await r2_get(client, "classification.json")
     rows = payload if isinstance(payload, list) else (payload or {}).get("items") or []
     m = {}
+    syms, names = [], {}
     for row in rows:
         code = (row.get("bse_code") or "").strip()
         sym = row.get("symbol")
         if code and sym and code not in m:
             m[code] = sym
+        nse = row.get("nse_code") or sym
+        if nse:
+            syms.append(nse)
+            nm = next((row.get(k) for k in ("name", "company_name", "company", "companyName", "stock_name")
+                       if row.get(k)), None)
+            if nm:
+                names[nm] = nse
+    _register_symbols(syms, names)
     print(f"  ✓ classification.json: {len(m)} bse_code -> symbol mapping(s) loaded")
     return m
 
@@ -1218,6 +1274,7 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
   "is_results_table": true or false,
   "document_type": "results_statement" or "investor_presentation" or "press_release" or "other",
   "basis": "Standalone" or "Consolidated" or null,
+  "company_name": "the company's full legal name as printed, e.g. \"Rentomojo Limited\"" or null,
   "unit": "Crore" or "Million" or "Lakh" or null,
   "period_end": "YYYY-MM-DD" or null,
   "current": {
@@ -1472,6 +1529,7 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     # STEAMHOUSE). Cover letters write it several ways:
     #   "NSE Symbol: X" / "Symbol: X (NSE)" / "National Stock Exchange ... Symbol: X"
     text_sym = _symbol_from_text(text)
+    explicit_symbol = bool(symbol_override)
     if symbol_override:
         symbol = symbol_override
     elif text_sym:
@@ -1486,8 +1544,26 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     audited = m_aud.group(1).capitalize() if m_aud else None
 
     first_line = text.strip().split("\n", 1)[0].strip()
-    company_name = rss_title.strip() if rss_title and rss_title.strip() else (
-        first_line if first_line and len(first_line) < 80 else symbol)
+    ai_name = (ai.get("company_name") or "").strip()
+    title = (rss_title or "").strip()
+    if title and title.upper() != (symbol or "").upper():
+        company_name = title
+    elif ai_name and len(ai_name) < 120:
+        # Manual runs (and some feeds) only know the SYMBOL — "RENTMOJO" is not
+        # a company name; the statement header is.
+        company_name = ai_name
+    else:
+        company_name = first_line if first_line and len(first_line) < 80 else (title or symbol)
+
+    sym_name_hint = ai_name or (title if title.upper() != (symbol or "").upper() else "")
+    resolved, sym_flag = _resolve_symbol(symbol, sym_name_hint, explicit_symbol)
+    if sym_flag:
+        quality_flags.append(sym_flag)
+        print(f"    · [{fname_dbg}] {sym_flag}" + ("" if resolved != symbol else
+              f" — '{symbol}' not in classification/calendar, kept as-is"))
+        if company_name == symbol:
+            company_name = resolved
+        symbol = resolved
 
     quarter = {
         "revenue": revenue, "other_income": other_income, "total_income": total_income,
@@ -3396,6 +3472,8 @@ async def run():
         # stored) so previously-admitted non-results self-heal out on each
         # run, not just prevented going forward.
         calendar_payload = await r2_get(client, "result_calendar.json")
+        if isinstance(calendar_payload, dict):
+            _register_symbols(s for v in calendar_payload.values() if isinstance(v, list) for s in v)
         if not calendar_payload:
             print("  ⚠ result_calendar.json unavailable — skipping calendar cross-check this run")
         # Calendar fallback: symbol is due today per result_calendar.json but its
