@@ -9,6 +9,13 @@ on:
         description: 'Galat/stale results dobara extract karo (Gemini calls lagenge)'
         type: boolean
         default: false
+      manual_pdfs:
+        description: 'Missed result PDFs: SYMBOL=URL (comma se alag)'
+        default: ''
+      manual_telegram:
+        description: 'Manual results ka Telegram bhi bhejo'
+        type: boolean
+        default: false
 jobs:
   run-pipelines:
     runs-on: ubuntu-latest
@@ -38,6 +45,8 @@ jobs:
           TELEGRAM_RESULTS_CHAT_ID: ${{ secrets.TELEGRAM_RESULTS_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           REPROCESS_STALE_RESULTS: ${{ inputs.reprocess_stale && '1' || '0' }}
+          MANUAL_RESULT_PDFS: ${{ inputs.manual_pdfs }}
+          MANUAL_SEND_TELEGRAM: ${{ inputs.manual_telegram && '1' || '0' }}
       - name: Run IPO scan
         if: ${{ github.event.inputs.mode == 'full' }}
         env:
