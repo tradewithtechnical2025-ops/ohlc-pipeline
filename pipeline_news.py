@@ -5,7 +5,7 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import feedparser
 import httpx
 
@@ -1341,6 +1341,27 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
         return None
 
 
+_MEETING_DATE_RE = re.compile(
+    r"meeting\s+(?:held|convened)\s+(?:today\s*,?\s*)?(?:i\.?\s*e\.?\s*,?\s*)?(?:on\s+)?(?:the\s+)?"
+    r"(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day\s*,?\s*)?"
+    r"(\d{1,2}(?:st|nd|rd|th)?[./\-\s]+(?:\d{1,2}|[A-Za-z]{3,9})[./\-\s,]+\d{4}|[A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4})",
+    re.IGNORECASE)
+
+
+def _cover_letter_meeting_date(text: str):
+    m = _MEETING_DATE_RE.search(re.sub(r"\s+", " ", (text or "")[:4000]))
+    if not m:
+        return None
+    raw = re.sub(r"(\d)(st|nd|rd|th)", r"\1", m.group(1)).replace(",", " ")
+    raw = re.sub(r"\s+", " ", re.sub(r"[./\-]", " ", raw)).strip()
+    for fmt in ("%d %m %Y", "%d %B %Y", "%d %b %Y", "%B %d %Y", "%b %d %Y"):
+        try:
+            return datetime.strptime(raw, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+
 def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_title: str = "",
                            scrip_code: str = None, fallback_board_meeting_date: str = None,
                            symbol_override: str = None, exchange: str = "NSE", preextracted_text: str = None):
@@ -1434,6 +1455,13 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     elif fallback_board_meeting_date:
         board_meeting_date = fallback_board_meeting_date
         fname_symbol = None
+        # The cover letter usually states the meeting date outright ("...at its
+        # meeting held today, i.e., October 05, 2026"). Prefer it over the
+        # fallback (publish time / manual run time) when it is on or before it.
+        txt_date = _cover_letter_meeting_date(text)
+        if txt_date and (date.fromisoformat(fallback_board_meeting_date) - timedelta(days=400)
+                         <= date.fromisoformat(txt_date) <= date.fromisoformat(fallback_board_meeting_date)):
+            board_meeting_date = txt_date
     else:
         print(f"    · [{fname_dbg}] no filename timestamp and no fallback date supplied — can't build dedup key")
         return None
@@ -1684,7 +1712,7 @@ def _scanned_results_likely(content: bytes, text: str) -> bool:
 async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = "",
                                        scrip_code: str = None, fallback_board_meeting_date: str = None,
                                        symbol_override: str = None, exchange: str = "NSE",
-                                       preextracted_text: str | None = None):
+                                       preextracted_text: str | None = None, force_ai: bool = False):
     """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
     {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
     flow through the same grouping/dedup/Telegram code.
@@ -1723,7 +1751,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
             print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
             return None
     # ── Investor presentation / press release: never a Reg 33 source ──
-    if _is_non_statement_doc(text):
+    if _is_non_statement_doc(text) and not force_ai:
         print(f"    · [{fname_dbg}] cover letter says investor presentation / press release / transcript — "
               f"not a results statement, skipping AI call")
         return None
@@ -1737,7 +1765,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     # heading tiers). If the cover letter cites Reg 33 / limited review and
     # some pages have no text layer, the table is almost certainly in the
     # images — send it to Gemini, which reads the PDF natively.
-    if not _pdf_find_heading_candidates(text):
+    if not _pdf_find_heading_candidates(text) and not force_ai:
         if _scanned_results_likely(content, text):
             print(f"    · [{fname_dbg}] no text-layer heading, but cover letter cites Reg 33 results and "
                   f"pages are image-only — sending PDF to AI")
@@ -2350,6 +2378,48 @@ def _group_parsed_results(parsed_new: list) -> list:
     return [groups[k] for k in order]
 
 
+def _manual_result_items() -> list:
+    """Missed result? Feed the PDF in by hand via the MANUAL_RESULT_PDFS env var.
+
+    Entries are separated by commas, spaces or newlines. Each entry is either
+        <PDF URL>                      e.g. https://www.bseindia.com/xml-data/corpfiling/AttachLive/<id>.pdf
+        <SYMBOL>=<PDF URL>             force the NSE symbol (recommended)
+        <SYMBOL>=<path/in/repo.pdf>    a PDF committed to the repo (e.g. manual_pdfs/x.pdf)
+
+    Manual items skip every "already seen / given up / duplicate / already
+    stored" guard and always go to AI extraction. If a record for the same
+    symbol + quarter + basis already exists, it is REPLACED (so this also
+    fixes a wrong record). Telegram is sent only if MANUAL_SEND_TELEGRAM=1."""
+    raw = os.environ.get("MANUAL_RESULT_PDFS", "") or ""
+    items = []
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30)))
+    for tok in re.split(r"[\s,]+", raw.strip()):
+        if not tok:
+            continue
+        sym, _, src = tok.rpartition("=") if re.match(r"^[A-Za-z0-9&\-]+=", tok) else ("", "", tok)
+        sym = sym.strip().upper() or None
+        it = {"_manual": True, "_manual_symbol": sym, "title": sym or "",
+              "published": now_ist.strftime("%d-%b-%Y %H:%M:%S"), "published_ts": int(now_ist.timestamp())}
+        if re.match(r"^https?://", src, re.I):
+            it["link"] = src
+            it["_exchange"] = "BSE" if "bseindia.com" in src.lower() else "NSE"
+            m = re.search(r"/(\d{6})(?:/|_|$)", src)
+            if m and it["_exchange"] == "BSE":
+                it["scripcode"] = m.group(1)
+        else:
+            if not os.path.isfile(src):
+                print(f"  ⚠ MANUAL_RESULT_PDFS: file not found: {src} — skipped")
+                continue
+            with open(src, "rb") as fh:
+                it["_pre_content"] = fh.read()
+            it["link"] = f"manual/{os.path.basename(src)}"
+            it["_exchange"] = "NSE"
+        items.append(it)
+    if items:
+        print(f"  ✍ MANUAL_RESULT_PDFS: {len(items)} PDF(s) queued for forced extraction")
+    return items
+
+
 async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict],
                                   fundamentals: dict | None, bse_pdf_items: list[dict] | None = None,
                                   bse_symbol_map: dict | None = None) -> dict | None:
@@ -2525,6 +2595,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print(f"  ↻ REPROCESS_STALE_RESULTS enabled: retrying {len(incomplete_pdf_links)} "
               f"existing stale/incomplete PDF record(s)")
 
+    manual_items = _manual_result_items()
+    manual_links = {it["link"] for it in manual_items}
     new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
     new_pdf = [it for it in pdf_items if it["link"] not in existing_links or it["link"] in incomplete_pdf_links]
 
@@ -2553,7 +2625,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             print(f"  ⏭ Skipping {skipped} filing(s) given up after {GIVE_UP_ATTEMPTS}+ failed "
                   f"attempts (see nse_xbrl_failures.json)")
 
-    if not new_xbrl and not new_pdf:
+    if not new_xbrl and not new_pdf and not manual_items:
         print("  ✓ nse_results_detailed: no new filings to parse")
         return None
 
@@ -2582,7 +2654,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     dupe_payload = await r2_get(client, "bse_nse_duplicate_links.json")
     known_dupe_links = set((dupe_payload or {}).get("links", []))
     before_dupe = len(new_pdf)
-    new_pdf = [it for it in new_pdf if it["link"] not in known_dupe_links]
+    new_pdf = [it for it in new_pdf if it["link"] not in known_dupe_links and it["link"] not in manual_links]
     if before_dupe != len(new_pdf):
         print(f"  ⏭ Skipping {before_dupe - len(new_pdf)} PDF(s) already known cross-exchange duplicates")
 
@@ -2622,7 +2694,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     grouped_links = {it["link"] for group in pdf_groups.values() for it in group}
     singleton_pdf = [it for it in new_pdf if it["link"] not in grouped_links]
 
-    if not new_xbrl and not new_pdf:
+    if not new_xbrl and not new_pdf and not manual_items:
         print("  ✓ nse_results_detailed: no new filings to parse")
         return None
 
@@ -2690,13 +2762,19 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                         client, content, it["link"], it.get("title", ""),
                         scrip_code=code,
                         fallback_board_meeting_date=_bse_fallback_date(it.get("published", "")),
-                        symbol_override=(bse_symbol_map or {}).get(code, code),
+                        symbol_override=it.get("_manual_symbol") or (bse_symbol_map or {}).get(code, code),
                         exchange="BSE",
                         preextracted_text=it.get("_pre_text"),
+                        force_ai=bool(it.get("_manual")),
                     )
                 else:
                     parsed = await parse_financial_results_pdf(client, content, it["link"], it.get("title", ""),
-                                                              preextracted_text=it.get("_pre_text"))
+                                                              preextracted_text=it.get("_pre_text"),
+                                                              symbol_override=it.get("_manual_symbol"),
+                                                              force_ai=bool(it.get("_manual")),
+                                                              fallback_board_meeting_date=(
+                                                                  _bse_fallback_date(it.get("published", ""))
+                                                                  if it.get("_manual") else None))
                 if not parsed:
                     print(f"  ⚠ PDF parse returned None for {fname} "
                           f"(no results heading / AI unavailable / AI said not a results table / "
@@ -2707,6 +2785,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 parsed["title"] = it.get("title", "")
                 parsed["published"] = it.get("published", "")
                 parsed["published_ts"] = it.get("published_ts", 0)
+                if it.get("_manual"):
+                    parsed.setdefault("meta", {})["manual"] = True
                 _attach_fundamentals(parsed)
                 return parsed
             except Exception as e:
@@ -2896,14 +2976,21 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     print(f"  AI-stage PDF candidates after pre-dedup: {sum(len(v) for v in pdf_groups.values()) + len(singleton_pdf)}")
 
-    xbrl_results, group_results, singleton_results = await asyncio.gather(
+    xbrl_results, group_results, singleton_results, manual_results = await asyncio.gather(
         asyncio.gather(*(process_xbrl(it) for it in new_xbrl)),
         asyncio.gather(*(process_pdf_group(sym, bucket, items) for (sym, bucket), items in pdf_groups.items())),
         asyncio.gather(*(process_pdf(it) for it in singleton_pdf)),
+        asyncio.gather(*(process_pdf(it) for it in manual_items)),
     )
-    pdf_results = list(group_results) + list(singleton_results)
+    pdf_results = list(group_results) + list(singleton_results) + list(manual_results)
     parsed_all = [r for r in xbrl_results if r] + [r for r in pdf_results if r]
-    print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf)} successfully")
+    print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf) + len(manual_items)} successfully")
+    if manual_items:
+        ok_manual = sum(1 for r in manual_results if r)
+        print(f"  ✍ Manual PDFs: {ok_manual}/{len(manual_items)} extracted"
+              + ("" if ok_manual == len(manual_items) else " — check the ⚠ lines above for the failed one(s)"))
+        # a manual attempt must never count toward the automatic give-up counters
+        failed_links[:] = [l for l in failed_links if l not in manual_links]
 
     # ── Narrative-only enrichment from presentations / press releases ──
     # Numbers ALWAYS come from the Reg 33 statement. A presentation for the
@@ -2991,7 +3078,10 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             unkeyed.append(r)
             continue
         prior = latest_by_key.get(key)
-        if prior is None or _filing_ts(r.get("link", "")) >= _filing_ts(prior.get("link", "")):
+        r_manual = (r.get("meta") or {}).get("manual")
+        p_manual = prior is not None and (prior.get("meta") or {}).get("manual")
+        if (prior is None or (r_manual and not p_manual)
+                or (r_manual == p_manual and _filing_ts(r.get("link", "")) >= _filing_ts(prior.get("link", "")))):
             latest_by_key[key] = r
     superseded_count = len(parsed_all) - len(latest_by_key) - len(unkeyed)
     parsed_all = list(latest_by_key.values()) + unkeyed
@@ -3111,7 +3201,10 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     now_ts = datetime.now(timezone.utc).timestamp()
     xbrl_backlog_silenced = []
     still_notify = []
+    manual_telegram = os.environ.get("MANUAL_SEND_TELEGRAM", "0").strip().lower() in ("1", "true", "yes")
     for r in parsed_new:
+        if (r.get("meta") or {}).get("manual") and not manual_telegram:
+            continue   # hand-fed late result: store it, don't announce it as fresh news
         is_xbrl = (r.get("meta", {}) or {}).get("source") != "pdf"
         if is_xbrl and (now_ts - _effective_ts(r)) > XBRL_TELEGRAM_MAX_AGE_SECONDS:
             xbrl_backlog_silenced.append((r.get("meta", {}) or {}).get("symbol") or "?")
