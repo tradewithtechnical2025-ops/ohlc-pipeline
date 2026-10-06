@@ -419,6 +419,16 @@ def _resolve_symbol(symbol: str, company_name: str, explicit: bool):
     by_name = _SYMBOL_REGISTRY["by_name"].get(cname) if cname else None
     if by_name and by_name in known:
         return by_name, f"symbol_corrected:{sym}->{by_name}"
+    # Company name begins with a known ticker ("Karamtara Engineering" ->
+    # KARAMTARA, "Steamhouse India" -> STEAMHOUSE). New IPOs are often on
+    # result_calendar.json (symbols only, no names) before classification.json
+    # has them, so this is what catches filenames carrying a phone number or
+    # uploader name. Longest match wins; >=5 chars to avoid TATA/ADANI-style
+    # group prefixes; a tie means ambiguous -> no correction.
+    if cname:
+        pref = sorted((k for k in known if len(k) >= 5 and cname.startswith(k.lower())), key=len, reverse=True)
+        if pref and (len(pref) == 1 or len(pref[0]) > len(pref[1])):
+            return pref[0], f"symbol_corrected:{sym}->{pref[0]}"
     import difflib
     close = difflib.get_close_matches(sym, list(known), n=3, cutoff=0.85)
     hits = [c for c in close if cname and (c.lower() in cname or cname.startswith(c.lower()[:6]))]
