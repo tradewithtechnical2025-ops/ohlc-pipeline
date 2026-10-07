@@ -464,6 +464,50 @@ async def _load_bse_symbol_map(client: httpx.AsyncClient) -> dict:
     return m
 
 
+async def _load_classification_universe(client: httpx.AsyncClient) -> set[str]:
+    """Strict Results universe from classification.json.
+
+    Accept both nse_code and symbol because the classification file uses both
+    conventions across NSE/dual-listed rows. Empty/unavailable data fails open
+    for this run so a transient R2 problem cannot erase the Results feed.
+    """
+    payload = await r2_get(client, "classification.json")
+    rows = payload if isinstance(payload, list) else (payload or {}).get("items") or []
+    universe = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in ("nse_code", "symbol"):
+            sym = str(row.get(key) or "").strip().upper()
+            if sym:
+                universe.add(sym)
+    if universe:
+        print(f"  ✓ Results universe: {len(universe)} symbol(s) loaded from classification.json")
+    else:
+        print("  ⚠ classification.json unavailable/empty — Results universe filter disabled this run")
+    return universe
+
+
+def _result_candidate_in_universe(it: dict, universe: set[str], bse_symbol_map: dict | None = None) -> bool:
+    """Return True only for automatic result candidates in classification.json.
+
+    For NSE, first try the archive filename symbol, then the existing company-name
+    resolver so legitimate filename/live-symbol mismatches (e.g. old internal
+    filing codes) are not unnecessarily lost. BSE uses classification's scrip map.
+    """
+    if not universe:
+        return True
+    sym = _pdf_probable_symbol(it, bse_symbol_map).strip().upper()
+    if sym in universe:
+        return True
+    if it.get("_exchange") != "BSE" and sym:
+        title = (it.get("title") or "").strip()
+        resolved, _ = _resolve_symbol(sym, title, explicit=False)
+        if resolved in universe:
+            return True
+    return False
+
+
 async def r2_put(client: httpx.AsyncClient, filename: str, data: dict):
     body = json.dumps(data, ensure_ascii=False).encode()
     r = await client.post(
@@ -3502,9 +3546,20 @@ async def run():
                 cal_fb += 1
             if cal_fb:
                 print(f"  + {cal_fb} NSE PDF(s) added via result_calendar.json (no results wording in subject/text)")
+        results_universe = await _load_classification_universe(client)
         existing_pdf_feed = await r2_get(client, "nse_results_pdf_feed.json")
         existing_pdf_items = (existing_pdf_feed or {}).get("items", [])
         all_pdf_candidates = dedup_items(pdf_candidates_now + existing_pdf_items)
+        if results_universe:
+            before_universe = len(all_pdf_candidates)
+            all_pdf_candidates = [
+                it for it in all_pdf_candidates
+                if _result_candidate_in_universe(it, results_universe)
+            ]
+            dropped_universe = before_universe - len(all_pdf_candidates)
+            if dropped_universe:
+                print(f"  🗑 {dropped_universe} NSE result PDF candidate(s) dropped — outside classification.json universe")
+
 
         before_cal = len(all_pdf_candidates)
         if calendar_payload:
@@ -3598,9 +3653,23 @@ async def run():
                 print(f"  🗑 {dropped_bse_cal} BSE announcement(s) dropped — symbol not on result_calendar.json "
                       f"for that date (likely a stale/non-current-quarter filing despite matching the results text pattern)")
         bse_candidates_now = bse_candidates_now + bse_extra
+        if results_universe:
+            before_bse_universe = len(bse_candidates_now)
+            bse_candidates_now = [
+                it for it in bse_candidates_now
+                if _result_candidate_in_universe(it, results_universe, bse_symbol_map)
+            ]
+            dropped_bse_universe = before_bse_universe - len(bse_candidates_now)
+            if dropped_bse_universe:
+                print(f"  🗑 {dropped_bse_universe} BSE result PDF candidate(s) dropped — outside classification.json universe")
         existing_bse_feed = await r2_get(client, "bse_results_pdf_feed.json")
         existing_bse_items = (existing_bse_feed or {}).get("items", [])
         merged_bse_feed = _dedup_bse_by_link(dedup_items(bse_candidates_now + existing_bse_items))
+        if results_universe:
+            merged_bse_feed = [
+                it for it in merged_bse_feed
+                if _result_candidate_in_universe(it, results_universe, bse_symbol_map)
+            ]
         merged_bse_feed.sort(key=_effective_ts, reverse=True)
         merged_bse_feed = merged_bse_feed[:BSE_PDF_FEED_CAP]
         print(f"  bse_results_pdf_feed.json: {len(existing_bse_items)} existing + "
