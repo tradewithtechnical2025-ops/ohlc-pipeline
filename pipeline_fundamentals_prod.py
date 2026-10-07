@@ -415,6 +415,9 @@ def _build_pl_core(row):
     core = _resolve_aliases(row, CORE_PL_ALIASES)
     if core.get("interest_earned") is not None and core.get("interest_expended") is not None:
         core["net_interest_income"] = core["interest_earned"] - core["interest_expended"]
+    if core.get("interest_earned") is not None:
+        core["total_income"] = row.get("income")
+        core["sales"] = core["interest_earned"]
     return core
 
 
@@ -646,6 +649,9 @@ async def _fetch_profile_raw(client, sem, sym):
 # ══════════════════════════════════════════════════════════════
 
 def _compute_opm(row):
+    # Bank operating profit is not conventional EBITDA/OPM.
+    if row.get("interest_earned") is not None:
+        return None
     sales = row.get("sales")
     interest_earned = row.get("interest_earned")
     if not sales and interest_earned:
@@ -678,6 +684,9 @@ def _compute_ebitda_abs(row):
     EBITDA-ish figure (the numerator) instead of dividing by sales to get
     a margin. Banks/NBFCs (no `sales`, only `interest_earned`) are handled
     the same way _compute_opm() handles them."""
+    # Bank operating profit is not conventional EBITDA/OPM.
+    if row.get("interest_earned") is not None:
+        return None
     sales = row.get("sales")
     interest_earned = row.get("interest_earned")
     if not sales and interest_earned:
@@ -704,7 +713,12 @@ def _build_quarters_list(q_core):
     stype can build the same shape without duplicating this logic."""
     return [{
         "header": _fmt_period_end(row.get("period_end")),
-        "sales":    row.get("sales") if row.get("sales") is not None else row.get("interest_earned"),
+        "sales":    row.get("interest_earned") if row.get("interest_earned") is not None else row.get("sales"),
+        "total_income": row.get("total_income"),
+        "interest_earned": row.get("interest_earned"),
+        "net_interest_income": row.get("net_interest_income"),
+        "pat_attributable": row.get("pat_attributable"),
+        "associates_share": row.get("associates_share"),
         "expenses": row.get("expenses"),
         "opm":      _compute_opm(row),
         "ebitda":   _compute_ebitda_abs(row),
