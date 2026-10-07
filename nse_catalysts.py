@@ -882,6 +882,25 @@ AI_ORDER_BATCH = int(os.environ.get("AI_ORDER_BATCH", "10"))     # max Gemini ca
 AI_ORDER_MAX_ATTEMPTS = 2       # failed AI calls per row before giving up
 AI_AGREE_TOL = 0.05             # local vs AI within 5% = confirmed
 _GEMINI_RATE_LIMITED = False
+_GEMINI_USAGE = {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "thought_tokens": 0, "total_tokens": 0}
+
+def _record_gemini_usage(data: dict, label: str = "") -> None:
+    """Accumulate Gemini usageMetadata and print one compact per-call audit line."""
+    meta = (data or {}).get("usageMetadata") or {}
+    prompt = int(meta.get("promptTokenCount") or 0)
+    output = int(meta.get("candidatesTokenCount") or 0)
+    thoughts = int(meta.get("thoughtsTokenCount") or 0)
+    total = int(meta.get("totalTokenCount") or (prompt + output + thoughts))
+    _GEMINI_USAGE["prompt_tokens"] += prompt
+    _GEMINI_USAGE["output_tokens"] += output
+    _GEMINI_USAGE["thought_tokens"] += thoughts
+    _GEMINI_USAGE["total_tokens"] += total
+    print(f"    · Gemini usage [{label or 'order'}]: input={prompt:,}, output={output:,}, thoughts={thoughts:,}, total={total:,}")
+
+def _print_gemini_usage_summary() -> None:
+    u = _GEMINI_USAGE
+    print(f"  🤖 GEMINI USAGE — Catalyst: calls={u['calls']}, input={u['prompt_tokens']:,}, "
+          f"output={u['output_tokens']:,}, thoughts={u['thought_tokens']:,}, total={u['total_tokens']:,}")
 
 _ORDER_AI_PROMPT = r"""
 Read this Indian listed company's order/contract announcement PDF. Return ONLY this JSON, nothing else:
@@ -941,10 +960,12 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
                f"{GEMINI_ORDER_MODEL}:generateContent?key={GEMINI_API_KEY}")
         if GEMINI_THINKING_LEVEL:
             payload["generationConfig"]["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+        _GEMINI_USAGE["calls"] += 1
         r = session.post(url, json=payload, timeout=120)
         if r.status_code == 400 and "thinkingConfig" in payload["generationConfig"]:
             # Model does not accept this thinking setting; retry with its default.
             payload["generationConfig"].pop("thinkingConfig", None)
+            _GEMINI_USAGE["calls"] += 1
             r = session.post(url, json=payload, timeout=120)
         if r.status_code == 429:
             _GEMINI_RATE_LIMITED = True
@@ -952,6 +973,7 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
             return {}
         r.raise_for_status()
         data = r.json()
+        _record_gemini_usage(data, filename)
         candidates = data.get("candidates") or []
         if not candidates:
             return {}
@@ -3298,6 +3320,7 @@ def main():
 
     print(f"  ✓ Catalyst scan complete: source={source}, fetched={fetched}, "
           f"new={added}, symbols={len(history)}, stored={total}")
+    _print_gemini_usage_summary()
 
 
 if __name__ == "__main__":
