@@ -294,6 +294,17 @@ def _classify_company(profile):
 # UNION across all 4 schemas. Safe because none of these field names
 # collide across company types (verified against the PDF).
 CORE_PL_ALIASES = {
+    "materials_cost": ['costOfMaterialsConsumed'],
+    "purchases_stock": ['purchasesOfStockInTrade'],
+    "inventory_change": ['changesInInventories'],
+    "other_expenses": ['otherExpenses'],
+    "other_operating_expenses": ['otherOperatingExpenses'],
+    "interest_advances": ['interestOrDiscountOnAdvancesOrBills'],
+    "interest_investments": ['revenueOnInvestments'],
+    "interest_rbi": ['interestOnBalancesWithRBIAndOthers'],
+    "other_interest": ['otherInterest'],
+    "cost_of_goods_sold": ['costofGoodsSold'],
+
     "year": ["year"], "period_end": ["period_end"], "period_start": ["period_start"],
     "sales": [
         "revenueFromOperations", "income",
@@ -334,6 +345,21 @@ CORE_PL_ALIASES = {
 }
 
 CORE_BS_ALIASES = {
+    "cwip": ['capitalWorkInProgress'],
+    "investments_current": ['currentInvestments'],
+    "investments_noncurrent": ['noncurrentInvestments'],
+    "trade_receivables_noncurrent": ['tradeReceivablesNoncurrent'],
+    "trade_payables_noncurrent": ['tradePayablesNoncurrent'],
+    "other_assets": ['otherAssets'],
+    "other_liabilities_provisions": ['otherLiabilitiesAndProvisions'],
+    "other_current_assets": ['otherCurrentAssets'],
+    "other_noncurrent_assets": ['otherNoncurrentAssets'],
+    "other_current_liabilities": ['otherCurrentLiabilities'],
+    "other_noncurrent_liabilities": ['otherNoncurrentLiabilities'],
+    "goodwill": ['goodwill'],
+    "intangibles": ['otherIntangibleAssets'],
+    "bank_balances": ['otherBankBalances', 'bankBalancesAndMoneyAtCallAndShortNotice'],
+
     "year": ["year"], "period_end": ["period_end"],
     "total_assets": ["assets"],
     "reserves": ["reserves"],
@@ -355,9 +381,20 @@ CORE_BS_ALIASES = {
 }
 
 CORE_CF_ALIASES = {
+    "working_capital_change": ['adjustmentsForWorkingCapitalChange'],
+    "inventory_adjustment": ['adjForInventories'],
+    "receivables_adjustment": ['adjForTradeReceivables', 'adjForTradeReceivablesCurrent'],
+    "depreciation_adjustment": ['adjForDepreciationAndAmortisationExpense'],
+    "taxes_paid": ['incomeTaxesPaidOrRefundClassifiedAsOperating'],
+    "asset_sales": ['saleOfFixed&IntangibleAssets', 'proceedsFromPPESalesClassifiedAsInvesting'],
+    "borrowings_proceeds": ['proceedsFromBorrowingsClassifiedAsFinancing'],
+    "borrowings_repaid": ['repaymentsOfBorrowings'],
+    "shares_issued": ['proceedsFromSharesClassifiedAsFinancing', 'proceedsFromIssuingShares'],
+    "fx_effects": ['foreignExchangeEffects'],
+
     "year": ["year"], "period_end": ["period_end"], "period_start": ["period_start"],
     "cfo": ["cashFlowsFromOperatingActivities"],
-    "cfi": ["cashFlowsFromInvestingActivities"],
+    "cfi": ["cashFlowFromInvestingActivities", "cashFlowsFromInvestingActivities"],
     "cff": ["cashFlowsFromFinancingActivities"],
     "net_cash_flow": ["netCashFlow"],
     "capex": ["purchaseOfPPEClassifiedAsInvesting", "purchaseOfFixed&IntangibleAssets"],
@@ -405,17 +442,27 @@ def _bs_total_equity(row):
     return None
 
 
+def _sum_components(row, keys):
+    values = [row.get(k) for k in keys if row.get(k) is not None]
+    return sum(values) if values else None
+
+
 def _bs_borrowings_total(row):
-    if "borrowingsCurrent" in row or "borrowingsNoncurrent" in row:
-        return (row.get("borrowingsCurrent") or 0) + (row.get("borrowingsNoncurrent") or 0)
-    return row.get("borrowings")
+    total = row.get("borrowings")
+    components = _sum_components(row, ("borrowingsCurrent", "borrowingsNoncurrent"))
+    # Padded cross-schema zero fields must not mask a reported bank total.
+    return total if total is not None and (total != 0 or components is None) else components
 
 
-def _build_pl_core(row):
+def _build_pl_core(row, company_type="other"):
     core = _resolve_aliases(row, CORE_PL_ALIASES)
+    core["company_type"] = company_type
+    # Life insurance: tax on shareholder profit differs from policy-account tax.
+    if company_type == "insurance" and (row.get("netPremiumIncome") not in (None, 0) or row.get("profitLossAfterTaxAndExtraordinaryItems") not in (None, 0)):
+        core["tax_expense"] = row.get("provisionsForTaxes")
     if core.get("interest_earned") is not None and core.get("interest_expended") is not None:
         core["net_interest_income"] = core["interest_earned"] - core["interest_expended"]
-    if core.get("interest_earned") is not None:
+    if company_type == "bank" and core.get("interest_earned") is not None:
         core["total_income"] = row.get("income")
         core["sales"] = core["interest_earned"]
     return core
@@ -425,13 +472,18 @@ def _build_bs_core(row):
     core = _resolve_aliases(row, CORE_BS_ALIASES)
     core["total_equity"] = _bs_total_equity(row)
     core["borrowings_total"] = _bs_borrowings_total(row)
+    components = _sum_components(row, ("noncurrentInvestments", "currentInvestments"))
+    reported = row.get("investments")
+    core["investments"] = reported if reported is not None and (reported != 0 or components is None) else components
+    core["trade_receivables_total"] = _sum_components(row, ("tradeReceivablesCurrent", "tradeReceivablesNoncurrent"))
+    core["trade_payables_total"] = _sum_components(row, ("tradePayablesCurrent", "tradePayablesNoncurrent"))
     return core
 
 
 def _build_cf_core(row):
     core = _resolve_aliases(row, CORE_CF_ALIASES)
     if core.get("cfo") is not None and core.get("capex") is not None:
-        core["fcf"] = core["cfo"] + core["capex"]
+        core["fcf"] = core["cfo"] - abs(core["capex"])
     return core
 
 
@@ -650,7 +702,7 @@ async def _fetch_profile_raw(client, sem, sym):
 
 def _compute_opm(row):
     # Bank operating profit is not conventional EBITDA/OPM.
-    if row.get("interest_earned") is not None:
+    if row.get("company_type") == "bank":
         return None
     sales = row.get("sales")
     interest_earned = row.get("interest_earned")
@@ -685,7 +737,7 @@ def _compute_ebitda_abs(row):
     a margin. Banks/NBFCs (no `sales`, only `interest_earned`) are handled
     the same way _compute_opm() handles them."""
     # Bank operating profit is not conventional EBITDA/OPM.
-    if row.get("interest_earned") is not None:
+    if row.get("company_type") == "bank":
         return None
     sales = row.get("sales")
     interest_earned = row.get("interest_earned")
@@ -707,21 +759,21 @@ def _compute_ebitda_abs(row):
     return None
 
 
-def _build_quarters_list(q_core):
+def _build_quarters_list(q_core, company_type="other"):
     """Builds the standard 'quarters' array shape from a stype's quarterly
     PL core rows. Factored out so both the primary and the alt (dual-track)
     stype can build the same shape without duplicating this logic."""
     return [{
         "header": _fmt_period_end(row.get("period_end")),
-        "sales":    row.get("interest_earned") if row.get("interest_earned") is not None else row.get("sales"),
+        "sales":    row.get("interest_earned") if company_type == "bank" else row.get("sales"),
         "total_income": row.get("total_income"),
         "interest_earned": row.get("interest_earned"),
         "net_interest_income": row.get("net_interest_income"),
         "pat_attributable": row.get("pat_attributable"),
         "associates_share": row.get("associates_share"),
         "expenses": row.get("expenses"),
-        "opm":      _compute_opm(row),
-        "ebitda":   _compute_ebitda_abs(row),
+        "opm":      None if company_type == "bank" else _compute_opm(row),
+        "ebitda":   None if company_type == "bank" else _compute_ebitda_abs(row),
         "eps":      row.get("eps"),
         "pat":      row.get("pat"),
         "pbt":      row.get("pbt"),
@@ -751,7 +803,7 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf=None, classi
         stype = "s"
 
     q_core = s_core if stype == "s" else c_core
-    quarters = _build_quarters_list(q_core)
+    quarters = _build_quarters_list(q_core, _classify_company(profile))
 
     # ── Dual-track: also keep the OTHER stype's quarters, if it has any
     # data, as quarters_alt/stype_alt (added July 2026). The single-stype
@@ -764,7 +816,7 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf=None, classi
     # no change at all.
     alt_stype = "s" if stype == "c" else "c"
     alt_core = s_core if alt_stype == "s" else c_core
-    quarters_alt = _build_quarters_list(alt_core) if alt_core else []
+    quarters_alt = _build_quarters_list(alt_core, _classify_company(profile)) if alt_core else []
 
     pr_rows  = ratios.get("pr", {}).get(f"raw_{stype}") or ratios.get("pr", {}).get("raw") or []
     le_rows  = ratios.get("le", {}).get(f"raw_{stype}") or ratios.get("le", {}).get("raw") or []
@@ -827,10 +879,10 @@ async def fetch_one_symbol(client, sem, sym, classification_lookup=None):
     company_type = _classify_company(profile)
 
     pl, basic, bs, cf, ratios, growth, price_ratios, segment_revenue = await asyncio.gather(
-        _fetch_financials_dual(client, sem, sym, "pl", PL_PERIODS, build_core_fn=_build_pl_core),
+        _fetch_financials_dual(client, sem, sym, "pl", PL_PERIODS, build_core_fn=lambda row: _build_pl_core(row, company_type)),
         _fetch_basic_financials_dual(client, sem, sym),
         _fetch_financials_single(client, sem, sym, "bs", BS_PERIODS, build_core_fn=_build_bs_core),
-        _fetch_financials_single(client, sem, sym, "cf", CF_PERIODS, build_core_fn=_build_cf_core, keep_raw=False),
+        _fetch_financials_single(client, sem, sym, "cf", CF_PERIODS, build_core_fn=_build_cf_core, keep_raw=True),
         _fetch_ratios_single(client, sem, sym),
         _fetch_growth_metrics_single(client, sem, sym),
         _fetch_annual_price_ratios_single(client, sem, sym),
@@ -1082,6 +1134,65 @@ async def run_sync(symbols):
     log.info(f"━━━ Sync complete — ✓{ok}  ✗{failed} ━━━")
 
 
+async def run_reprocess_existing(symbols=None):
+    """Rebuild stored raw statements and summary without FinEdge calls.
+
+    Legacy CF rows lacking raw data remain unchanged; sync those symbols
+    separately to populate the newly added cash-flow components.
+    """
+    async with httpx.AsyncClient() as client:
+        summary = await r2_download_summary(client)
+        lookup = await get_classification_lookup(client)
+        selected = symbols or await get_nse_universe(client)
+        ok = failed = legacy_cf = 0
+        for sym in selected:
+            sym = sym.upper()
+            try:
+                obj = await r2_download(client, f"fundamentals_full/{sym}.json")
+                if not obj:
+                    failed += 1
+                    continue
+                kind = obj.get("company_type") or _classify_company(obj.get("profile"))
+                for period, bases in obj.get("pl", {}).items():
+                    if not isinstance(bases, dict):
+                        continue
+                    for basis, entry in bases.items():
+                        if isinstance(entry, dict) and entry.get("raw"):
+                            entry["core"] = [_build_pl_core(r, kind) for r in entry["raw"]]
+                for section, builder in (("bs", _build_bs_core), ("cf", _build_cf_core)):
+                    for entry in obj.get(section, {}).values():
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get("raw"):
+                            entry["core"] = [builder(r) for r in entry["raw"]]
+                        elif section == "cf" and entry.get("core"):
+                            legacy_cf += 1
+                # Preserve filing-verified overrides if present in the stored object.
+                for correction in obj.get("verification", {}).get("corrections", []):
+                    rows = obj.get("pl", {}).get(correction["period"], {}).get(correction["basis"], {}).get("core", [])
+                    for row in rows:
+                        if row.get("period_end") == correction.get("period_end"):
+                            row[correction["field"]] = correction["corrected_value"]
+                            if kind == "bank":
+                                row["sales"] = row.get("interest_earned")
+                                if row.get("interest_earned") is not None and row.get("interest_expended") is not None:
+                                    row["net_interest_income"] = row["interest_earned"] - row["interest_expended"]
+                summ = _build_summary_entry(sym, obj.get("profile"), obj.get("pl", {}),
+                    obj.get("ratios", {}), obj.get("annual_price_ratios", {}),
+                    obj.get("cf", {}), lookup.get(sym))
+                summ["hash"] = await r2_upload_symbol(client, sym, obj)
+                summary[sym] = summ
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                log.warning("Reprocess %s failed (%s)", sym, type(exc).__name__)
+        if ok:
+            await r2_upload_summary(client, summary)
+        log.info("Reprocessed:%s failed:%s legacy CF periods needing refresh:%s", ok, failed, legacy_cf)
+        if failed:
+            raise RuntimeError("Some stored symbols could not be reprocessed")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode == "full":
@@ -1092,6 +1203,8 @@ if __name__ == "__main__":
         asyncio.run(run_full(0, exchange_filter="BSE"))
     elif mode == "daily":
         asyncio.run(run_daily())
+    elif mode == "reprocess_existing":
+        asyncio.run(run_reprocess_existing(sys.argv[2:] or None))
     elif mode == "backfill_summary":
         asyncio.run(run_backfill_summary())
     elif mode == "sync":
