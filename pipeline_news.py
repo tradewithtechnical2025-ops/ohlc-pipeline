@@ -32,6 +32,25 @@ TELEGRAM_RESULTS_CHAT_ID = os.environ.get("TELEGRAM_RESULTS_CHAT_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 AI_PDF_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
+_GEMINI_USAGE = {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "thought_tokens": 0, "total_tokens": 0}
+
+def _record_gemini_usage(data: dict, label: str = "") -> None:
+    meta = (data or {}).get("usageMetadata") or {}
+    prompt = int(meta.get("promptTokenCount") or 0)
+    output = int(meta.get("candidatesTokenCount") or 0)
+    thoughts = int(meta.get("thoughtsTokenCount") or 0)
+    total = int(meta.get("totalTokenCount") or (prompt + output + thoughts))
+    _GEMINI_USAGE["prompt_tokens"] += prompt
+    _GEMINI_USAGE["output_tokens"] += output
+    _GEMINI_USAGE["thought_tokens"] += thoughts
+    _GEMINI_USAGE["total_tokens"] += total
+    print(f"    · Gemini usage [{label or 'result'}]: input={prompt:,}, output={output:,}, thoughts={thoughts:,}, total={total:,}")
+
+def _print_gemini_usage_summary() -> None:
+    u = _GEMINI_USAGE
+    print(f"🤖 GEMINI USAGE — Results: calls={u['calls']}, input={u['prompt_tokens']:,}, "
+          f"output={u['output_tokens']:,}, thoughts={u['thought_tokens']:,}, total={u['total_tokens']:,}")
+
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 
 # XBRL processing — permanently OFF. This pipeline now runs PDF/AI-extraction
@@ -1393,6 +1412,7 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
             parts.append({"inline_data": {"mime_type": "application/pdf",
                                            "data": base64.b64encode(pdf_bytes).decode()}})
 
+        _GEMINI_USAGE["calls"] += 1
         r = await client.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{AI_PDF_MODEL}:generateContent?key={GEMINI_API_KEY}",
             json={
@@ -1420,6 +1440,7 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
             return None
         r.raise_for_status()
         data = r.json()
+        _record_gemini_usage(data, fname_dbg)
         candidates = data.get("candidates") or []
         if not candidates or "content" not in candidates[0]:
             print(f"    · [{fname_dbg}] AI extraction: unexpected Gemini response shape")
@@ -3687,6 +3708,7 @@ async def run():
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
 
+    _print_gemini_usage_summary()
     print("✅ Done")
 
 
