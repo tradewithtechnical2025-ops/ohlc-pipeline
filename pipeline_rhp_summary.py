@@ -93,6 +93,25 @@ DOWNLOAD_HEADERS = {
 }
 GEMINI_DELAY_SEC = 4  # stay well within free-tier RPM limits
 
+_GEMINI_USAGE = {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "thought_tokens": 0, "total_tokens": 0}
+
+def _record_gemini_usage(data: dict, label: str = "") -> None:
+    meta = (data or {}).get("usageMetadata") or {}
+    prompt = int(meta.get("promptTokenCount") or 0)
+    output = int(meta.get("candidatesTokenCount") or 0)
+    thoughts = int(meta.get("thoughtsTokenCount") or 0)
+    total = int(meta.get("totalTokenCount") or (prompt + output + thoughts))
+    _GEMINI_USAGE["prompt_tokens"] += prompt
+    _GEMINI_USAGE["output_tokens"] += output
+    _GEMINI_USAGE["thought_tokens"] += thoughts
+    _GEMINI_USAGE["total_tokens"] += total
+    log.info(f"  Gemini usage [{label or 'IPO'}]: input={prompt:,}, output={output:,}, thoughts={thoughts:,}, total={total:,}")
+
+def _print_gemini_usage_summary() -> None:
+    u = _GEMINI_USAGE
+    log.info(f"🤖 GEMINI USAGE — IPO: calls={u['calls']}, input={u['prompt_tokens']:,}, "
+             f"output={u['output_tokens']:,}, thoughts={u['thought_tokens']:,}, total={u['total_tokens']:,}")
+
 
 # ══════════════════════════════════════════════════════════════
 # MANIFEST (tracks which IPO ids have already been processed)
@@ -297,12 +316,14 @@ async def call_gemini(client: httpx.AsyncClient, prompt: str) -> str:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.05, "maxOutputTokens": 8192, "responseMimeType": "application/json"},
     }
+    _GEMINI_USAGE["calls"] += 1
     r = await client.post(url, json=body, timeout=90)
     if r.status_code == 429:
         raise GeminiQuotaError(f"Gemini quota/rate limit hit: {r.text[:300]}")
     if r.status_code != 200:
         raise RuntimeError(f"Gemini API error {r.status_code}: {r.text[:400]}")
     data = r.json()
+    _record_gemini_usage(data)
     candidates = data.get("candidates") or []
     if not candidates or "content" not in candidates[0]:
         raise RuntimeError(f"Unexpected Gemini response shape: {json.dumps(data)[:400]}")
@@ -599,6 +620,7 @@ async def run():
             if i < len(todo) - 1:
                 await asyncio.sleep(GEMINI_DELAY_SEC)
 
+    _print_gemini_usage_summary()
     done = sum(1 for v in processed.values() if v.get("status") == "done")
     log.info(f"━━━ Pipeline complete. Manifest: {done} done / {len(processed)} tracked total ━━━")
 
