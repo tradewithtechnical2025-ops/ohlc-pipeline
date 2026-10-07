@@ -1,0 +1,32 @@
+name: Daily Price Ratios
+on:
+  schedule:
+    - cron: '0 14 * * 1-5' # 19:30 IST, Monday-Friday
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: 'Optional comma-separated symbols; blank = classification universe'
+        required: false
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: price-ratios-daily
+  cancel-in-progress: false
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install httpx
+      - name: Fetch daily ratios
+        env:
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          REQUESTED_SYMBOLS: ${{ inputs.symbols }}
+        run: python pipeline_price_ratios_daily.py --symbols "$REQUESTED_SYMBOLS"
