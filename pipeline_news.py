@@ -969,7 +969,12 @@ _PDF_HEADING_PATTERNS = [
 # financial results..." or "...the accompanying Statement of Standalone...".
 # Checked against the ~40 chars immediately before the match.
 _PDF_BOILERPLATE_PRECEDE_RE = re.compile(r"(accompanying|reviewed)[\s\S]{0,15}$", re.IGNORECASE)
-_PDF_FILENAME_TS_RE = re.compile(r"^([A-Z0-9&\-]+)_(\d{2})(\d{2})(\d{4})\d{6}_", re.IGNORECASE)
+# Allow NSE internal uploader segments between the ticker and 14-digit filing time.
+# Group numbering stays unchanged for downstream symbol/date extraction.
+_PDF_FILENAME_TS_RE = re.compile(
+    r"^([A-Z0-9&\-]+)_(?:[A-Z][A-Z0-9&\-]*_){0,3}(\d{2})(\d{2})(\d{4})\d{6}_",
+    re.IGNORECASE,
+)
 
 
 # ── Whitespace-squashed fallback ──
@@ -1936,6 +1941,12 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         else:
             print(f"    · [{fname_dbg}] no 'Financial Results' heading found — not a results PDF, skipping AI call")
             return None
+
+    # Validate required NSE filing timestamp before making a billable call.
+    # Manual filings and BSE filings may legitimately use other filename forms.
+    if exchange == "NSE" and not fallback_board_meeting_date and not _PDF_FILENAME_TS_RE.match(fname_dbg):
+        print(f"    · [{fname_dbg}] invalid NSE filename timestamp — skipping Gemini call")
+        return None
 
     # ── AI extraction (sole extraction path — no regex fallback) ──
     # Send the FULL extracted PDF text (not a truncated head-of-document
@@ -2975,6 +2986,15 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
             it["_pre_content"] = content
             it["_pre_text"] = text
+            # Local-only identity: identical PDF bytes never need two AI calls.
+            import hashlib
+            it["_pre_sha256"] = hashlib.sha256(content).hexdigest()
+            # Validate the NSE filename metadata before an expensive request.
+            # BSE GUID filenames are handled through their published-date fallback.
+            if it.get("_exchange", "NSE") != "BSE" and not it.get("_manual"):
+                filename = it["link"].split("?", 1)[0].rsplit("/", 1)[-1]
+                if not _PDF_FILENAME_TS_RE.match(filename):
+                    it["_pre_bad_filename"] = True
             if _is_non_statement_doc(text) or it.get("_narrative"):
                 it["_pre_non_statement"] = True
                 # No RESULT key (must never supersede the real statement) —
@@ -3048,6 +3068,29 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     if singleton_pdf:
         singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
+        # Skip invalid NSE metadata BEFORE Gemini; do not charge for a
+        # result the downstream validator cannot store.
+        bad_filename = [it for it in singleton_pdf if it.get("_pre_bad_filename")]
+        if bad_filename:
+            print(f"  ⏭ {len(bad_filename)} PDF(s) missing required NSE filename timestamp — skipped BEFORE Gemini")
+            singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_bad_filename")]
+        # Content-addressed dedup also handles PDFs whose headings/periods
+        # could not be identified by the conservative business-key preflight.
+        seen_hashes = set()
+        duplicate_hash_links = []
+        unique_pdf = []
+        for it in sorted(singleton_pdf, key=lambda x: x.get("published_ts", 0), reverse=True):
+            h = it.get("_pre_sha256")
+            if h and h in seen_hashes:
+                duplicate_hash_links.append(it["link"])
+            else:
+                if h:
+                    seen_hashes.add(h)
+                unique_pdf.append(it)
+        singleton_pdf = unique_pdf
+        if duplicate_hash_links:
+            new_dupe_links.extend(duplicate_hash_links)
+            print(f"  ⏭ {len(duplicate_hash_links)} byte-identical PDF(s) removed BEFORE Gemini")
         non_stmt = [it for it in singleton_pdf if it.get("_pre_non_statement")]
         if non_stmt:
             narrative_candidates.extend(non_stmt)
