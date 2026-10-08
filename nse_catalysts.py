@@ -2887,7 +2887,7 @@ ARCHIVE_YEARS = 3
 ARCHIVE_DIR = "eventhistory"
 ARCHIVE_INDEX = f"{ARCHIVE_DIR}/_index.json"
 LEGACY_ARCHIVE_PREFIX = "cat_hist_"          # migration source only
-ARCHIVE_BATCH = int(os.environ.get("ARCHIVE_BATCH", "200"))   # symbol files written per run
+ARCHIVE_BATCH = int(os.environ.get("ARCHIVE_BATCH", "1000"))   # symbol files written per run
 
 
 def _archive_slug(symbol: str) -> str:
@@ -2933,13 +2933,19 @@ def update_symbol_archives(session, history: dict, suppressed: dict, today: date
     import hashlib
     ok, index = _r2_get_json_strict(session, ARCHIVE_INDEX)
     if not ok:
-        print("  ⚠ Archive skipped this run (index unreadable)")
-        return
+        # Fail loudly: a silently skipped run loses every event that leaves the
+        # 20-day window today, because nothing else ever archives it.
+        raise RuntimeError("Archive index unreadable — eventhistory/ not updated this run")
     index = index if isinstance(index, dict) else {}
     win_cut = (today - timedelta(days=HISTORY_DAYS)).isoformat()
     arch_cut = (today - timedelta(days=365 * ARCHIVE_YEARS + 1)).isoformat()
     written = failed = pending = 0
-    for sym in sorted(history):
+    # Symbols whose oldest live event is closest to leaving the 20-day window go
+    # first. Alphabetical order let A–C symbols use up the write budget every run
+    # while later symbols stayed pending until their events aged out unarchived.
+    def _oldest_dt(s):
+        return min((str(x.get("dt", "")) for x in history[s]), default="")
+    for sym in sorted(history, key=_oldest_dt):
         compact = sorted((_compact_event(x) for x in history[sym] if x.get("id")),
                          key=lambda e: e.get("dt", ""), reverse=True)
         h = hashlib.sha1(json.dumps(compact, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
@@ -3317,6 +3323,7 @@ def main():
         update_symbol_archives(r2_session, history, suppressed, today)
     except Exception as e:
         print(f"  ⚠ Symbol archive step failed ({e})")
+        raise   # live file is already uploaded; mark the Actions run red so it is noticed
 
     print(f"  ✓ Catalyst scan complete: source={source}, fetched={fetched}, "
           f"new={added}, symbols={len(history)}, stored={total}")
