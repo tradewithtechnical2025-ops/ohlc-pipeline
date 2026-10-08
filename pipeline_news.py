@@ -519,7 +519,7 @@ def _result_candidate_in_universe(it: dict, universe: set[str], bse_symbol_map: 
     sym = _pdf_probable_symbol(it, bse_symbol_map).strip().upper()
     if sym in universe:
         return True
-    if it.get("_exchange") != "BSE" and sym:
+    if it.get("_exchange") != "BSE":
         title = (it.get("title") or "").strip()
         resolved, _ = _resolve_symbol(sym, title, explicit=False)
         if resolved in universe:
@@ -1101,6 +1101,12 @@ def _extract_filename_symbol(link: str) -> str:
     m = _PDF_FILENAME_TS_RE.match(fname)
     if m:
         return m.group(1).upper()
+    # NSE sometimes inserts internal segments before the timestamp, e.g.
+    # TCS_CORPCS_0810202615324_Post_BM_SE_Letter_fin.pdf. Only trust a
+    # leading token if it is already registered in classification.json.
+    prefix = fname.split("_", 1)[0].upper()
+    if prefix in _SYMBOL_REGISTRY["symbols"]:
+        return prefix
     return ""
 
 
@@ -1115,7 +1121,14 @@ def _pdf_probable_symbol(it: dict, bse_symbol_map: dict | None) -> str:
     if it.get("_exchange") == "BSE":
         code = it.get("scripcode", "")
         return ((bse_symbol_map or {}).get(code, code) or "").upper()
-    return _extract_filename_symbol(it.get("link", ""))
+    sym = _extract_filename_symbol(it.get("link", ""))
+    if sym in _SYMBOL_REGISTRY["symbols"]:
+        return sym
+    # Company name is authoritative when NSE uses an internal/uploader
+    # filename prefix; permit lookup even when the filename yields nothing.
+    title = (it.get("title") or "").strip()
+    resolved, _ = _resolve_symbol(sym, title, explicit=False)
+    return resolved if resolved in _SYMBOL_REGISTRY["symbols"] else sym
 
 
 def _pdf_date_bucket(it: dict):
