@@ -1385,13 +1385,15 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
     "eps_basic": number or null,
     "eps_diluted": number or null
   },
-  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
-  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null},
+  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
+  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
   "segment_breakup": [{"segment": string, "revenue": number}] or omitted,
   "management_commentary": string or null,
   "key_highlights": [string, ...] or omitted,
   "board_meeting_outcome": string or null
 }
+
+For EACH period (current, qoq_prior, yoy_prior), extract exceptional_items independently from that column: positive for an exceptional charge/loss that reduces PBT, negative for a gain. A dash/blank in the exceptional-items row means zero. Do not copy the current quarter's exceptional amount into comparison periods. Extract share_of_associates independently too. Reconcile total income - total expenses - exceptional items + share of associates = PBT. Never change reported total expenses to compensate for a genuine exceptional item.
 
 All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
 
@@ -1722,6 +1724,8 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
             "pat": scale(d.get("pat")), "eps_basic": d.get("eps_basic"),
             "total_expenses": scale(d.get("total_expenses")),
             "finance_costs": scale(d.get("finance_costs")), "depreciation": scale(d.get("depreciation")),
+            "exceptional_items": scale(d.get("exceptional_items")),
+            "share_of_associates": scale(d.get("share_of_associates")),
         }
     qoq_prior, yoy_prior = _prior(qoq), _prior(yoy)
     # Same identity check on each comparative column. A prior column with no
@@ -1729,6 +1733,8 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
     # needed the Fin+D&A add-back, the comparatives share that layout.
     for lbl, pr in (("qoq_prior", qoq_prior), ("yoy_prior", yoy_prior)):
         _reconcile_total_expenses(pr, lbl, fname_dbg, quality_flags,
+                                  exceptional=pr.get("exceptional_items"),
+                                  assoc_share=pr.get("share_of_associates"),
                                   force_addback=cur_fixed and pr.get("pbt") is None)
     if quality_flags:
         result["meta"]["quality_flags"] = quality_flags
