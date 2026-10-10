@@ -5271,23 +5271,20 @@ TRANSITION_LABELS = {
 
 
 def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
-                              slope_lookback=4, flat_threshold_pct=1.0,
+                              slope_lookback=4, flat_threshold_pct=0.5,
                               ema_short_period=10, swing_lookback=10):
-    """Classify the prevailing weekly Weinstein PHASE, not trade-entry signals.
+    """ARCStage-inspired weekly phase classification (EMA variant).
 
-    2/4 = sustained directional EMA trend; a fresh range breakout is NOT
-    required. 1/3 = sideways/flattening after a prior downtrend/uptrend.
-    Stage 1/3 can start inside the range, before a structural breakout.
-    No future bars, pivot lookahead or R2 dependency.
+    Directional stages use 30-week EMA slope and closing-price position.
+    Flat phases use the most recent confirmed directional stage to
+    distinguish basing (after decline) from topping (after advance).
+    No breakout, pivot lookahead, or future candles required.
     """
     n = len(wc)
     ema30 = _calc_ema(wc, ema_period)
     ema10 = _calc_ema(wc, ema_short_period)
     records = []
-    stage = None
-    stage_start = None
-    last_direction = None
-    bullish_run = bearish_run = 0
+    stage = stage_start = last_direction = None
     for i in range(n):
         price, e30, e10 = wc[i], ema30[i], ema10[i]
         ep = ema30[i-slope_lookback] if i >= slope_lookback else None
@@ -5298,62 +5295,28 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     and all(x is not None for x in wh[i-swing_lookback:i]) else None)
         low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
                    and all(x is not None for x in wl[i-swing_lookback:i]) else None)
-        bull = (price is not None and e30 is not None and e10 is not None
-                and slope is not None and price > e30 and e10 > e30
-                and slope > flat_threshold_pct)
-        bear = (price is not None and e30 is not None and e10 is not None
-                and slope is not None and price < e30 and e10 < e30
-                and slope < -flat_threshold_pct)
-        bullish_run = bullish_run + 1 if bull else 0
-        bearish_run = bearish_run + 1 if bear else 0
-
-        # Two weekly observations distinguish an established phase from a
-        # one-week MA fluctuation; breakout is useful evidence, not a gate.
-        if i >= 39 and (bullish_run >= 2 or (bull and high_ref is not None and price > high_ref)):
-            stage = 2
-        elif i >= 39 and (bearish_run >= 2 or (bear and low_ref is not None and price < low_ref)):
-            stage = 4
-        elif i >= 51 and slope is not None and price is not None:
-            # Sideways phase: recent EMA30 flattening and a contained 12-week
-            # trading range.  The base/top is identified by prior direction.
-            slopes = []
-            for j in range(max(ema_period + slope_lookback - 1, i-5), i+1):
-                old = ema30[j-slope_lookback]
-                if ema30[j] is not None and old not in (None, 0):
-                    slopes.append((ema30[j]/old-1)*100)
-            flat = sum(abs(x) <= 1.5 for x in slopes) >= 3
-            recent_h = max(wh[i-11:i+1]) if all(x is not None for x in wh[i-11:i+1]) else None
-            recent_l = min(wl[i-11:i+1]) if all(x is not None for x in wl[i-11:i+1]) else None
-            # 25% is a broad guard against a steep ongoing trend being called
-            # a base; it is not a breakout, depth or pivot requirement.
-            contained = (recent_h is not None and recent_l is not None
-                         and recent_l > 0 and (recent_h/recent_l-1) <= .25)
-            if flat and contained:
+        if price is not None and e30 is not None and slope is not None:
+            distance = (price / e30 - 1) * 100
+            if slope > flat_threshold_pct and price > e30:
+                stage = 2
+                last_direction = 2
+            elif slope < -flat_threshold_pct and price < e30:
+                stage = 4
+                last_direction = 4
+            elif abs(slope) <= flat_threshold_pct and abs(distance) <= 12:
                 if last_direction == 4:
                     stage = 1
                 elif last_direction == 2:
                     stage = 3
-                elif stage in (1, 3):
-                    pass
-                else:
-                    # Initial classification: only infer context from data
-                    # that preceded the current 12-week consolidation.
-                    anchor = i-12
-                    past = []
-                    for j in range(max(ema_period+slope_lookback-1, anchor-26), anchor):
-                        old = ema30[j-slope_lookback]
-                        if ema30[j] is not None and old not in (None, 0):
-                            past.append((ema30[j]/old-1)*100)
-                    if sum(x < -flat_threshold_pct for x in past) >= 6:
-                        stage = 1
-                    elif sum(x > flat_threshold_pct for x in past) >= 6:
-                        stage = 3
-        if stage in (2, 4):
-            last_direction = stage
+                # With no known preceding trend, leave stage unknown.
+            # Other transitional weeks retain the last confirmed phase.
         if stage != prev:
             stage_start = i if stage is not None else None
-        candidate = bool(i >= 39 and stage != 2 and bull and high_ref is not None
-                         and price <= high_ref and price >= high_ref * .95)
+        candidate = bool(stage != 2 and slope is not None
+                         and slope > flat_threshold_pct and price is not None
+                         and e30 is not None and price > e30
+                         and high_ref is not None
+                         and high_ref * .95 <= price <= high_ref)
         prior_volumes = wv[max(0, i-10):i]
         volume_confirmed = (wv[i] >= 1.5 * sum(prior_volumes)/10
                             if len(prior_volumes) == 10 and wv[i] is not None
@@ -5371,7 +5334,7 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
 
 
 def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
-                              flat_threshold_pct=1.0, min_weeks=40,
+                              flat_threshold_pct=0.5, min_weeks=40,
                               early_breakout_lookback=26, ema_short_period=10,
                               min_weeks_in_prior_stage=3, confirm_weeks=2,
                               swing_lookback=10, early_stage2_weeks=8):
