@@ -4144,7 +4144,7 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,consol_days=3):
         if curr_close is None or curr_close<=0: continue   # bad candle (c=0) guard
         # Fixed ATR(14)% × 1.5 proximity, matching the chart's Wilder ATR.
         atr_value = _calc_atr_series(highs, lows, closes, 14)[-1]
-        near_pct = atr_value / curr_close * 100 * 1.5 if atr_value is not None else None
+        near_pct = min(4.0, atr_value / curr_close * 100 * 1.5) if atr_value is not None else None
         curr_date=dates[-1]
         if n>=consol_days:
             rh=[v for v in highs[-consol_days:] if v is not None]; rl=[v for v in lows[-consol_days:] if v is not None]
@@ -4203,7 +4203,7 @@ def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, consol_days=3):
         if curr_close is None or curr_close <= 0: continue   # bad candle (c=0) → ZeroDivisionError guard
         # Weekly proximity uses ATR of weekly candles, not daily ATR.
         atr_value = _calc_atr_series(wh, wl, wc, 14)[-1]
-        near_pct = atr_value / curr_close * 100 * 1.5 if atr_value is not None else None
+        near_pct = min(4.0, atr_value / curr_close * 100 * 1.5) if atr_value is not None else None
         curr_date = wd[-1]
         if n >= consol_days:
             rh = [v for v in wh[-consol_days:] if v is not None]; rl = [v for v in wl[-consol_days:] if v is not None]
