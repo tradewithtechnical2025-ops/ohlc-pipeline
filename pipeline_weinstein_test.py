@@ -5291,6 +5291,9 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
     highest_high_since_bo = None
     below_base_streak = 0
     return_to_base = False
+    pending_bo = None
+    pending_start = None
+    pending_below = 0
     for i in range(n):
         price, e30, e10 = wc[i], ema30[i], ema10[i]
         ep = ema30[i-slope_lookback] if i >= slope_lookback else None
@@ -5301,22 +5304,47 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     and all(x is not None for x in wh[i-swing_lookback:i]) else None)
         low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
                    and all(x is not None for x in wl[i-swing_lookback:i]) else None)
-        # A new Stage 2 entry must break the PREVIOUS 10-week high.
-        # Do not mistake an EMA-only recovery for a fresh breakout.
-        fresh_bo = (price is not None and high_ref is not None
-                    and price > high_ref and e30 is not None
-                    and e10 is not None and e10 > e30
-                    and slope is not None and slope > flat_threshold_pct)
-        if fresh_bo and (breakout_level is None or (return_to_base and price > breakout_level)):
-            breakout_level = high_ref
+        raw_bo = (price is not None and high_ref is not None and price > high_ref)
+        aligned = (e10 is not None and e30 is not None and e10 > e30
+                   and slope is not None and slope > flat_threshold_pct
+                   and price is not None and price > e30)
+        # Remember a breakout even when EMA alignment arrives later.
+        # Two consecutive closes below its level invalidate it.
+        if raw_bo and (pending_bo is None or price > pending_bo):
+            if pending_bo is None:
+                pending_bo = high_ref
+                pending_start = i
+        if pending_bo is not None:
+            if price is not None and price < pending_bo:
+                pending_below = pending_below + 1
+            else:
+                pending_below = 0
+            if pending_below >= 2:
+                pending_bo = None
+                pending_start = None
+                pending_below = 0
+        # Delayed alignment only qualifies if price is actually advancing:
+        # last three weekly highs AND lows must be rising, not sideways.
+        advancing = (i >= 2 and all(x is not None for x in wh[i-2:i+1])
+                     and all(x is not None for x in wl[i-2:i+1])
+                     and wh[i] > wh[i-1] > wh[i-2]
+                     and wl[i] > wl[i-1] > wl[i-2])
+        delayed_bo = (pending_bo is not None and pending_start is not None
+                      and i > pending_start and price > pending_bo
+                      and advancing and aligned)
+        fresh_bo = bool(raw_bo and aligned)
+        enter_stage2 = bool(fresh_bo or delayed_bo)
+        if enter_stage2 and (breakout_level is None or return_to_base):
+            breakout_level = pending_bo if delayed_bo else high_ref
             highest_high_since_bo = wh[i]
             below_base_streak = 0
             return_to_base = False
-
+        # After return-to-base, new BO must be a NEW event, not old EMA slope.
         if price is not None and e30 is not None and slope is not None:
             distance = (price / e30 - 1) * 100
             if slope > flat_threshold_pct and price > e30:
-                if stage == 2 or fresh_bo or (not return_to_base and breakout_level is None):
+                if stage == 2 or enter_stage2 or (stage == 3 and breakout_level is not None
+                                                    and not return_to_base and price > breakout_level):
                     stage = 2
                     last_direction = 2
             elif slope < -flat_threshold_pct and price < e30:
@@ -5346,7 +5374,7 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                 stage = 1
                 last_direction = 4  # Flat EMA remains basing, not topping.
                 return_to_base = True
-        if return_to_base and not fresh_bo and stage in (2, 3):
+        if return_to_base and not enter_stage2 and stage in (2, 3):
             stage = 1
         if stage != prev:
             stage_start = i if stage is not None else None
