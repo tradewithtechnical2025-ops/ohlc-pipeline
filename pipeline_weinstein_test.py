@@ -5261,6 +5261,8 @@ TRANSITION_LABELS = {
     # those 4 — .get() just returns None for them (won't happen, but safe).
     (1, 2): "Base Breakout — Basing to Advancing",
     (2, 3): "Topping Started — Advancing to Topping",
+    (2, 1): "Failed Breakout — Return to Base",
+    (3, 1): "Return to Base — Original Breakout Failed",
     (3, 4): "Breakdown Confirmed — Topping to Declining",
     (4, 1): "Bottoming — Declining to Basing",
     (3, 2): "Failed Top — resumed Advancing without breaking down",
@@ -5285,6 +5287,10 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
     ema10 = _calc_ema(wc, ema_short_period)
     records = []
     stage = stage_start = last_direction = None
+    breakout_level = None
+    highest_high_since_bo = None
+    below_base_streak = 0
+    return_to_base = False
     for i in range(n):
         price, e30, e10 = wc[i], ema30[i], ema10[i]
         ep = ema30[i-slope_lookback] if i >= slope_lookback else None
@@ -5295,11 +5301,24 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     and all(x is not None for x in wh[i-swing_lookback:i]) else None)
         low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
                    and all(x is not None for x in wl[i-swing_lookback:i]) else None)
+        # A new Stage 2 entry must break the PREVIOUS 10-week high.
+        # Do not mistake an EMA-only recovery for a fresh breakout.
+        fresh_bo = (price is not None and high_ref is not None
+                    and price > high_ref and e30 is not None
+                    and e10 is not None and e10 > e30
+                    and slope is not None and slope > flat_threshold_pct)
+        if fresh_bo and (breakout_level is None or (return_to_base and price > breakout_level)):
+            breakout_level = high_ref
+            highest_high_since_bo = wh[i]
+            below_base_streak = 0
+            return_to_base = False
+
         if price is not None and e30 is not None and slope is not None:
             distance = (price / e30 - 1) * 100
             if slope > flat_threshold_pct and price > e30:
-                stage = 2
-                last_direction = 2
+                if stage == 2 or fresh_bo or (not return_to_base and breakout_level is None):
+                    stage = 2
+                    last_direction = 2
             elif slope < -flat_threshold_pct and price < e30:
                 stage = 4
                 last_direction = 4
@@ -5310,6 +5329,25 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     stage = 3
                 # With no known preceding trend, leave stage unknown.
             # Other transitional weeks retain the last confirmed phase.
+        # Failed Stage 2 breakout: two consecutive weekly closes back
+        # below the ORIGINAL 10-week BO level, with no new post-entry high
+        # on either week. Applies even if EMA flattening labelled Stage 3.
+        if breakout_level is not None and not return_to_base:
+            new_high = (highest_high_since_bo is not None and wh[i] is not None
+                        and wh[i] > highest_high_since_bo)
+            if new_high:
+                highest_high_since_bo = wh[i]
+                below_base_streak = 0
+            elif price is not None and price < breakout_level:
+                below_base_streak += 1
+            else:
+                below_base_streak = 0
+            if below_base_streak >= 2:
+                stage = 1
+                last_direction = 4  # Flat EMA remains basing, not topping.
+                return_to_base = True
+        if return_to_base and not fresh_bo and stage in (2, 3):
+            stage = 1
         if stage != prev:
             stage_start = i if stage is not None else None
         candidate = bool(stage != 2 and slope is not None
