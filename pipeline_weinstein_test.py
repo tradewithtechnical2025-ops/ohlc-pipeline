@@ -5521,6 +5521,19 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                 log.info(f"Breadth history: {len(breadth_history)} weeks")
 
             if dry_run:
+                # Full, sortable audit export; no R2 writes.
+                import csv
+                from pathlib import Path
+                out = Path("weinstein_test_results.csv")
+                columns = ["symbol", "week", "stage", "stage_name", "prev_stage",
+                           "weeks_in_stage", "close", "ema10", "ema30",
+                           "ema30_slope_pct", "stage_change", "transition_type",
+                           "stage2_candidate", "volume_confirmed"]
+                with out.open("w", newline="", encoding="utf-8") as fh:
+                    writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(sorted(signals, key=lambda x: x["symbol"]))
+                log.info(f"Full Weinstein audit CSV: {out} ({len(signals)} stocks)")
                 for n in (1, 2, 3, 4):
                     stage_syms = [s for s in signals if s["stage"] == n]
                     log.info(f"\n── Stage {n} ({STAGE_NAMES[n]}) — {len(stage_syms)} stocks, "
