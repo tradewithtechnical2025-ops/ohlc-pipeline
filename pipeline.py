@@ -4113,7 +4113,7 @@ def _detect_weekly_pullback_v2(all_data, min_gain_pct=30.0, pole_min_weeks=3, po
     return all_signals
 
 
-def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,consol_pct=4.0):
+def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,consol_days=3):
     signals=[]
     for sym,s in all_data.items():
         dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
@@ -4142,17 +4142,20 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
             levels.append((level,zone_low,len(cluster),len(cluster)>=2,touch_pts,cluster_tag))
         curr_close=closes[-1]
         if curr_close is None or curr_close<=0: continue   # bad candle (c=0) guard
+        # Fixed ATR(14)% × 1.5 proximity, matching the chart's Wilder ATR.
+        atr_value = _calc_atr_series(highs, lows, closes, 14)[-1]
+        near_pct = atr_value / curr_close * 100 * 1.5 if atr_value is not None else None
         curr_date=dates[-1]
         if n>=consol_days:
             rh=[v for v in highs[-consol_days:] if v is not None]; rl=[v for v in lows[-consol_days:] if v is not None]
-            range_pct=(max(rh)-min(rl))/curr_close*100 if rh and rl else 0; is_consol=range_pct<consol_pct
+            range_pct=(max(rh)-min(rl))/curr_close*100 if rh and rl else 0; is_consol=atr_value is not None and range_pct<atr_value/curr_close*100
         else: range_pct=0; is_consol=False
         for (level,zone_low,touches,is_zone,touch_pts,cluster_tag) in levels:
             if not level or level<=0: continue
             dist_pct=(level-curr_close)/level*100
             if cluster_tag=="BO":
                 state="BO"
-            elif 0<=dist_pct<=near_pct: state="Consolidating near HLR" if is_consol else "Near HLR"
+            elif near_pct is not None and 0<=dist_pct<=near_pct: state="Consolidating near HLR" if is_consol else "Near HLR"
             else: continue
             signals.append({"symbol":sym,"state":state,"resistance":round(level,2),"zone_low":round(zone_low,2),
                 "is_zone":is_zone,"touches":touches,"touch_points":touch_pts,"dist_pct":round(dist_pct,2),
@@ -4160,12 +4163,11 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,near_pct=4.0,consol_days=5,co
                 "vol_spike":round(vol_spike,1) if vol_spike is not None else None})
     return signals
 
-def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, near_pct=5.0, consol_days=2, consol_pct=5.0):
+def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, consol_days=3):
     """
     Same swing-cluster resistance-zone logic as _detect_hlr, run on weekly
-    candles. swing_n/consol_days are reduced from the daily defaults since a
-    weekly series only has ~52 bars/year vs ~250 for daily — same idea, scaled
-    down to the timeframe. Volume-spike isn't tracked here (weekly aggregated
+    candles. Both timeframes use three candles for consolidation and a
+    total range below their own Wilder ATR(14). Volume-spike isn't tracked here (weekly aggregated
     volume is a less meaningful "spike" signal than daily's).
     """
     signals = []
@@ -4199,17 +4201,20 @@ def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, near_pct=5.0, c
 
         curr_close = wc[-1]
         if curr_close is None or curr_close <= 0: continue   # bad candle (c=0) → ZeroDivisionError guard
+        # Weekly proximity uses ATR of weekly candles, not daily ATR.
+        atr_value = _calc_atr_series(wh, wl, wc, 14)[-1]
+        near_pct = atr_value / curr_close * 100 * 1.5 if atr_value is not None else None
         curr_date = wd[-1]
         if n >= consol_days:
             rh = [v for v in wh[-consol_days:] if v is not None]; rl = [v for v in wl[-consol_days:] if v is not None]
-            range_pct = (max(rh) - min(rl)) / curr_close * 100 if rh and rl else 0; is_consol = range_pct < consol_pct
+            range_pct = (max(rh) - min(rl)) / curr_close * 100 if rh and rl else 0; is_consol = atr_value is not None and range_pct < atr_value / curr_close * 100
         else: range_pct = 0; is_consol = False
 
         for (level, zone_low, touches, is_zone, touch_pts, cluster_tag) in levels:
             if not level or level <= 0: continue
             dist_pct = (level - curr_close) / level * 100
             if cluster_tag == "BO": state = "BO"
-            elif 0 <= dist_pct <= near_pct: state = "Consolidating near HLR" if is_consol else "Near HLR"
+            elif near_pct is not None and 0 <= dist_pct <= near_pct: state = "Consolidating near HLR" if is_consol else "Near HLR"
             else: continue
             signals.append({"symbol": sym, "tf": tf, "state": state, "resistance": round(level, 2), "zone_low": round(zone_low, 2),
                 "is_zone": is_zone, "touches": touches, "touch_points": touch_pts, "dist_pct": round(dist_pct, 2),
