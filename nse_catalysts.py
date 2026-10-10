@@ -1043,6 +1043,88 @@ def _best_money(clean: str, context_re: str = "") -> tuple[float | None, str, st
     return value, raw, context
 
 
+def _local_corporate_news(category: str, pdf_text: str) -> dict:
+    """Conservative, no-AI readable news from an acquisition/divestment filing.
+
+    Prefer the actual transaction subject (Sub or Ref), then the first meaningful
+    disclosure sentences. Never invent a counterparty, stake, or completion.
+    """
+    if category not in {"Acquisition", "Divestment"} or not pdf_text:
+        return {}
+    lines = [re.sub(r"\s+", " ", x).strip() for x in pdf_text.splitlines()]
+    lines = [x for x in lines if x]
+    if not lines:
+        return {}
+    head = lines[:75]
+    sections = []
+    for i, line in enumerate(head):
+        m = re.match(r"^(?:sub(?:ject)?|ref(?:erence)?)\s*[:.\-–]\s*(.*)$", line, re.I)
+        if not m:
+            continue
+        parts = [m.group(1).strip()]
+        for next_line in head[i + 1:i + 7]:
+            if re.match(r"^(?:sub(?:ject)?|ref(?:erence)?|dear|sir|madam|respected)\b", next_line, re.I):
+                break
+            if re.match(r"^(?:this is|we (?:wish|hereby|enclose)|in this regard|pursuant|the company|alok |kindly)\b", next_line, re.I):
+                break
+            if next_line.endswith(('.', ':')) and len(next_line) > 65:
+                parts.append(next_line)
+                break
+            parts.append(next_line)
+        sections.append(re.sub(r"\s+", " ", " ".join(parts)).strip(' -–:;'))
+
+    # Regulatory headers are not news; Ref often contains the real transaction.
+    def meaningful(s):
+        return bool(re.search(r"\b(?:sale|sell|stake|acquisit|acquir|equity shares?|divest|disposal)\b", s, re.I))
+    headings = [h for h in sections if meaningful(h) and len(h) >= 22]
+    headings.sort(key=lambda h: (bool(re.search(r"\b(?:regulation|sebi|listing obligations|disclosure requirements)\b", h, re.I)), -len(h)))
+    headline = headings[0] if headings else ""
+    headline = re.sub(r"^(?:update on|intimation (?:regarding|of)|disclosure (?:regarding|of))\s+", "", headline, flags=re.I).strip(' -–:;')
+    if re.search(r"\b(?:regulation|sebi listing|listing obligations)\b", headline, re.I):
+        # Retain an event-specific suffix after regulatory boilerplate if present.
+        match = re.search(r"\b(?:update on|regarding|in respect of)\s+((?:sale|acquisition|divestment|disposal)\b.{12,220})", headline, re.I)
+        headline = match.group(1).strip(' -–:;') if match else ""
+    if len(headline) > 210:
+        headline = ""
+
+    # Work with prose, not annexure tables, signatures or boilerplate.
+    prose = re.sub(r"\s+", " ", " ".join(lines[:110])).strip()
+    prose = re.split(r"\b(?:kindly take (?:the same|this)|this is for (?:your )?information|thank(?:ing)? you|yours faithfully|for [A-Z ]+ LIMITED)\b", prose, maxsplit=1, flags=re.I)[0]
+    candidates = re.split(r"(?<=[.!?])\s+(?=[A-Z])", prose)
+    skip = re.compile(r"^(?:sub(?:ject)?|ref(?:erence)?|dear|sir|madam|this is with reference|further to our|we enclose|we wish to inform you that the details required|intimation under|disclosure under)", re.I)
+    event = re.compile(r"\b(?:acquir(?:e|ed|ing|es)|acquisition|sale|sold|divest|stake|equity shares?|share transfer|purchase consideration|ceased to be|agreement for sale|entered into.*agreement)\b", re.I)
+    selected = []
+    for sentence in candidates:
+        sentence = sentence.strip()
+        if len(sentence) < 35 or len(sentence) > 620 or skip.search(sentence):
+            continue
+        if not event.search(sentence):
+            continue
+        if re.search(r"\b(?:sebi|regulation 30|master circular|schedule iii|threshold limit)\b", sentence, re.I) and not re.search(r"\b(?:has (?:completed|acquired|paid)|transfer .*under process|entered into|will acquire)\b", sentence, re.I):
+            continue
+        selected.append(sentence)
+        if len(selected) == 2:
+            break
+    summary = " ".join(selected)[:850].strip()
+    out = {}
+    if headline:
+        out["headline"] = headline[0].upper() + headline[1:]
+    if summary:
+        out["news_summary"] = summary
+
+    # Explicit current-state evidence overrides generic NSE announcement stage.
+    current = re.sub(r"\s+", " ", " ".join(lines[:95]))
+    if re.search(r"\b(?:transfer of (?:the )?(?:aforesaid )?(?:equity )?shares? (?:is |are )?(?:currently )?under process|share transfer (?:is )?pending)\b", current, re.I):
+        out["stage"] = "Transfer Pending"
+    elif re.search(r"\b(?:has|have)\s+(?:on [^.]{0,55}?\s+)?completed\s+(?:the )?(?:sale|acquisition|divestment)\b|\b(?:sale|acquisition|divestment)\s+(?:has been |was )?completed\b", current, re.I):
+        out["stage"] = "Completed"
+    elif re.search(r"\b(?:has|have)\s+(?:entered into|signed|executed)\s+(?:an? |the )?(?:share purchase |investment |definitive )?agreement\b|\bagreement (?:has been |was )?(?:signed|executed)\b", current, re.I):
+        out["stage"] = "Agreement Signed"
+    elif re.search(r"\b(?:board (?:has )?approved|approved by (?:the )?board)\b", current, re.I):
+        out["stage"] = "Approved"
+    return out
+
+
 def _extract_local_catalyst_details(category: str, text: str) -> dict:
     """Conservative non-AI parser for material catalyst PDFs.
 
@@ -1052,7 +1134,7 @@ def _extract_local_catalyst_details(category: str, text: str) -> dict:
     clean = _normalize_pdf_text(text)
     if not clean:
         return {}
-    out = {}
+    out = _local_corporate_news(category, text)
 
     if category == "Order":
         return _extract_order_details(clean)
@@ -1404,7 +1486,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
             pdf_text = _extract_pdf_text_bytes(pdf_bytes)
             details = _extract_local_catalyst_details(cat, pdf_text)
             it["local_pdf_checked"] = True
-            it["local_parser_version"] = 4.1
+            it["local_parser_version"] = 4.2
             if details:
                 it.update(details)
                 _apply_materiality_ratios(it, cat, details, market_cap_map, ttm_sales_map)
@@ -1413,7 +1495,7 @@ def enrich_local_pdfs(session, new_items: dict, existing_ids: set[str], today: d
                     values_found += 1
     if initial_build:
         print(f"  ⚡ Initial/rebuild mode → historical PDFs skipped; only {today.isoformat()} catalysts enriched")
-    print(f"  ✓ Local PDF enrichment v4.1 → checked={checked}, details_found={enriched}, value_found={values_found}")
+    print(f"  ✓ Local PDF enrichment v4.2 → checked={checked}, details_found={enriched}, value_found={values_found}")
     return checked, enriched
 
 
@@ -1472,7 +1554,7 @@ def backfill_local_history(session, history: dict, market_cap_map: dict | None =
         details = _extract_local_catalyst_details(cat, _extract_pdf_text_bytes(pdf_bytes))
         it.pop("local_pdf_attempts", None)
         it["local_pdf_checked"] = True
-        it["local_parser_version"] = 4.1
+        it["local_parser_version"] = 4.2
         if cat == "Negative":
             it["negative_parser_version"] = NEG_PARSER_VERSION
         if details:
@@ -1499,7 +1581,7 @@ _LOCAL_ENRICHMENT_FIELDS = {
     "award_amount_cr", "award_amount_text", "total_exposure_cr",
     "agreement_value_cr", "agreement_value_text", "binding_status", "counterparty",
     "scheme_type", "scheme_date_text", "issue_value_cr", "issue_value_text",
-    "ratio", "price_per_security", "detail_excerpt",
+    "ratio", "price_per_security", "detail_excerpt", "headline", "news_summary",
     "order_to_market_cap_pct", "order_to_ttm_sales_pct",
     "transaction_to_market_cap_pct", "amount_to_market_cap_pct",
     "agreement_to_market_cap_pct", "issue_to_market_cap_pct",
@@ -1535,7 +1617,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
                 continue
             if not it.get("local_pdf_checked") and source not in {"local_pdf", "pdf_local"}:
                 continue
-            if float(it.get("local_parser_version") or 0) >= 4.1:
+            if float(it.get("local_parser_version") or 0) >= 4.2:
                 continue
 
             checked += 1
@@ -1543,7 +1625,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
             pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
             _clear_local_enrichment(it)
             it["local_pdf_checked"] = True
-            it["local_parser_version"] = 4.1
+            it["local_parser_version"] = 4.2
 
             if pdf_bytes:
                 pdf_text = _extract_pdf_text_bytes(pdf_bytes)
@@ -1562,7 +1644,7 @@ def revalidate_local_history(session, history: dict, market_cap_map: dict | None
                 changed += 1
 
     if checked:
-        print(f"  ♻ Local PDF v4.1 history revalidation → checked={checked}, changed={changed}, value_found={values}")
+        print(f"  ♻ Local PDF v4.2 history revalidation → checked={checked}, changed={changed}, value_found={values}")
     return checked, changed, values
 
 
