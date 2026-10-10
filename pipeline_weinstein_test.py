@@ -5273,95 +5273,95 @@ TRANSITION_LABELS = {
 def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                               slope_lookback=4, flat_threshold_pct=1.0,
                               ema_short_period=10, swing_lookback=10):
-    """Non-repainting, simplified weekly Weinstein state machine.
+    """Classify the prevailing weekly Weinstein PHASE, not trade-entry signals.
 
-    Stage 2/4: EMA alignment, EMA30 4-week slope and first 10-week high/low
-    close breakout. Stage 1/3: confirmed 3-left/3-right H-L-H / L-H-L
-    structure, flat EMA evidence and structural close breakout. No extra
-    depth/duration/age/volume filters. Never infer Stage 1 from no evidence.
+    2/4 = sustained directional EMA trend; a fresh range breakout is NOT
+    required. 1/3 = sideways/flattening after a prior downtrend/uptrend.
+    Stage 1/3 can start inside the range, before a structural breakout.
+    No future bars, pivot lookahead or R2 dependency.
     """
     n = len(wc)
     ema30 = _calc_ema(wc, ema_period)
     ema10 = _calc_ema(wc, ema_short_period)
     records = []
-    pivots = []
     stage = None
-    last_direction = None
     stage_start = None
+    last_direction = None
+    bullish_run = bearish_run = 0
     for i in range(n):
-        # A pivot at i-3 can first be known at week i.
-        k = i - 3
-        if k >= 3:
-            hs = wh[k-3:k+4]
-            ls = wl[k-3:k+4]
-            if all(x is not None for x in hs) and hs[3] == max(hs) and hs.count(hs[3]) == 1:
-                pivots.append((k, 'H', wh[k]))
-            if all(x is not None for x in ls) and ls[3] == min(ls) and ls.count(ls[3]) == 1:
-                pivots.append((k, 'L', wl[k]))
-        e30, e10 = ema30[i], ema10[i]
-        eprev = ema30[i-slope_lookback] if i >= slope_lookback else None
-        slope = ((e30 / eprev - 1) * 100 if e30 is not None and eprev not in (None, 0) else None)
-        price = wc[i]
-        previous = stage
-        high_ref = max((x for x in wh[i-swing_lookback:i] if x is not None), default=None) if i >= swing_lookback else None
-        low_ref = min((x for x in wl[i-swing_lookback:i] if x is not None), default=None) if i >= swing_lookback else None
-        bullish = (price is not None and e30 is not None and e10 is not None and slope is not None
-                   and price > e30 and e10 > e30 and slope > flat_threshold_pct)
-        bearish = (price is not None and e30 is not None and e10 is not None and slope is not None
-                   and price < e30 and e10 < e30 and slope < -flat_threshold_pct)
-        # Stage 2/4 entries take priority over any simultaneous base/top signal.
-        if i >= 39 and bullish and high_ref is not None and price > high_ref and stage != 2:
+        price, e30, e10 = wc[i], ema30[i], ema10[i]
+        ep = ema30[i-slope_lookback] if i >= slope_lookback else None
+        slope = ((e30 / ep - 1) * 100
+                 if e30 is not None and ep not in (None, 0) else None)
+        prev = stage
+        high_ref = (max(wh[i-swing_lookback:i]) if i >= swing_lookback
+                    and all(x is not None for x in wh[i-swing_lookback:i]) else None)
+        low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
+                   and all(x is not None for x in wl[i-swing_lookback:i]) else None)
+        bull = (price is not None and e30 is not None and e10 is not None
+                and slope is not None and price > e30 and e10 > e30
+                and slope > flat_threshold_pct)
+        bear = (price is not None and e30 is not None and e10 is not None
+                and slope is not None and price < e30 and e10 < e30
+                and slope < -flat_threshold_pct)
+        bullish_run = bullish_run + 1 if bull else 0
+        bearish_run = bearish_run + 1 if bear else 0
+
+        # Two weekly observations distinguish an established phase from a
+        # one-week MA fluctuation; breakout is useful evidence, not a gate.
+        if i >= 39 and (bullish_run >= 2 or (bull and high_ref is not None and price > high_ref)):
             stage = 2
-        elif i >= 39 and bearish and low_ref is not None and price < low_ref and stage != 4:
+        elif i >= 39 and (bearish_run >= 2 or (bear and low_ref is not None and price < low_ref)):
             stage = 4
-        elif stage not in (1, 3) and i >= 51 and slope is not None and price is not None:
-            # Pivot structure is chronological; all pivots were confirmed by i.
-            # Prefer the latest complete matching structure.
-            flat_recent = sum(1 for j in range(max(slope_lookback, i-5), i+1)
-                              if ema30[j] is not None and ema30[j-slope_lookback] not in (None, 0)
-                              and abs((ema30[j] / ema30[j-slope_lookback] - 1)*100) <= flat_threshold_pct) >= 3
-            if flat_recent:
-                for kind, target in (('HLH', 3), ('LHL', 1)):
-                    if stage == target:
-                        continue
-                    seq = [x for x in pivots if x[1] in kind]
-                    # Search latest chronological triple, rather than only last 3 pivots.
-                    match = None
-                    for z in range(len(seq)-1, 1, -1):
-                        x, y, t = seq[z-2:z+1]
-                        if (x[1]+y[1]+t[1]) != kind:
-                            continue
-                        if kind == 'HLH' and t[2] < x[2] and price < y[2]:
-                            match = (x, y, t)
-                            break
-                        if kind == 'LHL' and t[2] > x[2] and price > y[2]:
-                            match = (x, y, t)
-                            break
-                    if match:
-                        # A confirmed preceding directional stage OR observable
-                        # preceding EMA trend supports initial classification.
-                        anchor = match[0][0]
-                        trend_slopes = []
-                        for j in range(max(slope_lookback, anchor-26), anchor):
-                            if ema30[j] is not None and ema30[j-slope_lookback] not in (None, 0):
-                                trend_slopes.append((ema30[j]/ema30[j-slope_lookback]-1)*100)
-                        trend_ok = (last_direction == (2 if target == 3 else 4) or
-                                    sum(v > flat_threshold_pct if target == 3 else v < -flat_threshold_pct
-                                        for v in trend_slopes) >= 4)
-                        if trend_ok:
-                            stage = target
-                            break
+        elif i >= 51 and slope is not None and price is not None:
+            # Sideways phase: recent EMA30 flattening and a contained 12-week
+            # trading range.  The base/top is identified by prior direction.
+            slopes = []
+            for j in range(max(ema_period + slope_lookback - 1, i-5), i+1):
+                old = ema30[j-slope_lookback]
+                if ema30[j] is not None and old not in (None, 0):
+                    slopes.append((ema30[j]/old-1)*100)
+            flat = sum(abs(x) <= 1.5 for x in slopes) >= 3
+            recent_h = max(wh[i-11:i+1]) if all(x is not None for x in wh[i-11:i+1]) else None
+            recent_l = min(wl[i-11:i+1]) if all(x is not None for x in wl[i-11:i+1]) else None
+            # 25% is a broad guard against a steep ongoing trend being called
+            # a base; it is not a breakout, depth or pivot requirement.
+            contained = (recent_h is not None and recent_l is not None
+                         and recent_l > 0 and (recent_h/recent_l-1) <= .25)
+            if flat and contained:
+                if last_direction == 4:
+                    stage = 1
+                elif last_direction == 2:
+                    stage = 3
+                elif stage in (1, 3):
+                    pass
+                else:
+                    # Initial classification: only infer context from data
+                    # that preceded the current 12-week consolidation.
+                    anchor = i-12
+                    past = []
+                    for j in range(max(ema_period+slope_lookback-1, anchor-26), anchor):
+                        old = ema30[j-slope_lookback]
+                        if ema30[j] is not None and old not in (None, 0):
+                            past.append((ema30[j]/old-1)*100)
+                    if sum(x < -flat_threshold_pct for x in past) >= 6:
+                        stage = 1
+                    elif sum(x > flat_threshold_pct for x in past) >= 6:
+                        stage = 3
         if stage in (2, 4):
             last_direction = stage
-        if stage != previous:
+        if stage != prev:
             stage_start = i if stage is not None else None
-        candidate = bool(i >= 39 and stage != 2 and bullish and high_ref is not None
-                         and price <= high_ref and price >= high_ref * 0.95)
-        vol_ref = [v for v in wv[max(0, i-10):i] if v is not None]
-        volume_confirmed = (wv[i] >= 1.5 * sum(vol_ref)/len(vol_ref)
-                            if len(vol_ref) == 10 and wv[i] is not None and sum(vol_ref) > 0 else None)
+        candidate = bool(i >= 39 and stage != 2 and bull and high_ref is not None
+                         and price <= high_ref and price >= high_ref * .95)
+        prior_volumes = wv[max(0, i-10):i]
+        volume_confirmed = (wv[i] >= 1.5 * sum(prior_volumes)/10
+                            if len(prior_volumes) == 10 and wv[i] is not None
+                            and all(v is not None for v in prior_volumes)
+                            and sum(prior_volumes) > 0 else None)
         records.append({
-            'stage': stage, 'prev_stage': previous, 'stage_change': previous is not None and stage != previous,
+            'stage': stage, 'prev_stage': prev,
+            'stage_change': prev is not None and stage != prev,
             'weeks_in_stage': i-stage_start+1 if stage_start is not None else 0,
             'close': price, 'ema30': e30, 'ema10': e10, 'slope_pct': slope,
             'stage2_candidate': candidate, 'volume_confirmed': volume_confirmed,
