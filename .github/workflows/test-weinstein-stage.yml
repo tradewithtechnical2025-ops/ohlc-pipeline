@@ -1,4 +1,4 @@
-name: Test Weinstein Stage Detector
+name: Test Weinstein Stage Detector new
 
 on:
   push:
@@ -86,6 +86,14 @@ jobs:
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
         run: python pipeline_weinstein_test.py weinstein_scan_dryrun
+      - name: Upload complete Weinstein results CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weinstein-test-results
+          path: weinstein_test_results.csv
+          if-no-files-found: warn
+          retention-days: 14
 
   run_real_save:
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_real_save == 'YES' && github.event.inputs.debug_symbol == ''
