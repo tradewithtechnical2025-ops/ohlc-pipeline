@@ -163,6 +163,25 @@ async def r2_upload_summary(client, stocks):
     await r2_upload(client, SUMMARY_FILE, payload)
 
 
+# fundamentals_rich.json (schema 2) — see _build_rich_entry. Lives beside
+# the summary and is saved at the same moments, from the same stored objects.
+async def r2_download_rich(client):
+    d = await r2_download(client, "fundamentals_rich.json")
+    if isinstance(d, dict) and d.get("schema_version") == 2 and isinstance(d.get("stocks"), dict):
+        return d["stocks"]
+    return {}
+
+
+async def r2_upload_rich(client, stocks):
+    payload = json.dumps({
+        "schema_version": 2,
+        "updated": today_ist(),
+        "units": {"money": "crore", "per_share": "rupee", "ratios": "percent", "order": "newest_first"},
+        "stocks": stocks,
+    }, separators=(",", ":"), allow_nan=False)
+    await r2_upload(client, "fundamentals_rich.json", payload)
+
+
 async def r2_download_pending(client):
     d = await r2_download(client, PENDING_FILE)
     return d if isinstance(d, dict) else {}
@@ -866,6 +885,417 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf=None, classi
 
 
 # ══════════════════════════════════════════════════════════════
+# RICH SUMMARY ENTRY  (schema 2 → fundamentals_rich.json, Oct 2026)
+# ══════════════════════════════════════════════════════════════
+# Built from the stored per-symbol object only, so it can be rebuilt for
+# the whole universe with reprocess_existing / backfill_summary — no FinEdge
+# calls. Written to its own file; fundamentals_summary.json and its keys are
+# left exactly as before so nothing that reads it today changes.
+#
+# Units in this file:
+#   money        → ₹ crore, 2 decimals
+#   per-share    → ₹ (eps, book_value_ps)
+#   ratios/growth/margins → percent (29.3 means 29.3%), 2 decimals
+#   *_days       → days;  current/quick/de/turnover → plain ratio (x)
+#   period_end   → int YYYYMMDD;  period → "Mar 2026"
+# Every list is newest first.
+
+RICH_FILE = "fundamentals_rich.json"
+RICH_SCHEMA = 2
+RICH_QUARTERS = QUARTERLY_CAP   # 12 — what the pipeline stores
+RICH_YEARS = 5
+
+
+def _cr(v):
+    return round(v / 1e7, 2) if isinstance(v, (int, float)) else None
+
+
+def _pct(v):
+    """fraction → percent"""
+    return round(v * 100, 2) if isinstance(v, (int, float)) else None
+
+
+def _r2(v):
+    return round(v, 2) if isinstance(v, (int, float)) else None
+
+
+def _div(a, b):
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)) or b == 0:
+        return None
+    return a / b
+
+
+def _growth(cur, prev):
+    """% change; None when the base is missing, zero or negative-to-anything
+    would give a meaningless sign."""
+    if not isinstance(cur, (int, float)) or not isinstance(prev, (int, float)) or prev == 0:
+        return None
+    return round((cur - prev) / abs(prev) * 100, 2)
+
+
+def _cagr(end, start, years):
+    if not isinstance(end, (int, float)) or not isinstance(start, (int, float)) or years <= 0:
+        return None
+    if start <= 0 or end <= 0:
+        return None
+    return round(((end / start) ** (1 / years) - 1) * 100, 2)
+
+
+def _month_index(period_end):
+    try:
+        pe = int(period_end)
+    except (TypeError, ValueError):
+        return None
+    return (pe // 10000) * 12 + (pe // 100) % 100
+
+
+def _fmt_date(yyyymmdd):
+    try:
+        s = str(int(yyyymmdd))
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _pick_basis(pl):
+    """Consolidated unless it is missing or its latest quarter is more than
+    one quarter behind standalone's — then standalone."""
+    c_core = pl.get("quarterly", {}).get("c", {}).get("core") or []
+    s_core = pl.get("quarterly", {}).get("s", {}).get("core") or []
+    if not c_core and not s_core:
+        return None, "no_quarterly_data"
+    if not s_core:
+        return "c", "only_consolidated"
+    if not c_core:
+        return "s", "only_standalone"
+    c_m = _month_index(c_core[0].get("period_end"))
+    s_m = _month_index(s_core[0].get("period_end"))
+    if c_m is None:
+        return "s", "consolidated_undated"
+    if s_m is None or c_m >= s_m - 3:
+        return "c", "consolidated"
+    return "s", "consolidated_stale"
+
+
+def _pl_rows(pl, period, basis):
+    entry = pl.get(period, {}).get(basis, {}) if basis else {}
+    return entry.get("core") or [], entry.get("raw") or []
+
+
+def _rich_pl_row(row, kind):
+    bank = kind == "bank"
+    pat = row.get("pat")
+    out = {
+        "period": _fmt_period_end(row.get("period_end")),
+        "period_end": row.get("period_end"),
+        "sales": _cr(row.get("sales")),
+        "ebitda": None if bank else _cr(_compute_ebitda_abs(row)),
+        "opm": None if bank else _pct(_compute_opm(row)),
+        "other_income": _cr(row.get("other_income")),
+        "interest": _cr(row.get("interest_expended") if bank else row.get("finance_costs")),
+        "depreciation": _cr(row.get("depreciation")),
+        "exceptional": _cr(row.get("exceptional_items")),
+        "pbt": _cr(row.get("pbt")),
+        "tax": _cr(row.get("tax_expense")),
+        "pat": _cr(pat),
+        "pat_attr": _cr(row.get("pat_attributable") if row.get("pat_attributable") not in (None, 0) else pat),
+        "eps": _r2(row.get("eps")),
+        "npm": _pct(_div(pat, row.get("sales"))),
+    }
+    if bank:
+        out.update({
+            "nii": _cr(row.get("net_interest_income")),
+            "provisions": _cr(row.get("provisions_loan_loss")),
+            # pre-provision operating profit
+            "ppop": _cr(row["pbt"] + (row.get("provisions_loan_loss") or 0)) if row.get("pbt") is not None else None,
+            # FinEdge gives these as fractions and pads them with 0 when not
+            # reported (always 0 in consolidated) — 0 is treated as missing.
+            "gnpa_pct": _pct(row.get("gross_npa_pct") or None),
+            "nnpa_pct": _pct(row.get("npa_pct") or None),
+            "cet1": _pct(row.get("cet1_ratio") or None),
+        })
+    return out
+
+
+_BANK_ASSET_QUALITY = (("gnpa_pct", "gross_npa_pct"), ("nnpa_pct", "npa_pct"), ("cet1", "cet1_ratio"))
+
+
+def _fill_bank_asset_quality(rows, pl, period, basis):
+    """Banks report NPA % and CET1 only in standalone results. When the
+    chosen basis is consolidated, borrow them from the standalone row of the
+    same period."""
+    other = "s" if basis == "c" else "c"
+    alt = {r.get("period_end"): r for r in (pl.get(period, {}).get(other, {}).get("core") or [])}
+    for r in rows:
+        src = alt.get(r.get("period_end"))
+        if not src:
+            continue
+        for key, field in _BANK_ASSET_QUALITY:
+            if r.get(key) is None:
+                r[key] = _pct(src.get(field) or None)
+    return rows
+
+
+def _add_yoy(rows, keys=("sales", "ebitda", "pat", "eps")):
+    """YoY matched on the period_end one year earlier — never on list
+    position, so a missing quarter can't shift the comparison."""
+    by_end = {r.get("period_end"): r for r in rows if r.get("period_end")}
+    for r in rows:
+        pe = r.get("period_end")
+        prev = by_end.get(pe - 10000) if isinstance(pe, int) else None
+        for k in keys:
+            r[f"{k}_yoy"] = _growth(r.get(k), prev.get(k)) if prev else None
+    return rows
+
+
+def _row_by_end(rows, period_end):
+    return next((r for r in rows if r.get("period_end") == period_end), None)
+
+
+def _ratio_row(ratios, rtype, basis, header):
+    block = ratios.get(rtype, {}) or {}
+    rows = block.get(f"raw_{basis}") or block.get("raw") or []
+    return next((r for r in rows if r.get("header") == header), {}) or {}
+
+
+def _build_rich_entry(sym, obj, classification=None):
+    obj = obj or {}
+    profile = obj.get("profile") or {}
+    classification = classification or {}
+    kind = obj.get("company_type") or _classify_company(profile)
+    pl = obj.get("pl") or {}
+    bs = obj.get("bs") or {}
+    cf = obj.get("cf") or {}
+    ratios = obj.get("ratios") or {}
+    basic = obj.get("basic_financials") or {}
+    warnings = []
+
+    basis, basis_reason = _pick_basis(pl)
+
+    # ── P&L: quarterly / TTM / annual, all on the chosen basis ──────────
+    q_core, q_raw = _pl_rows(pl, "quarterly", basis)
+    quarters = _add_yoy([_rich_pl_row(r, kind) for r in q_core[:RICH_QUARTERS]])
+    if len(quarters) >= 2:
+        quarters[0]["sales_qoq"] = _growth(quarters[0]["sales"], quarters[1]["sales"])
+        quarters[0]["pat_qoq"] = _growth(quarters[0]["pat"], quarters[1]["pat"])
+    result_date = _fmt_date(q_raw[0].get("result_date")) if q_raw else None
+
+    t_core, _ = _pl_rows(pl, "ttm", basis)
+    ttm = _rich_pl_row(t_core[0], kind) if t_core else None
+    if ttm and quarters and ttm.get("period_end") != quarters[0].get("period_end"):
+        warnings.append("ttm_not_on_latest_quarter")
+
+    a_core_all, _ = _pl_rows(pl, "annual", basis)
+    annual_all = _add_yoy([_rich_pl_row(r, kind) for r in a_core_all], keys=("sales", "pat", "eps"))
+    if kind == "bank":
+        _fill_bank_asset_quality(quarters, pl, "quarterly", basis)
+        _fill_bank_asset_quality(annual_all, pl, "annual", basis)
+    bf_rows = basic.get(basis) or []
+    for r in annual_all:
+        bf = next((b for b in bf_rows if b.get("header") == r["period"]), None)
+        r["dividend_payout"] = _pct(bf.get("dividendPayout")) if bf else None
+    annual = annual_all[:RICH_YEARS]
+
+    # ── Balance sheet / cash flow (pipeline stores one basis for these) ──
+    bs_basis = (bs.get("annual") or {}).get("stype_used")
+    cf_basis = (cf.get("annual") or {}).get("stype_used")
+    if bs_basis and basis and bs_basis != basis:
+        warnings.append(f"bs_basis_{bs_basis}_vs_pl_{basis}")
+    if cf_basis and basis and cf_basis != basis:
+        warnings.append(f"cf_basis_{cf_basis}_vs_pl_{basis}")
+
+    bs_core = (bs.get("annual") or {}).get("core") or []
+    bs_annual = [{
+        "period": _fmt_period_end(r.get("period_end")),
+        "period_end": r.get("period_end"),
+        "equity_capital": _cr(r.get("equity_capital")),
+        "reserves": _cr(r.get("reserves")),
+        "shareholders_equity": _cr((r.get("equity_capital") or 0) + (r.get("reserves") or 0))
+            if (r.get("equity_capital") is not None or r.get("reserves") is not None) else None,
+        "total_equity": _cr(r.get("total_equity")),
+        "borrowings": _cr(r.get("borrowings_total")),
+        "cash": _cr(r.get("cash")),
+        "bank_balances": _cr(r.get("bank_balances")),
+        "investments": _cr(r.get("investments")),
+        "investments_current": _cr(r.get("investments_current")),
+        "fixed_assets": _cr(r.get("fixed_assets")),
+        "cwip": _cr(r.get("cwip")),
+        "total_assets": _cr(r.get("total_assets")),
+        "current_assets": _cr(r.get("current_assets")),
+        "current_liabilities": _cr(r.get("current_liabilities")),
+        "inventories": _cr(r.get("inventories")),
+        "receivables": _cr(r.get("trade_receivables_total")),
+        "payables": _cr(r.get("trade_payables_total")),
+        "deposits": _cr(r.get("deposits")),
+        "advances": _cr(r.get("advances")),
+    } for r in bs_core[:RICH_YEARS]]
+
+    cf_core = (cf.get("annual") or {}).get("core") or []
+    cf_annual = [{
+        "period": _fmt_period_end(r.get("period_end")),
+        "period_end": r.get("period_end"),
+        "cfo": _cr(r.get("cfo")),
+        "cfi": _cr(r.get("cfi")),
+        "cff": _cr(r.get("cff")),
+        "capex": _cr(-abs(r["capex"]) if isinstance(r.get("capex"), (int, float)) else None),
+        "fcf": _cr(r.get("fcf")),
+        "dividends_paid": _cr(r.get("dividends_paid")),
+    } for r in cf_core[:RICH_YEARS]]
+
+    # ── Ratios (screener.in convention, computed from raw statements) ────
+    diluted = next((r.get("diluted_shares") for r in q_core if r.get("diluted_shares")), None)
+    fy = a_core_all[0] if a_core_all else {}
+    fy_end = fy.get("period_end")
+    bs_fy = _row_by_end(bs_core, fy_end) if fy_end else None
+    bs_prev = _row_by_end(bs_core, fy_end - 10000) if isinstance(fy_end, int) else None
+    if fy_end and not bs_fy:
+        warnings.append("no_bs_for_latest_fy")
+
+    # Matched against screener.in on RELIANCE FY26 (ROE 8.91, ROCE 10.3,
+    # BV 668): all on CLOSING balances of the FY, and
+    #   shareholders' equity = equity capital + reserves (no minority)
+    #   ROE  = PAT attributable to owners / shareholders' equity
+    #   ROCE = (PBT + finance cost) / (total equity incl. minority + borrowings)
+    #   BV   = shareholders' equity / diluted shares
+    #   D/E  = borrowings / shareholders' equity
+    def sh_eq(r):
+        if not r:
+            return None
+        cap, res = r.get("equity_capital"), r.get("reserves")
+        if cap is None and res is None:
+            return r.get("total_equity")
+        return (cap or 0) + (res or 0)
+
+    def cap_employed(r):
+        if not r or r.get("total_equity") is None:
+            return None
+        return r.get("total_equity") + (r.get("borrowings_total") or 0)
+
+    fy_pat = fy.get("pat")
+    fy_pat_attr = fy.get("pat_attributable") if fy.get("pat_attributable") not in (None, 0) else fy_pat
+    ebit = (fy.get("pbt") + (fy.get("finance_costs") or 0)) if fy.get("pbt") is not None else None
+    roe = _pct(_div(fy_pat_attr, sh_eq(bs_fy)))
+    roce = None if kind == "bank" else _pct(_div(ebit, cap_employed(bs_fy)))
+    roa = _pct(_div(fy_pat, bs_fy.get("total_assets") if bs_fy else None))
+
+    bs_last = bs_core[0] if bs_core else {}
+    debt = bs_last.get("borrowings_total")
+    equity = sh_eq(bs_last)
+    liquid = sum(v for v in (bs_last.get("cash"), bs_last.get("bank_balances"), bs_last.get("investments_current"))
+                 if isinstance(v, (int, float)))
+    net_debt = (debt - liquid) if isinstance(debt, (int, float)) else None
+
+    cf_fy = _row_by_end(cf_core, fy_end) if fy_end else None
+    fy_ebitda = None if kind == "bank" else _compute_ebitda_abs(fy)
+    li = _ratio_row(ratios, "li", basis, "TTM")
+    ef = _ratio_row(ratios, "ef", basis, "TTM")
+
+    ratio_block = {
+        "fy": _fmt_period_end(fy_end) if fy_end else None,
+        "roe": roe,
+        "roce": roce,
+        "roa": roa,
+        "opm_ttm": ttm.get("opm") if ttm else None,
+        "npm_ttm": ttm.get("npm") if ttm else None,
+        "de": _r2(_div(debt, equity)),
+        "net_debt": _cr(net_debt),
+        "book_value_ps": _r2(_div(equity, diluted)),
+        "fcf_to_ebitda": _pct(_div(cf_fy.get("fcf"), fy_ebitda)) if cf_fy else None,
+        "cfo_to_pat": _pct(_div(cf_fy.get("cfo"), fy_pat)) if cf_fy else None,
+        "dividend_payout": annual[0].get("dividend_payout") if annual else None,
+        "current_ratio": _r2(li.get("currentRatio")),
+        "quick_ratio": _r2(li.get("quickRatio")),
+        "interest_coverage": _r2(li.get("interestCoverage")),
+        "debtor_days": _r2(ef.get("debtorDays")),
+        "inventory_days": _r2(ef.get("inventoryDays")),
+        "payable_days": _r2(ef.get("daysPayable")),
+        "cash_conversion_cycle": _r2(ef.get("cashConversionCycle")),
+        "working_capital_days": _r2(ef.get("workingCapitalDays")),
+        "asset_turnover": _r2(ef.get("assetTurnover")),
+    }
+    if fy_end and cf_core and not cf_fy:
+        warnings.append("no_cf_for_latest_fy")
+    if kind == "bank":
+        # Borrowings/deposits are a bank's raw material, not leverage, and
+        # its cash flow is mostly lending — these would mislead a filter.
+        for k in ("de", "net_debt", "fcf_to_ebitda", "cfo_to_pat", "current_ratio", "quick_ratio",
+                  "interest_coverage", "debtor_days", "inventory_days", "payable_days",
+                  "cash_conversion_cycle", "working_capital_days", "asset_turnover"):
+            ratio_block[k] = None
+        pr_ttm = _ratio_row(ratios, "pr", basis, "TTM")
+        ratio_block["nim"] = _pct(pr_ttm.get("netInterestMargin"))
+        latest = quarters[0] if quarters else {}
+        ratio_block["gnpa_pct"] = latest.get("gnpa_pct")
+        ratio_block["nnpa_pct"] = latest.get("nnpa_pct")
+        ratio_block["cet1"] = latest.get("cet1")
+
+    # ── Growth: CAGR from the annual P&L on the same basis ──────────────
+    def cagr_of(key, years):
+        if len(annual_all) <= years:
+            return None
+        end, start = annual_all[0], annual_all[years]
+        if _month_index(end.get("period_end")) is None or _month_index(start.get("period_end")) is None:
+            return None
+        span = (_month_index(end["period_end"]) - _month_index(start["period_end"])) / 12
+        if abs(span - years) > 0.25:      # a missing year — don't guess
+            return None
+        return _cagr(end.get(key), start.get(key), years)
+
+    def bv_cagr(years):
+        if not bs_core or len(bs_core) <= years:
+            return None
+        return _cagr(sh_eq(bs_core[0]), sh_eq(bs_core[years]), years)
+
+    growth = {
+        "sales_cagr_3y": cagr_of("sales", 3), "sales_cagr_5y": cagr_of("sales", 5),
+        "ebitda_cagr_3y": cagr_of("ebitda", 3), "ebitda_cagr_5y": cagr_of("ebitda", 5),
+        "pat_cagr_3y": cagr_of("pat", 3), "pat_cagr_5y": cagr_of("pat", 5),
+        "eps_cagr_3y": cagr_of("eps", 3), "eps_cagr_5y": cagr_of("eps", 5),
+        "bv_cagr_3y": bv_cagr(3), "bv_cagr_5y": bv_cagr(5),
+    }
+
+    return _finite({
+        "symbol": sym,
+        "name": profile.get("name"),
+        "nse_code": profile.get("nse_code"),
+        "bse_code": profile.get("bse_code"),
+        "exchange": classification.get("exchange"),
+        "sector": profile.get("sector"),
+        "industry": profile.get("industry"),
+        "macro_sector": profile.get("macro_sector"),
+        "sector_group": classification.get("sector_group"),
+        "display_industry": classification.get("display_industry"),
+        "company_type": kind,
+        "basis": basis,
+        "basis_reason": basis_reason,
+        "bs_basis": bs_basis,
+        "cf_basis": cf_basis,
+        "diluted_shares": diluted,
+        "last_result_date": result_date,
+        "fetched_at": obj.get("fetched_at"),
+        "ttm": ttm,
+        "ratios": ratio_block,
+        "growth": growth,
+        "quarters": quarters,
+        "annual": annual,
+        "bs_annual": bs_annual,
+        "cf_annual": cf_annual,
+        "warnings": warnings,
+    })
+
+
+def _finite(o):
+    """NaN/inf → None, so the file always parses in a browser."""
+    if isinstance(o, float):
+        return o if o == o and o not in (float("inf"), float("-inf")) else None
+    if isinstance(o, dict):
+        return {k: _finite(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_finite(v) for v in o]
+    return o
+
+
+# ══════════════════════════════════════════════════════════════
 # ASSEMBLE PER-SYMBOL OBJECT
 # ══════════════════════════════════════════════════════════════
 
@@ -926,6 +1356,7 @@ async def run_full(part=0, exchange_filter=None):
         log.info(f"━━━ Fundamentals Full {label}  ({len(chunk)} stocks) ━━━")
 
         summary = await r2_download_summary(client)
+        rich = await r2_download_rich(client)
 
         ok = failed = 0
         for i, sym in enumerate(chunk, 1):
@@ -934,6 +1365,7 @@ async def run_full(part=0, exchange_filter=None):
                 file_hash = await r2_upload_symbol(client, sym, obj)
                 summ["hash"] = file_hash
                 summary[sym] = summ
+                rich[sym] = {**_build_rich_entry(sym, obj, classification_lookup.get(sym)), "hash": file_hash}
                 ok += 1
             except Exception as e:
                 failed += 1
@@ -941,6 +1373,7 @@ async def run_full(part=0, exchange_filter=None):
             if i % 25 == 0 or i == len(chunk):
                 log.info(f"  {i}/{len(chunk)}  ✓{ok}  ✗{failed}")
                 await r2_upload_summary(client, summary)
+                await r2_upload_rich(client, rich)
     log.info(f"━━━ Fundamentals Full {label} complete — ✓{ok}  ✗{failed} ━━━")
 
 
@@ -962,6 +1395,7 @@ async def run_daily():
         symbols = await get_nse_universe(client)
         classification_lookup = await get_classification_lookup(client)
         summary = await r2_download_summary(client)
+        rich = await r2_download_rich(client)
         pending = await r2_download_pending(client)
 
         todays_new = await get_today_result_symbols(client, sem, symbols)
@@ -1007,6 +1441,7 @@ async def run_daily():
                     file_hash = await r2_upload_symbol(client, sym, obj)
                     summ["hash"] = file_hash
                     summary[sym] = summ
+                    rich[sym] = {**_build_rich_entry(sym, obj, classification_lookup.get(sym)), "hash": file_hash}
                     del pending[sym]
                     updated += 1
                     log.info(f"  ✓ {sym} updated ({old_q} → {new_q})")
@@ -1026,6 +1461,8 @@ async def run_daily():
                 log.warning(f"  ✗ {sym}: {e}")
 
         await r2_upload_summary(client, summary)
+        if updated:
+            await r2_upload_rich(client, rich)
         await r2_upload_pending(client, pending)
 
     log.info(f"━━━ Daily complete — updated:{updated}  still_pending:{still_pending}  "
@@ -1042,6 +1479,10 @@ async def run_local(symbols):
         results = await asyncio.gather(*[fetch_one_symbol(client, sem, sym.upper()) for sym in symbols])
     data = {sym: obj for sym, obj, _ in results}
     summary = {sym: summ for sym, _, summ in results}
+    rich = {sym: _build_rich_entry(sym, obj) for sym, obj, _ in results}
+    rich_path = OUT_DIR / "fundamentals_rich_local.json"
+    rich_path.write_text(json.dumps(rich, indent=2, ensure_ascii=False))
+    log.info(f"💾 Saved locally → {rich_path}  ({rich_path.stat().st_size/1024:.1f} KB)")
     out_path = OUT_DIR / "fundamentals_prod.json"
     out_path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     summary_path = OUT_DIR / "fundamentals_summary_local.json"
@@ -1057,13 +1498,14 @@ async def run_local(symbols):
 async def _backfill_one(client, sym, classification_lookup=None):
     obj = await r2_download(client, f"fundamentals_full/{sym}.json")
     if not obj:
-        return sym, None
+        return sym, None, None
     classification = (classification_lookup or {}).get(sym)
     summ = _build_summary_entry(sym, obj.get("profile"), obj.get("pl", {}),
                                  obj.get("ratios", {}), obj.get("annual_price_ratios", {}),
                                  obj.get("cf", {}), classification)
     summ["hash"] = compute_hash(json.dumps(obj, separators=(",", ":")))
-    return sym, summ
+    rich_entry = {**_build_rich_entry(sym, obj, classification), "hash": summ["hash"]}
+    return sym, summ, rich_entry
 
 
 async def run_backfill_summary():
@@ -1072,14 +1514,16 @@ async def run_backfill_summary():
         symbols = await get_nse_universe(client)
         classification_lookup = await get_classification_lookup(client)
         summary = {}
+        rich = {}
         ok = failed = 0
         failed_syms = []
         for i in range(0, len(symbols), BATCH):
             batch = symbols[i:i + BATCH]
             results = await asyncio.gather(*[_backfill_one(client, sym, classification_lookup) for sym in batch])
-            for sym, summ in results:
+            for sym, summ, rich_entry in results:
                 if summ:
                     summary[sym] = summ
+                    rich[sym] = rich_entry
                     ok += 1
                 else:
                     failed += 1
@@ -1088,6 +1532,7 @@ async def run_backfill_summary():
             done = min(i + BATCH, len(symbols))
             log.info(f"  {done}/{len(symbols)}  ✓{ok}  ✗{failed}")
             await r2_upload_summary(client, summary)
+            await r2_upload_rich(client, rich)
         if failed_syms:
             log.info(f"  Auto-syncing {len(failed_syms)} missing symbols via Finedge...")
             sem = asyncio.Semaphore(CONCURRENCY)
@@ -1098,12 +1543,14 @@ async def run_backfill_summary():
                     file_hash = await r2_upload_symbol(client, sym, obj)
                     summ["hash"] = file_hash
                     summary[sym] = summ
+                    rich[sym] = {**_build_rich_entry(sym, obj, classification_lookup.get(sym)), "hash": file_hash}
                     ok += 1; failed -= 1; s_ok += 1
                     log.info(f"  ✓ {sym} (auto-synced)")
                 except Exception as e:
                     s_fail += 1
                     log.error(f"  ✗ {sym} auto-sync failed: {e}")
             await r2_upload_summary(client, summary)
+            await r2_upload_rich(client, rich)
             log.info(f"  Auto-sync done — ✓{s_ok}  ✗{s_fail}")
     log.info(f"━━━ Summary backfill complete — ✓{ok}  ✗{failed} ━━━")
 
@@ -1117,6 +1564,7 @@ async def run_sync(symbols):
     async with httpx.AsyncClient() as client:
         classification_lookup = await get_classification_lookup(client)
         summary = await r2_download_summary(client)
+        rich = await r2_download_rich(client)
         ok = failed = 0
         for sym in symbols:
             sym = sym.upper()
@@ -1125,12 +1573,15 @@ async def run_sync(symbols):
                 file_hash = await r2_upload_symbol(client, sym, obj)
                 summ["hash"] = file_hash
                 summary[sym] = summ
+                rich[sym] = {**_build_rich_entry(sym, obj, classification_lookup.get(sym)), "hash": file_hash}
                 ok += 1
                 log.info(f"  ✓ {sym}")
             except Exception as e:
                 failed += 1
                 log.warning(f"  ✗ {sym}: {e}")
         await r2_upload_summary(client, summary)
+        if ok:
+            await r2_upload_rich(client, rich)
     log.info(f"━━━ Sync complete — ✓{ok}  ✗{failed} ━━━")
 
 
@@ -1142,6 +1593,7 @@ async def run_reprocess_existing(symbols=None):
     """
     async with httpx.AsyncClient() as client:
         summary = await r2_download_summary(client)
+        rich = await r2_download_rich(client)
         lookup = await get_classification_lookup(client)
         selected = symbols or await get_nse_universe(client)
         ok = failed = legacy_cf = 0
@@ -1182,12 +1634,14 @@ async def run_reprocess_existing(symbols=None):
                     obj.get("cf", {}), lookup.get(sym))
                 summ["hash"] = await r2_upload_symbol(client, sym, obj)
                 summary[sym] = summ
+                rich[sym] = {**_build_rich_entry(sym, obj, lookup.get(sym)), "hash": summ["hash"]}
                 ok += 1
             except Exception as exc:
                 failed += 1
                 log.warning("Reprocess %s failed (%s)", sym, type(exc).__name__)
         if ok:
             await r2_upload_summary(client, summary)
+            await r2_upload_rich(client, rich)
         log.info("Reprocessed:%s failed:%s legacy CF periods needing refresh:%s", ok, failed, legacy_cf)
         if failed:
             raise RuntimeError("Some stored symbols could not be reprocessed")
