@@ -100,6 +100,11 @@ async def finedge_get(client, sem, path, params):
 
                 continue
 
+            if r.status_code >= 500:
+                # FinEdge/edge hiccup — worth another try, unlike a 4xx.
+                await asyncio.sleep(2 ** attempt)
+                continue
+
             if r.status_code != 200:
                 return None
 
@@ -135,6 +140,15 @@ CATEGORY_MAP = {
 }
 
 FIELDS = ["promoter", "fii", "dii", "govt", "public"]
+
+
+# Same ETF rule as pipeline_fundamentals_prod.py (_is_etf) — keep in sync.
+ETF_ENDSWITH = ("ETF", "BEES", "LIQUID", "GILT", "IETF", "MMQS", "TOTAL")
+ETF_CONTAINS = ("NIFTY", "BANKEX", "MSCIN")
+
+
+def is_etf(sym):
+    return sym.endswith(ETF_ENDSWITH) or any(k in sym for k in ETF_CONTAINS)
 
 
 def get_field(catagory, name):
@@ -223,10 +237,13 @@ def parse_shareholding(symbol, data):
 
         structured.append(entry)
 
-    # Validation: total should be ~100%
+    # Validation: total should be ~100%.
+    # FinEdge returns columns oldest → newest, so the LATEST quarter is the
+    # last entry (was checking structured[0], i.e. the oldest — Jun 2016 for
+    # most stocks). Order of "data" itself is unchanged: consumers reverse it.
     if structured:
 
-        latest = structured[0]
+        latest = structured[-1]
         total  = sum(latest[f] for f in FIELDS)
 
         if abs(total - 100) > 5:
@@ -285,38 +302,26 @@ async def main():
         # in too. "symbol" in bse.json is Finedge's own symbol (numeric BSE
         # code for BSE-exclusive stocks), same convention used everywhere
         # else in this pipeline.
-        master = await r2_download(client, "master.json")
+        # UNIVERSE (Oct 2026): classification.json — the same NSE+BSE list
+        # and the same ETF rule the fundamentals and daily pipelines use, so
+        # all three files cover the same stocks. Replaces master.json +
+        # bse.json and the old substring filter, which also dropped real
+        # companies whose symbol contains GOLD/SILVER (GOLDIAM, SKYGOLD,
+        # SHANTIGOLD, DECNGOLD, SILVERTUC).
+        classification = await r2_download(client, "classification.json")
+        if not isinstance(classification, list) or not classification:
+            raise RuntimeError("classification.json missing or invalid")
 
-        try:
-            bse = await r2_download(client, "bse.json")
-        except Exception:
-            bse = []
-        if not isinstance(bse, list):
-            bse = []
+        symbols = sorted({
+            str(x.get("symbol", "")).strip().upper()
+            for x in classification
+            if isinstance(x, dict)
+            and str(x.get("symbol", "")).strip()
+            and str(x.get("exchange", "")).strip().upper() in ("NSE", "BSE")
+            and not is_etf(str(x.get("symbol", "")).strip().upper())
+        })
 
-        symbols = [
-            x["symbol"]
-            for x in master
-            if x.get("exchange") in ("NSE", "BSE")
-        ] + [
-            x["symbol"]
-            for x in bse
-            if x.get("symbol")
-        ]
-        symbols = sorted(set(symbols))
-        print(f"  📋 master.json : {len(master)} | bse.json : {len(bse)} | combined unique : {len(symbols)}")
-
-        BAD_KEYWORDS = [
-            "ETF", "LIQUID", "NIFTY", "GOLD",
-            "SILVER", "NEXT50", "MIDCAP", "SMALLCAP",
-        ]
-
-        symbols = [
-            s for s in symbols
-            if not any(k in s for k in BAD_KEYWORDS)
-        ]
-
-        print(f"Total symbols: {len(symbols)}")
+        print(f"  📋 classification.json : {len(classification)} rows | equity symbols : {len(symbols)}")
 
         # ── Download existing data (for preservation) ──
         try:
