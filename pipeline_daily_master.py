@@ -201,7 +201,10 @@ def latest_ratio_row(payload, today):
     d, raw = best
     out = {"date": d.isoformat()}
     for f in RATIO_FIELDS:
-        out[f] = r2(raw.get(f))
+        v = r2(raw.get(f))
+        # FinEdge sends 0 for "not available" (e.g. no earnings data) — a real
+        # P/E or P/B is never exactly 0, so treat it as missing.
+        out[f] = None if v == 0 else v
     return out
 
 
@@ -274,6 +277,9 @@ class RatioFetcher:
 def shareholding_block(sh_entry):
     """shareholding.json keeps quarters oldest → newest; flip, keep 16."""
     data = (sh_entry or {}).get("data") or []
+    # FinEdge occasionally returns a quarter with every category at 0
+    # (VENKEYS Jun 2026) — that is a missing filing, not 0% holdings.
+    data = [q for q in data if sum(num(q.get(k)) or 0 for k in ("promoter", "fii", "dii", "govt", "public")) > 50]
     hist = list(reversed(data))[:SH_QUARTERS]
     if not hist:
         return None, []
@@ -335,6 +341,9 @@ def build_record(sym, cls, rich, sh_entry, ratio, price):
 
     if not rich:
         flags.append("no_fundamentals")
+    elif not rich.get("basis"):
+        # FinEdge has no P&L for these (mostly SME / half-yearly filers)
+        flags.append("no_pl_data")
     if not sh:
         flags.append("no_shareholding")
     if not ratio:
@@ -404,7 +413,7 @@ def ratios_from_daily_file(daily, sym):
     if not latest:
         return None
     row = {"date": latest.get("quote_date"), "basis": e.get("statement_type")}
-    row.update({f: r2(latest.get(f)) for f in RATIO_FIELDS})
+    row.update({f: (r2(latest.get(f)) or None) for f in RATIO_FIELDS})
     return row
 
 
@@ -510,7 +519,8 @@ async def run(args):
                                "not uploading; check classification.json")
         counts = {
             "stocks": len(stocks),
-            "with_fundamentals": sum(1 for v in stocks.values() if "no_fundamentals" not in v["flags"]),
+            "with_fundamentals": sum(1 for v in stocks.values()
+                                     if "no_fundamentals" not in v["flags"] and "no_pl_data" not in v["flags"]),
             "with_shareholding": sum(1 for v in stocks.values() if v.get("sh")),
             "with_ratios": sum(1 for v in stocks.values() if v["val"].get("date")),
             "ratios_fresh": sum(1 for v in stocks.values() if v["val"].get("date") and not v["val"]["stale"]),
