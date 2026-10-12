@@ -45,6 +45,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from r2_manifest import upload_str_with_manifest
 from breadth_returns import build_index_ma_history, build_group_returns_history
+from structure_scan import build_structure_map
 
 # ── Telegram notify ──
 try:
@@ -2700,7 +2701,7 @@ def _today_gap_events(gaps_by_sym, today):
 SHAKEOUT_PAUSE_MAX_AGE = 20
 
 def _build_screener_feed(all_data, classification, rs_data, mswing_data,
-    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None, vcp_map=None, ath_map=None):
+    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None, vcp_map=None, ath_map=None, struct_map=None):
     cls_map={}
     for x in (classification or []):
         sym=x.get("symbol") or x.get("nse_code")
@@ -2907,6 +2908,8 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             "w_hlr_dist":(w_hlr_map or {}).get(sym,{}).get("dist_pct"),"w_hlr_touches":(w_hlr_map or {}).get(sym,{}).get("touches"),
             "m_pullback":sym in (m_pb_map or {}),"m_pullback_date":(m_pb_map or {}).get(sym,{}).get("date"),
             "m_pullback_ema":(m_pb_map or {}).get(sym,{}).get("ema_touch")}
+        # HH-HL / LL-LH and consolidation (structure_scan.py), daily + weekly
+        if struct_map and sym in struct_map: row.update(struct_map[sym])
         _es_cats=(ema_shakeout_map or {}).get(sym)
         if _es_cats:
             _es_today=[cat for cat,rec in _es_cats.items() if rec.get("recovery_date")==today]
@@ -3601,7 +3604,7 @@ async def run_ep_scan() -> None:
             industry_ma_history=_build_group_ma_history_multi(classification,ma_history_combos,"display_industry")
             # Index breadth (Nifty 50/500/Midcap 150/Smallcap 250/MidSmall 400,
             # % above EMA/SMA 10/21/50/200) and sector/industry returns
-            # (1D/1W/1M/6M/1Y; median, equal, mcap-weighted), 1 year each —
+            # (1M/3M/6M/1Y; median, equal, mcap-weighted), 1 year each —
             # see breadth_returns.py. Never allowed to break the scan.
             index_ma_history=sector_returns_history=industry_returns_history=None
             try:
@@ -3623,7 +3626,17 @@ async def run_ep_scan() -> None:
             gaps_by_sym=await update_gap_tracker(client,all_data,today)
             gap_state=_build_gap_state(all_data,gaps_by_sym,today)
             gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
-            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,market_data_date,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map,vcp_map=vcp_map,ath_map=ath_map)
+            # Price structure (HH-HL / LL-LH, consolidation) — never allowed to break the scan
+            struct_map={}
+            try:
+                struct_map=build_structure_map(all_data,_check_liquidity)
+                log.info(f"Structure: {sum(1 for r in struct_map.values() if r.get('hhhl')=='HH-HL')} HH-HL, "
+                         f"{sum(1 for r in struct_map.values() if r.get('hhhl')=='LL-LH')} LL-LH, "
+                         f"{sum(1 for r in struct_map.values() if r.get('cons'))} consolidating (daily); "
+                         f"{sum(1 for r in struct_map.values() if r.get('w_cons'))} consolidating (weekly)")
+            except Exception as e:
+                log.warning(f"Structure scan skipped: {e}")
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,market_data_date,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map,vcp_map=vcp_map,ath_map=ath_map,struct_map=struct_map)
             mtf_ma_map=_calc_multi_tf_ma(all_data)
             log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
             for row in screener_feed:
