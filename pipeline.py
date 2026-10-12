@@ -3619,6 +3619,25 @@ async def run_ep_scan() -> None:
                 log.info(f"Group returns: {len(sector_returns_history['groups'])} sectors, {len(industry_returns_history['groups'])} industries")
             except Exception as e:
                 log.warning(f"Group returns skipped: {e}")
+            # Per-exchange copies of the group files, for the RS Dashboard's
+            # All / NSE / BSE switch. Same builders, run on the NSE-only and
+            # BSE-only part of classification; the "All" files above are
+            # unchanged. Never allowed to break the scan.
+            exch_group_files={}
+            for _ex in ("NSE","BSE"):
+                try:
+                    _cls_ex=[c for c in (classification or []) if (c.get("exchange") or "NSE").upper()==_ex]
+                    _sfx=_ex.lower()
+                    exch_group_files[f"sector_group_rs_history_{_sfx}.json"]=_build_group_rs_history(_cls_ex,rs_history_list,"sector_group")
+                    exch_group_files[f"industry_rs_history_{_sfx}.json"]=_build_group_rs_history(_cls_ex,rs_history_list,"display_industry")
+                    exch_group_files[f"sector_group_ma_history_{_sfx}.json"]=_build_group_ma_history_multi(_cls_ex,ma_history_combos,"sector_group")
+                    exch_group_files[f"industry_ma_history_{_sfx}.json"]=_build_group_ma_history_multi(_cls_ex,ma_history_combos,"display_industry")
+                    exch_group_files[f"sector_returns_history_{_sfx}.json"]=build_group_returns_history(all_data,_cls_ex,"sector_group")
+                    exch_group_files[f"industry_returns_history_{_sfx}.json"]=build_group_returns_history(all_data,_cls_ex,"display_industry")
+                    _last=(exch_group_files[f"sector_group_rs_history_{_sfx}.json"] or [{}])[-1]
+                    log.info(f"Exchange {_ex}: {len(_cls_ex)} stocks, {len(_last.get('groups',{}))} sectors")
+                except Exception as e:
+                    log.warning(f"Exchange {_ex} group files skipped: {e}")
             for sig in signals:
                 sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
             for sig in pr_signals:
@@ -3762,7 +3781,8 @@ async def run_ep_scan() -> None:
             extra_uploads=[]
             for fname,obj in (("index_ma_history.json",index_ma_history),
                               ("sector_returns_history.json",sector_returns_history),
-                              ("industry_returns_history.json",industry_returns_history)):
+                              ("industry_returns_history.json",industry_returns_history),
+                              *exch_group_files.items()):
                 if obj:
                     extra_uploads.append(upload_str_with_manifest(client,r2_upload,fname,
                                          json.dumps(obj,separators=(",",":")),schema_v=1))
