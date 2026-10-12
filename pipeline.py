@@ -44,6 +44,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from r2_manifest import upload_str_with_manifest
+from breadth_returns import build_index_ma_history, build_group_returns_history
 
 # ── Telegram notify ──
 try:
@@ -3598,6 +3599,23 @@ async def run_ep_scan() -> None:
             ma_history_combos=_build_ma_history_all_combos(all_data,history_days=180)
             sector_group_ma_history=_build_group_ma_history_multi(classification,ma_history_combos,"sector_group")
             industry_ma_history=_build_group_ma_history_multi(classification,ma_history_combos,"display_industry")
+            # Index breadth (Nifty 50/500/Midcap 150/Smallcap 250/MidSmall 400,
+            # % above EMA/SMA 10/21/50/200) and sector/industry returns
+            # (1D/1W/1M/6M/1Y; median, equal, mcap-weighted), 1 year each —
+            # see breadth_returns.py. Never allowed to break the scan.
+            index_ma_history=sector_returns_history=industry_returns_history=None
+            try:
+                index_master_br=await r2_download(client,"index_master.json") or {}
+                index_ma_history=build_index_ma_history(all_data,index_master_br)
+                log.info("Index breadth: "+", ".join(f"{v['name']} {v['matched']}/{v['constituents']}" for v in index_ma_history["indices"].values()))
+            except Exception as e:
+                log.warning(f"Index breadth skipped: {e}")
+            try:
+                sector_returns_history=build_group_returns_history(all_data,classification,"sector_group")
+                industry_returns_history=build_group_returns_history(all_data,classification,"display_industry")
+                log.info(f"Group returns: {len(sector_returns_history['groups'])} sectors, {len(industry_returns_history['groups'])} industries")
+            except Exception as e:
+                log.warning(f"Group returns skipped: {e}")
             for sig in signals:
                 sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
             for sig in pr_signals:
@@ -3728,6 +3746,18 @@ async def run_ep_scan() -> None:
                 backup_pattern_history(client,screener_feed,market_data_date,gap_new=gap_new,gap_filled=gap_filled),
                 archive_screener_feed_history(client, screener_feed, market_data_date),
             )
+            extra_uploads=[]
+            for fname,obj in (("index_ma_history.json",index_ma_history),
+                              ("sector_returns_history.json",sector_returns_history),
+                              ("industry_returns_history.json",industry_returns_history)):
+                if obj:
+                    extra_uploads.append(upload_str_with_manifest(client,r2_upload,fname,
+                                         json.dumps(obj,separators=(",",":")),schema_v=1))
+            if extra_uploads:
+                try:
+                    await asyncio.gather(*extra_uploads)
+                except Exception as e:
+                    log.warning(f"Breadth/returns upload failed: {e}")
             log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
         status.success()
         log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
