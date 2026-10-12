@@ -9,7 +9,7 @@ has in memory (all_data), plus the index list and classification:
 
   sector_returns_history.json / industry_returns_history.json
       For each screener sector (classification sector_group) and industry
-      (display_industry): the 1D / 1W / 1M / 6M / 1Y return of its stocks,
+      (display_industry): the 1M / 3M / 6M / 1Y return of its stocks,
       every trading day for the last year, three ways —
         median  : the middle stock's return (one wild stock can't skew it)
         equal   : plain average of the stocks' returns
@@ -46,7 +46,7 @@ BREADTH_INDICES = {
 }
 
 # window lengths in trading days
-RETURN_PERIODS = (("1D", 1), ("1W", 5), ("1M", 21), ("6M", 126), ("1Y", 252))
+RETURN_PERIODS = (("1M", 21), ("3M", 63), ("6M", 126), ("1Y", 252))
 MIN_STOCKS = 3                     # a group needs this many stocks with data on a day
 
 
