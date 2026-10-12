@@ -11,18 +11,20 @@ For every liquid stock, from its OHLC (all_data):
               while today's close is still at or above the last swing low.
       LL-LH : last swing low < the one before AND last swing high < the one before,
               while today's close is still at or below the last swing high.
-      Equal levels do not count as higher / lower.
+      Swings within 1% of each other count as equal, not higher / lower.
 
   Consolidation (from the same last two swing highs and lows)
-      Contracting : lower high + higher low (triangle).
+      Any zone whose swings are not a clear HH-HL / LL-LH. Its shape is kept:
+      Contracting : the range narrows — lower high and/or higher low, neither side widening.
       Range       : both highs within 3% of each other and both lows within 3%.
+      Sideways    : anything else (e.g. a flat top with a slightly lower low).
       Zone = highest of the two highs to lowest of the two lows. Kept only when
       the zone is at most MAX_WIDTH wide and all four swings are recent.
       Status: inside / breakout (close above the zone) / breakdown (close below),
       plus how many bars ago the close left the zone.
-      Trend before the zone: the swing high/low before the zone's first ones —
-      if the zone's first high and low are both higher it came after an
-      uptrend, both lower after a downtrend.
+      Trend before the zone: the zone began at a new high (its first swing
+      high more than 1% above the one before) with the close above the 50 EMA
+      (weekly 30 EMA) = up; began at a new low with the close below it = down.
 
                      daily      weekly
       pivot N        5 bars     3 bars
@@ -34,13 +36,13 @@ Feed fields (weekly ones prefixed "w_"); a stock with nothing to report gets non
   hhhl      "HH-HL" | "LL-LH"
   hhhl_sh   last swing high      hhhl_sl  last swing low
   hhhl_age  bars since the newer of those two swings was confirmed
-  cons      "Contracting" | "Range"
+  cons      "Contracting" | "Range" | "Sideways"
   cons_st   "inside" | "breakout" | "breakdown"
   cons_top / cons_bot   zone levels      cons_w   zone width %
   cons_days bars since the oldest swing of the zone
   cons_brk  bars since the close left the zone (0 = today); null while inside
-  cons_trend "up" | "down" | null — the swing pair before the zone was
-            HH-HL ("up") or LL-LH ("down"): consolidation inside a trend
+  cons_trend "up" | "down" | null — the zone began at a new high / new low
+            (with the close on the matching side of the EMA)
 
 Summary fields the website filters on (two rows of chips):
   st_trend  "up" | "down"        (needs close above / below the 50 EMA; weekly 30 EMA)
@@ -52,13 +54,20 @@ Wired into pipeline.py run_ep_scan; merged into screener_feed.json rows.
 from datetime import date
 
 SETTINGS = {
-    "d": {"n": 5, "max_width": 20.0, "max_age": 63},
-    "w": {"n": 3, "max_width": 35.0, "max_age": 26},
+    "d": {"n": 5, "max_width": 20.0, "max_age": 63, "ema": 50},
+    "w": {"n": 3, "max_width": 35.0, "max_age": 26, "ema": 30},
 }
 # Trend / stage summary (the two rows of filter chips on the website)
 EMA_GUARD = {"d": 50, "w": 30}     # up-trend needs close above this EMA, down-trend below
 BREAK_LIVE = {"d": 5, "w": 1}      # a breakout / breakdown stays the stage for this many bars
 FLAT_PCT = 3.0
+TOL_PCT = 1.0        # swings closer than this count as equal (not higher / lower)
+
+
+def _cmp(a, b, tol=TOL_PCT):
+    """+1 when a is more than tol % above b, -1 when more than tol % below, else 0."""
+    p = (a - b) / b * 100
+    return 1 if p > tol else -1 if p < -tol else 0
 
 
 def swings(highs, lows, n):
@@ -79,11 +88,22 @@ def swings(highs, lows, n):
     return sh, sl
 
 
+def _ema_last(closes, period):
+    vals = [c for c in closes if c is not None]
+    if len(vals) < period:
+        return None
+    k = 2 / (period + 1)
+    e = sum(vals[:period]) / period
+    for v in vals[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
 def _r(v):
     return None if v is None else round(v, 2)
 
 
-def analyse(highs, lows, closes, n, max_width, max_age, flat=FLAT_PCT):
+def analyse(highs, lows, closes, n, max_width, max_age, flat=FLAT_PCT, ema=None):
     """Both results for one series; {} when there is not enough history."""
     m = len(closes)
     if m < 4 * n + 2 or closes[-1] is None:
@@ -96,16 +116,24 @@ def analyse(highs, lows, closes, n, max_width, max_age, flat=FLAT_PCT):
     c = closes[-1]
     out = {}
 
-    up = H1 > H0 and L1 > L0 and c >= L1
-    dn = L1 < L0 and H1 < H0 and c <= H1
+    ch, cl = _cmp(H1, H0), _cmp(L1, L0)
+    up = ch == 1 and cl == 1 and c >= L1
+    dn = ch == -1 and cl == -1 and c <= H1
     if up or dn:
         out.update({"hhhl": "HH-HL" if up else "LL-LH", "hhhl_sh": _r(H1), "hhhl_sl": _r(L1),
                     "hhhl_age": (m - 1) - (max(h1, l1) + n)})
 
-    contracting = H1 < H0 and L1 > L0
+    # Consolidation: any zone that is not a clear swing trend (HH-HL or LL-LH),
+    # or whose highs and lows are both flat (a box wins over a tiny HH-HL),
+    # as long as it is narrow and recent. The shape is kept for reference:
+    # contracting = the range narrows (lower high and/or higher low, neither
+    # side widening), range = both sides flat within FLAT_PCT, else sideways.
+    trend_swings = (ch == 1 and cl == 1) or (ch == -1 and cl == -1)
+    contracting = (ch == -1 and cl >= 0) or (ch <= 0 and cl == 1)
     rng = abs(H1 - H0) / H0 * 100 <= flat and abs(L1 - L0) / L0 * 100 <= flat
+    shape = "Contracting" if contracting else "Range" if rng else "Sideways"
     oldest = min(h0, l0)
-    if (contracting or rng) and (m - 1) - oldest <= max_age:
+    if (rng or not trend_swings) and (m - 1) - oldest <= max_age:
         top, bot = max(H1, H0), min(L1, L0)
         width = (top - bot) / bot * 100 if bot > 0 else None
         if width is not None and width <= max_width:
@@ -118,27 +146,21 @@ def analyse(highs, lows, closes, n, max_width, max_age, flat=FLAT_PCT):
                     if ci is None or not ((ci > top) if st == "breakout" else (ci < bot)):
                         break
                     brk = (m - 1) - i
-            # trend before the zone: the swing pair before the zone's first
-            # high/low — higher high + higher low = "up", lower + lower = "down"
+            # trend before the zone: the zone began at a new high (its first swing
+            # high clearly above the one before) with the close above the EMA = up;
+            # began at a new low with the close below the EMA = down
             trend = None
-            if len(sh) >= 3 and len(sl) >= 3:
-                Hp, Lp = highs[sh[-3]], lows[sl[-3]]
-                trend = "up" if H0 > Hp and L0 > Lp else "down" if H0 < Hp and L0 < Lp else None
-            out.update({"cons": "Contracting" if contracting else "Range", "cons_st": st,
+            if len(sh) >= 3 and len(sl) >= 3 and ema:
+                e = _ema_last(closes, ema)
+                if e is not None:
+                    if _cmp(H0, highs[sh[-3]]) == 1 and c > e:
+                        trend = "up"
+                    elif _cmp(L0, lows[sl[-3]]) == -1 and c < e:
+                        trend = "down"
+            out.update({"cons": shape, "cons_st": st,
                         "cons_top": _r(top), "cons_bot": _r(bot), "cons_w": round(width, 1),
                         "cons_days": (m - 1) - oldest, "cons_brk": brk, "cons_trend": trend})
     return out
-
-
-def _ema_last(closes, period):
-    vals = [c for c in closes if c is not None]
-    if len(vals) < period:
-        return None
-    k = 2 / (period + 1)
-    e = sum(vals[:period]) / period
-    for v in vals[period:]:
-        e = v * k + e * (1 - k)
-    return e
 
 
 def summarise(row, closes, tf):
@@ -146,7 +168,7 @@ def summarise(row, closes, tf):
     stage: consolidating / breakout / breakdown while a zone is live (inside it,
            or the close left it within BREAK_LIVE bars); otherwise trending when
            the swings are HH-HL or LL-LH; otherwise none.
-    trend: the zone's earlier swing pair while a zone is live, else HH-HL = up,
+    trend: the zone's cons_trend (began at a new high / low) while a zone is live, else HH-HL = up,
            LL-LH = down; kept only when the close agrees with the EMA guard
            (up above it, down below it), so small swings inside a big move
            don't flip the trend. A "trending" stage whose trend fails the guard
