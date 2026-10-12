@@ -20,6 +20,9 @@ For every liquid stock, from its OHLC (all_data):
       the zone is at most MAX_WIDTH wide and all four swings are recent.
       Status: inside / breakout (close above the zone) / breakdown (close below),
       plus how many bars ago the close left the zone.
+      Trend before the zone: the swing high/low before the zone's first ones —
+      if the zone's first high and low are both higher it came after an
+      uptrend, both lower after a downtrend.
 
                      daily      weekly
       pivot N        5 bars     3 bars
@@ -36,6 +39,13 @@ Feed fields (weekly ones prefixed "w_"); a stock with nothing to report gets non
   cons_top / cons_bot   zone levels      cons_w   zone width %
   cons_days bars since the oldest swing of the zone
   cons_brk  bars since the close left the zone (0 = today); null while inside
+  cons_trend "up" | "down" | null — the swing pair before the zone was
+            HH-HL ("up") or LL-LH ("down"): consolidation inside a trend
+
+Summary fields the website filters on (two rows of chips):
+  st_trend  "up" | "down"        (needs close above / below the 50 EMA; weekly 30 EMA)
+  st_stage  "trending" | "consolidating" | "breakout" | "breakdown"
+  A breakout / breakdown stays the stage for 5 sessions (weekly: 1 week).
 
 Wired into pipeline.py run_ep_scan; merged into screener_feed.json rows.
 """
@@ -45,6 +55,9 @@ SETTINGS = {
     "d": {"n": 5, "max_width": 20.0, "max_age": 63},
     "w": {"n": 3, "max_width": 35.0, "max_age": 26},
 }
+# Trend / stage summary (the two rows of filter chips on the website)
+EMA_GUARD = {"d": 50, "w": 30}     # up-trend needs close above this EMA, down-trend below
+BREAK_LIVE = {"d": 5, "w": 1}      # a breakout / breakdown stays the stage for this many bars
 FLAT_PCT = 3.0
 
 
@@ -105,9 +118,57 @@ def analyse(highs, lows, closes, n, max_width, max_age, flat=FLAT_PCT):
                     if ci is None or not ((ci > top) if st == "breakout" else (ci < bot)):
                         break
                     brk = (m - 1) - i
+            # trend before the zone: the swing pair before the zone's first
+            # high/low — higher high + higher low = "up", lower + lower = "down"
+            trend = None
+            if len(sh) >= 3 and len(sl) >= 3:
+                Hp, Lp = highs[sh[-3]], lows[sl[-3]]
+                trend = "up" if H0 > Hp and L0 > Lp else "down" if H0 < Hp and L0 < Lp else None
             out.update({"cons": "Contracting" if contracting else "Range", "cons_st": st,
                         "cons_top": _r(top), "cons_bot": _r(bot), "cons_w": round(width, 1),
-                        "cons_days": (m - 1) - oldest, "cons_brk": brk})
+                        "cons_days": (m - 1) - oldest, "cons_brk": brk, "cons_trend": trend})
+    return out
+
+
+def _ema_last(closes, period):
+    vals = [c for c in closes if c is not None]
+    if len(vals) < period:
+        return None
+    k = 2 / (period + 1)
+    e = sum(vals[:period]) / period
+    for v in vals[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def summarise(row, closes, tf):
+    """Collapse the detail fields into the two values the website filters on.
+    stage: consolidating / breakout / breakdown while a zone is live (inside it,
+           or the close left it within BREAK_LIVE bars); otherwise trending when
+           the swings are HH-HL or LL-LH; otherwise none.
+    trend: the zone's earlier swing pair while a zone is live, else HH-HL = up,
+           LL-LH = down; kept only when the close agrees with the EMA guard
+           (up above it, down below it), so small swings inside a big move
+           don't flip the trend. A "trending" stage whose trend fails the guard
+           is dropped too."""
+    p = "w_" if tf == "w" else ""
+    trend = stage = None
+    cons, st, brk = row.get(p + "cons"), row.get(p + "cons_st"), row.get(p + "cons_brk")
+    if cons and (st == "inside" or (brk is not None and brk <= BREAK_LIVE[tf])):
+        stage = {"inside": "consolidating", "breakout": "breakout", "breakdown": "breakdown"}[st]
+        trend = row.get(p + "cons_trend")
+    elif row.get(p + "hhhl"):
+        stage = "trending"
+        trend = "up" if row[p + "hhhl"] == "HH-HL" else "down"
+    if trend:
+        ema, c = _ema_last(closes, EMA_GUARD[tf]), closes[-1]
+        if ema is None or c is None or (trend == "up" and c <= ema) or (trend == "down" and c >= ema):
+            trend = None
+            if stage == "trending":   # a swing trend against the EMA is no clear trend
+                stage = None
+    out = {}
+    if trend: out[p + "st_trend"] = trend
+    if stage: out[p + "st_stage"] = stage
     return out
 
 
@@ -141,8 +202,11 @@ def build_structure_map(all_data, is_liquid=None):
             if is_liquid and not is_liquid(v, c, n):
                 continue
             row = analyse(h, l, c, **SETTINGS["d"])
+            row.update(summarise(row, c, "d"))
             wh, wl, wc = to_weekly(d, h, l, c)
-            row.update({"w_" + k: val for k, val in analyse(wh, wl, wc, **SETTINGS["w"]).items()})
+            wrow = {"w_" + k: val for k, val in analyse(wh, wl, wc, **SETTINGS["w"]).items()}
+            wrow.update(summarise(wrow, wc, "w"))
+            row.update(wrow)
             if row:
                 out[sym] = row
         except Exception:
