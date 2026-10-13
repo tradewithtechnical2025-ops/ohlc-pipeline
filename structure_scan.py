@@ -1,236 +1,197 @@
 """
-structure_scan.py — price structure from swing points, daily and weekly.
+structure_history.py — how many index stocks are in an HH-HL / LL-LH swing
+structure, day by day (daily and weekly), for the dashboard's Market Structure
+widget.
 
-For every liquid stock, from its OHLC (all_data):
+Same rules as structure_scan.analyse (so today's numbers match the screener's
+HH-HL / LL-LH): last two confirmed swing highs and lows, 1% tolerance, close
+still on the right side of the last swing. A swing at bar i is confirmed once
+n bars after it exist, so the history needs no look-ahead: each past day sees
+only the bars up to that day. Weekly bars include the unfinished current week
+(as of that day), like the screener.
 
-  HH-HL / LL-LH (trend structure)
-      Swing high = a bar whose high is above the N bars before it and not below
-      the N bars after it; swing low the same with lows. A swing is known only
-      N bars after it forms.
-      HH-HL : last swing high > the one before AND last swing low > the one before,
-              while today's close is still at or above the last swing low.
-      LL-LH : last swing low < the one before AND last swing high < the one before,
-              while today's close is still at or below the last swing high.
-      Swings within 1% of each other count as equal, not higher / lower.
+Output — index_structure_history.json:
+  { updated, dates:[...],
+    indices: { KEY: { name, constituents, matched,
+                      d: { hh:[count…], ll:[count…], n:[stocks with data…] },
+                      w: { hh:[…], ll:[…], n:[…] } } } }
 
-  Consolidation (from the same last two swing highs and lows)
-      Any zone whose swings are not a clear HH-HL / LL-LH. Its shape is kept:
-      Contracting : the range narrows — lower high and/or higher low, neither side widening.
-      Range       : both highs within 3% of each other and both lows within 3%.
-      Sideways    : anything else (e.g. a flat top with a slightly lower low).
-      Zone = highest of the two highs to lowest of the two lows. Kept only when
-      the zone is at most MAX_WIDTH wide and all four swings are recent.
-      Status: inside / breakout (close above the zone) / breakdown (close below),
-      plus how many bars ago the close left the zone.
-      Trend before the zone: the zone began at a new high (its first swing
-      high more than 1% above the one before) with the close above the 50 EMA
-      (weekly 30 EMA) = up; began at a new low with the close below it = down.
-
-                     daily      weekly
-      pivot N        5 bars     3 bars
-      max zone width 20%        35%
-      max swing age  63 bars    26 bars
-      break          on close   on close
-
-Feed fields (weekly ones prefixed "w_"); a stock with nothing to report gets none:
-  hhhl      "HH-HL" | "LL-LH"
-  hhhl_sh   last swing high      hhhl_sl  last swing low
-  hhhl_age  bars since the newer of those two swings was confirmed
-  cons      "Contracting" | "Range" | "Sideways"
-  cons_st   "inside" | "breakout" | "breakdown"
-  cons_top / cons_bot   zone levels      cons_w   zone width %
-  cons_days bars since the oldest swing of the zone
-  cons_brk  bars since the close left the zone (0 = today); null while inside
-  cons_trend "up" | "down" | null — the zone began at a new high / new low
-            (with the close on the matching side of the EMA)
-
-Summary fields the website filters on (two rows of chips):
-  st_trend  "up" | "down"        (needs close above / below the 50 EMA; weekly 30 EMA)
-  st_stage  "trending" | "consolidating" | "breakout" | "breakdown"
-  A breakout / breakdown stays the stage for 5 sessions (weekly: 1 week).
-
-Wired into pipeline.py run_ep_scan; merged into screener_feed.json rows.
+Stocks are the index's current constituents; thin stocks are skipped with the
+same liquidity check the screener uses (when one is passed in).
 """
 from datetime import date
 
-SETTINGS = {
-    "d": {"n": 5, "max_width": 20.0, "max_age": 63, "ema": 50},
-    "w": {"n": 3, "max_width": 35.0, "max_age": 26, "ema": 30},
+from structure_scan import SETTINGS, _cmp, swings
+from breadth_returns import _calendar, _norm
+
+STRUCTURE_INDICES = {
+    "NIFTY50": "Nifty 50",
+    "NIFMID400": "Nifty MidSmallcap 400",
+    "NIF500": "Nifty 500",
 }
-# Trend / stage summary (the two rows of filter chips on the website)
-EMA_GUARD = {"d": 50, "w": 30}     # up-trend needs close above this EMA, down-trend below
-BREAK_LIVE = {"d": 5, "w": 1}      # a breakout / breakdown stays the stage for this many bars
-FLAT_PCT = 3.0
-TOL_PCT = 1.0        # swings closer than this count as equal (not higher / lower)
+STRUCTURE_DAYS = 252
 
 
-def _cmp(a, b, tol=TOL_PCT):
-    """+1 when a is more than tol % above b, -1 when more than tol % below, else 0."""
-    p = (a - b) / b * 100
-    return 1 if p > tol else -1 if p < -tol else 0
+def _is_swing(highs, lows, i, n):
+    """(is swing high, is swing low) at bar i — swing_scan.swings' rule for one bar."""
+    h, l = highs[i], lows[i]
+    if h is None or l is None or i < n or i + n >= len(highs):
+        return False, False
+    lh = [x for x in highs[i - n:i] if x is not None]
+    rh = [x for x in highs[i + 1:i + n + 1] if x is not None]
+    ll = [x for x in lows[i - n:i] if x is not None]
+    rl = [x for x in lows[i + 1:i + n + 1] if x is not None]
+    return (bool(lh and rh and h > max(lh) and h >= max(rh)),
+            bool(ll and rl and l < min(ll) and l <= min(rl)))
 
 
-def swings(highs, lows, n):
-    sh, sl = [], []
-    m = len(highs)
-    for i in range(n, m - n):
-        h, l = highs[i], lows[i]
-        if h is None or l is None:
-            continue
-        lh = [x for x in highs[i - n:i] if x is not None]
-        rh = [x for x in highs[i + 1:i + n + 1] if x is not None]
-        if lh and rh and h > max(lh) and h >= max(rh):
-            sh.append(i)
-        ll = [x for x in lows[i - n:i] if x is not None]
-        rl = [x for x in lows[i + 1:i + n + 1] if x is not None]
-        if ll and rl and l < min(ll) and l <= min(rl):
-            sl.append(i)
-    return sh, sl
-
-
-def _ema_last(closes, period):
-    vals = [c for c in closes if c is not None]
-    if len(vals) < period:
+def _state(highs, lows, c, sh, sl, n):
+    """'hh' / 'll' / None from the last two swing highs and lows (analyse's rule)."""
+    if len(sh) < 2 or len(sl) < 2 or c is None:
         return None
-    k = 2 / (period + 1)
-    e = sum(vals[:period]) / period
-    for v in vals[period:]:
-        e = v * k + e * (1 - k)
-    return e
-
-
-def _r(v):
-    return None if v is None else round(v, 2)
-
-
-def analyse(highs, lows, closes, n, max_width, max_age, flat=FLAT_PCT, ema=None):
-    """Both results for one series; {} when there is not enough history."""
-    m = len(closes)
-    if m < 4 * n + 2 or closes[-1] is None:
-        return {}
-    sh, sl = swings(highs, lows, n)
-    if len(sh) < 2 or len(sl) < 2:
-        return {}
-    h1, h0, l1, l0 = sh[-1], sh[-2], sl[-1], sl[-2]
-    H1, H0, L1, L0 = highs[h1], highs[h0], lows[l1], lows[l0]
-    c = closes[-1]
-    out = {}
-
+    H1, H0, L1, L0 = highs[sh[-1]], highs[sh[-2]], lows[sl[-1]], lows[sl[-2]]
     ch, cl = _cmp(H1, H0), _cmp(L1, L0)
-    up = ch == 1 and cl == 1 and c >= L1
-    dn = ch == -1 and cl == -1 and c <= H1
-    if up or dn:
-        out.update({"hhhl": "HH-HL" if up else "LL-LH", "hhhl_sh": _r(H1), "hhhl_sl": _r(L1),
-                    "hhhl_age": (m - 1) - (max(h1, l1) + n)})
+    if ch == 1 and cl == 1 and c >= L1:
+        return "hh"
+    if ch == -1 and cl == -1 and c <= H1:
+        return "ll"
+    return None
 
-    # Consolidation: any zone that is not a clear swing trend (HH-HL or LL-LH),
-    # or whose highs and lows are both flat (a box wins over a tiny HH-HL),
-    # as long as it is narrow and recent. The shape is kept for reference:
-    # contracting = the range narrows (lower high and/or higher low, neither
-    # side widening), range = both sides flat within FLAT_PCT, else sideways.
-    trend_swings = (ch == 1 and cl == 1) or (ch == -1 and cl == -1)
-    contracting = (ch == -1 and cl >= 0) or (ch <= 0 and cl == 1)
-    rng = abs(H1 - H0) / H0 * 100 <= flat and abs(L1 - L0) / L0 * 100 <= flat
-    shape = "Contracting" if contracting else "Range" if rng else "Sideways"
-    oldest = min(h0, l0)
-    if (rng or not trend_swings) and (m - 1) - oldest <= max_age:
-        top, bot = max(H1, H0), min(L1, L0)
-        width = (top - bot) / bot * 100 if bot > 0 else None
-        if width is not None and width <= max_width:
-            st = "breakout" if c > top else "breakdown" if c < bot else "inside"
-            brk = None
-            if st != "inside":
-                start = max(h1, l1) + 1
-                for i in range(m - 1, start - 1, -1):
-                    ci = closes[i]
-                    if ci is None or not ((ci > top) if st == "breakout" else (ci < bot)):
-                        break
-                    brk = (m - 1) - i
-            # trend before the zone: the zone began at a new high (its first swing
-            # high clearly above the one before) with the close above the EMA = up;
-            # began at a new low with the close below the EMA = down
-            trend = None
-            if len(sh) >= 3 and len(sl) >= 3 and ema:
-                e = _ema_last(closes, ema)
-                if e is not None:
-                    if _cmp(H0, highs[sh[-3]]) == 1 and c > e:
-                        trend = "up"
-                    elif _cmp(L0, lows[sl[-3]]) == -1 and c < e:
-                        trend = "down"
-            out.update({"cons": shape, "cons_st": st,
-                        "cons_top": _r(top), "cons_bot": _r(bot), "cons_w": round(width, 1),
-                        "cons_days": (m - 1) - oldest, "cons_brk": brk, "cons_trend": trend})
+
+def _daily_series(h, l, c, upto, n):
+    """state for each bar index t in `upto` (sorted), using bars 0..t only."""
+    sh_all, sl_all = swings(h, l, n)
+    out, a, b = {}, 0, 0
+    sh, sl = [], []
+    for t in upto:
+        while a < len(sh_all) and sh_all[a] + n <= t:
+            sh.append(sh_all[a]); a += 1
+        while b < len(sl_all) and sl_all[b] + n <= t:
+            sl.append(sl_all[b]); b += 1
+        m = t + 1
+        if m < 4 * n + 2 or c[t] is None:
+            out[t] = None
+            continue
+        out[t] = _state(h, l, c[t], sh, sl, n)
     return out
 
 
-def summarise(row, closes, tf):
-    """Collapse the detail fields into the two values the website filters on.
-    stage: consolidating / breakout / breakdown while a zone is live (inside it,
-           or the close left it within BREAK_LIVE bars); otherwise trending when
-           the swings are HH-HL or LL-LH; otherwise none.
-    trend: the zone's cons_trend (began at a new high / low) while a zone is live, else HH-HL = up,
-           LL-LH = down; kept only when the close agrees with the EMA guard
-           (up above it, down below it), so small swings inside a big move
-           don't flip the trend. A "trending" stage whose trend fails the guard
-           is dropped too."""
-    p = "w_" if tf == "w" else ""
-    trend = stage = None
-    cons, st, brk = row.get(p + "cons"), row.get(p + "cons_st"), row.get(p + "cons_brk")
-    if cons and (st == "inside" or (brk is not None and brk <= BREAK_LIVE[tf])):
-        stage = {"inside": "consolidating", "breakout": "breakout", "breakdown": "breakdown"}[st]
-        trend = row.get(p + "cons_trend")
-    elif row.get(p + "hhhl"):
-        stage = "trending"
-        trend = "up" if row[p + "hhhl"] == "HH-HL" else "down"
-    if trend:
-        ema, c = _ema_last(closes, EMA_GUARD[tf]), closes[-1]
-        if ema is None or c is None or (trend == "up" and c <= ema) or (trend == "down" and c >= ema):
-            trend = None
-            if stage == "trending":   # a swing trend against the EMA is no clear trend
-                stage = None
-    out = {}
-    if trend: out[p + "st_trend"] = trend
-    if stage: out[p + "st_stage"] = stage
-    return out
-
-
-def to_weekly(d, h, l, c):
-    """ISO-week bars (the current, unfinished week included, like the other weekly scans)."""
-    wk, order = {}, []
+def _week_bars(d, h, l, c):
+    """Completed ISO-week bars plus, for every daily bar, which week it is in."""
+    keys, wh, wl, wc, wk_of = [], [], [], [], []
     for di, hi, li, ci in zip(d, h, l, c):
         if None in (hi, li, ci) or not di:
+            wk_of.append(None)
             continue
-        k = date.fromisoformat(di).isocalendar()[:2]
-        if k not in wk:
-            wk[k] = [hi, li, ci]
-            order.append(k)
+        k = date.fromisoformat(str(di)[:10]).isocalendar()[:2]
+        if not keys or keys[-1] != k:
+            keys.append(k); wh.append(hi); wl.append(li); wc.append(ci)
         else:
-            w = wk[k]
-            w[0] = max(w[0], hi); w[1] = min(w[1], li); w[2] = ci
-    rows = [wk[k] for k in order]
-    return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+            wh[-1] = max(wh[-1], hi); wl[-1] = min(wl[-1], li); wc[-1] = ci
+        wk_of.append(len(keys) - 1)
+    return wh, wl, wc, wk_of
 
 
-def build_structure_map(all_data, is_liquid=None):
-    """{symbol: feed fields} for every stock with something to report.
-    is_liquid(volumes, closes, n) -> bool skips thin stocks (pipeline's _check_liquidity)."""
+def _weekly_series(d, h, l, c, upto, n):
+    """Weekly state as of each daily bar t: completed weeks + the partial week to t."""
+    wh, wl, wc, wk_of = _week_bars(d, h, l, c)
+    sh_full, sl_full = swings(wh, wl, n)   # valid for swings whose right window is all complete weeks
     out = {}
-    for sym, s in (all_data or {}).items():
+    # running partial bar of the current week
+    cur_k, ph, pl, pc = None, None, None, None
+    ti = 0
+    upto_set = set(upto)
+    for t in range(len(c)):
+        k = wk_of[t]
+        if k is None:
+            if t in upto_set:
+                out[t] = None
+            continue
+        if k != cur_k:
+            cur_k, ph, pl, pc = k, h[t], l[t], c[t]
+        else:
+            ph = max(ph, h[t]); pl = min(pl, l[t]); pc = c[t]
+        if t not in upto_set:
+            continue
+        # weeks 0..k-1 complete, week k partial (ph, pl, pc)
+        m = k + 1
+        if m < 4 * n + 2:
+            out[t] = None
+            continue
+        sh = [i for i in sh_full if i + n <= k - 1]
+        sl = [i for i in sl_full if i + n <= k - 1]
+        i = k - n                          # its right window ends in the partial week
+        if i >= n:
+            hh = wh[:k] + [ph]; ll = wl[:k] + [pl]
+            is_h, is_l = _is_swing(hh, ll, i, n)
+            if is_h: sh.append(i)
+            if is_l: sl.append(i)
+            out[t] = _state(hh, ll, pc, sh, sl, n)
+        else:
+            out[t] = None
+    return out
+
+
+def build_index_structure_history(all_data, index_master, is_liquid=None,
+                                  indices=STRUCTURE_INDICES, days=STRUCTURE_DAYS):
+    dates = _calendar(all_data, days)
+    pos = {dd: i for i, dd in enumerate(dates)}
+    by_norm = {_norm(s): s for s in all_data}
+
+    members, meta = {}, {}
+    for key, name in indices.items():
+        entry = (index_master or {}).get(key) or {}
+        raw = entry.get("constituents") or []
+        syms = []
+        for x in raw:
+            x = x if isinstance(x, str) else (x or {}).get("symbol") or ""
+            x = str(x).strip().upper()
+            s = x if x in all_data else by_norm.get(_norm(x))
+            if s:
+                syms.append(s)
+        members[key] = sorted(set(syms))
+        meta[key] = {"name": entry.get("name") or name, "constituents": len(raw), "matched": len(members[key])}
+
+    if not any(members.values()):
+        raise ValueError("no index constituents matched (index_master.json)")
+
+    nd, nw = SETTINGS["d"]["n"], SETTINGS["w"]["n"]
+    per = {}   # sym -> (daily states on calendar, weekly states on calendar)
+    for sym in set(s for v in members.values() for s in v):
         try:
+            s = all_data[sym]
             d, h, l, c, v = s.get("d") or [], s.get("h") or [], s.get("l") or [], s.get("c") or [], s.get("v") or []
-            n = len(c)
-            if n < 60 or not (len(d) == len(h) == len(l) == n):
+            if len(c) < 60 or not (len(d) == len(h) == len(l) == len(c)):
                 continue
-            if is_liquid and not is_liquid(v, c, n):
+            if is_liquid and not is_liquid(v, c, len(c)):
                 continue
-            row = analyse(h, l, c, **SETTINGS["d"])
-            row.update(summarise(row, c, "d"))
-            wh, wl, wc = to_weekly(d, h, l, c)
-            wrow = {"w_" + k: val for k, val in analyse(wh, wl, wc, **SETTINGS["w"]).items()}
-            wrow.update(summarise(wrow, wc, "w"))
-            row.update(wrow)
-            if row:
-                out[sym] = row
+            idx = [i for i in range(len(d)) if str(d[i])[:10] in pos or d[i] in pos]
+            ds, ws = _daily_series(h, l, c, idx, nd), _weekly_series(d, h, l, c, idx, nw)
+            dcal, wcal = [False] * len(dates), [False] * len(dates)   # False = no data that day
+            for i in idx:
+                j = pos.get(d[i], pos.get(str(d[i])[:10]))
+                dcal[j], wcal[j] = ds.get(i), ws.get(i)
+            per[sym] = (dcal, wcal)
         except Exception:
             continue
-    return out
+
+    out = {}
+    for key, syms in members.items():
+        e = dict(meta[key])
+        for tf, slot in (("d", 0), ("w", 1)):
+            hh, ll, nn = [], [], []
+            for j in range(len(dates)):
+                a = b = k = 0
+                for sym in syms:
+                    p = per.get(sym)
+                    if not p or p[slot][j] is False:
+                        continue
+                    k += 1
+                    st = p[slot][j]
+                    if st == "hh": a += 1
+                    elif st == "ll": b += 1
+                hh.append(a); ll.append(b); nn.append(k)
+            e[tf] = {"hh": hh, "ll": ll, "n": nn}
+        out[key] = e
+
+    return {"updated": date.today().isoformat(), "dates": dates, "indices": out}
