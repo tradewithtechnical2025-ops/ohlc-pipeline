@@ -1129,8 +1129,8 @@ def _has_explicit_financial_results_text(it: dict) -> bool:
     The SUBJECT tag is intentionally excluded because a generic subject such as
     'Outcome of Board Meeting' is not proof of a results filing.
     """
-    summary = it.get("summary", "") or ""
-    free_text = summary.split("|SUBJECT:", 1)[0].strip()
+    summary = it.get("summary") or it.get("description") or ""
+    free_text = re.split(r"\|\s*SUBJECT\s*:", summary, maxsplit=1, flags=re.I)[0].strip()
     return bool(_PDF_EXPLICIT_RESULT_RE.search(free_text))
 
 
@@ -1223,11 +1223,13 @@ def _is_board_outcome_pdf(it: dict) -> bool:
     link = it.get("link", "")
     if not link.lower().endswith(".pdf"):
         return False
-    summary = it.get("summary", "")
+    summary = it.get("summary") or it.get("description") or ""
     m = _SUBJECT_TAG_RE.search(summary)
-    if not (m and _PDF_SUBJECT_RE.search(m.group(1))):
+    subject_match = bool(m and _PDF_SUBJECT_RE.search(m.group(1)))
+    description_match = _has_explicit_financial_results_text(it)
+    if not (subject_match or description_match):
         return False
-    free_text = summary.split("|SUBJECT:")[0]
+    free_text = re.split(r"\|\s*SUBJECT\s*:", summary, maxsplit=1, flags=re.I)[0]
     if _PDF_NON_RESULT_RE.search(free_text):
         return False
     return True
@@ -1941,9 +1943,26 @@ Rules:
 - Use only information present in the document. Do not invent anything."""
 
 
-def _is_non_statement_doc(text: str) -> bool:
+def _has_statement_evidence(text: str, content: bytes | None = None) -> bool:
+    """A release may also enclose the formal statement; verify its contents.
+
+    AI still decides document_type and must use only the formal statement.
+    Plain earnings summaries are not admitted just by their RSS wording.
+    """
+    text = text or ""
+    flat = re.sub(r"\s+", " ", text)
+    if (_pdf_find_heading_candidates(text)
+            and re.search(r"earnings\s+per\s+share", flat, re.I)
+            and re.search(r"profit.{0,100}?before\s+tax", flat, re.I)
+            and re.search(r"total\s+(?:expenses|expenditure)", flat, re.I)
+            and re.search(r"limited\s+review|independent\s+auditor|regulation\s*33", flat, re.I)):
+        return True
+    return bool(content and _scanned_results_likely(content, text))
+
+
+def _is_non_statement_doc(text: str, content: bytes | None = None) -> bool:
     head = re.sub(r"[ \t]+", " ", (text or "")[:3000])
-    return bool(_NON_STATEMENT_SUBJECT_RE.search(head))
+    return bool(_NON_STATEMENT_SUBJECT_RE.search(head)) and not _has_statement_evidence(text, content)
 
 
 def _scanned_results_likely(content: bytes, text: str) -> bool:
@@ -2006,7 +2025,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
             print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
             return None
     # ── Investor presentation / press release: never a Reg 33 source ──
-    if _is_non_statement_doc(text) and not force_ai:
+    if _is_non_statement_doc(text, content) and not force_ai:
         print(f"    · [{fname_dbg}] cover letter says investor presentation / press release / transcript — "
               f"not a results statement, skipping AI call")
         return None
@@ -3131,7 +3150,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 filename = it["link"].split("?", 1)[0].rsplit("/", 1)[-1]
                 if not _PDF_FILENAME_TS_RE.match(filename):
                     it["_pre_bad_filename"] = True
-            if _is_non_statement_doc(text) or it.get("_narrative"):
+            if (_is_non_statement_doc(text, content)
+                    or (it.get("_narrative") and not _has_statement_evidence(text, content))):
                 it["_pre_non_statement"] = True
                 # No RESULT key (must never supersede the real statement) —
                 # only a (symbol, period) key used to attach its narrative.
