@@ -770,12 +770,37 @@ def _operating_profit_value(revenue, total_expenses, finance_costs=None, depreci
     return round(revenue - total_expenses, 2), "ebit"
 
 
+def _is_bank_period(period: dict) -> bool:
+    return period.get("financial_sector") == "bank"
+
+
+def _compute_bank_metrics(period: dict) -> None:
+    """Use banking P&L rows; interest expense is not an EBITDA add-back."""
+    for key in ("opm", "opm_basis", "ebitda", "operating_profit"):
+        period.pop(key, None)
+    earned, expended = period.get("interest_income"), period.get("interest_expense")
+    if earned is not None and expended is not None:
+        period["nii"] = round(earned - expended, 2)
+    ppop = period.get("ppop")
+    if ppop is None:
+        ti, expenditure = period.get("total_income"), period.get("expenditure_excl_provisions")
+        if ti is not None and expenditure is not None:
+            ppop = round(ti - expenditure, 2)
+            period["ppop"] = ppop
+    if ppop is not None:
+        period["operating_profit"] = ppop
+        period["operating_profit_basis"] = "ppop"
+
+
 def _compute_opm(period_dict: dict) -> None:
     """
     Mutates period_dict in place, adding 'opm' as a decimal fraction (e.g.
     0.241 = 24.1%) plus 'opm_basis' ("ebitda" or "ebit") — see _opm_value() —
     and 'operating_profit' (absolute, same basis).
     """
+    if _is_bank_period(period_dict):
+        _compute_bank_metrics(period_dict)
+        return
     opm, basis = _opm_value(period_dict.get("revenue"), period_dict.get("total_expenses"),
                             period_dict.get("finance_costs"), period_dict.get("depreciation"))
     if opm is not None:
@@ -803,6 +828,18 @@ def _reconcile_total_expenses(period: dict, label: str, fname_dbg: str, flags: l
     fix to a comparative column that has no PBT to test against, used when
     the current column of the same table needed it.
     Returns True if the add-back was applied."""
+    if _is_bank_period(period):
+        ti, te, provisions, pbt = (period.get(k) for k in
+            ("total_income", "expenditure_excl_provisions", "provisions", "pbt"))
+        if all(v is not None for v in (ti, te, provisions, pbt)):
+            gap = ti - te - provisions - (exceptional or 0) + (assoc_share or 0) - pbt
+            if abs(gap) > max(1e5, 0.005 * abs(ti)):
+                flags.append(f"{label}:bank_pnl_identity_mismatch_{gap/1e7:.2f}Cr")
+        reported_ppop = period.get("ppop")
+        if ti is not None and te is not None and reported_ppop is not None:
+            if abs(ti - te - reported_ppop) > max(1e5, 0.005 * abs(ti)):
+                flags.append(f"{label}:bank_ppop_identity_mismatch")
+        return False
     ti, te, pbt = period.get("total_income"), period.get("total_expenses"), period.get("pbt")
     fin, dep = period.get("finance_costs"), period.get("depreciation")
     if ti is None and period.get("revenue") is not None and period.get("other_income") is not None:
@@ -1358,6 +1395,9 @@ Your job:
 11. Segment-wise revenue is usually in its own table/note (often titled "Segment Information" or "Segment Revenue") — look for it actively rather than only checking the main P&L; most listed operating companies with multiple business lines report this. Omit segment_breakup entirely if the company doesn't report segments.
 12. management_commentary: 1-3 sentence summary of any outlook/commentary/guidance mentioned in the document (not the standard boilerplate disclaimers), or null if there's none.
 13. key_highlights: 2-5 short, specific, numbers-first strings on the most notable things about this result (big beats/misses, one-off items, margin changes, notable segment performance) — omit if nothing stands out beyond the raw numbers already captured.
+14a. Classify financial_sector as "bank" ONLY for a bank using the banking results format (Interest earned, Interest expended, Operating profit before provisions, Provisions and contingencies). NBFCs, insurers and other financial companies are "other"; do not classify by company name alone.
+14b. For banks, extract the following for EACH of current, qoq_prior and yoy_prior from that SAME basis/table: interest_income (Interest earned), interest_expense (Interest expended), expenditure_excl_provisions (Total expenditure excluding provisions and contingencies), provisions (other than tax), and ppop (reported Operating profit before provisions and contingencies). Do not include provisions in expenditure_excl_provisions. Do not treat interest expended as finance_costs, and do not borrow half-year cash-flow depreciation for a quarterly P&L. Keep revenue equal to interest_income for compatibility; total_income includes other income. Banking OP is PPOP, not EBITDA. Do not invent NIM or asset-quality ratios when not disclosed on the selected basis.
+14c. EPS uses weighted-average shares; do not reject valid EPS because quarter-end share capital differs following an allotment. Use reported EPS.
 14. board_meeting_outcome: brief note on any OTHER board decisions mentioned (dividend, bonus, other corporate actions), or null if there's nothing beyond the results approval itself.
 
 Return ONLY valid JSON (no markdown fences, no other text) matching exactly this schema:
@@ -1365,11 +1405,12 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
   "is_results_table": true or false,
   "document_type": "results_statement" or "investor_presentation" or "press_release" or "other",
   "basis": "Standalone" or "Consolidated" or null,
+  "financial_sector": "bank" or "other",
   "company_name": "the company's full legal name as printed, e.g. \"Rentomojo Limited\"" or null,
   "unit": "Crore" or "Million" or "Lakh" or null,
   "period_end": "YYYY-MM-DD" or null,
   "current": {
-    "revenue": number or null,
+    "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null,
     "other_income": number or null,
     "total_income": number or null,
     "total_expenses": number or null,
@@ -1385,15 +1426,15 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
     "eps_basic": number or null,
     "eps_diluted": number or null
   },
-  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
-  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
+  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
+  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
   "segment_breakup": [{"segment": string, "revenue": number}] or omitted,
   "management_commentary": string or null,
   "key_highlights": [string, ...] or omitted,
   "board_meeting_outcome": string or null
 }
 
-For EACH period (current, qoq_prior, yoy_prior), extract exceptional_items independently from that column: positive for an exceptional charge/loss that reduces PBT, negative for a gain. A dash/blank in the exceptional-items row means zero. Do not copy the current quarter's exceptional amount into comparison periods. Extract share_of_associates independently too. Reconcile total income - total expenses - exceptional items + share of associates = PBT. Never change reported total expenses to compensate for a genuine exceptional item.
+For EACH period (current, qoq_prior, yoy_prior), extract exceptional_items independently from that column: positive for an exceptional charge/loss that reduces PBT, negative for a gain. A dash/blank in the exceptional-items row means zero. Do not copy the current quarter's exceptional amount into comparison periods. Extract share_of_associates independently too. For non-banks reconcile total income - total expenses - exceptional items + share of associates = PBT. For banks reconcile total income - expenditure_excl_provisions - provisions - exceptional items + share of associates = PBT. Never change reported total expenses to compensate for a genuine exceptional item.
 
 All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
 
@@ -1673,6 +1714,17 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         quarter["exceptional_items"] = exceptional_items
     if share_of_associates:
         quarter["share_of_associates"] = share_of_associates
+    is_bank = ai.get("financial_sector") == "bank"
+    bank_fields = ("interest_income", "interest_expense", "expenditure_excl_provisions", "provisions", "ppop")
+    if is_bank:
+        quarter["financial_sector"] = "bank"
+        for field in bank_fields:
+            quarter[field] = scale(cur.get(field))
+        if quarter.get("interest_income") is None:
+            quarter["interest_income"] = revenue
+        for field in bank_fields:
+            if quarter.get(field) is None:
+                quality_flags.append(f"current:bank_missing_{field}")
     cur_fixed = _reconcile_total_expenses(quarter, "current", fname_dbg, quality_flags,
                                           exceptional=exceptional_items, assoc_share=share_of_associates)
     _compute_opm(quarter)
@@ -1690,6 +1742,8 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
             "source": "pdf",
             "extraction_method": "ai",
             "document_type": doc_type or "results_statement",
+            "financial_sector": "bank" if is_bank else "other",
+            "bank_metrics_version": 1 if is_bank else None,
         },
         "quarter": quarter,
     }
@@ -1728,6 +1782,18 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
             "share_of_associates": scale(d.get("share_of_associates")),
         }
     qoq_prior, yoy_prior = _prior(qoq), _prior(yoy)
+    if is_bank:
+        for label, raw, pr in (("qoq_prior", qoq, qoq_prior), ("yoy_prior", yoy, yoy_prior)):
+            pr["financial_sector"] = "bank"
+            for field in bank_fields:
+                pr[field] = scale(raw.get(field))
+            if pr.get("interest_income") is None:
+                pr["interest_income"] = pr.get("revenue")
+            if raw:
+                for field in bank_fields:
+                    if pr.get(field) is None:
+                        quality_flags.append(f"{label}:bank_missing_{field}")
+            _compute_bank_metrics(pr)
     # Same identity check on each comparative column. A prior column with no
     # PBT can't be tested directly; if the CURRENT column of the same table
     # needed the Fin+D&A add-back, the comparatives share that layout.
@@ -1768,6 +1834,20 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
             out[f"{out_field}_prior"] = prior_v
             out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
             got_any = True
+    if _is_bank_period(cur):
+        for field in ("interest_income", "nii", "ppop"):
+            cv, pv = cur.get(field), prior.get(field)
+            if pv is not None:
+                out[f"{field}_prior"] = pv
+                got_any = True
+                if cv is not None and pv != 0:
+                    out[f"{field}_{suffix}_pct"] = round((cv - pv) / abs(pv) * 100, 2)
+        out["operating_profit_basis"] = "ppop"
+        if prior.get("ppop") is not None:
+            out["operating_profit_prior"] = prior["ppop"]
+        if out.get(f"ppop_{suffix}_pct") is not None:
+            out[f"operating_profit_{suffix}_pct"] = out[f"ppop_{suffix}_pct"]
+        return out if got_any else None
     # Compute both sides on the SAME basis: if either period is missing its
     # finance_costs/depreciation add-backs, fall back to the EBIT-style
     # formula for both, so the pp delta never mixes two margin definitions.
@@ -2337,6 +2417,15 @@ def _telegram_fin_table(parsed: dict) -> list:
         ("OPM%",  cur_opm,      qoq_opm,      qoq_opm_pp,  yoy_opm,      yoy_opm_pp,  1, "pp"),
     ]
 
+    if _is_bank_period(q):
+        rows = []
+        for label, field in (("Income", "total_income"), ("NII", "nii"), ("PPOP", "ppop"), ("PAT", "pat")):
+            native_y = yoy_native.get(field) if yoy_native else None
+            yp = native_y if native_y is not None else yf.get(f"{field}_prior")
+            rows.append((label, _cr(q.get(field)), _cr(qf.get(f"{field}_prior")),
+                         qf.get(f"{field}_qoq_pct"), _cr(yp),
+                         None if native_y is not None else yf.get(f"{field}_yoy_pct"), 1, "pct"))
+        rows.append(("EPS", cur_eps, qoq_eps, None, yoy_eps, None, 2, "pct"))
     hdr_cur = cur_header or "Cur"
     hdr_qoq = qoq_header or "-"
     hdr_yoy = yoy_header or "-"
@@ -2357,7 +2446,8 @@ def _telegram_fin_table(parsed: dict) -> list:
                f"{_fmt_table_num(cur, dec):>9}{_fmt_table_num(qprior, dec):>9}{_fmt_table_num(yprior, dec):>9}")
         lines.append(row)
     lines.append("</pre>")
-    lines.append("<i>Sales/OP/PAT in ₹Cr · OP = EBITDA excl. other income</i>")
+    lines.append("<i>Total Income/NII/PPOP/PAT in ₹Cr · PPOP = profit before provisions</i>"
+                 if _is_bank_period(q) else "<i>Sales/OP/PAT in ₹Cr · OP = EBITDA excl. other income</i>")
     return lines
 
 
@@ -2381,7 +2471,12 @@ def _telegram_basis_block(parsed: dict) -> list:
         # or fundamentals lookup failed) — fall back to a plain current-
         # quarter summary rather than sending an empty/dash-only table.
         lines = [f"<b>Current Qtr{' (' + cur_header + ')' if cur_header else ''}</b>"]
-        lines.append(f"Rev: <b>{_fmt_cr(rev_display)}</b>")
+        if _is_bank_period(q):
+            for label, field in (("Total Income", "total_income"), ("NII", "nii"), ("PPOP", "ppop")):
+                if q.get(field) is not None:
+                    lines.append(f"{label}: <b>{_fmt_cr(q[field])}</b>")
+        else:
+            lines.append(f"Rev: <b>{_fmt_cr(rev_display)}</b>")
         lines.append(f"PAT: {pat_emoji} <b>{_fmt_cr(pat)}</b>")
         if q.get("eps_basic") is not None:
             lines.append(f"EPS: <b>₹{q['eps_basic']}</b>")
@@ -2716,6 +2811,17 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         if meta.get("source") != "pdf":
             return False
         q = it.get("quarter", {}) or {}
+        # Bank records created before the dedicated schema need re-extraction.
+        # Existing opt-in REPROCESS_STALE_RESULTS guard still controls retries.
+        if (_is_bank_period(q) or re.search(r"\bbank\b", meta.get("company_name") or "", re.I)):
+            if meta.get("bank_metrics_version") != 1:
+                return True
+            if _is_bank_period(q):
+                flags = []
+                _reconcile_total_expenses(q, "current", "stored", flags,
+                    exceptional=q.get("exceptional_items"), assoc_share=q.get("share_of_associates"))
+                already_flagged = meta.get("quality_flags") or []
+                return bool(flags) and not any("bank_pnl_identity_mismatch" in f or "bank_ppop_identity_mismatch" in f for f in already_flagged)
         pat, pbt = q.get("pat"), q.get("pbt")
         if pat is None and pbt is None:
             return True
