@@ -46,6 +46,7 @@ import httpx
 from r2_manifest import upload_str_with_manifest
 from breadth_returns import build_index_ma_history, build_group_returns_history
 from structure_scan import build_structure_map
+from structure_history import build_index_structure_history
 
 # ── Telegram notify ──
 try:
@@ -3607,12 +3608,22 @@ async def run_ep_scan() -> None:
             # (1M/3M/6M/1Y; median, equal, mcap-weighted), 1 year each —
             # see breadth_returns.py. Never allowed to break the scan.
             index_ma_history=sector_returns_history=industry_returns_history=None
+            index_master_br={}
             try:
                 index_master_br=await r2_download(client,"index_master.json") or {}
                 index_ma_history=build_index_ma_history(all_data,index_master_br)
                 log.info("Index breadth: "+", ".join(f"{v['name']} {v['matched']}/{v['constituents']}" for v in index_ma_history["indices"].values()))
             except Exception as e:
                 log.warning(f"Index breadth skipped: {e}")
+            # Market Structure widget: HH-HL / LL-LH counts per index (Nifty 50,
+            # MidSmall 400, Nifty 500), daily + weekly swings, 1 year — see
+            # structure_history.py. Never allowed to break the scan.
+            index_structure_history=None
+            try:
+                index_structure_history=build_index_structure_history(all_data,index_master_br,_check_liquidity)
+                log.info("Index structure: "+", ".join(f"{v['name']} HH-HL {v['d']['hh'][-1]} / LL-LH {v['d']['ll'][-1]} of {v['d']['n'][-1]}" for v in index_structure_history["indices"].values()))
+            except Exception as e:
+                log.warning(f"Index structure skipped: {e}")
             try:
                 sector_returns_history=build_group_returns_history(all_data,classification,"sector_group")
                 industry_returns_history=build_group_returns_history(all_data,classification,"display_industry")
@@ -3780,6 +3791,7 @@ async def run_ep_scan() -> None:
             )
             extra_uploads=[]
             for fname,obj in (("index_ma_history.json",index_ma_history),
+                              ("index_structure_history.json",index_structure_history),
                               ("sector_returns_history.json",sector_returns_history),
                               ("industry_returns_history.json",industry_returns_history),
                               *exch_group_files.items()):
