@@ -46,7 +46,9 @@ BREADTH_INDICES = {
 }
 
 # window lengths in trading days
-RETURN_PERIODS = (("1M", 21), ("3M", 63), ("6M", 126), ("1Y", 252))
+# "1W" is special: the last COMPLETED Mon–Fri week (changes once a week),
+# not a rolling 5 days. Its window is None and it is computed separately.
+RETURN_PERIODS = (("1W", None), ("1M", 21), ("3M", 63), ("6M", 126), ("1Y", 252))
 MIN_STOCKS = 3                     # a group needs this many stocks with data on a day
 
 
@@ -198,8 +200,56 @@ def _r1(v):
     return None if v is None or not math.isfinite(v) else round(v, 1)
 
 
+def _week_key(ds):
+    y, w, _ = date.fromisoformat(str(ds)[:10]).isocalendar()
+    return (y, w)
+
+
+def _completed_weeks(all_data, dates):
+    """For each calendar date: (end_date, prev_end_date) of the last completed
+    Mon–Fri week as of that date, or None. A week counts as completed on its
+    last trading day if that day is a Friday (or later) or a newer week exists
+    in the data — so a Friday holiday is picked up the following Monday."""
+    if not dates:
+        return []
+    sample = max(all_data.values(), key=lambda s: len(s.get("d") or []))
+    full = [str(x)[:10] for x in (sample.get("d") or [])]
+    wk_order, wk_end = [], {}
+    for ds in full:
+        k = _week_key(ds)
+        if k not in wk_end:
+            wk_order.append(k)
+        wk_end[k] = ds
+    wk_idx = {k: i for i, k in enumerate(wk_order)}
+    out = []
+    for ds in dates:
+        ds = str(ds)[:10]
+        k = _week_key(ds)
+        i = wk_idx.get(k)
+        if i is None:
+            out.append(None); continue
+        done = wk_end[k] == ds and (i < len(wk_order) - 1 or date.fromisoformat(ds).weekday() >= 4)
+        ci = i if done else i - 1
+        if ci < 1:
+            out.append(None); continue
+        out.append((wk_end[wk_order[ci]], wk_end[wk_order[ci - 1]]))
+    return out
+
+
+def _close_in_week(dl, c, end):
+    """Last close on/before `end` that falls in the same ISO week as `end`."""
+    import bisect
+    i = bisect.bisect_right(dl, end) - 1
+    while i >= 0 and not c[i]:
+        i -= 1
+    if i < 0 or _week_key(dl[i]) != _week_key(end) or c[i] <= 0:
+        return None
+    return c[i]
+
+
 def build_group_returns_history(all_data, classification, field, days=HISTORY_DAYS, periods=RETURN_PERIODS):
     dates = _calendar(all_data, days)
+    weekly = _completed_weeks(all_data, dates) if any(w is None for _, w in periods) else []
     pos = {d: i for i, d in enumerate(dates)}
     groups, mcap_now = {}, {}
     for row in classification or []:
@@ -235,12 +285,29 @@ def build_group_returns_history(all_data, classification, field, days=HISTORY_DA
                 if j is None or not c[i]:
                     continue
                 for p, w in periods:
+                    if w is None:
+                        continue
                     k = i - w
                     if k < 0 or not c[k] or c[k] <= 0:
                         continue
                     r = (c[i] / c[k] - 1) * 100
                     wt = m_now * c[k] / last if (m_now and last) else None
                     out[p][j] = (r, wt)
+            if weekly:
+                dl = [str(x)[:10] for x in d]
+                cache = {}
+                for p, w in periods:
+                    if w is not None:
+                        continue
+                    for j, wk in enumerate(weekly):
+                        if not wk:
+                            continue
+                        if wk not in cache:
+                            a, b = _close_in_week(dl, c, wk[0]), _close_in_week(dl, c, wk[1])
+                            cache[wk] = (
+                                ((a / b - 1) * 100, m_now * b / last if (m_now and last) else None)
+                                if a and b else None)
+                        out[p][j] = cache[wk]
             per[sym] = out
 
     result = {}
