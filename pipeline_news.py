@@ -2696,6 +2696,25 @@ def _manual_result_items() -> list:
     return items
 
 
+def _processed_result_links(payload: dict | None) -> set:
+    """Successful URLs survive result replacement, basis cleanup and item caps.
+
+    Store with the result payload so records and history commit together.
+    Seed older payloads from their current links on the first upgraded run.
+    Failed attempts are never entered in this history.
+    """
+    payload = payload or {}
+    links = {link for link in payload.get("processed_result_links", [])
+             if isinstance(link, str) and link}
+    links.update(it["link"] for it in payload.get("items", [])
+                 if isinstance(it.get("link"), str) and it["link"])
+    return links
+
+
+def _unprocessed_result_candidates(items: list, processed: set, retry: set) -> list:
+    return [it for it in items if it["link"] not in processed or it["link"] in retry]
+
+
 async def build_results_detailed(client: httpx.AsyncClient, results_items: list[dict], board_items: list[dict],
                                   fundamentals: dict | None, bse_pdf_items: list[dict] | None = None,
                                   bse_symbol_map: dict | None = None) -> dict | None:
@@ -2734,6 +2753,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     existing = await r2_get(client, "nse_results_detailed.json")
     existing_items = (existing or {}).get("items", [])
+    processed_links = _processed_result_links(existing)
 
     def _basis_key(it):
         """(symbol, period_end) — ignores standalone/consolidated nature,
@@ -2884,8 +2904,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     manual_items = _manual_result_items()
     manual_links = {it["link"] for it in manual_items}
-    new_xbrl = [it for it in xbrl_items if it["link"] not in existing_links]
-    new_pdf = [it for it in pdf_items if it["link"] not in existing_links or it["link"] in incomplete_pdf_links]
+    new_xbrl = _unprocessed_result_candidates(xbrl_items, processed_links, set())
+    new_pdf = _unprocessed_result_candidates(pdf_items, processed_links, incomplete_pdf_links)
+    skipped_successful = len(pdf_items) - len(new_pdf)
+    if skipped_successful:
+        print(f"  ⏭ Skipping {skipped_successful} PDF(s) already successfully processed "
+              "(persistent URL history; no Gemini call)")
 
     # Give-up tracking: NSE's WAF blocks some specific filing URLs
     # persistently for GitHub Actions' IP/pattern (confirmed: the same file
@@ -3303,6 +3327,10 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     )
     pdf_results = list(group_results) + list(singleton_results) + list(manual_results)
     parsed_all = [r for r in xbrl_results if r] + [r for r in pdf_results if r]
+    # Record EVERY successful URL before choosing the latest result per key.
+    # Both NSE/BSE copies and superseded same-run filings must remain seen,
+    # even when only one canonical result record survives below.
+    processed_links.update(r["link"] for r in parsed_all if r.get("link"))
     print(f"  ✓ Parsed {len(parsed_all)}/{len(new_xbrl) + len(new_pdf) + len(manual_items)} successfully")
     if manual_items:
         ok_manual = sum(1 for r in manual_results if r)
@@ -3586,7 +3614,9 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     merged = parsed_new + older_existing[:keep_older]
     merged.sort(key=_effective_ts, reverse=True)
 
-    return make_payload(merged)
+    payload = make_payload(merged)
+    payload["processed_result_links"] = sorted(processed_links)
+    return payload
 
 
 async def run():
