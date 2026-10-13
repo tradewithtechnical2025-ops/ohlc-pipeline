@@ -1097,6 +1097,8 @@ def _pdf_find_heading_candidates(text: str):
 # results table for the heading-check/AI to find, so they'd always stay
 # unparsed clutter in the Results tab).
 _PDF_NON_RESULT_PATTERNS = [
+    r"prior\s+intimation.{0,100}?(?:board|meeting|financial)",
+    r"intimation.{0,60}?board\s+meeting.{0,100}?(?:will\s+be\s+held|scheduled|to\s+be\s+held)",
     r"non.?convertible debentures?",
     r"\bNCDs?\b",
     r"issuance of .*(debentures?|securities)",
@@ -1986,7 +1988,8 @@ def _scanned_results_likely(content: bytes, text: str) -> bool:
 async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes, link: str, rss_title: str = "",
                                        scrip_code: str = None, fallback_board_meeting_date: str = None,
                                        symbol_override: str = None, exchange: str = "NSE",
-                                       preextracted_text: str | None = None, force_ai: bool = False):
+                                       preextracted_text: str | None = None, force_ai: bool = False,
+                                       rejection_sink: dict | None = None):
     """Best-effort parse of an 'Outcome of Board Meeting' PDF into the same
     {meta, quarter} shape parse_financial_results_xbrl() produces, so it can
     flow through the same grouping/dedup/Telegram code.
@@ -2071,6 +2074,16 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
             print(f"    · [{fname_dbg}] AI extraction failed or returned unparseable data — skipping")
         return None
     if not ai.get("is_results_table"):
+        # Only a valid, explicit classification is terminal. API/JSON errors,
+        # missing fields and result-validation failures remain retryable.
+        if (rejection_sink is not None and ai.get("is_results_table") is False
+                and ai.get("document_type") in
+                ("results_statement", "press_release", "investor_presentation", "other")):
+            rejection_sink[link] = {
+                "terminal_not_result": True,
+                "document_type": ai["document_type"],
+                "rejected_at": datetime.now(timezone.utc).isoformat(),
+            }
         print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
         return None
 
@@ -2941,6 +2954,14 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     GIVE_UP_ATTEMPTS = 15
     failures_payload = await r2_get(client, "nse_xbrl_failures.json")
     failures = (failures_payload or {}).get("links", {})
+    terminal_links = {link for link, entry in failures.items() if entry.get("terminal_not_result")}
+    if terminal_links:
+        before_terminal = len(new_pdf)
+        new_pdf = [it for it in new_pdf if it["link"] not in terminal_links]
+        if before_terminal != len(new_pdf):
+            print(f"  ⏭ Skipping {before_terminal - len(new_pdf)} PDF(s) previously classified "
+                  "as not a results table — no repeat Gemini call (manual override available)")
+    ai_rejections = {}
     # Calendar/loose fallback PDFs are mostly governance letters with no results
     # heading (a deterministic "no" every run) -> stop retrying them sooner.
     soft_links = {it["link"] for it in pdf_items if it.get("_cal_fallback") or it.get("_loose")}
@@ -3096,12 +3117,14 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                         exchange="BSE",
                         preextracted_text=it.get("_pre_text"),
                         force_ai=bool(it.get("_manual")),
+                        rejection_sink=None if it.get("_manual") else ai_rejections,
                     )
                 else:
                     parsed = await parse_financial_results_pdf(client, content, it["link"], it.get("title", ""),
                                                               preextracted_text=it.get("_pre_text"),
                                                               symbol_override=it.get("_manual_symbol"),
                                                               force_ai=bool(it.get("_manual")),
+                                                              rejection_sink=None if it.get("_manual") else ai_rejections,
                                                               fallback_board_meeting_date=(
                                                                   _bse_fallback_date(it.get("published", ""))
                                                                   if it.get("_manual") else None))
@@ -3420,6 +3443,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         now_iso = datetime.now(timezone.utc).isoformat()
         for link in failed_links:
             entry = failures.get(link, {"first_failed": now_iso, "attempts": 0})
+            if link in ai_rejections:
+                entry.update(ai_rejections[link])
             entry["attempts"] += 1
             entry["last_failed"] = now_iso
             failures[link] = entry
