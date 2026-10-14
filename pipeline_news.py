@@ -2022,8 +2022,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         text = preextracted_text
     else:
         try:
-            with pdfplumber.open(_io.BytesIO(content)) as pdf:
-                text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
+            content, text = await _load_result_pdf(client, link, content)
         except Exception as e:
             print(f"    · [{fname_dbg}] pdfplumber open/extract_text raised: {type(e).__name__}: {e}")
             return None
@@ -2095,6 +2094,52 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     return result
 
 
+def _validate_pdf_download(content: bytes, headers=None, status_code: int = 200) -> None:
+    """Reject HTML, partial HTTP responses and truncated files before parsing."""
+    if status_code == 206:
+        raise ValueError("partial HTTP 206 response")
+    if not content or b"%PDF-" not in content[:1024]:
+        raise ValueError("response is not a PDF")
+    if b"%%EOF" not in content[-4096:]:
+        raise ValueError(f"PDF missing final EOF marker ({len(content):,} bytes)")
+    headers = headers or {}
+    length = headers.get("content-length")
+    if length and not headers.get("content-encoding"):
+        if int(length) != len(content):
+            raise ValueError(f"PDF length mismatch: received {len(content):,}, expected {length}")
+
+
+def _extract_result_pdf_text(content: bytes) -> str:
+    import io
+    import pdfplumber
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            return "\n".join((page.extract_text(layout=True) or "") for page in pdf.pages)
+    except Exception as first_error:
+        from pypdf import PdfReader
+        try:
+            reader = PdfReader(io.BytesIO(content), strict=False)
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+            print(f"    · pdfplumber failed ({type(first_error).__name__}); pypdf fallback read {len(reader.pages)} pages")
+            return text
+        except Exception as second_error:
+            raise ValueError(f"both PDF parsers failed: {type(first_error).__name__}; {type(second_error).__name__}") from second_error
+
+
+async def _load_result_pdf(client, link: str, content: bytes):
+    """Use complete bytes; if parsing fails, try one fresh cache-busted download."""
+    try:
+        _validate_pdf_download(content)
+        return content, _extract_result_pdf_text(content)
+    except Exception as error:
+        print(f"    · [{link.rsplit('/', 1)[-1]}] PDF read failed ({error}); fetching a fresh copy")
+        sep = "&" if "?" in link else "?"
+        fresh = await fetch_pdf_bytes(client, f"{link}{sep}_pdf_retry={time.time_ns()}", retries=2)
+        if not fresh:
+            raise ValueError("fresh PDF download unavailable")
+        return fresh, _extract_result_pdf_text(fresh)
+
+
 async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4):
     """Same retry/backoff/cache-bust profile as fetch_xbrl_bytes — NSE's
     archive host shows the same flakiness for PDFs as for XBRL."""
@@ -2111,6 +2156,8 @@ async def fetch_pdf_bytes(client: httpx.AsyncClient, url: str, retries: int = 4)
                     continue
                 r.raise_for_status()
             r.raise_for_status()
+            _validate_pdf_download(r.content, r.headers, r.status_code)
+            print(f"    · PDF downloaded: {len(r.content):,} bytes [{url.split('?', 1)[0].rsplit('/', 1)[-1]}]")
             return r.content
         except httpx.HTTPStatusError:
             raise
@@ -3102,6 +3149,9 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         async with sem:
             fname = it["link"].split("/")[-1]
             try:
+                if it.get("_pre_load_failed"):
+                    failed_links.append(it["link"])
+                    return None  # preflight already exhausted parser/download fallbacks
                 content = it.get("_pre_content") or await fetch_pdf_bytes(client, it["link"])
                 if not content:
                     print(f"  ⚠ PDF fetch returned empty for {fname}")
@@ -3160,8 +3210,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             content = await fetch_pdf_bytes(client, it["link"])
             if not content:
                 return it
-            with pdfplumber.open(_io.BytesIO(content)) as pdf:
-                text = "\n".join((p.extract_text(layout=True) or "") for p in pdf.pages)
+            content, text = await _load_result_pdf(client, it["link"], content)
             it["_pre_content"] = content
             it["_pre_text"] = text
             # Local-only identity: identical PDF bytes never need two AI calls.
@@ -3221,6 +3270,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             return it
         except Exception as e:
             print(f"  ⚠ pre-AI PDF preflight failed for {it['link'].split('/')[-1]}: {type(e).__name__}: {e}")
+            it["_pre_load_failed"] = True
             return it
 
     new_dupe_links = []  # persisted so skipped copies never re-enter a later run
