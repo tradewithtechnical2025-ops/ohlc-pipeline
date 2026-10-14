@@ -198,9 +198,35 @@
     },
     "hd-fire-protect-limited-ipo": {
       "status": "download_failed",
-      "at": "2026-10-07 18:22",
+      "at": "2026-10-14 06:56",
+      "attempts": 2,
+      "error": "RemoteProtocolError: peer closed connection without sending complete message body (received 2774807 bytes, expected 14637227)"
+    },
+    "fusion-cx-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-10-14 06:45",
       "attempts": 1,
-      "error": "RemoteProtocolError: peer closed connection without sending complete message body (received 13111887 bytes, expected 14637227)"
+      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (11918 bytes)"
+    },
+    "bonfiglioli-transmissions-limted-ipopo": {
+      "status": "done",
+      "at": "2026-10-14 06:47",
+      "attempts": 1
+    },
+    "tonbo-imaging-india-limited-ipo": {
+      "status": "done",
+      "at": "2026-10-14 06:50",
+      "attempts": 1
+    },
+    "zetwerk-manufacturing-limted-ipo": {
+      "status": "done",
+      "at": "2026-10-14 06:53",
+      "attempts": 1
+    },
+    "sahajanand-medical-technologies-ipo": {
+      "status": "done",
+      "at": "2026-10-14 06:55",
+      "attempts": 1
     }
   }
 }
