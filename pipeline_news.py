@@ -493,6 +493,7 @@ async def _load_classification_universe(client: httpx.AsyncClient) -> set[str]:
     payload = await r2_get(client, "classification.json")
     rows = payload if isinstance(payload, list) else (payload or {}).get("items") or []
     universe = set()
+    names = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -500,6 +501,13 @@ async def _load_classification_universe(client: httpx.AsyncClient) -> set[str]:
             sym = str(row.get(key) or "").strip().upper()
             if sym:
                 universe.add(sym)
+        canonical = str(row.get("nse_code") or row.get("symbol") or "").strip().upper()
+        if canonical:
+            for key in ("name", "company_name", "company", "companyName", "stock_name"):
+                if row.get(key):
+                    names[str(row[key])] = canonical
+    # NSE filtering runs before the BSE loader; populate names here too.
+    _register_symbols(universe, names)
     if universe:
         print(f"  ✓ Results universe: {len(universe)} symbol(s) loaded from classification.json")
     else:
@@ -3893,7 +3901,7 @@ async def run():
                 # preserves the existing protection against NCD/KMP/fundraise
                 # PDFs that share the same generic NSE subject.
                 if _in_result_calendar(
-                    _extract_filename_symbol(it.get("link", "")),
+                    _pdf_probable_symbol(it, None),
                     calendar_payload,
                     it.get("link", ""),
                 ):
