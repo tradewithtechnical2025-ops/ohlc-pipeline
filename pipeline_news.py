@@ -806,6 +806,10 @@ def _compute_opm(period_dict: dict) -> None:
     0.241 = 24.1%) plus 'opm_basis' ("ebitda" or "ebit") — see _opm_value() —
     and 'operating_profit' (absolute, same basis).
     """
+    if period_dict.get("financial_sector") == "insurance":
+        for key in ("opm", "opm_basis", "ebitda", "operating_profit"):
+            period_dict.pop(key, None)
+        return
     if _is_bank_period(period_dict):
         _compute_bank_metrics(period_dict)
         return
@@ -836,6 +840,10 @@ def _reconcile_total_expenses(period: dict, label: str, fname_dbg: str, flags: l
     fix to a comparative column that has no PBT to test against, used when
     the current column of the same table needed it.
     Returns True if the add-back was applied."""
+    if period.get("financial_sector") == "insurance":
+        # Insurers split underwriting and shareholder accounts. A generic
+        # manufacturing P&L identity cannot reconcile those accounts.
+        return False
     if _is_bank_period(period):
         ti, te, provisions, pbt = (period.get(k) for k in
             ("total_income", "expenditure_excl_provisions", "provisions", "pbt"))
@@ -998,6 +1006,7 @@ _PDF_SUBJECT_RE = re.compile("|".join(_PDF_SUBJECT_PATTERNS), re.IGNORECASE)
 # that boilerplate sentence is excluded via _PDF_BOILERPLATE_PRECEDE_RE
 # rather than by pattern alone, since the wording is otherwise identical.
 _PDF_HEADING_PATTERNS = [
+    re.compile(r"Statement\s+of\s+(?:Un[\s-]?)?Audited\s+Results\s+for\s+the\s+(?:Quarter|Half[\s-]?Year|Year)", re.IGNORECASE),
     re.compile(r"Statement of (Standalone|Consolidated)[\s\S]{0,80}?Financial Results", re.IGNORECASE),
     # Order A: "...Standalone Unaudited Financial Results..." (qualifier before audited-word)
     re.compile(r"(Standalone|Consolidated)[\s\S]{0,20}?(?:Un-?)?[Aa]udited[\s\S]{0,10}?Financial Results", re.IGNORECASE),
@@ -1407,8 +1416,9 @@ Your job:
 11. Segment-wise revenue is usually in its own table/note (often titled "Segment Information" or "Segment Revenue") — look for it actively rather than only checking the main P&L; most listed operating companies with multiple business lines report this. Omit segment_breakup entirely if the company doesn't report segments.
 12. management_commentary: 1-3 sentence summary of any outlook/commentary/guidance mentioned in the document (not the standard boilerplate disclaimers), or null if there's none.
 13. key_highlights: 2-5 short, specific, numbers-first strings on the most notable things about this result (big beats/misses, one-off items, margin changes, notable segment performance) — omit if nothing stands out beyond the raw numbers already captured.
-14a. Classify financial_sector as "bank" ONLY for a bank using the banking results format (Interest earned, Interest expended, Operating profit before provisions, Provisions and contingencies). NBFCs, insurers and other financial companies are "other"; do not classify by company name alone.
+14a. Classify financial_sector as "bank" ONLY for a bank using the banking results format (Interest earned, Interest expended, Operating profit before provisions, Provisions and contingencies). Insurers with premium/claims/underwriting accounts are "insurance". NBFCs and other financial companies are "other"; do not classify by company name alone.
 14b. For banks, extract the following for EACH of current, qoq_prior and yoy_prior from that SAME basis/table: interest_income (Interest earned), interest_expense (Interest expended), expenditure_excl_provisions (Total expenditure excluding provisions and contingencies), provisions (other than tax), and ppop (reported Operating profit before provisions and contingencies). Do not include provisions in expenditure_excl_provisions. Do not treat interest expended as finance_costs, and do not borrow half-year cash-flow depreciation for a quarterly P&L. Keep revenue equal to interest_income for compatibility; total_income includes other income. Banking OP is PPOP, not EBITDA. Do not invent NIM or asset-quality ratios when not disclosed on the selected basis.
+14-insurance. Formal insurer statements may be headed "Statement of Audited Results" without the word "Financial" and use the IRDAI format; these ARE results_statement. For insurance, in EACH current/qoq_prior/yoy_prior extract gross_premium_written, net_premium_written, net_premium_earned, underwriting_profit (loss negative), insurance_operating_profit (the reported operating-account profit), and solvency_ratio if reported. Use revenue = net_premium_earned only; never mix gross written premiums with earned premiums. total_income must be the operating table's Total Income, while PAT/PBT/EPS must be the reported shareholder/company bottom line. Do not derive EBITDA/OPM or force generic Total Income minus Expenses = company PBT. Never guess a missing number or use half-year data for the quarter.
 14c. EPS uses weighted-average shares; do not reject valid EPS because quarter-end share capital differs following an allotment. Use reported EPS.
 14. board_meeting_outcome: brief note on any OTHER board decisions mentioned (dividend, bonus, other corporate actions), or null if there's nothing beyond the results approval itself.
 
@@ -1417,12 +1427,12 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
   "is_results_table": true or false,
   "document_type": "results_statement" or "investor_presentation" or "press_release" or "other",
   "basis": "Standalone" or "Consolidated" or null,
-  "financial_sector": "bank" or "other",
+  "financial_sector": "bank" or "insurance" or "other",
   "company_name": "the company's full legal name as printed, e.g. \"Rentomojo Limited\"" or null,
   "unit": "Crore" or "Million" or "Lakh" or null,
   "period_end": "YYYY-MM-DD" or null,
   "current": {
-    "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null,
+    "gross_premium_written": number or null, "net_premium_written": number or null, "net_premium_earned": number or null, "underwriting_profit": number or null, "insurance_operating_profit": number or null, "solvency_ratio": number or null, "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null,
     "other_income": number or null,
     "total_income": number or null,
     "total_expenses": number or null,
@@ -1438,8 +1448,8 @@ Return ONLY valid JSON (no markdown fences, no other text) matching exactly this
     "eps_basic": number or null,
     "eps_diluted": number or null
   },
-  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
-  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
+  "qoq_prior": {"period_end": "YYYY-MM-DD" or null, "gross_premium_written": number or null, "net_premium_written": number or null, "net_premium_earned": number or null, "underwriting_profit": number or null, "insurance_operating_profit": number or null, "solvency_ratio": number or null, "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
+  "yoy_prior": {"period_end": "YYYY-MM-DD" or null, "gross_premium_written": number or null, "net_premium_written": number or null, "net_premium_earned": number or null, "underwriting_profit": number or null, "insurance_operating_profit": number or null, "solvency_ratio": number or null, "interest_income": number or null, "interest_expense": number or null, "expenditure_excl_provisions": number or null, "provisions": number or null, "ppop": number or null, "revenue": number or null, "total_income": number or null, "pbt": number or null, "pat": number or null, "eps_basic": number or null, "total_expenses": number or null, "finance_costs": number or null, "depreciation": number or null, "exceptional_items": number or null, "share_of_associates": number or null},
   "segment_breakup": [{"segment": string, "revenue": number}] or omitted,
   "management_commentary": string or null,
   "key_highlights": [string, ...] or omitted,
@@ -1726,6 +1736,14 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
         quarter["exceptional_items"] = exceptional_items
     if share_of_associates:
         quarter["share_of_associates"] = share_of_associates
+    is_insurance = ai.get("financial_sector") == "insurance"
+    insurance_fields = ("gross_premium_written", "net_premium_written", "net_premium_earned", "underwriting_profit", "insurance_operating_profit")
+    if is_insurance:
+        quarter["financial_sector"] = "insurance"
+        for field in insurance_fields:
+            quarter[field] = scale(cur.get(field))
+        quarter["solvency_ratio"] = cur.get("solvency_ratio")
+        quarter["revenue"] = quarter.get("net_premium_earned")
     is_bank = ai.get("financial_sector") == "bank"
     bank_fields = ("interest_income", "interest_expense", "expenditure_excl_provisions", "provisions", "ppop")
     if is_bank:
@@ -1754,7 +1772,7 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
             "source": "pdf",
             "extraction_method": "ai",
             "document_type": doc_type or "results_statement",
-            "financial_sector": "bank" if is_bank else "other",
+            "financial_sector": "bank" if is_bank else "insurance" if is_insurance else "other",
             "bank_metrics_version": 1 if is_bank else None,
         },
         "quarter": quarter,
@@ -1794,6 +1812,13 @@ def _build_result_from_ai(ai: dict, text: str, link: str, fname_dbg: str, rss_ti
             "share_of_associates": scale(d.get("share_of_associates")),
         }
     qoq_prior, yoy_prior = _prior(qoq), _prior(yoy)
+    if is_insurance:
+        for raw, pr in ((qoq, qoq_prior), (yoy, yoy_prior)):
+            pr["financial_sector"] = "insurance"
+            for field in insurance_fields:
+                pr[field] = scale(raw.get(field))
+            pr["solvency_ratio"] = raw.get("solvency_ratio")
+            pr["revenue"] = pr.get("net_premium_earned")
     if is_bank:
         for label, raw, pr in (("qoq_prior", qoq, qoq_prior), ("yoy_prior", yoy, yoy_prior)):
             pr["financial_sector"] = "bank"
@@ -1846,6 +1871,15 @@ def _pdf_comparison(cur: dict, prior: dict, prior_header, suffix: str):
             out[f"{out_field}_prior"] = prior_v
             out[f"{out_field}_{suffix}_pct"] = round((cur_v - prior_v) / abs(prior_v) * 100, 2)
             got_any = True
+    if cur.get("financial_sector") == "insurance":
+        for field in ("gross_premium_written", "net_premium_written", "net_premium_earned", "underwriting_profit", "insurance_operating_profit", "solvency_ratio"):
+            cv, pv = cur.get(field), prior.get(field)
+            if pv is not None:
+                out[f"{field}_prior"] = pv
+                got_any = True
+                if cv is not None and pv != 0:
+                    out[f"{field}_{suffix}_pct"] = round((cv - pv) / abs(pv) * 100, 2)
+        return out if got_any else None
     if _is_bank_period(cur):
         for field in ("interest_income", "nii", "ppop"):
             cv, pv = cur.get(field), prior.get(field)
@@ -2513,6 +2547,12 @@ def _telegram_fin_table(parsed: dict) -> list:
                          qf.get(f"{field}_qoq_pct"), _cr(yp),
                          None if native_y is not None else yf.get(f"{field}_yoy_pct"), 1, "pct"))
         rows.append(("EPS", cur_eps, qoq_eps, None, yoy_eps, None, 2, "pct"))
+    if q.get("financial_sector") == "insurance":
+        rows = []
+        for label, field in (("Income", "total_income"), ("Premium", "net_premium_earned"), ("UW P/L", "underwriting_profit"), ("PAT", "pat")):
+            rows.append((label, _cr(q.get(field)), _cr(qf.get(f"{field}_prior")), qf.get(f"{field}_qoq_pct"),
+                         _cr(yf.get(f"{field}_prior")), yf.get(f"{field}_yoy_pct"), 1, "pct"))
+        rows.append(("EPS", cur_eps, qoq_eps, None, yoy_eps, None, 2, "pct"))
     hdr_cur = cur_header or "Cur"
     hdr_qoq = qoq_header or "-"
     hdr_yoy = yoy_header or "-"
@@ -2533,7 +2573,7 @@ def _telegram_fin_table(parsed: dict) -> list:
                f"{_fmt_table_num(cur, dec):>9}{_fmt_table_num(qprior, dec):>9}{_fmt_table_num(yprior, dec):>9}")
         lines.append(row)
     lines.append("</pre>")
-    lines.append("<i>Total Income/NII/PPOP/PAT in ₹Cr · PPOP = profit before provisions</i>"
+    lines.append("<i>Income/Premium/UW P&amp;L/PAT in ₹Cr · Premium = net premium earned</i>" if q.get("financial_sector") == "insurance" else "<i>Total Income/NII/PPOP/PAT in ₹Cr · PPOP = profit before provisions</i>"
                  if _is_bank_period(q) else "<i>Sales/OP/PAT in ₹Cr · OP = EBITDA excl. other income</i>")
     return lines
 
