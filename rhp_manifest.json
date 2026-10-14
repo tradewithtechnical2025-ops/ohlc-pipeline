@@ -197,16 +197,14 @@
       "attempts": 1
     },
     "hd-fire-protect-limited-ipo": {
-      "status": "download_failed",
-      "at": "2026-10-14 06:56",
-      "attempts": 2,
-      "error": "RemoteProtocolError: peer closed connection without sending complete message body (received 2774807 bytes, expected 14637227)"
+      "status": "done",
+      "at": "2026-10-14 07:09",
+      "attempts": 3
     },
     "fusion-cx-limited-ipo": {
-      "status": "download_failed",
-      "at": "2026-10-14 06:45",
-      "attempts": 1,
-      "error": "RuntimeError: got an HTML page instead of a PDF, and couldn't find a .pdf link inside it (11918 bytes)"
+      "status": "done",
+      "at": "2026-10-14 07:06",
+      "attempts": 2
     },
     "bonfiglioli-transmissions-limted-ipopo": {
       "status": "done",
