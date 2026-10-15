@@ -79,7 +79,9 @@ def detect(a):
             state = ('Consolidation Near BO' if window else
                      'Near BO' if 0 <= distance <= .02 else 'Box Forming')
         window = cons(c, top, j + 4) if state == 'Consolidation Near BO' else 0
-        boxes.append(dict(i=i, j=j, top=top, bot=low, low_idx=low_idx,
+        end_idx = breakout if breakout is not None else (overdepth if overdepth is not None else n - 1)
+        base_length_candles = end_idx - i + 1  # inclusive trading bars, from swing-high bar
+        boxes.append(dict(i=i, j=j, base_length_candles=base_length_candles, top=top, bot=low, low_idx=low_idx,
                           bo=breakout, overdepth=overdepth, state=state,
                           cons=window, depth=(top-low)/top))
 
@@ -119,6 +121,7 @@ def build_box_finder(all_data, asof=None):
         def encode(b):
             return {
                 'start_date': dates[b['i']],
+                'base_length_candles': int(b['base_length_candles']),
                 'swing_low_date': dates[b['j']],
                 'lower_updated_date': dates[b['low_idx']],
                 'upper': round(float(b['top']), 4),
@@ -136,6 +139,7 @@ def build_box_finder(all_data, asof=None):
         results.append({
             'symbol': symbol, 'date': dates[-1], 'status': status,
             'start_date': dates[chosen['i']],
+            'base_length_candles': int(chosen['base_length_candles']),
             'upper': round(float(chosen['top']), 4),
             'lower': round(float(chosen['bot']), 4),
             'close': round(close, 4),
