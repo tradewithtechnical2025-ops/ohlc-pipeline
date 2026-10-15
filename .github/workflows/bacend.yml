@@ -1,7 +1,7 @@
 name: OHLC Pipeline Scans (Manual)
 
 # Manual trigger only — runs any of pipeline.py's scan/report modes on
-# demand (VCP, Minervini Trend Template, Weinstein, EP, HLR, status, etc.)
+# demand (VCP, Minervini Trend Template, Weinstein, Box Finder, EP, HLR, status, etc.)
 # without needing a separate .yml per mode.
 # Option values must be the exact pipeline.py mode names (no spaces).
 on:
@@ -19,6 +19,8 @@ on:
           - stage2_scan
           - weinstein_scan
           - weinstein_scan_dryrun
+          - box_scan_dryrun
+          - box_scan
           - ep_scan
           - hlr_scan
           - pattern_scan
