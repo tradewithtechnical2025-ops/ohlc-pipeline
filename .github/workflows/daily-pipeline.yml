@@ -73,11 +73,7 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python shakeout_scanner.py --r2-key shakeout_signals.json
-      # ─── Pattern Scan moved AFTER Shakeout Scan (and HTF Scan) so that
-      # screener_feed.json's ema_shakeout_map / shakeout_pause_* fields and
-      # htf_map are built from TODAY's signals, not yesterday's. Pattern
-      # Scan is what builds screener_feed.json — everything it reads from
-      # R2 needs to already be fresh by the time it runs. ───
+      # Pattern Scan runs after HTF and Shakeout to use today's signals.
       - name: Pattern Scan
         uses: nick-fields/retry@v3
         with:
@@ -99,7 +95,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py candle_scan
-
       - name: EP Scan
         uses: nick-fields/retry@v3
         with:
@@ -121,7 +116,14 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py weinstein_scan
-      # Home page ticker reads the outputs of the scans above — keep it after them
+      - name: Box Finder Scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py box_scan
+      # Home ticker reads scan outputs; keep after the scans.
       - name: Home Page Ticker
         uses: nick-fields/retry@v3
         with:
