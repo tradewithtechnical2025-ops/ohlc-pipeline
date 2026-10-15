@@ -23,6 +23,8 @@ Usage:
   python pipeline.py vcp_scan
   python pipeline.py stage2_scan
   python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
+  python pipeline.py box_scan         # TwT Box Finder -> box_finder.json
+  python pipeline.py box_scan_dryrun  # preview Box Finder without R2 writes
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
   python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
@@ -5341,6 +5343,8 @@ TRANSITION_LABELS = {
     # those 4 — .get() just returns None for them (won't happen, but safe).
     (1, 2): "Base Breakout — Basing to Advancing",
     (2, 3): "Topping Started — Advancing to Topping",
+    (2, 1): "Failed Breakout — Return to Base",
+    (3, 1): "Return to Base — Original Breakout Failed",
     (3, 4): "Breakdown Confirmed — Topping to Declining",
     (4, 1): "Bottoming — Declining to Basing",
     (3, 2): "Failed Top — resumed Advancing without breaking down",
@@ -5350,258 +5354,179 @@ TRANSITION_LABELS = {
 }
 
 
+def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
+                              slope_lookback=4, flat_threshold_pct=0.5,
+                              ema_short_period=10, swing_lookback=10):
+    """ARCStage-inspired weekly phase classification (EMA variant).
+
+    Directional stages use 30-week EMA slope and closing-price position.
+    Flat phases use the most recent confirmed directional stage to
+    distinguish basing (after decline) from topping (after advance).
+    No breakout, pivot lookahead, or future candles required.
+    """
+    n = len(wc)
+    ema30 = _calc_ema(wc, ema_period)
+    ema10 = _calc_ema(wc, ema_short_period)
+    records = []
+    stage = stage_start = last_direction = None
+    breakout_level = None
+    highest_high_since_bo = None
+    below_base_streak = 0
+    return_to_base = False
+    pending_bo = None
+    pending_start = None
+    pending_below = 0
+    for i in range(n):
+        price, e30, e10 = wc[i], ema30[i], ema10[i]
+        ep = ema30[i-slope_lookback] if i >= slope_lookback else None
+        slope = ((e30 / ep - 1) * 100
+                 if e30 is not None and ep not in (None, 0) else None)
+        prev = stage
+        high_ref = (max(wh[i-swing_lookback:i]) if i >= swing_lookback
+                    and all(x is not None for x in wh[i-swing_lookback:i]) else None)
+        low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
+                   and all(x is not None for x in wl[i-swing_lookback:i]) else None)
+        raw_bo = (price is not None and high_ref is not None and price > high_ref)
+        aligned = (e10 is not None and e30 is not None and e10 > e30
+                   and slope is not None and slope > flat_threshold_pct
+                   and price is not None and price > e30)
+        # Remember a breakout even when EMA alignment arrives later.
+        # Two consecutive closes below its level invalidate it.
+        if raw_bo and (pending_bo is None or price > pending_bo):
+            if pending_bo is None:
+                pending_bo = high_ref
+                pending_start = i
+        if pending_bo is not None:
+            if price is not None and price < pending_bo:
+                pending_below = pending_below + 1
+            else:
+                pending_below = 0
+            if pending_below >= 2:
+                pending_bo = None
+                pending_start = None
+                pending_below = 0
+        # Delayed alignment only qualifies if price is actually advancing:
+        # last three weekly highs AND lows must be rising, not sideways.
+        advancing = (i >= 2 and all(x is not None for x in wh[i-2:i+1])
+                     and all(x is not None for x in wl[i-2:i+1])
+                     and wh[i] > wh[i-1] > wh[i-2]
+                     and wl[i] > wl[i-1] > wl[i-2])
+        delayed_bo = (pending_bo is not None and pending_start is not None
+                      and i > pending_start and price > pending_bo
+                      and advancing and aligned)
+        fresh_bo = bool(raw_bo and aligned)
+        enter_stage2 = bool(fresh_bo or delayed_bo)
+        if enter_stage2 and (breakout_level is None or return_to_base):
+            breakout_level = pending_bo if delayed_bo else high_ref
+            highest_high_since_bo = wh[i]
+            below_base_streak = 0
+            return_to_base = False
+        # After return-to-base, new BO must be a NEW event, not old EMA slope.
+        if price is not None and e30 is not None and slope is not None:
+            distance = (price / e30 - 1) * 100
+            if slope > flat_threshold_pct and price > e30:
+                if stage == 2 or enter_stage2 or (stage == 3 and breakout_level is not None
+                                                    and not return_to_base and price > breakout_level):
+                    stage = 2
+                    last_direction = 2
+            elif slope < -flat_threshold_pct and price < e30:
+                stage = 4
+                last_direction = 4
+            elif abs(slope) <= flat_threshold_pct and abs(distance) <= 12:
+                if last_direction == 4:
+                    stage = 1
+                elif last_direction == 2:
+                    stage = 3
+                # With no known preceding trend, leave stage unknown.
+            # Other transitional weeks retain the last confirmed phase.
+        # Failed Stage 2 breakout: two consecutive weekly closes back
+        # below the ORIGINAL 10-week BO level, with no new post-entry high
+        # on either week. Applies even if EMA flattening labelled Stage 3.
+        if breakout_level is not None and not return_to_base:
+            new_high = (highest_high_since_bo is not None and wh[i] is not None
+                        and wh[i] > highest_high_since_bo)
+            if new_high:
+                highest_high_since_bo = wh[i]
+                below_base_streak = 0
+            elif price is not None and price < breakout_level:
+                below_base_streak += 1
+            else:
+                below_base_streak = 0
+            if below_base_streak >= 2:
+                stage = 1
+                last_direction = 4  # Flat EMA remains basing, not topping.
+                return_to_base = True
+        if return_to_base and not enter_stage2 and stage in (2, 3):
+            stage = 1
+        if stage != prev:
+            stage_start = i if stage is not None else None
+        candidate = bool(stage != 2 and slope is not None
+                         and slope > flat_threshold_pct and price is not None
+                         and e30 is not None and price > e30
+                         and high_ref is not None
+                         and high_ref * .95 <= price <= high_ref)
+        prior_volumes = wv[max(0, i-10):i]
+        volume_confirmed = (wv[i] >= 1.5 * sum(prior_volumes)/10
+                            if len(prior_volumes) == 10 and wv[i] is not None
+                            and all(v is not None for v in prior_volumes)
+                            and sum(prior_volumes) > 0 else None)
+        records.append({
+            'stage': stage, 'prev_stage': prev,
+            'stage_change': prev is not None and stage != prev,
+            'weeks_in_stage': i-stage_start+1 if stage_start is not None else 0,
+            'close': price, 'ema30': e30, 'ema10': e10, 'slope_pct': slope,
+            'stage2_candidate': candidate, 'volume_confirmed': volume_confirmed,
+            'high_ref': high_ref, 'low_ref': low_ref,
+        })
+    return records
+
+
 def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
-                              flat_threshold_pct=1.0, min_weeks=40,
+                              flat_threshold_pct=0.5, min_weeks=40,
                               early_breakout_lookback=26, ema_short_period=10,
                               min_weeks_in_prior_stage=3, confirm_weeks=2,
                               swing_lookback=10, early_stage2_weeks=8):
-    """
-    Stan Weinstein's original 4-Stage Analysis (his book "Secrets for Profiting
-    in Bull and Bear Markets") — WEEKLY chart, ema_period-week average
-    (Weinstein used a 30-week SMA; this uses EMA instead — see EMA NOTE below).
-
-      Stage 1 (Basing)     — price hovering near a flat average, after a decline
-      Stage 2 (Advancing)  — price > 10wk EMA > 30wk EMA, slope rising;
-                              ENTERING Stage 2 also requires close > highest
-                              weekly HIGH of the prior swing_lookback weeks
-                              (genuine new swing high) — once already in
-                              Stage 2, this swing check is not re-required
-                              every week (see SWING HIGH/LOW section)
-      Stage 3 (Topping)    — price hovering near a flat average, after an advance
-      Stage 4 (Declining)  — price < 10wk EMA < 30wk EMA, slope falling;
-                              ENTERING Stage 4 also requires close < lowest
-                              weekly LOW of the prior swing_lookback weeks
-
-    SWING HIGH/LOW CONFIRMATION — ENTRY ONLY: on top of the EMA-based
-    conditions, the FIRST week of entering Stage 2/4 also requires the close
-    to actually break the prior swing_lookback weeks' real price extreme
-    (weekly high for Stage 2, weekly low for Stage 4 — wicks, not just
-    closes) — a genuine breakout of recent price structure, not merely an
-    EMA crossover with no new high/low to show for it. This check is NOT
-    re-applied on weeks where the stock is already reading Stage 2/4 (i.e.
-    last week's literal stage already matched) — otherwise a single volatile
-    prior week's wick (that closed lower) could choke a genuine ongoing
-    uptrend into a false Topping/Basing read purely because this week's
-    close sits below that one earlier wick, despite EMA/slope still being
-    solidly in trend.
-
-    EMA NOTE (why not SMA): Weinstein's original method used a simple 30-week
-    SMA, which weighs a week from 6 months ago the same as last week. That
-    causes real lag after a big prior move — e.g. a stock that ran up 3x then
-    spent 2 months declining can still show a "rising" SMA slope, because the
-    old rally is still baked into the average with full weight, even while
-    price has clearly turned down. EMA weights recent weeks more heavily, so
-    it reflects a genuine trend change faster — at the cost of being somewhat
-    more reactive to short-term noise, which is why the confirmation layers
-    below (EMA10 agreement + confirm_weeks persistence) matter more, not less,
-    with EMA.
-
-    Average slope over slope_lookback weeks decides rising/falling/flat
-    (threshold flat_threshold_pct%). Flat/ambiguous weeks are 1-vs-3 by
-    carrying forward the last confirmed trending stage (2 or 4) — the
-    standard resolution for this ambiguity, since basing and topping look
-    identical on average+price alone.
-
-    EMA10>EMA30 CONFIRMATION + 2-WEEK PERSISTENCE (anti-whipsaw / anti-poison):
-    a single borderline week — price barely above EMA30 with slope just over
-    the flat_threshold — used to be enough to flip Stage 4→2 outright, which
-    then "poisoned" last_trend for months afterward (every later ambiguous
-    week got called Topping instead of Basing, since last_trend was wrongly
-    left at 2). Three defenses: (a) price itself must be above the faster
-    10-week EMA too, not just the 30-week one (price > EMA10 > EMA30 for
-    Stage 2, reversed for Stage 4) — a stronger, stricter entry condition
-    than price vs EMA30 alone, (b) that 10-week EMA must be on the correct
-    side of the 30-week EMA, and (c) even when a week's raw read is 2 or 4,
-    `last_trend` (the value the 1-vs-3 fallback actually uses) only updates
-    once that raw read repeats for confirm_weeks CONSECUTIVE weeks. That
-    single week's `stage` is still shown honestly (it can momentarily read 2
-    or 4), but it can no longer by itself flip the fallback bucket for every
-    later ambiguous week.
-
-    MIN 3-WEEK HOLD FOR TRANSITION LABELS (anti-chatter): `stage`/`stage_change`
-    still reflect the literal week-by-week math honestly. But `transition_type`
-    (the human-facing label like "Failed Top") is only set if the PRIOR stage
-    was held for at least min_weeks_in_prior_stage weeks before this week's
-    flip — a 1-week whipsaw in and back out of Topping/Basing no longer gets
-    dressed up with a named pattern label.
-
-    EARLY TRANSITION (fixes the lag): the official `stage` field only flips
-    to 2 once the 30-week EMA's slope confirms — which can still take a few
-    weeks after a base-high breakout. To catch the breakout itself, while
-    stage is still 1 (Basing) we separately check if this week's close broke
-    above the highest close of the prior early_breakout_lookback weeks (the
-    base range) — if so, early_transition=True ("Possible Stage 2 — base
-    breakout, EMA30 slope not yet confirmed"), even though `stage` still
-    correctly reads 1. Symmetric check while stage==3 (Topping) flags a range
-    breakdown as a possible early Stage 4. Use `stage` for the confirmed/
-    reliable read and `early_transition` for a faster (noisier) heads-up.
-
-    NOT SEQUENTIAL: each week's stage is recomputed independently from that
-    week's price/slope — it does NOT require passing through 1→2→3→4 in
-    order. So a "failed top" (Topping reverting straight back to Advancing,
-    3→2, skipping Declining) and a "failed base" (Basing reverting straight
-    back to Declining, 1→4, skipping Advancing) are both real, valid outputs
-    — not bugs. `transition_type` (via TRANSITION_LABELS) names exactly which
-    kind of transition stage_change represents, including these two.
-
-    EARLY STAGE 2 (broader than "Base Breakout"): `transition_type` only
-    fires "Base Breakout" on the exact week Basing flips to Advancing —
-    miss checking that one week and there's no tag left showing the move
-    is still fresh. `early_stage2` stays True for every week the stock is
-    confirmed Stage 2 AND weeks_in_stage <= early_stage2_weeks (default 8)
-    — a wider "still early in the advance, better risk/reward" window,
-    not just the single flip week.
-
-    Returns:
-      current_signals  -> [{symbol, week, stage, prev_stage, stage_change,
-                             weeks_in_stage, close, ema30}] as of latest week
-      breadth_history  -> [{week, stage1, stage2, stage3, stage4}] full history
-    """
-    current_signals = []
-    breadth = {}  # week_label -> {1:count, 2:count, 3:count, 4:count}
-
+    """Simplified Weinstein detector. Legacy arguments kept for callers."""
+    signals, breadth = [], {}
     for sym, s in all_data.items():
-        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
-        n_daily = len(dates)
-        if n_daily < 200 or not _check_liquidity(volumes, closes, n_daily):
+        dates, highs, lows, closes, volumes = (s[k] for k in ('d','h','l','c','v'))
+        if len(dates) < 200 or not _check_liquidity(volumes, closes, len(dates)):
             continue
-
-        w_labels, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, "W")
-        n = len(wc)
-        if n < ema_period + slope_lookback + min_weeks:
+        labels, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, 'W')
+        if not wc:
             continue
-
-        ema30_arr = _calc_ema(wc, ema_period)
-        ema10_arr = _calc_ema(wc, ema_short_period)
-        start = ema_period + slope_lookback
-
-        last_trend = None      # CONFIRMED trend (2 or 4) — only this decides the 1-vs-3 fallback
-        candidate_trend = None
-        candidate_streak = 0
-        stage_seq = [None] * start
-
-        for i in range(start, n):
-            price, e30, e30_prev = wc[i], ema30_arr[i], ema30_arr[i - slope_lookback]
-            e10 = ema10_arr[i]
-            if price is None or e30 is None or e30_prev is None or e30_prev == 0 or e10 is None:
-                stage_seq.append(None)
-                continue
-            slope_pct = (e30 - e30_prev) / e30_prev * 100
-
-            # Swing-high/low confirmation applies only at ENTRY into Stage 2/4
-            # (i.e. last week's literal stage wasn't already 2/4) — once
-            # already established, a stock doesn't need to clear a fresh
-            # 10-week high every single week just to continue, since a
-            # volatile prior week's wick can otherwise choke a genuine
-            # ongoing uptrend (e.g. last week's high spiked but closed lower,
-            # so this week's close — even while still rising cleanly on
-            # EMA/slope — sits below that one-off wick).
-            prior_literal_stage = stage_seq[-1] if stage_seq else None
-            raw2 = price > e10 > e30 and slope_pct > flat_threshold_pct
-            raw4 = price < e10 < e30 and slope_pct < -flat_threshold_pct
-
-            if raw2 and prior_literal_stage == 2:
-                stage = 2   # continuing — no fresh swing high required
-            elif raw4 and prior_literal_stage == 4:
-                stage = 4   # continuing — no fresh swing low required
-            elif raw2:
-                swing_start = max(0, i - swing_lookback)
-                prior_highs = [v for v in wh[swing_start:i] if v is not None]
-                swing_high = max(prior_highs) if prior_highs else None
-                stage = 2 if (swing_high is not None and price > swing_high) else (3 if last_trend == 2 else 1)
-            elif raw4:
-                swing_start = max(0, i - swing_lookback)
-                prior_lows = [v for v in wl[swing_start:i] if v is not None]
-                swing_low = min(prior_lows) if prior_lows else None
-                stage = 4 if (swing_low is not None and price < swing_low) else (3 if last_trend == 2 else 1)
-            else:
-                stage = 3 if last_trend == 2 else 1   # default Stage 1 if unknown
-
-            # last_trend (used above for the 1-vs-3 fallback) only updates once
-            # a raw 2/4 read repeats for confirm_weeks CONSECUTIVE weeks — a
-            # single borderline week is shown honestly as that week's stage,
-            # but can't by itself "poison" every later ambiguous week into
-            # the wrong bucket (see docstring: EMA10 CONFIRMATION section).
-            if stage in (2, 4):
-                if stage == candidate_trend:
-                    candidate_streak += 1
+        rows = _weinstein_weekly_records(wh, wl, wc, wv, ema_period, slope_lookback,
+                                        flat_threshold_pct, ema_short_period, swing_lookback)
+        for label, row in zip(labels, rows):
+            if row['stage'] is not None:
+                breadth.setdefault(label, {1:0, 2:0, 3:0, 4:0})[row['stage']] += 1
+        r = rows[-1]
+        prior_duration = 0
+        if r['stage_change']:
+            for old in reversed(rows[:-1]):
+                if old['stage'] == r['prev_stage']:
+                    prior_duration += 1
                 else:
-                    candidate_trend, candidate_streak = stage, 1
-                if candidate_streak >= confirm_weeks:
-                    last_trend = stage
-            else:
-                candidate_trend, candidate_streak = None, 0
-
-            stage_seq.append(stage)
-
-            breadth.setdefault(w_labels[i], {1: 0, 2: 0, 3: 0, 4: 0})
-            breadth[w_labels[i]][stage] += 1
-
-        if stage_seq and stage_seq[-1] is not None:
-            cur_stage = stage_seq[-1]
-            prev_stage = next((v for v in reversed(stage_seq[:-1]) if v is not None), None)
-            weeks_in_stage = 0
-            for v in reversed(stage_seq):
-                if v == cur_stage: weeks_in_stage += 1
-                else: break
-            i_last = n - 1
-
-            # How long was the PRIOR stage held before this week's flip? —
-            # used to gate transition_type (anti-chatter), see docstring.
-            weeks_in_prev_stage = 0
-            if prev_stage is not None:
-                for v in reversed(stage_seq[:-1]):
-                    if v == prev_stage: weeks_in_prev_stage += 1
-                    else: break
-
-            is_change = bool(prev_stage is not None and prev_stage != cur_stage)
-            transition_type = (TRANSITION_LABELS.get((prev_stage, cur_stage))
-                                if is_change and weeks_in_prev_stage >= min_weeks_in_prior_stage
-                                else None)
-
-            # Early transition check — only meaningful while officially in Basing/Topping
-            early_transition = False
-            early_transition_label = None
-            range_ref = None
-            if cur_stage in (1, 3):
-                lb_start = max(0, i_last - early_breakout_lookback)
-                prior_closes = [v for v in wc[lb_start:i_last] if v is not None]
-                today_close = wc[i_last]
-                if prior_closes and today_close is not None:
-                    if cur_stage == 1:
-                        base_high = max(prior_closes)
-                        range_ref = round(base_high, 2)
-                        if today_close > base_high:
-                            early_transition = True
-                            early_transition_label = "Possible Stage 2 — base breakout, EMA30 slope not yet confirmed"
-                    else:  # cur_stage == 3
-                        range_low = min(prior_closes)
-                        range_ref = round(range_low, 2)
-                        if today_close < range_low:
-                            early_transition = True
-                            early_transition_label = "Possible Stage 4 — range breakdown, EMA30 slope not yet confirmed"
-
-            current_signals.append({
-                "symbol": sym, "week": w_labels[i_last], "stage": cur_stage,
-                "prev_stage": prev_stage,
-                "stage_change": is_change,
-                "transition_type": transition_type,
-                "weeks_in_stage": weeks_in_stage,
-                "weeks_in_prev_stage": weeks_in_prev_stage,
-                "close": round(wc[i_last], 2),
-                "ema30": round(ema30_arr[i_last], 2) if ema30_arr[i_last] is not None else None,
-                "ema10": round(ema10_arr[i_last], 2) if ema10_arr[i_last] is not None else None,
-                "early_transition": early_transition,
-                "early_transition_label": early_transition_label,
-                "range_ref": range_ref,
-                "early_stage2": cur_stage == 2 and weeks_in_stage <= early_stage2_weeks,
-            })
-
-    breadth_history = [
-        {"week": wk, "stage1": c[1], "stage2": c[2], "stage3": c[3], "stage4": c[4]}
-        for wk, c in sorted(breadth.items())
-    ]
-    return current_signals, breadth_history
+                    break
+        transition = TRANSITION_LABELS.get((r['prev_stage'],r['stage'])) if r['stage_change'] else None
+        signals.append({
+            'symbol': sym, 'week': labels[-1], 'stage': r['stage'], 'prev_stage': r['prev_stage'],
+            'stage_change': r['stage_change'], 'transition_type': transition,
+            'weeks_in_stage': r['weeks_in_stage'], 'weeks_in_prev_stage': prior_duration,
+            'close': round(r['close'],2) if r['close'] is not None else None,
+            'ema30': round(r['ema30'],2) if r['ema30'] is not None else None,
+            'ema10': round(r['ema10'],2) if r['ema10'] is not None else None,
+            'early_transition': r['stage2_candidate'],
+            'early_transition_label': 'Stage 2 Candidate' if r['stage2_candidate'] else None,
+            'range_ref': round(r['high_ref'],2) if r['high_ref'] is not None else None,
+            'early_stage2': r['stage'] == 2 and r['weeks_in_stage'] <= early_stage2_weeks,
+            'stage2_candidate': r['stage2_candidate'],
+            'volume_confirmed': r['volume_confirmed'],
+            'ema30_slope_pct': round(r['slope_pct'],3) if r['slope_pct'] is not None else None,
+        })
+    breadth_history = [{'week': w, **{f'stage{k}': c[k] for k in (1,2,3,4)}}
+                       for w,c in sorted(breadth.items())]
+    return signals, breadth_history
 
 
 async def backup_weinstein_history(client, signals):
@@ -5684,119 +5609,26 @@ async def backup_weinstein_transitions(client, signals):
               f"({len(transitions)} transitions this week, {len(hist)} weeks tracked)")
 
 
-async def debug_weinstein_symbol(symbol, ema_period=30, slope_lookback=4, flat_threshold_pct=1.0,
-                                  ema_short_period=10, min_weeks_in_prior_stage=3, confirm_weeks=2,
-                                  swing_lookback=10, weeks_shown=20) -> None:
-    """
-    Diagnostic: prints week-by-week close/ema30/ema10/slope%/stage for ONE
-    symbol, using the EXACT same math as _detect_weinstein_stages() (duplicated
-    here on purpose — read-only, no R2 writes, just for comparing against a
-    chart when a classification looks wrong).
-    Usage: python pipeline.py weinstein_debug SYMBOL
-    """
+async def debug_weinstein_symbol(symbol, weeks_shown=20, **kwargs) -> None:
+    """Debug with the same shared stage engine used by the production scan."""
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
         all_data = await download_all_chunks(client)
-
     sym = symbol.upper().strip()
     if sym not in all_data:
-        print(f"'{sym}' not found in all_data. {len(all_data)} symbols loaded — check spelling.")
+        print(f"{sym} not found")
         return
-
     s = all_data[sym]
-    dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
-    n_daily = len(dates)
-    print(f"━━━ {sym} — daily bars: {n_daily}, last daily date: {dates[-1] if dates else None} ━━━")
-    liq = _check_liquidity(volumes, closes, n_daily)
-    print(f"Liquidity check (turnover >= 3,00,00,000): {liq}")
-    if not liq:
-        print("FAILS liquidity — would be SKIPPED entirely by _detect_weinstein_stages (no signal at all).")
-
-    w_labels, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, "W")
-    n = len(wc)
-    print(f"Weekly bars (complete weeks only): {n}")
-    if n < 3:
-        print("Not enough weekly bars.")
-        return
-    print(f"Last 3 weekly labels → dates: "
-          f"{[(w_labels[i], _isoweek_to_date(w_labels[i])) for i in range(max(0,n-3), n)]}")
-    print(f"Last 3 weekly closes: {wc[-3:]}   highs: {wh[-3:]}   lows: {wl[-3:]}")
-
-    min_weeks = 40
-    start = ema_period + slope_lookback
-    if n < ema_period + slope_lookback + min_weeks:
-        print(f"n={n} < required {ema_period + slope_lookback + min_weeks} (ema_period+slope_lookback+min_weeks) "
-              f"— would be SKIPPED entirely by _detect_weinstein_stages (no signal at all).")
-
-    ema30_arr = _calc_ema(wc, ema_period)
-    ema10_arr = _calc_ema(wc, ema_short_period)
-
-    last_trend = None
-    candidate_trend = None
-    candidate_streak = 0
-    stage_seq_full = [None] * start   # for weeks_in_prev_stage / transition_type preview
-    print(f"\n{'Week':<12}{'Close':<10}{'EMA30':<10}{'EMA10':<10}{'Slope%':<10}{'SwHigh':<10}{'SwLow':<10}{'Stage':<20}{'last_trend after'}")
-    show_from = max(start, n - weeks_shown)
-    for i in range(start, n):
-        price, e30, e30_prev = wc[i], ema30_arr[i], ema30_arr[i - slope_lookback]
-        e10 = ema10_arr[i]
-        row_week = _isoweek_to_date(w_labels[i])
-        if price is None or e30 is None or e30_prev is None or e30_prev == 0 or e10 is None:
-            stage_seq_full.append(None)
-            if i >= show_from:
-                print(f"{row_week:<12}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'—':<10}{'None (missing data)':<20}{last_trend}")
-            continue
-        slope_pct = (e30 - e30_prev) / e30_prev * 100
-        prior_literal_stage = stage_seq_full[-1] if stage_seq_full else None
-        raw2 = price > e10 > e30 and slope_pct > flat_threshold_pct
-        raw4 = price < e10 < e30 and slope_pct < -flat_threshold_pct
-        swing_high = swing_low = None
-        if raw2 and prior_literal_stage == 2:
-            stage = 2
-        elif raw4 and prior_literal_stage == 4:
-            stage = 4
-        elif raw2:
-            swing_start = max(0, i - swing_lookback)
-            prior_highs = [v for v in wh[swing_start:i] if v is not None]
-            swing_high = max(prior_highs) if prior_highs else None
-            stage = 2 if (swing_high is not None and price > swing_high) else (3 if last_trend == 2 else 1)
-        elif raw4:
-            swing_start = max(0, i - swing_lookback)
-            prior_lows = [v for v in wl[swing_start:i] if v is not None]
-            swing_low = min(prior_lows) if prior_lows else None
-            stage = 4 if (swing_low is not None and price < swing_low) else (3 if last_trend == 2 else 1)
-        else:
-            stage = 3 if last_trend == 2 else 1
-        if stage in (2, 4):
-            if stage == candidate_trend:
-                candidate_streak += 1
-            else:
-                candidate_trend, candidate_streak = stage, 1
-            if candidate_streak >= confirm_weeks:
-                last_trend = stage
-        else:
-            candidate_trend, candidate_streak = None, 0
-        stage_seq_full.append(stage)
-        if i >= show_from:
-            sh_str = f"{swing_high:.2f}" if swing_high is not None else "—"
-            sl_str = f"{swing_low:.2f}" if swing_low is not None else "—"
-            print(f"{row_week:<12}{price:<10.2f}{e30:<10.2f}{e10:<10.2f}{slope_pct:<10.2f}{sh_str:<10}{sl_str:<10}"
-                  f"{STAGE_NAMES[stage]+' ('+str(stage)+')':<20}{last_trend}   (candidate={candidate_trend}x{candidate_streak})")
-
-    print(f"\nFinal stage this run: {STAGE_NAMES[stage]} ({stage})")
-
-    prev_stage = next((v for v in reversed(stage_seq_full[:-1]) if v is not None), None)
-    weeks_in_prev_stage = 0
-    if prev_stage is not None:
-        for v in reversed(stage_seq_full[:-1]):
-            if v == prev_stage: weeks_in_prev_stage += 1
-            else: break
-    is_change = bool(prev_stage is not None and prev_stage != stage)
-    label = TRANSITION_LABELS.get((prev_stage, stage)) if is_change and weeks_in_prev_stage >= min_weeks_in_prior_stage else None
-    print(f"prev_stage: {prev_stage}, held for {weeks_in_prev_stage} weeks before this flip "
-          f"(need >= {min_weeks_in_prior_stage} for a transition_type label)")
-    print(f"stage_change: {is_change}   transition_type: {label!r}")
+    labels, wh, wl, wc, wv = _build_tf_series(s['d'],s['h'],s['l'],s['c'],s['v'],'W')
+    rows = _weinstein_weekly_records(wh,wl,wc,wv)
+    print(f"{sym}: {len(rows)} completed weekly bars")
+    print(f"{'Week':<13}{'Close':>11}{'EMA30':>11}{'Slope%':>11}{'Stage':>12}{'Candidate':>12}")
+    for label,r in list(zip(labels,rows))[-weeks_shown:]:
+        fmt = lambda x: f'{x:.2f}' if x is not None else '—'
+        print(f"{_isoweek_to_date(label):<13}{fmt(r['close']):>11}{fmt(r['ema30']):>11}"
+              f"{fmt(r['slope_pct']):>11}{str(r['stage'] or 'Unknown'):>12}"
+              f"{str(r['stage2_candidate']):>12}")
 
 
 async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
@@ -5825,9 +5657,9 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                 await backup_weinstein_transitions(client, signals)
 
             for sig in signals:
-                sig["stage_name"] = STAGE_NAMES[sig["stage"]]
+                sig["stage_name"] = STAGE_NAMES.get(sig["stage"], "Unknown")
                 sig["week"] = _isoweek_to_date(sig["week"])
-            signals.sort(key=lambda x: (x["stage"], -x["weeks_in_stage"]))
+            signals.sort(key=lambda x: (x["stage"] is None, x["stage"] or 0, -x["weeks_in_stage"]))
 
             stage_counts = {STAGE_NAMES[n]: sum(1 for s in signals if s["stage"] == n) for n in (1, 2, 3, 4)}
             log.info(f"Weinstein stages today: {stage_counts}")
@@ -5835,6 +5667,19 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                 log.info(f"Breadth history: {len(breadth_history)} weeks")
 
             if dry_run:
+                # Full, sortable audit export; no R2 writes.
+                import csv
+                from pathlib import Path
+                out = Path("weinstein_test_results.csv")
+                columns = ["symbol", "week", "stage", "stage_name", "prev_stage",
+                           "weeks_in_stage", "close", "ema10", "ema30",
+                           "ema30_slope_pct", "stage_change", "transition_type",
+                           "stage2_candidate", "volume_confirmed"]
+                with out.open("w", newline="", encoding="utf-8") as fh:
+                    writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(sorted(signals, key=lambda x: x["symbol"]))
+                log.info(f"Full Weinstein audit CSV: {out} ({len(signals)} stocks)")
                 for n in (1, 2, 3, 4):
                     stage_syms = [s for s in signals if s["stage"] == n]
                     log.info(f"\n── Stage {n} ({STAGE_NAMES[n]}) — {len(stage_syms)} stocks, "
@@ -6526,6 +6371,28 @@ def _calc_supertrend(highs, lows, closes, period=10, mult=3):
             trend[i] = 1   # first valid bar — default uptrend seed
         st[i] = lower[i] if trend[i] == 1 else upper[i]
     return st
+async def run_box_scan(dry_run=False) -> None:
+    """Scan existing R2 OHLC and publish Box Finder results."""
+    from box_finder import build_box_finder
+    today = today_ist()
+    async with httpx.AsyncClient() as client:
+        all_data = await download_all_chunks(client)
+        payload = build_box_finder(all_data, asof=today)
+        from collections import Counter
+        counts = Counter(row['status'] for row in payload['stocks'])
+        log.info(f"Box Finder: {payload['total']} rows; statuses={dict(counts)}")
+        if dry_run:
+            for row in payload['stocks'][:25]:
+                log.info(f"  {row['symbol']:15s} {row['status']:23s} upper={row['upper']}")
+            log.info("Box Finder dry run: no R2 writes")
+            return
+        await upload_str_with_manifest(
+            client, r2_upload, 'box_finder.json', json.dumps(payload),
+            schema_v=1, extra_meta={'stock_count': payload['total'], 'asof': today}
+        )
+        log.info('Box Finder uploaded: box_finder.json')
+
+
 # ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
@@ -6562,6 +6429,8 @@ if __name__ == "__main__":
         case "home_ticker":   asyncio.run(run_home_ticker())
         case "stage2_scan":   asyncio.run(run_stage2_scan())
         case "minervini_scan": asyncio.run(run_minervini_scan())
+        case "box_scan": asyncio.run(run_box_scan())
+        case "box_scan_dryrun": asyncio.run(run_box_scan(dry_run=True))
         case "weinstein_scan": asyncio.run(run_weinstein_scan())
         case "weinstein_scan_dryrun": asyncio.run(run_weinstein_scan(dry_run=True))
         case "weinstein_debug":
