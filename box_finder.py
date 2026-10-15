@@ -10,6 +10,12 @@ import numpy as np
 MAX_DEPTH = .30
 MIN_INITIAL_DEPTH = .055
 BREAKOUT_BUFFER = .0025
+MIN_BASE_CANDLES = 9  # a box must hold at least this many bars (swing high .. bar before BO)
+SAME_TOP_TOL = .02     # boxes whose tops are this close are the same resistance
+MERGE_GAP = 5          # a same-top box starting within this many bars after a breakout continues it
+FAIL_WINDOW = 5        # a breakout that closes back below the top within this many bars failed (poke)
+POKE_MAX = .05         # total poke allowance above the box's ORIGINAL top; beyond it a move is a real breakout
+POKE_CLOSE_MAX = .02   # a poke only closes marginally above the top; a stronger close is a real breakout
 
 
 def cons(closes, top, start):
@@ -25,6 +31,71 @@ def cons(closes, top, start):
                 and (np.mean(x[-3:]) - np.mean(x[:3])) / top >= -.015):
             return w
     return 0
+
+
+def prune(boxes):
+    """Remove redundant boxes.
+
+    1. Same resistance as an older box:
+       - the swing high forms while the older box is running and is within
+         -SAME_TOP_TOL .. +POKE_MAX of the older box's top at that bar (or its
+         poke-raised top ends up there) -> part of the older box, dropped
+         (a clearly lower high is an inner base);
+       - same top (SAME_TOP_TOL) starting within MERGE_GAP bars after the older
+         box's breakout -> one box: the older start, the newer top and status.
+    2. Boxes shorter than MIN_BASE_CANDLES are dropped.
+    3. Nesting: keep a box and the boxes directly inside it, but drop boxes
+       that sit inside two or more other boxes (inside = starts later, ends no
+       later, top not higher, bottom not lower).
+    """
+    def top_at(a, t):
+        cur = a['top_hist'][0][1]
+        for bar, val in a['top_hist']:
+            if bar <= t:
+                cur = val
+        return cur
+
+    out = []
+    for b in sorted(boxes, key=lambda x: x['i']):
+        action = None
+        for k, a in enumerate(out):
+            if a['overdepth'] is not None:
+                continue
+            if a['i'] <= b['i'] <= a['last']:
+                # b's swing high forms while a is running: same resistance
+                # (or a small poke over it) -> b is part of a.
+                # Also when pokes later lift b's top up to a's top: compare
+                # b's final top with a's top at b's last bar.
+                ratio = b['top0'] / top_at(a, b['i']) - 1
+                ratio_end = b['top'] / top_at(a, min(b['last'], a['last'])) - 1
+                if -SAME_TOP_TOL <= ratio <= POKE_MAX or -SAME_TOP_TOL <= ratio_end <= POKE_MAX:
+                    action = ('drop', k)
+                    break
+            elif (a['bo'] is not None and a['last'] < b['i'] <= a['last'] + 1 + MERGE_GAP
+                  and abs(a['top'] - b['top0']) / max(a['top'], b['top0']) <= SAME_TOP_TOL):
+                action = ('merge', k)
+                break
+        if action is None:
+            out.append(b)
+        elif action[0] == 'merge':
+            a = out[action[1]]
+            m = dict(b)
+            m['i'], m['j'] = a['i'], a['j']
+            m['top_hist'] = a['top_hist'] + b['top_hist']
+            if a['bot'] < b['bot']:
+                m['bot'], m['low_idx'] = a['bot'], a['low_idx']
+            m['depth'] = (m['top'] - m['bot']) / m['top']
+            m['base_length_candles'] = m['last'] - m['i'] + 1
+            if m['depth'] > MAX_DEPTH + 1e-10:
+                out.append(b)  # too deep as one box: keep them separate
+            else:
+                out[action[1]] = m
+    out = [b for b in out if b['base_length_candles'] >= MIN_BASE_CANDLES]
+
+    def inside(b, a):
+        return (a is not b and a['i'] <= b['i'] and a['last'] >= b['last']
+                and a['top'] >= b['top'] and a['bot'] <= b['bot'])
+    return [b for b in out if sum(1 for a in out if inside(b, a)) <= 1]
 
 
 def detect(a):
@@ -50,6 +121,10 @@ def detect(a):
         initial_depth = (top - initial_low) / top
         if top <= 0 or not MIN_INITIAL_DEPTH <= initial_depth <= MAX_DEPTH:
             continue
+        # Price already broke out above this swing high before the swing low
+        # that starts the box was confirmed: there is no base here.
+        if any(c[t] > top * (1 + POKE_CLOSE_MAX) for t in range(i + 1, j + 1)):
+            continue
 
         # A box starts once its first subsequent swing low is confirmed.
         # It then tracks the lowest actual candle LOW, not the close.
@@ -58,6 +133,8 @@ def detect(a):
         low_idx = j
         breakout = None
         overdepth = None
+        skip_until = -1
+        top_hist = [(i, top)]  # (bar, top) whenever a poke raises the top
         for t in range(j + 1, n):
             if l[t] < low:
                 low = float(l[t])
@@ -65,9 +142,33 @@ def detect(a):
             if (top - low) / top > MAX_DEPTH + 1e-10:
                 overdepth = t
                 break
+            if t < skip_until:
+                continue
             if t >= j + 4 and c[t] > top * (1 + BREAKOUT_BUFFER):
-                breakout = t
-                break
+                # Failed breakout (poke): within FAIL_WINDOW bars a close is
+                # back below the top, and closes never went more than
+                # POKE_CLOSE_MAX above the top / POKE_MAX above the box's
+                # original top (pokes do not stack). Wicks may reach POKE_MAX.
+                # The box then continues with its top
+                # raised to the poke high (or to the highest close when the
+                # high is a big wick beyond POKE_MAX).
+                back, hi_max, cl_max = None, top, top
+                for u in range(t, min(n, t + FAIL_WINDOW + 1)):
+                    if u > t and c[u] < top:
+                        back = u
+                        break
+                    hi_max = max(hi_max, float(h[u]))
+                    cl_max = max(cl_max, float(c[u]))
+                cap = top_hist[0][1] * (1 + POKE_MAX)  # pokes never lift the top past this
+                if back is None or cl_max > cap or cl_max > top * (1 + POKE_CLOSE_MAX):
+                    breakout = t
+                    break
+                top = max(top, hi_max if hi_max <= cap else cl_max)
+                top_hist.append((t, top))
+                skip_until = back
+                if (top - low) / top > MAX_DEPTH + 1e-10:
+                    overdepth = t
+                    break
         if overdepth is not None:
             # Historical box remains visible in box_history but never active.
             state = 'Depth Exceeded'
@@ -79,14 +180,17 @@ def detect(a):
             state = ('Consolidation Near BO' if window else
                      'Near BO' if 0 <= distance <= .02 else 'Box Forming')
         window = cons(c, top, j + 4) if state == 'Consolidation Near BO' else 0
-        end_idx = breakout if breakout is not None else (overdepth if overdepth is not None else n - 1)
-        base_length_candles = end_idx - i + 1  # inclusive trading bars, from swing-high bar
-        boxes.append(dict(i=i, j=j, base_length_candles=base_length_candles, top=top, bot=low, low_idx=low_idx,
+        # The breakout / depth-exceed bar is not part of the base.
+        end_idx = breakout if breakout is not None else overdepth
+        last = end_idx - 1 if end_idx is not None else n - 1
+        base_length_candles = last - i + 1  # trading bars from the swing-high bar to the last base bar
+        boxes.append(dict(i=i, j=j, last=last, top0=float(h[i]), top_hist=top_hist, base_length_candles=base_length_candles, top=top, bot=low, low_idx=low_idx,
                           bo=breakout, overdepth=overdepth, state=state,
                           cons=window, depth=(top-low)/top))
 
     # Only remove true duplicate pivot identities, never nearby independent boxes.
     kept = list({(b['i'], b['j']): b for b in boxes}.values())
+    kept = prune(kept)
     # Show the dominant recent resistance, rather than the smallest newest nested box.
     # Independent boxes still remain in history and evolve separately.
     recent = [b for b in kept if b['bo'] is None and b['overdepth'] is None
