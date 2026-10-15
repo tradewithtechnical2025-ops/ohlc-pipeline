@@ -42,7 +42,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install httpx
+        run: pip install httpx numpy
 
       - name: Run pipeline.py (${{ inputs.mode }})
         env:
