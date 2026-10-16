@@ -1,0 +1,62 @@
+# Chart data (5 years, NSE + older BSE history) -> R2 folder chart/
+# Separate from the main pipeline workflow: it only runs pipeline_chart.py
+# and never touches the ohlc_N.json chunks.
+#
+# Place this file at: .github/workflows/chart_data.yml
+#
+# First time: Actions -> "Chart Data" -> Run workflow -> mode = backfill
+# After that the schedule runs "daily" automatically (Mon-Fri, 7:45 PM IST).
+
+name: Chart Data
+
+on:
+  
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "What to run"
+        required: true
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - backfill
+          - backfill_force
+          - rebuild
+          - status
+      symbols:
+        description: "Only for rebuild: comma-separated symbols, e.g. RELIANCE,TCS"
+        required: false
+        default: ""
+
+concurrency:
+  group: chart-data
+  cancel-in-progress: false
+
+jobs:
+  chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install httpx
+
+      - name: Run pipeline_chart.py
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          MODE: ${{ github.event.inputs.mode || 'daily' }}
+          SYMBOLS: ${{ github.event.inputs.symbols }}
+        run: |
+          if [ "$MODE" = "rebuild" ]; then
+            python pipeline_chart.py rebuild "$SYMBOLS"
+          else
+            python pipeline_chart.py "$MODE"
+          fi
