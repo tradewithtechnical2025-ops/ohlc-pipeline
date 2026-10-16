@@ -2769,6 +2769,9 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             if not close_then: return None
             return round((ltp-close_then)/close_then*100,2)
         mg1=ret_cal(1); mg3=ret_cal(3); mg6=ret_cal(6); mg9=ret_cal(9); mg12=ret_cal(12)
+        # 1-week return: close vs the last close on or before 7 calendar days back
+        _wk_pos=bisect.bisect_right(dates,(date.fromisoformat(dates[ltp_idx])-timedelta(days=7)).isoformat())-1
+        wg1=round((ltp-closes[_wk_pos])/closes[_wk_pos]*100,2) if _wk_pos>=0 and closes[_wk_pos] else None
         def rng(n_days):
             h=[v for v in highs[-n_days:] if v]; l=[v for v in lows[-n_days:] if v]
             if not h or not l or not ltp: return None
@@ -2889,7 +2892,7 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
             "ath":ath_val,"ath_date":ath_info.get("ath_date"),"ath_off_pct":ath_off_pct,
             "pct_atr":pct_atr,"pct_bbw":pct_bbw,"ema10":ema10,"ema21":ema21,"ema50":ema50,"ema200":ema200,
             "emad10":emad10,"emad21":emad21,"emad50":emad50,"above_21":above_21,"above_50":above_50,"above_200":above_200,
-            "gt_50_200":gt_50_200,"gt_21_50":gt_21_50,"1mg":mg1,"3mg":mg3,"6mg":mg6,"9mg":mg9,"12mg":mg12,
+            "gt_50_200":gt_50_200,"gt_21_50":gt_21_50,"1wg":wg1,"1mg":mg1,"3mg":mg3,"6mg":mg6,"9mg":mg9,"12mg":mg12,
             "range3d":range3d,"range5d":range5d,"drsi":drsi,"wrsi":wrsi,"mrsi":mrsi,
             "rs_rating":rs_info.get("rs"),"mswing":ms_info.get("mswing"),"mswing_avg9":ms_info.get("mswing_avg9"),
             **rs_idx,"sales_ch":None,"eps_ch":None,"patterns":"","results":result_date,
@@ -3132,9 +3135,28 @@ def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, st
             k = (r.get(field) or "").strip()
             if k.lower() not in DASH_SKIP_GROUPS: g.setdefault(k, []).append(r)
         return {k: v for k, v in g.items() if len(v) >= DASH_GROUP_MIN}
-    sectors = [{"name": k, "chg": round(_dash_median(r["pct_ch"] for r in v), 2),
-                "adv": sum(1 for r in v if r["pct_ch"] > 0), "dec": sum(1 for r in v if r["pct_ch"] < 0)}
-               for k, v in groups("sector").items()]
+    # Group returns for the dashboard: ONE method for every widget (Performance, Sector Moves,
+    # Industry Ranks, drill-downs) = the MEDIAN of the group's live stocks.
+    # 1D = feed pct_ch, 1M / 6M / 1Y = feed 1mg / 6mg / 12mg (calendar months),
+    # 1W = feed 1wg (close vs the last close on or before 7 calendar days back).
+    # The dashboard's drill-down shows the same feed fields per stock.
+    def med(vals):
+        m = _dash_median(vals)
+        return round(m, 2) if m is not None else None
+    def perf_rows(field):
+        out = []
+        for k, v in groups(field).items():
+            out.append({"name": k, "count": len(v),
+                        "d1": med(r["pct_ch"] for r in v), "w1": med(r.get("1wg") for r in v),
+                        "m1": med(r.get("1mg") for r in v), "m6": med(r.get("6mg") for r in v), "y1": med(r.get("12mg") for r in v),
+                        "adv": sum(1 for r in v if r["pct_ch"] > 0), "dec": sum(1 for r in v if r["pct_ch"] < 0),
+                        "stocks": sorted(r["symbol"] for r in v)})
+        out.sort(key=lambda x: -(x["d1"] if x["d1"] is not None else -1e9))
+        return out
+    perf = {"sector": perf_rows("sector"), "industry": perf_rows("industry")}
+
+    # Sector Moves reads the same numbers as Performance > Sector > 1D
+    sectors = [{"name": x["name"], "chg": x["d1"], "adv": x["adv"], "dec": x["dec"]} for x in perf["sector"] if x["d1"] is not None]
     sectors.sort(key=lambda x: -x["chg"])
 
     industries = []
@@ -3188,6 +3210,7 @@ def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, st
         "results": results,
         "sectors": sectors,
         "industries": industries,
+        "perf": perf,
         "industryRankHistory": hist,
         "breadth": breadth,
         "stages": {"updated": (stages_raw or {}).get("updated"), "counts": counts, "stocks": stocks},
