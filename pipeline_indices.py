@@ -32,6 +32,17 @@ UPSTOX_CONCURRENCY = 3
 # Finedge symbol → Upstox instrument_key, for any index the name match misses
 # (the run log lists unmatched ones). Example: "SNSXFOCIT": "BSE_INDEX|FOCUSED IT"
 UPSTOX_INDEX_OVERRIDES: dict = {
+    # from Upstox's BSE instrument file (segment BSE_INDEX), Oct 2026
+    "SNSXBSEFMCG": "BSE_INDEX|BSEFMC",
+    "SNSXBSEIT":   "BSE_INDEX|BSEIT",
+    "SNSXCAPINS":  "BSE_INDEX|CAPINS",
+    "SNSXCONDIS":  "BSE_INDEX|CONDIS",
+    "SNSXFINSER":  "BSE_INDEX|FINSER",
+    "SNSXINFRA":   "BSE_INDEX|INFRA",
+    "SNSXMFG":     "BSE_INDEX|MFG",
+    "SNSXPRECON":  "BSE_INDEX|PRECON",
+    # Not on Upstox at all: SNSXSMLCAP, SNSXMIDCAP, SNSXLRGCAP, SNSXNXT500,
+    # SNSXNXT250, SNSXBSM250, SNSXCAPMKT, SNSXSPBSAIP / HOIP / LMIP / MSIP
 }
 
 # How many index-history requests to run in parallel. Sequential (1) was
@@ -602,15 +613,38 @@ async def load_upstox_bse_indices(client):
         print(f"⚠ Upstox BSE instrument file failed ({e}) — BSE indices use Finedge only")
         return {}
     out = {}
+    UPSTOX_BSE_LIST.clear()
     for inst in instruments:
         if inst.get("segment") != "BSE_INDEX" or not inst.get("instrument_key"):
             continue
+        UPSTOX_BSE_LIST.append((inst.get("name") or "", inst.get("trading_symbol") or "", inst["instrument_key"]))
         for label in (inst.get("name"), inst.get("trading_symbol")):
-            k = _index_name_key(label)
-            if k and k not in out:
-                out[k] = inst["instrument_key"]
-    print(f"✓ Upstox BSE indices: {len(out)} name keys")
+            # two keys per label: words like "BSE" removed ("FOCUSEDIT"), and the
+            # label squeezed as it is ("BSEIT", "SMLCAP") — Upstox trading
+            # symbols are BSE's index codes, which match Finedge's SNSX<code>
+            for k in (_index_name_key(label), _compact(label)):
+                if k and k not in out:
+                    out[k] = inst["instrument_key"]
+    print(f"✓ Upstox BSE indices: {len(UPSTOX_BSE_LIST)} instruments")
     return out
+
+
+UPSTOX_BSE_LIST: list = []   # (name, trading_symbol, instrument_key), for log hints
+
+
+def _compact(label):
+    return "".join(ch for ch in str(label or "").upper() if ch.isalnum())
+
+
+def upstox_hints(name, limit=3):
+    """Upstox BSE indices that share a word with name — printed for unmatched indices."""
+    words = [w for w in _compact_words(name) if len(w) >= 3 and w not in ("BSE", "INDEX", "S&P")]
+    hits = [x for x in UPSTOX_BSE_LIST if any(w in (x[0] + " " + x[1]).upper() for w in words)]
+    return hits[:limit]
+
+
+def _compact_words(name):
+    return "".join(ch if ch.isalnum() else " " for ch in str(name or "").upper()).split()
 
 
 def upstox_key_for(symbol, meta, upstox_keys):
@@ -619,7 +653,11 @@ def upstox_key_for(symbol, meta, upstox_keys):
     is_bse = str(meta.get("exchange") or "").upper() == "BSE" or symbol.startswith("SNSX")
     if not is_bse or not upstox_keys:
         return None
-    return upstox_keys.get(_index_name_key(meta.get("name")))
+    for k in (_index_name_key(meta.get("name")), _compact(symbol[4:] if symbol.startswith("SNSX") else symbol),
+              _compact(meta.get("name"))):
+        if k and k in upstox_keys:
+            return upstox_keys[k]
+    return None
 
 
 async def fetch_upstox_index_history(client, instrument_key, symbol):
@@ -652,6 +690,15 @@ async def fetch_upstox_index_history(client, instrument_key, symbol):
     return [rows[d] for d in sorted(rows)]
 
 
+def upstox_mismatch(parsed, upstox_rows):
+    """Median % gap between Finedge and Upstox closes on shared dates, or None
+    when they share fewer than 5 dates. A big gap means a wrong name match."""
+    fin = {str(r.get("date", ""))[:10]: _num(r.get("close")) for r in parsed}
+    diffs = sorted(abs(_num(u["close"]) / fin[u["date"]] - 1) * 100
+                   for u in upstox_rows if fin.get(u["date"]) and _num(u.get("close")))
+    return diffs[len(diffs) // 2] if len(diffs) >= 5 else None
+
+
 def fill_from_upstox(parsed, upstox_rows):
     """Add Upstox candles for dates Finedge does not have. Returns (rows, added)."""
     have = {str(r.get("date", ""))[:10] for r in parsed}
@@ -662,7 +709,7 @@ def fill_from_upstox(parsed, upstox_rows):
     return merged, len(extra)
 
 
-UPSTOX_STATS = {"matched": 0, "filled": 0, "candles": 0, "unmatched": []}
+UPSTOX_STATS = {"matched": 0, "filled": 0, "candles": 0, "unmatched": [], "rejected": []}
 
 
 async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, daily_row=None,
@@ -685,6 +732,13 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
             parsed, _ = drop_stale_tail(parsed)
         else:
             merge_status = "empty-history"
+        if up_rows and parsed:
+            gap = upstox_mismatch(parsed, up_rows)
+            if gap is not None and gap > 1.5:
+                print(f"[{i}/{total}]   {symbol}: Upstox prices differ {gap:.1f}% from Finedge — "
+                      f"wrong match ({upstox_key}), not used")
+                UPSTOX_STATS["rejected"].append((symbol, upstox_key, round(gap, 1)))
+                up_rows = []
         if up_rows:
             parsed, added = fill_from_upstox(parsed, up_rows)
             if added:
@@ -960,10 +1014,15 @@ async def main():
         if UPSTOX_STATS["matched"]:
             print(f"\n🔗 Upstox: {UPSTOX_STATS['matched']} BSE indices matched, "
                   f"{UPSTOX_STATS['filled']} got {UPSTOX_STATS['candles']} missing candle(s)")
+        if UPSTOX_STATS["rejected"]:
+            print("   Matched but prices did not agree (fix in UPSTOX_INDEX_OVERRIDES):")
+            for sym, key, gap in UPSTOX_STATS["rejected"]:
+                print(f"     {sym:<16} {key}  ({gap}% apart)")
         if UPSTOX_STATS["unmatched"]:
             print("   Not found on Upstox (add to UPSTOX_INDEX_OVERRIDES if needed):")
             for sym, nm in UPSTOX_STATS["unmatched"]:
-                print(f"     {sym:<16} {nm}")
+                hint = "; ".join(f"{n or t} = {k}" for n, t, k in upstox_hints(nm))
+                print(f"     {sym:<16} {nm}" + (f"   → maybe: {hint}" if hint else ""))
         if STALE_INDICES:
             print(f"\n⚠ {len(STALE_INDICES)} indices have no new data for over {STALE_AFTER_DAYS} days "
                   f"(Finedge not updating them):")
