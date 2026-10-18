@@ -18,6 +18,22 @@ WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
 
 FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
 
+# ─────────────────────────────────────────────
+# Upstox — second source for BSE index history. Finedge stopped updating
+# several BSE indices (12 froze on 2026-08-14) and has holes (e.g. 12–27 Jan
+# 2026 for most BSE indices). Upstox candles fill every date Finedge is
+# missing; on dates both have, Finedge's candle is kept. Without
+# UPSTOX_TOKEN the pipeline runs exactly as before (Finedge only).
+# ─────────────────────────────────────────────
+UPSTOX_TOKEN   = os.environ.get("UPSTOX_TOKEN", "").strip()
+UPSTOX_BASE    = "https://api.upstox.com/v2"
+UPSTOX_BSE_BOD = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
+UPSTOX_CONCURRENCY = 3
+# Finedge symbol → Upstox instrument_key, for any index the name match misses
+# (the run log lists unmatched ones). Example: "SNSXFOCIT": "BSE_INDEX|FOCUSED IT"
+UPSTOX_INDEX_OVERRIDES: dict = {
+}
+
 # How many index-history requests to run in parallel. Sequential (1) was
 # safe but slow. 8 was tried and caused Finedge to throw 503s on nearly
 # every request (44% failure rate even with retries) — their server
@@ -466,6 +482,40 @@ def build_ohlc_arrays(parsed):
     }
 
 
+def _num(v):
+    """Finedge sends prices as strings in history and (sometimes) numbers in the
+    daily feed — compare them as numbers, never as raw values."""
+    try:
+        return round(float(v), 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def _same_ohlc(a, b):
+    return all(_num(a.get(k)) == _num(b.get(k)) for k in ("open", "high", "low", "close")) \
+        and _num(b.get("close")) is not None
+
+
+def drop_stale_tail(parsed):
+    """
+    Remove trailing candles that only repeat the previous candle's OHLC.
+    When Finedge stops updating an index (12 BSE indices froze on 2026-08-14),
+    its daily feed keeps returning that last session; stamped with a later
+    date it drew a flat line across the chart. Returns (parsed, dropped).
+    """
+    dropped = 0
+    while len(parsed) >= 2 and _same_ohlc(parsed[-2], parsed[-1]):
+        parsed.pop()
+        dropped += 1
+    return parsed, dropped
+
+
+# Indices whose newest real candle is older than this are reported at the end
+# of the run (Finedge has stopped updating them).
+STALE_AFTER_DAYS = 7
+STALE_INDICES: dict = {}
+
+
 def merge_daily_into_history(parsed, daily_row):
     """
     Merge today's daily-feed row into the historical candle list, so
@@ -510,9 +560,9 @@ def merge_daily_into_history(parsed, daily_row):
 
     last_date = str(parsed[-1].get("date", ""))[:10]
     if last_date != today_str:
-        last = parsed[-1]
-        same = all(last.get(k) == merged_row.get(k) for k in ("open", "high", "low", "close"))
-        if same and merged_row.get("close") is not None:
+        # numeric compare: history holds strings ("38038.02"), the feed may hold
+        # numbers — the old raw == never matched, so stale rows were appended
+        if _same_ohlc(parsed[-1], merged_row):
             return parsed, "stale-skip"
     if last_date == today_str:
         parsed[-1] = merged_row
@@ -523,14 +573,124 @@ def merge_daily_into_history(parsed, daily_row):
     return parsed, status
 
 
-async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, daily_row=None):
+# ─────────────────────────────────────────────
+# Upstox helpers
+# ─────────────────────────────────────────────
+
+def _upstox_headers():
+    return {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_TOKEN}"}
+
+
+def _index_name_key(name):
+    """'BSE Focused IT' / 'S&P BSE FOCUSED IT' / 'FOCUSED IT' → 'FOCUSEDIT'."""
+    n = str(name or "").upper().replace("S&P", " ")
+    n = "".join(ch for ch in n if ch.isalnum() or ch == " ")
+    words = [w for w in n.split() if w not in ("BSE", "INDEX", "TRI")]
+    return "".join(words)
+
+
+async def load_upstox_bse_indices(client):
+    """{name_key: instrument_key} for every BSE index in Upstox's instrument file."""
+    import gzip
+    if not UPSTOX_TOKEN:
+        print("⚠ UPSTOX_TOKEN not set — BSE indices use Finedge only")
+        return {}
+    try:
+        r = await fetch_with_retry(client, UPSTOX_BSE_BOD, None, retries=3, base_delay=2, timeout=120)
+        instruments = json.loads(gzip.decompress(r.content))
+    except Exception as e:
+        print(f"⚠ Upstox BSE instrument file failed ({e}) — BSE indices use Finedge only")
+        return {}
+    out = {}
+    for inst in instruments:
+        if inst.get("segment") != "BSE_INDEX" or not inst.get("instrument_key"):
+            continue
+        for label in (inst.get("name"), inst.get("trading_symbol")):
+            k = _index_name_key(label)
+            if k and k not in out:
+                out[k] = inst["instrument_key"]
+    print(f"✓ Upstox BSE indices: {len(out)} name keys")
+    return out
+
+
+def upstox_key_for(symbol, meta, upstox_keys):
+    if symbol in UPSTOX_INDEX_OVERRIDES:
+        return UPSTOX_INDEX_OVERRIDES[symbol]
+    is_bse = str(meta.get("exchange") or "").upper() == "BSE" or symbol.startswith("SNSX")
+    if not is_bse or not upstox_keys:
+        return None
+    return upstox_keys.get(_index_name_key(meta.get("name")))
+
+
+async def fetch_upstox_index_history(client, instrument_key, symbol):
+    """Daily candles from Upstox for the same window as Finedge, as history rows."""
+    lookback_days = EXTENDED_HISTORY_DAYS.get(symbol, DEFAULT_HISTORY_DAYS)
+    t = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    f = t - timedelta(days=lookback_days)
+    rows = {}
+    cur = f
+    while cur <= t:  # Upstox gives at most one year of daily candles per call
+        chunk_to = min(date(cur.year, 12, 31), t)
+        url = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/day/{chunk_to.isoformat()}/{cur.isoformat()}"
+        try:
+            r = await client.get(url, headers=_upstox_headers(), timeout=30)
+            if r.status_code == 429:
+                await asyncio.sleep(20)
+                r = await client.get(url, headers=_upstox_headers(), timeout=30)
+            if r.status_code == 200:
+                for c in ((r.json().get("data") or {}).get("candles") or []):
+                    d = str(c[0])[:10]
+                    rows[d] = {"date": d, "open": c[1], "high": c[2], "low": c[3], "close": c[4],
+                               "change_pct": None, "points_change": None,
+                               "volume": c[5] if len(c) > 5 else None, "turnover": None}
+            elif r.status_code == 401:
+                print("  ✗ UPSTOX_TOKEN rejected (401)")
+                return []
+        except httpx.HTTPError as e:
+            print(f"  ⚠ Upstox {symbol} {cur.year}: {e.__class__.__name__}")
+        cur = date(cur.year + 1, 1, 1)
+    return [rows[d] for d in sorted(rows)]
+
+
+def fill_from_upstox(parsed, upstox_rows):
+    """Add Upstox candles for dates Finedge does not have. Returns (rows, added)."""
+    have = {str(r.get("date", ""))[:10] for r in parsed}
+    extra = [r for r in upstox_rows if r["date"] not in have and r.get("close") is not None]
+    if not extra:
+        return parsed, 0
+    merged = sorted(parsed + extra, key=lambda r: str(r.get("date", ""))[:10])
+    return merged, len(extra)
+
+
+UPSTOX_STATS = {"matched": 0, "filled": 0, "candles": 0, "unmatched": []}
+
+
+async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, daily_row=None,
+                                         upstox_key=None, upstox_sem=None):
     async with sem:
         rows = await fetch_index_history_one(client, meta["api_symbol"], symbol)
         parsed = parse_index_history(rows)
-        if not parsed:
+        up_rows = []
+        if upstox_key:
+            async with upstox_sem:
+                up_rows = await fetch_upstox_index_history(client, upstox_key, symbol)
+        if not parsed and up_rows:
+            print(f"[{i}/{total}]   {symbol}: no Finedge history — using Upstox")
+        if not parsed and not up_rows:
             print(f"[{i}/{total}] ✗ {symbol} | no data")
             return symbol, None, None, False, "no-history", None
-        parsed, merge_status = merge_daily_into_history(parsed, daily_row)
+        if parsed:
+            parsed, merge_status = merge_daily_into_history(parsed, daily_row)
+            # a frozen Finedge tail must go before Upstox fills the dates after it
+            parsed, _ = drop_stale_tail(parsed)
+        else:
+            merge_status = "empty-history"
+        if up_rows:
+            parsed, added = fill_from_upstox(parsed, up_rows)
+            if added:
+                UPSTOX_STATS["filled"] += 1
+                UPSTOX_STATS["candles"] += added
+                print(f"[{i}/{total}]   {symbol}: +{added} candle(s) from Upstox")
         if DROP_DATES:
             before = len(parsed)
             parsed = [r for r in parsed if str(r.get("date", ""))[:10] not in DROP_DATES]
@@ -539,6 +699,15 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
             if not parsed:
                 print(f"[{i}/{total}] ✗ {symbol} | no data left after --drop-date")
                 return symbol, None, None, False, "no-history", None
+        parsed, n_stale = drop_stale_tail(parsed)
+        if n_stale:
+            print(f"[{i}/{total}]   {symbol}: dropped {n_stale} repeated candle(s) at the end (feed not updating)")
+        last_real = str(parsed[-1].get("date", ""))[:10]
+        try:
+            if (date.fromisoformat(today_ist()) - date.fromisoformat(last_real)).days > STALE_AFTER_DAYS:
+                STALE_INDICES[symbol] = last_real
+        except ValueError:
+            pass
         weekly = compute_weekly_return(parsed)
         msw = compute_index_mswing(parsed)
         ohlc_arrays = build_ohlc_arrays(parsed)
@@ -715,11 +884,24 @@ async def main():
         symbols = sorted(master_parsed.items())
         total = len(symbols)
         sem = asyncio.Semaphore(HISTORY_CONCURRENCY)
+        upstox_sem = asyncio.Semaphore(UPSTOX_CONCURRENCY)
+        upstox_keys = await load_upstox_bse_indices(client)
+        upstox_for = {}
+        for symbol, meta in symbols:
+            k = upstox_key_for(symbol, meta, upstox_keys)
+            if k:
+                upstox_for[symbol] = k
+            elif upstox_keys and (str(meta.get("exchange") or "").upper() == "BSE" or symbol.startswith("SNSX")):
+                UPSTOX_STATS["unmatched"].append((symbol, meta.get("name")))
+        UPSTOX_STATS["matched"] = len(upstox_for)
+        if upstox_keys:
+            print(f"✓ Upstox matched {len(upstox_for)} BSE indices, unmatched {len(UPSTOX_STATS['unmatched'])}\n")
 
         tasks = [
             fetch_parse_upload_one_history(
                 client, sem, i, total, symbol, meta,
                 daily_row=daily_parsed.get(symbol),
+                upstox_key=upstox_for.get(symbol), upstox_sem=upstox_sem,
             )
             for i, (symbol, meta) in enumerate(symbols, 1)
         ]
@@ -775,6 +957,18 @@ async def main():
               f"replaced: {merge_counts['replaced']} | holiday skip: {merge_counts['holiday-skip']} | "
               f"stale skip: {merge_counts['stale-skip']} | no daily row: {merge_counts['no-daily-row']} | "
               f"empty history: {merge_counts['empty-history']} | no history at all: {merge_counts['no-history']}")
+        if UPSTOX_STATS["matched"]:
+            print(f"\n🔗 Upstox: {UPSTOX_STATS['matched']} BSE indices matched, "
+                  f"{UPSTOX_STATS['filled']} got {UPSTOX_STATS['candles']} missing candle(s)")
+        if UPSTOX_STATS["unmatched"]:
+            print("   Not found on Upstox (add to UPSTOX_INDEX_OVERRIDES if needed):")
+            for sym, nm in UPSTOX_STATS["unmatched"]:
+                print(f"     {sym:<16} {nm}")
+        if STALE_INDICES:
+            print(f"\n⚠ {len(STALE_INDICES)} indices have no new data for over {STALE_AFTER_DAYS} days "
+                  f"(Finedge not updating them):")
+            for sym, last in sorted(STALE_INDICES.items(), key=lambda x: x[1]):
+                print(f"   {sym:<16} last candle {last}")
         print(f"\n✅ Success: {success}")
         print(f"❌ Failed : {failed}")
         print(f"📦 Total  : {total}\n")
