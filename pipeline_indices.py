@@ -525,6 +525,11 @@ def drop_stale_tail(parsed):
 # of the run (Finedge has stopped updating them).
 STALE_AFTER_DAYS = 7
 STALE_INDICES: dict = {}
+# Indices with no new candle for longer than this are marked "stale": true in
+# index_master.json, and the Index Monitor hides them. When data comes back,
+# the next run drops the flag and the index shows again.
+HIDE_AFTER_DAYS = 30
+LAST_REAL_DATE: dict = {}
 
 
 def merge_daily_into_history(parsed, daily_row):
@@ -757,6 +762,7 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
         if n_stale:
             print(f"[{i}/{total}]   {symbol}: dropped {n_stale} repeated candle(s) at the end (feed not updating)")
         last_real = str(parsed[-1].get("date", ""))[:10]
+        LAST_REAL_DATE[symbol] = last_real
         try:
             if (date.fromisoformat(today_ist()) - date.fromisoformat(last_real)).days > STALE_AFTER_DAYS:
                 STALE_INDICES[symbol] = last_real
@@ -978,6 +984,32 @@ async def main():
                     index_ohlc_map[symbol] = ohlc_arrays
             else:
                 failed += 1
+
+        # Mark long-stale indices in index_master.json (uploaded again with the flag)
+        hidden = []
+        for symbol, last in LAST_REAL_DATE.items():
+            meta = master_parsed.get(symbol)
+            if meta is None:
+                continue
+            try:
+                age = (date.fromisoformat(_today) - date.fromisoformat(last)).days
+            except ValueError:
+                continue
+            if age > HIDE_AFTER_DAYS:
+                meta["stale"] = True
+                meta["last_date"] = last
+                hidden.append((symbol, last))
+            else:
+                meta.pop("stale", None)
+                meta.pop("last_date", None)
+        await upload_with_manifest(client, r2_upload, "index_master.json", master_parsed,
+                                    schema_v=1, extra_meta={"index_count": len(master_parsed),
+                                                            "stale_count": len(hidden)})
+        print(f"✅ index_master.json uploaded again — {len(hidden)} stale index(es) flagged "
+              f"(no data for over {HIDE_AFTER_DAYS} days, hidden on the site)")
+        for symbol, last in sorted(hidden, key=lambda x: x[1]):
+            print(f"   {symbol:<16} last candle {last}")
+        print()
 
         # index_mswing.json — { symbol: {d, w, wprev} }. Independent of the
         # returns endpoint (only needs the history already fetched above),
