@@ -722,6 +722,11 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
     async with sem:
         rows = await fetch_index_history_one(client, meta["api_symbol"], symbol)
         parsed = parse_index_history(rows)
+        # Finedge returns history newest-first. Everything below (daily merge,
+        # stale-tail check, Upstox fill, last-date) needs oldest-first, so sort
+        # here and put the original order back just before upload.
+        newest_first = len(parsed) > 1 and str(parsed[0].get("date", ""))[:10] > str(parsed[-1].get("date", ""))[:10]
+        parsed.sort(key=lambda r: str(r.get("date", ""))[:10])
         up_rows = []
         if upstox_key:
             async with upstox_sem:
@@ -761,7 +766,7 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
         parsed, n_stale = drop_stale_tail(parsed)
         if n_stale:
             print(f"[{i}/{total}]   {symbol}: dropped {n_stale} repeated candle(s) at the end (feed not updating)")
-        last_real = str(parsed[-1].get("date", ""))[:10]
+        last_real = max(str(r.get("date", ""))[:10] for r in parsed)
         LAST_REAL_DATE[symbol] = last_real
         try:
             if (date.fromisoformat(today_ist()) - date.fromisoformat(last_real)).days > STALE_AFTER_DAYS:
@@ -770,6 +775,8 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
             pass
         weekly = compute_weekly_return(parsed)
         msw = compute_index_mswing(parsed)
+        if newest_first:
+            parsed = parsed[::-1]
         ohlc_arrays = build_ohlc_arrays(parsed)
         await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
                                     schema_v=1, extra_meta={"candle_count": len(parsed)})
@@ -1002,6 +1009,14 @@ async def main():
             else:
                 meta.pop("stale", None)
                 meta.pop("last_date", None)
+        if len(hidden) > len(LAST_REAL_DATE) // 4:
+            # that many dead indices at once means a bug or a feed outage, not
+            # discontinued indices — don't hide anything this run
+            print(f"⚠ {len(hidden)} of {len(LAST_REAL_DATE)} indices look stale — too many, flags NOT applied")
+            for symbol, _ in hidden:
+                master_parsed[symbol].pop("stale", None)
+                master_parsed[symbol].pop("last_date", None)
+            hidden = []
         await upload_with_manifest(client, r2_upload, "index_master.json", master_parsed,
                                     schema_v=1, extra_meta={"index_count": len(master_parsed),
                                                             "stale_count": len(hidden)})
