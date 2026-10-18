@@ -17,6 +17,7 @@ jobs:
           pip install httpx boto3 pandas numpy
       - name: Run Indices Pipeline
         env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
@@ -24,6 +25,7 @@ jobs:
           python pipeline_indices.py
       - name: Run RRG Pipeline
         env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
