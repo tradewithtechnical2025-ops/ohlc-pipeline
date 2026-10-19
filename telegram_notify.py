@@ -23,8 +23,12 @@ import time
 import traceback
 import requests
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Secrets pasted with a trailing newline/space, or with a leading "bot",
+# produce a wrong URL and Telegram answers 404 Not Found.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+if TELEGRAM_BOT_TOKEN.lower().startswith("bot"):
+    TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN[3:]
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 PIPELINE_EMOJIS = {
     "pipeline":                   "📊",
@@ -52,7 +56,7 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
     notifications in the main channel). Falls back to TELEGRAM_CHAT_ID if
     not given.
     """
-    target_chat_id = chat_id or TELEGRAM_CHAT_ID
+    target_chat_id = str(chat_id or TELEGRAM_CHAT_ID).strip()
     if not TELEGRAM_BOT_TOKEN or not target_chat_id:
         print("[telegram_notify] Token or chat_id missing — skipping notification.")
         return False
@@ -68,10 +72,41 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
             },
             timeout=10,
         )
-        resp.raise_for_status()
-        return True
+        if resp.ok:
+            return True
+        # Broken HTML in the text (an unescaped "<" or "&", e.g. "R&D" or
+        # "<5%" in a company narrative) is rejected with 400 "can't parse
+        # entities" — send the same text once more as plain text instead.
+        if resp.status_code == 400 and "parse entities" in resp.text.lower():
+            print("[telegram_notify] HTML not accepted by Telegram — resending as plain text")
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id":                  target_chat_id,
+                    "text":                     text,
+                    "disable_notification":     silent,
+                    "disable_web_page_preview": True,
+                },
+                timeout=10,
+            )
+            if resp.ok:
+                return True
+        # Telegram's own reason, without the URL (it contains the bot token)
+        try:
+            reason = resp.json().get("description", "")
+        except Exception:
+            reason = resp.text[:200]
+        hint = {
+            404: "bot token is wrong, revoked or empty — check the TELEGRAM_BOT_TOKEN secret",
+            400: "check the chat id (channel ids start with -100) and the message HTML",
+            403: "the bot is not a member/admin of this chat or was blocked",
+            401: "bot token is not valid",
+        }.get(resp.status_code, "")
+        print(f"[telegram_notify] Failed to send message: HTTP {resp.status_code} {reason}"
+              + (f" — {hint}" if hint else "") + f" (chat {target_chat_id})")
+        return False
     except Exception as exc:
-        print(f"[telegram_notify] Failed to send message: {exc}")
+        print(f"[telegram_notify] Failed to send message: {exc.__class__.__name__}")
         return False
 
 
