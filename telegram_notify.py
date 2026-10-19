@@ -74,6 +74,32 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
         )
         if resp.ok:
             return True
+        # A group made public (or upgraded) becomes a supergroup with a NEW
+        # chat id; Telegram answers 400 "group chat was upgraded to a
+        # supergroup chat" and gives the new id. Send there, and print it so
+        # the GitHub secret can be updated.
+        if resp.status_code == 400:
+            try:
+                new_id = ((resp.json() or {}).get("parameters") or {}).get("migrate_to_chat_id")
+            except Exception:
+                new_id = None
+            if new_id:
+                print(f"[telegram_notify] Chat {target_chat_id} was upgraded to a supergroup — new chat id {new_id}. "
+                      f"Update the chat id secret to {new_id}.")
+                target_chat_id = str(new_id)
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={
+                        "chat_id":                  target_chat_id,
+                        "text":                     text,
+                        "parse_mode":               "HTML",
+                        "disable_notification":     silent,
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10,
+                )
+                if resp.ok:
+                    return True
         # Broken HTML in the text (an unescaped "<" or "&", e.g. "R&D" or
         # "<5%" in a company narrative) is rejected with 400 "can't parse
         # entities" — send the same text once more as plain text instead.
