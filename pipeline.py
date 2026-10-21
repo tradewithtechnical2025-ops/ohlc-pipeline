@@ -4225,8 +4225,8 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,consol_days=3):
         for i in range(swing_n,n-swing_n):
             if all(highs[i]>=highs[i-k] for k in range(1,swing_n+1)) and all(highs[i]>=highs[i+k] for k in range(1,swing_n+1)):
                 sh_price=highs[i]
-                if any(closes[j]>sh_price for j in range(i+1,n-1) if closes[j] is not None): continue
-                broke_today=closes[-1] is not None and closes[-1]>sh_price
+                if any(closes[j]>sh_price * 1.002 for j in range(i+1,n-1) if closes[j] is not None): continue
+                broke_today=closes[-1] is not None and closes[-1]>sh_price * 1.002
                 swing_highs.append((sh_price,dates[i],"BO" if broke_today else "valid"))
         if not swing_highs: continue
         swing_highs.sort(key=lambda x:x[0],reverse=True); used=[False]*len(swing_highs); levels=[]
@@ -4239,23 +4239,23 @@ def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,consol_days=3):
             level=max(c[0] for c in cluster); zone_low=min(c[0] for c in cluster)
             cluster_tag="BO" if any(c[2]=="BO" for c in cluster) else "valid"
             touch_pts=sorted([{"date":c[1],"price":round(c[0],2)} for c in cluster],key=lambda x:x["date"])
-            levels.append((level,zone_low,len(cluster),len(cluster)>=2,touch_pts,cluster_tag))
+            levels.append((level,zone_low,len(cluster),len(cluster)>=2,touch_pts,cluster_tag, [c[0] for c in cluster]))
         curr_close=closes[-1]
         if curr_close is None or curr_close<=0: continue   # bad candle (c=0) guard
-        # Fixed ATR(14)% × 1.5 proximity, matching the chart's Wilder ATR.
+        # Match TwTScript's fixed 4% proximity (not ATR-adjusted).
         atr_value = _calc_atr_series(highs, lows, closes, 14)[-1]
-        near_pct = min(4.0, atr_value / curr_close * 100 * 1.5) if atr_value is not None else None
+        near_pct = 4.0
         curr_date=dates[-1]
         if n>=consol_days:
             rh=[v for v in highs[-consol_days:] if v is not None]; rl=[v for v in lows[-consol_days:] if v is not None]
             range_pct=(max(rh)-min(rl))/curr_close*100 if rh and rl else 0; is_consol=atr_value is not None and range_pct<atr_value/curr_close*100
         else: range_pct=0; is_consol=False
-        for (level,zone_low,touches,is_zone,touch_pts,cluster_tag) in levels:
+        for (level,zone_low,touches,is_zone,touch_pts,cluster_tag,member_highs) in levels:
             if not level or level<=0: continue
             dist_pct=(level-curr_close)/level*100
             if cluster_tag=="BO":
                 state="BO"
-            elif near_pct is not None and 0<=dist_pct<=near_pct: state="Consolidating near HLR" if is_consol else "Near HLR"
+            elif any(abs(curr_close - sh) / sh * 100 <= near_pct and curr_close <= sh * 1.002 for sh in member_highs): state="Consolidating near HLR" if is_consol else "Near HLR"
             else: continue
             signals.append({"symbol":sym,"state":state,"resistance":round(level,2),"zone_low":round(zone_low,2),
                 "is_zone":is_zone,"touches":touches,"touch_points":touch_pts,"dist_pct":round(dist_pct,2),
