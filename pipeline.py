@@ -3699,6 +3699,12 @@ async def run_ep_scan() -> None:
             sq_map=_calc_squeeze_vol_flags(all_data)
             for row in screener_feed:
                 row.update(sq_map.get(row["symbol"],{}))
+            tx_map=_calc_tech_extras(all_data)
+            for row in screener_feed:
+                row.update(tx_map.get(row["symbol"],{}))
+            log.info(f"Tech extras: {len(tx_map)} stocks  "
+                     f"ST buy {sum(1 for v in tx_map.values() if v.get('st_dir')==1)}  "
+                     f"BB expansion {sum(1 for v in tx_map.values() if v.get('bb_exp_days') is not None)}")
             log.info(f"Squeeze/VolShock: TTM {sum(1 for v in sq_map.values() if v['ttm_squeeze'])}  "
                      f"BB {sum(1 for v in sq_map.values() if v['bb_squeeze'])}  "
                      f"VolShocker {sum(1 for v in sq_map.values() if v['vol_shocker'])}")
@@ -5081,6 +5087,178 @@ def _calc_squeeze_vol_flags(all_data):
         out[sym] = row
     return out
 
+
+# ══════════════════════════════════════════════════════════════
+# TECHNICAL EXTRAS (daily) — merged into screener_feed.json rows
+#   st_dir / st_flip_days : Supertrend(10, 3) direction (1 buy, -1 sell) and
+#                           bars since it last flipped (0 = flipped today)
+#   macd_bull / macd_x_days : MACD(12,26,9) line above signal; bars since the
+#                           last bullish crossover (only while still above)
+#   adx / pdi / mdi       : ADX(14) with +DI / -DI (Wilder)
+#   drsi_prev             : yesterday's daily RSI(14), same method as drsi
+#   bb_pos                : close vs Bollinger(20,2): "above" | "inside" | "below"
+#   bb_exp_days           : bars since a Bollinger expansion started (0 = today):
+#                           first day the BB width rose above BB_SQUEEZE_MAX_BBW_PCT
+#                           after at least BB_EXP_MIN_SQUEEZE squeeze days; None if
+#                           the width went back into a squeeze since
+#   w_*                   : the same on weekly candles (weekly squeeze width
+#                           BB_SQUEEZE_MAX_BBW_PCT_W), plus wrsi_prev
+# ══════════════════════════════════════════════════════════════
+BB_EXP_MIN_SQUEEZE = 3      # squeeze days needed right before the expansion
+BB_EXP_LOOKBACK    = 10     # how far back an expansion start is looked for
+BB_SQUEEZE_MAX_BBW_PCT_W = 15.0   # weekly squeeze: BB(20,2) width at or below this % (weekly bands are wider)
+
+
+def _ema_valid(vals, period):
+    """EMA over a series that may start with None (seeded on the first `period` valid values)."""
+    out = [None] * len(vals); k = 2 / (period + 1); seed = []; prev = None
+    for i, v in enumerate(vals):
+        if v is None:
+            out[i] = prev; continue
+        if prev is None:
+            seed.append(v)
+            if len(seed) == period:
+                prev = sum(seed) / period; out[i] = prev
+            continue
+        prev = v * k + prev * (1 - k); out[i] = prev
+    return out
+
+
+def _calc_adx(highs, lows, closes, period=14):
+    """(adx, +di, -di) for the last bar, Wilder smoothing; (None, None, None) if too short."""
+    n = len(closes)
+    if n < period * 2 + 2:
+        return None, None, None
+    tr_s = pdm_s = mdm_s = None; dxs = []; adx = None; pdi = mdi = None
+    trs, pdms, mdms = [], [], []
+    for i in range(1, n):
+        h, l, pc, ph, pl = highs[i], lows[i], closes[i - 1], highs[i - 1], lows[i - 1]
+        if None in (h, l, pc, ph, pl):
+            continue
+        up, dn = h - ph, pl - l
+        pdm = up if (up > dn and up > 0) else 0.0
+        mdm = dn if (dn > up and dn > 0) else 0.0
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        if tr_s is None:
+            trs.append(tr); pdms.append(pdm); mdms.append(mdm)
+            if len(trs) == period:
+                tr_s, pdm_s, mdm_s = sum(trs), sum(pdms), sum(mdms)
+            else:
+                continue
+        else:
+            tr_s = tr_s - tr_s / period + tr
+            pdm_s = pdm_s - pdm_s / period + pdm
+            mdm_s = mdm_s - mdm_s / period + mdm
+        if not tr_s:
+            continue
+        pdi, mdi = 100 * pdm_s / tr_s, 100 * mdm_s / tr_s
+        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0.0
+        if adx is None:
+            dxs.append(dx)
+            if len(dxs) == period:
+                adx = sum(dxs) / period
+        else:
+            adx = (adx * (period - 1) + dx) / period
+    if adx is None:
+        return None, None, None
+    return round(adx, 2), round(pdi, 2), round(mdi, 2)
+
+
+def _tech_core(highs, lows, closes, sq_max, prefix=""):
+    """Supertrend / MACD / ADX / Bollinger fields for one OHLC series (see the table above)."""
+    n = len(closes); row = {}; c = closes[-1]
+    st = _calc_supertrend(highs, lows, closes, 10, 3)
+    dirs = [None if (st[i] is None or closes[i] is None) else (1 if closes[i] > st[i] else -1) for i in range(n)]
+    if dirs[-1] is not None:
+        k = 0
+        for i in range(n - 2, -1, -1):
+            if dirs[i] is None or dirs[i] != dirs[-1]:
+                break
+            k += 1
+        row["st_dir"] = dirs[-1]; row["st_flip_days"] = k
+    e12, e26 = _ema_valid(closes, 12), _ema_valid(closes, 26)
+    macd = [(x - y) if (x is not None and y is not None) else None for x, y in zip(e12, e26)]
+    sig = _ema_valid(macd, 9)
+    if macd[-1] is not None and sig[-1] is not None:
+        bull = macd[-1] > sig[-1]
+        row["macd_bull"] = bull
+        xd = None
+        if bull:
+            xd = 0
+            for i in range(n - 2, -1, -1):
+                if macd[i] is None or sig[i] is None or macd[i] <= sig[i]:
+                    break
+                xd += 1
+        row["macd_x_days"] = xd
+    adx, pdi, mdi = _calc_adx(highs, lows, closes, 14)
+    if adx is not None:
+        row.update({"adx": adx, "pdi": pdi, "mdi": mdi})
+    L = SQUEEZE_LEN
+    win = [v for v in closes[-L:] if v is not None]
+    if len(win) == L and c is not None:
+        sma = sum(win) / L
+        sd = (sum((x - sma) ** 2 for x in win) / L) ** 0.5
+        up, lo = sma + TTM_BB_MULT * sd, sma - TTM_BB_MULT * sd
+        row["bb_pos"] = "above" if c > up else "below" if c < lo else "inside"
+    widths = {}
+    for back in range(BB_EXP_LOOKBACK + BB_EXP_MIN_SQUEEZE + 1):
+        i = n - 1 - back
+        _, bbw = _squeeze_at(highs, lows, closes, i)
+        widths[i] = bbw
+    exp = None
+    for back in range(BB_EXP_LOOKBACK):
+        i = n - 1 - back
+        w = widths.get(i)
+        if w is None or w <= sq_max:
+            continue
+        if any(widths.get(j) is None or widths[j] <= sq_max for j in range(i + 1, n)):
+            break    # went back into a squeeze after this bar
+        pre = [widths.get(i - 1 - t) for t in range(BB_EXP_MIN_SQUEEZE)]
+        if all(v is not None and v <= sq_max for v in pre):
+            exp = back
+            break
+    row["bb_exp_days"] = exp
+    return {prefix + k: v for k, v in row.items()}
+
+
+def _weekly_ohlc(dates, highs, lows, closes):
+    """ISO-week bars, the current unfinished week included (same as wrsi)."""
+    wk, order = {}, []
+    for d, h, l, c in zip(dates, highs, lows, closes):
+        if None in (h, l, c) or not d:
+            continue
+        try:
+            k = date.fromisoformat(d[:10]).isocalendar()[:2]
+        except Exception:
+            continue
+        if k not in wk:
+            wk[k] = [h, l, c]; order.append(k)
+        else:
+            w = wk[k]; w[0] = max(w[0], h); w[1] = min(w[1], l); w[2] = c
+    rows = [wk[k] for k in order]
+    return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+
+
+def _calc_tech_extras(all_data):
+    out = {}
+    for sym, s in all_data.items():
+        try:
+            highs, lows, closes = s["h"], s["l"], s["c"]
+            n = len(closes)
+            if n < 60 or closes[-1] is None:
+                continue
+            row = _tech_core(highs, lows, closes, BB_SQUEEZE_MAX_BBW_PCT)
+            # yesterday's RSI, same window as drsi in _build_screener_feed
+            row["drsi_prev"] = _calc_rsi([v for v in closes[-31:-1] if v is not None])
+            # weekly: same indicators on ISO-week candles (fields prefixed w_)
+            wh, wl, wc = _weekly_ohlc(s.get("d") or [], highs, lows, closes)
+            if len(wc) >= 40:
+                row.update(_tech_core(wh, wl, wc, BB_SQUEEZE_MAX_BBW_PCT_W, "w_"))
+                row["wrsi_prev"] = _calc_rsi(wc[-31:-1])
+            out[sym] = row
+        except Exception:
+            continue
+    return out
 
 def _calc_multi_tf_ma(all_data, daily_sma_periods=(10, 21, 50, 200),
                        weekly_periods=(10, 30, 40, 50), monthly_periods=(10, 21)):
