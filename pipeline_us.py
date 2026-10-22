@@ -7,6 +7,8 @@ built by pipeline_us_meta.py from Wikipedia constituent lists. See us_universe.p
 
 R2 files written:
   us_ohlc_<SYMBOL>.json   -> {symbol, updated, company{...}, indices[...], bars[{date,o,h,l,c,v}]}
+  us_market_overview.json -> historical US breadth (up to 504 sessions, ETFs excluded)
+  us_breadth_state.json   -> compact per-symbol state for failed-run recovery
   us_screener_feed.json   -> {updated, count, stocks[{symbol, name, indices, exchange, sector, ..., ltp, pct_ch}]}
 Read (not written): us_company_meta.json, us_universe.json
 
@@ -330,8 +332,117 @@ def compute_ma(bars):
                     "price_cross_up": (closes[-1] > current and closes[-2] <= previous)
                                       if previous is not None else None,
                 }
+            crosses = {}
+            pairs = list(zip(periods, periods[1:]))
+            if tf == "D":
+                pairs.append((50, 200))
+            for fast, slow in dict.fromkeys(pairs):
+                f, sl = ma_series(closes, fast, kind), ma_series(closes, slow, kind)
+                crosses[f"{fast}_{slow}"] = (f[-1] > sl[-1] and f[-2] <= sl[-2]) if len(sl) > 1 and sl[-2] is not None else None
+            block[kind + "_cross_up"] = crosses
             block[kind] = values
         result["timeframes"][tf] = block
+    return result
+
+
+
+TECH_VERSION = 1
+
+
+def technical_bars(bars, tf):
+    """Aggregate valid daily OHLCV; incomplete volume is unknown, never zero-filled."""
+    daily = {}
+    for b in bars:
+        try:
+            day = datetime.strptime(str(b["date"]), "%Y-%m-%d").date()
+            o, h, l, c = (float(b[k]) for k in ("o", "h", "l", "c"))
+            if not all(math.isfinite(x) and x > 0 for x in (o, h, l, c)) or h < max(o, c, l) or l > min(o, c):
+                continue
+            v = b.get("v")
+            v = float(v) if v is not None else None
+            if v is not None and (not math.isfinite(v) or v < 0):
+                v = None
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        daily[day] = {"date": day.isoformat(), "o": o, "h": h, "l": l, "c": c, "v": v}
+    grouped = {}
+    for day, b in sorted(daily.items()):
+        key = day if tf == "D" else day.toordinal() - day.weekday() if tf == "W" else (day.year, day.month)
+        if key not in grouped:
+            grouped[key] = dict(b)
+        else:
+            g = grouped[key]
+            g.update(h=max(g["h"], b["h"]), l=min(g["l"], b["l"]), c=b["c"], date=b["date"],
+                     v=g["v"] + b["v"] if g["v"] is not None and b["v"] is not None else None)
+    return list(grouped.values())
+
+
+def wilder_last(values, period):
+    if len(values) < period:
+        return None
+    value = sum(values[:period]) / period
+    for x in values[period:]:
+        value = (value * (period - 1) + x) / period
+    return value
+
+
+def technical_snapshot(bars):
+    """Period-bar metrics; volume baselines exclude the current bar.
+
+    NR7 requires a strictly smaller range. MCP = last three bars inside
+    bar[-4]. Breakouts compare today's close with prior completed highs.
+    Tightness = (highest high / lowest low - 1) * 100 over 3/5 bars.
+    """
+    if not bars:
+        return {}
+    c = [b["c"] for b in bars]
+    last, previous = bars[-1], bars[-2] if len(bars) > 1 else None
+    out = {}
+    for n in (20, 50):
+        vols = [b["v"] for b in bars[-n-1:-1]]
+        avg = sum(vols) / n if len(vols) == n and all(v is not None for v in vols) else None
+        out[f"avg_volume{n}"] = avg
+        out[f"rvol{n}"] = last["v"] / avg if avg and last["v"] is not None else None
+    # ATR includes the first bar's own range, then true ranges; Wilder smoothing.
+    tr = [max(b["h"] - b["l"], abs(b["h"] - bars[i-1]["c"]), abs(b["l"] - bars[i-1]["c"]))
+          if i else b["h"] - b["l"] for i, b in enumerate(bars)]
+    atr = wilder_last(tr, 14)
+    out["atr14"] = atr
+    out["atr_pct"] = atr / c[-1] * 100 if atr is not None else None
+    mean = sum(c[-20:]) / 20 if len(c) >= 20 else None
+    std = math.sqrt(sum((v - mean) ** 2 for v in c[-20:]) / 20) if mean else None
+    out["bbw_pct"] = 4 * std / mean * 100 if mean else None
+    changes = [b - a for a, b in zip(c, c[1:])]
+    gain = wilder_last([max(x, 0) for x in changes], 14)
+    loss = wilder_last([max(-x, 0) for x in changes], 14)
+    out["rsi14"] = None if gain is None else (50 if gain == 0 and loss == 0 else 100 if loss == 0 else 100 - 100 / (1 + gain / loss))
+    out["mswing"] = ((c[-1] / c[-21] - 1) / 20 + (c[-1] / c[-51] - 1) / 50) if len(c) > 50 else None
+    for n in (3, 5):
+        out[f"tight{n}_pct"] = (max(b["h"] for b in bars[-n:]) / min(b["l"] for b in bars[-n:]) - 1) * 100 if len(bars) >= n else None
+    out["ib"] = last["h"] <= previous["h"] and last["l"] >= previous["l"] if previous else None
+    out["nr7"] = tr[-1] is not None and (last["h"] - last["l"]) < min(b["h"] - b["l"] for b in bars[-7:-1]) if len(bars) >= 7 else None
+    out["mcp"] = all(b["h"] <= bars[-4]["h"] and b["l"] >= bars[-4]["l"] for b in bars[-3:]) if len(bars) >= 4 else None
+    out["gap_pct"] = (last["o"] / previous["c"] - 1) * 100 if previous else None
+    out["gap_up"] = last["o"] > previous["h"] if previous else None
+    out["gap_down"] = last["o"] < previous["l"] if previous else None
+    for n in (20, 50, 252):
+        prior = bars[-n-1:-1]
+        out[f"breakout{n}"] = last["c"] > max(b["h"] for b in prior) if len(prior) == n else None
+    return out
+
+
+def compute_technical(bars):
+    daily = technical_bars(bars, "D")
+    result = {"version": TECH_VERSION, "includes_developing_period": True,
+              "timeframes": {tf: technical_snapshot(technical_bars(bars, tf)) for tf in ("D", "W", "M")}}
+    # A full 252-session window is required for a 52-week high/low field.
+    window = daily[-252:]
+    high = max(b["h"] for b in window) if len(window) == 252 else None
+    low = min(b["l"] for b in window) if len(window) == 252 else None
+    close = daily[-1]["c"] if daily else None
+    result.update(high52=high, low52=low, below_high52_pct=(1 - close / high) * 100 if high else None,
+                  above_low52_pct=(close / low - 1) * 100 if low else None,
+                  asof=daily[-1]["date"] if daily else None)
     return result
 
 
@@ -349,6 +460,88 @@ def rs_ratings(scores: dict, stock_syms: set) -> dict:
         pct = bisect.bisect_left(pool, v) / max(n - 1, 1)     # 0..1, share of stocks this one beats
         out[sym] = max(1, min(99, int(pct * 98) + 1))
     return out
+
+
+
+def market_history(bars):
+    """Historical breadth inputs for the current tracked universe, stocks only.
+
+    Each date uses only history through that date. Keep the latest 504 sessions;
+    per-MA eligible counts exclude securities lacking enough history.
+    """
+    daily = technical_bars(bars, "D")
+    closes = [b["c"] for b in daily]
+    series = {f"{kind.lower()}{n}": ma_series(closes, n, kind)
+              for kind in ("EMA", "SMA") for n in (10, 20, 21, 40, 50, 200)}
+    rows = []
+    for i in range(max(0, len(daily) - 504), len(daily)):
+        b = daily[i]
+        r = {"date": b["date"], "advance": int(i > 0 and closes[i] > closes[i-1]),
+             "decline": int(i > 0 and closes[i] < closes[i-1]), "ad_eligible": int(i > 0)}
+        for key, values in series.items():
+            r[key] = None if values[i] is None else int(closes[i] > values[i])
+        window = daily[i-251:i+1] if i >= 251 else []
+        r["high52"] = int(b["h"] >= max(x["h"] for x in window)) if window else None
+        r["low52"] = int(b["l"] <= min(x["l"] for x in window)) if window else None
+        r["mswing"] = ((closes[i] / closes[i-20] - 1) / 20 + (closes[i] / closes[i-50] - 1) / 50) if i >= 50 else None
+        rows.append(r)
+    return rows
+
+
+def aggregate_breadth(histories):
+    dates = {}
+    keys = [f"{kind}{n}" for kind in ("ema", "sma") for n in (10, 20, 21, 40, 50, 200)] + ["high52", "low52"]
+    for hist in histories.values():
+        for row in hist:
+            r = dates.setdefault(row["date"], {"date": row["date"], "total": 0, "advance": 0, "decline": 0,
+                      "ad_eligible": 0, "mswing_sum": 0, "mswing_eligible": 0,
+                      **{k: 0 for k in keys}, **{k + "_eligible": 0 for k in keys}})
+            r["total"] += 1
+            for key in ("advance", "decline", "ad_eligible"):
+                r[key] += row[key]
+            for key in keys:
+                if row[key] is not None:
+                    r[key] += row[key]
+                    r[key + "_eligible"] += 1
+            if row["mswing"] is not None:
+                r["mswing_sum"] += row["mswing"]
+                r["mswing_eligible"] += 1
+    out, ad_line = [], 0
+    for date in sorted(dates):
+        r = dates[date]
+        r["unchanged"] = r["ad_eligible"] - r["advance"] - r["decline"]
+        r["net_ad"] = r["advance"] - r["decline"]
+        ad_line += r["net_ad"]
+        r["ad_line"] = ad_line
+        r["net_high_low"] = r["high52"] - r["low52"]
+        r["mswing"] = r.pop("mswing_sum") / r["mswing_eligible"] if r["mswing_eligible"] else None
+        for key in keys:
+            r[key + "_pct"] = r[key] / r[key + "_eligible"] * 100 if r[key + "_eligible"] else None
+        out.append(r)
+    return out[-504:]
+
+
+async def publish_market_data(client, latest_bars, rows):
+    # Existing rows are retained only for failed symbols, never assigned today's date.
+    previous = await r2_download(client, "us_breadth_state.json") or {}
+    histories = dict(previous.get("histories", {}))
+    fields = previous.get("fields")
+    if fields:
+        histories = {sym: [dict(zip(fields, row)) for row in history] for sym, history in histories.items()}
+    tracked = {s for s in US_SYMBOLS if UNIVERSE.get(s, {}).get("indices") != ["ETF"]}
+    histories = {s: h for s, h in histories.items() if s in tracked}
+    for sym, info in latest_bars.items():
+        if sym in tracked:
+            histories[sym] = info["market_history"]
+    payload = {"version": 1, "updated": now_iso(), "universe": "Current tracked US stocks; excludes ETFs",
+               "method": "Current-universe historical breadth, not point-in-time index membership",
+               "tracked": len(tracked), "covered": len(histories),
+               "history": aggregate_breadth(histories)}
+    # Keep compact symbol histories privately in a second file for failed-run recovery.
+    fields = list(next((row for hist in histories.values() for row in hist), {}).keys())
+    packed = {sym: [[row.get(k) for k in fields] for row in hist] for sym, hist in histories.items()}
+    await r2_upload(client, "us_breadth_state.json", {"version": 1, "fields": fields, "histories": packed})
+    await r2_upload(client, "us_market_overview.json", payload)
 
 
 async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
@@ -374,6 +567,7 @@ async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
             "name": m.get("name") or info.get("name") or UNIVERSE.get(symbol, {}).get("name") or symbol,
             "indices": indices,
             "exchange": m.get("exchangeName"),
+            "themes": m.get("themes") if isinstance(m.get("themes"), list) else [],
             "sector": m.get("sector"),
             "industry": m.get("industry"),
             "mcap": m.get("marketCap"),
@@ -385,6 +579,7 @@ async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
             "rs_score": info["perf"]["rs_score"],
             "rs_rating": None,      # filled below once all scores are known
             "ma": info["ma"],
+            "technical": info["technical"],
         })
 
     # RS rating: rank every row's score (fresh rows + kept-over rows from failed symbols)
@@ -396,8 +591,10 @@ async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
     if not rows:
         log.warning("  screener feed: nothing to write, skipping")
         return
-    await r2_upload(r2_client, "us_screener_feed.json", {"updated": now_iso(), "schema_version": 3, "ma_version": MA_SCHEMA_VERSION, "count": len(rows), "stocks": rows})
+    await r2_upload(r2_client, "us_screener_feed.json", {"updated": now_iso(), "schema_version": 5, "ma_version": MA_SCHEMA_VERSION, "technical_version": TECH_VERSION, "count": len(rows), "stocks": rows})
     log.info(f"  screener feed: uploaded ({len(rows)} symbols)")
+    await publish_market_data(r2_client, latest_bars, rows)
+    log.info("  US market breadth: uploaded historical overview")
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +623,7 @@ async def _upload_full(r2_client, symbols, all_bars, meta_stocks, stats, latest_
             })
             stats["ok"] += 1
             latest_bars[sym] = {"name": company.get("name"), "last": bars[-1],
-                                "prev": bars[-2] if len(bars) > 1 else None, "perf": compute_perf(bars), "ma": compute_ma(bars)}
+                                "prev": bars[-2] if len(bars) > 1 else None, "perf": compute_perf(bars), "ma": compute_ma(bars), "technical": compute_technical(bars), "market_history": market_history(bars)}
         except Exception as e:
             log.error(f"  {sym}: {e}")
             stats["failed"].append(sym)
@@ -479,7 +676,7 @@ async def run_daily():
                 stats["ok"] += 1
                 latest_bars[sym] = {"name": (existing.get("company") or {}).get("name"),
                                     "last": bars[-1], "prev": bars[-2] if len(bars) > 1 else None,
-                                    "perf": compute_perf(bars), "ma": compute_ma(bars)}
+                                    "perf": compute_perf(bars), "ma": compute_ma(bars), "technical": compute_technical(bars), "market_history": market_history(bars)}
             except Exception as e:
                 log.error(f"  {sym}: {e}")
                 stats["failed"].append(sym)
