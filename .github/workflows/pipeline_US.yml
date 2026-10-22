@@ -12,9 +12,9 @@ on:
         default: "daily"
         type: choice
         options:
-          - backfill   # pipeline_us.py --mode backfill (Yahoo, last 3 years adjusted OHLC)
+          - backfill   # pipeline_us.py --mode backfill (Yahoo, 3y adjusted OHLC, all ~520 symbols)
           - daily      # pipeline_us.py --mode daily (Yahoo, last 10 days merged — heals gaps)
-          - meta       # pipeline_us_meta.py (Yahoo sector/industry/market cap)
+          - meta       # pipeline_us_meta.py (index lists from Wikipedia + Yahoo sector/industry/mcap)
 
 # Don't let a manual backfill and a scheduled daily run write the same R2 files at once
 concurrency:
@@ -24,7 +24,7 @@ concurrency:
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: pip install httpx "yfinance>=0.2.50" pandas
+        run: pip install httpx "yfinance>=0.2.50" pandas lxml
 
       - name: Run Yahoo OHLC pipeline (backfill or daily)
         if: steps.pick.outputs.mode == 'backfill' || steps.pick.outputs.mode == 'daily'
