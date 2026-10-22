@@ -1,382 +1,144 @@
 """
-pipeline_us.py
-US Stocks OHLC pipeline (Yahoo Finance via yfinance) for tradewithtech.in
+pipeline_us_meta.py
+1) Rebuilds us_universe.json (index constituents from Wikipedia — see us_universe.py)
+2) Fetches company meta from Yahoo for every symbol -> us_company_meta.json on R2
 
-Symbols: everything in us_universe.json (S&P 500 + Nasdaq-100 + Dow 30 + a few ETFs, ~520 unique),
-built by pipeline_us_meta.py from Wikipedia constituent lists. See us_universe.py.
+us_company_meta.json:
+  {
+    "updated": "...Z",
+    "count": N,
+    "stocks": {
+      "AAPL": {"name", "indices", "sector", "industry", "marketCap", "exchange", "exchangeName",
+               "country", "website", "employees", "beta", "pe", "fwdPe", "divYield",
+               "high52", "low52", "avgVolume", "sharesOut", "description", "startDate"},
+      ...
+    }
+  }
 
-R2 files written:
-  us_ohlc_<SYMBOL>.json   -> {symbol, updated, company{...}, indices[...], bars[{date,o,h,l,c,v}]}
-  us_screener_feed.json   -> {updated, count, stocks[{symbol, name, indices, exchange, sector, ..., ltp, pct_ch}]}
-Read (not written): us_company_meta.json, us_universe.json
+Existing entries are MERGED field by field: a field Yahoo didn't return this time keeps its old value,
+and fields this script doesn't know about are left untouched.
 
-  - Prices are split/dividend ADJUSTED (no fake crashes on splits).
-  - Daily mode pulls the last 10 days and merges, so a missed run never leaves a gap.
-  - A symbol newly added to an index gets its full history automatically on the next daily run.
-
-Env vars (GitHub Actions secrets): WORKER_URL, WORKER_TOKEN
-
-Run modes:
-  python pipeline_us.py --mode backfill   # 3y history for all symbols, overwrites per-symbol files
-  python pipeline_us.py --mode daily      # last 10 days merged; backfills symbols with no file yet
+Env vars: WORKER_URL, WORKER_TOKEN
+Run: python pipeline_us_meta.py
 """
 
-import os
 import sys
-import json
 import time
 import asyncio
-import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import httpx
-import pandas as pd
 import yfinance as yf
 
-import us_universe
+import pipeline_us as p
+from pipeline_us import r2_upload, r2_download, now_iso, EXCHANGE_NAMES
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
+log = logging.getLogger("meta")
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
-WORKER_URL     = os.environ["WORKER_URL"].rstrip("/")
-WORKER_TOKEN   = os.environ["WORKER_TOKEN"]
-WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
-
-BACKFILL_PERIOD    = "3y"
-DAILY_PERIOD       = "10d"   # overlap window: heals gaps from missed runs
-YAHOO_CHUNK        = 100     # symbols per yf.download call
-RETRY              = 5
-UPLOAD_CONCURRENCY = 10      # parallel Worker requests
-LOG_EVERY          = 50      # progress log interval (avoid 500 log lines)
-
-# Filled at runtime from us_universe.json
-US_SYMBOLS: list[str] = []
-UNIVERSE: dict = {}          # symbol -> {"name", "indices"}
-UNIVERSE_INDICES: dict = {}  # index key -> {"name", "count", "source"}
-
-EXCHANGE_NAMES = {
-    "NMS": "NASDAQ", "NGM": "NASDAQ", "NCM": "NASDAQ", "NAS": "NASDAQ",
-    "NYQ": "NYSE", "NYS": "NYSE", "ASE": "NYSE American", "PCX": "NYSE Arca",
-    "BTS": "Cboe BZX", "CXI": "Cboe BZX",
-}
+META_FILE    = "us_company_meta.json"
+WORKERS      = 4      # parallel Yahoo info requests
+RETRY_PASSES = 2      # extra passes over symbols that failed
+LOG_EVERY    = 100
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
-def r2_filename(symbol: str) -> str:
-    return f"us_ohlc_{symbol.replace('.', '_')}.json"
-
-
-# ---------------------------------------------------------------------------
-# Worker upload / download (unchanged pattern from pipeline_nse.py)
-# ---------------------------------------------------------------------------
-
-async def r2_upload(client: httpx.AsyncClient, filename: str, data):
-    if not isinstance(data, (bytes, str)):
-        data = json.dumps(data, separators=(",", ":"))
-    if isinstance(data, str):
-        data = data.encode()
-    url = f"{WORKER_URL}?file={filename}"
-    last_err = None
-    for attempt in range(RETRY):
-        try:
-            r = await client.post(url, headers={**WORKER_HEADERS, "Content-Type": "application/json"}, content=data, timeout=90)
-        except httpx.RequestError as e:
-            last_err = e
-            log.warning(f"  Upload {filename}: {e}, retry {attempt + 1}")
-            await asyncio.sleep(2 ** attempt)
-            continue
-        if r.status_code == 200:
-            return
-        last_err = RuntimeError(f"Upload failed: HTTP {r.status_code}")
-        log.warning(f"  Upload {filename}: HTTP {r.status_code}, retry {attempt + 1}")
-        await asyncio.sleep(2 ** attempt)
-    raise last_err
-
-
-async def r2_download(client: httpx.AsyncClient, filename: str):
-    url = f"{WORKER_URL}/{filename}"
-    last_err = None
-    for attempt in range(RETRY):
-        try:
-            r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
-        except httpx.RequestError as e:
-            last_err = e
-            log.warning(f"  Download {filename}: {e}, retry {attempt + 1}")
-            await asyncio.sleep(2 ** attempt)
-            continue
-        if r.status_code == 404:
-            return None
-        if r.status_code == 200:
-            return r.json()
-        last_err = RuntimeError(f"Download failed: HTTP {r.status_code}")
-        log.warning(f"  Download {filename}: HTTP {r.status_code}, retry {attempt + 1}")
-        await asyncio.sleep(2 ** attempt)
-    raise last_err
-
-
-# ---------------------------------------------------------------------------
-# Universe
-# ---------------------------------------------------------------------------
-
-async def init_universe(client, rebuild=False):
-    """Load us_universe.json (built daily by the meta job); build it if missing or rebuild=True."""
-    uni = {} if rebuild else await us_universe.load_universe(client, r2_download)
-    if not uni.get("symbols"):
-        log.info("  building universe from Wikipedia")
-        uni = await us_universe.build_universe(client, r2_download, r2_upload, now_iso)
-    UNIVERSE.clear()
-    UNIVERSE.update(uni["symbols"])
-    US_SYMBOLS[:] = list(UNIVERSE)
-    UNIVERSE_INDICES.clear()
-    UNIVERSE_INDICES.update(uni.get("indices", {}))
-    counts = ", ".join(f"{k} {v['count']}" for k, v in uni.get("indices", {}).items())
-    log.info(f"Universe: {len(US_SYMBOLS)} symbols ({counts})")
-
-
-# ---------------------------------------------------------------------------
-# Yahoo
-# ---------------------------------------------------------------------------
-
-def _r(x, nd=4):
-    return None if pd.isna(x) else round(float(x), nd)
-
-
-def _download_chunk(symbols, period):
-    for attempt in range(3):
-        try:
-            data = yf.download(symbols, period=period, interval="1d", group_by="ticker",
-                               auto_adjust=True, actions=False, threads=True, progress=False)
-            if not data.empty:
-                return data
-        except Exception as e:
-            log.warning(f"  Yahoo chunk error: {e}")
-        log.warning(f"  Yahoo returned nothing for chunk, retry {attempt + 1}")
-        time.sleep(10 * (attempt + 1))
-    return pd.DataFrame()
-
-
-def yahoo_bars(symbols, period) -> dict:
-    """Batched downloads -> {symbol: [bar, ...]} (adjusted OHLC). Missing symbols are absent."""
-    out = {}
-    for i in range(0, len(symbols), YAHOO_CHUNK):
-        chunk = symbols[i:i + YAHOO_CHUNK]
-        data = _download_chunk(chunk, period)
-        if data.empty:
-            continue
-        for sym in chunk:
-            try:
-                df = data[sym] if isinstance(data.columns, pd.MultiIndex) else data
-            except KeyError:
-                continue
-            df = df.dropna(subset=["Close"])
-            if df.empty:
-                continue
-            out[sym] = [
-                {"date": idx.strftime("%Y-%m-%d"), "o": _r(row.Open), "h": _r(row.High),
-                 "l": _r(row.Low), "c": _r(row.Close), "v": None if pd.isna(row.Volume) else int(row.Volume)}
-                for idx, row in df.iterrows()
-            ]
-        log.info(f"  Yahoo {period}: {min(i + YAHOO_CHUNK, len(symbols))}/{len(symbols)} requested, {len(out)} received")
-        time.sleep(1)
-    return out
-
-
-def merge_bars(old, new):
-    by_date = {b["date"]: b for b in old}
-    by_date.update({b["date"]: b for b in new})   # newer data wins (also fixes revised bars)
-    return [by_date[d] for d in sorted(by_date)]
-
-
-# ---------------------------------------------------------------------------
-# Meta + screener
-# ---------------------------------------------------------------------------
-
-async def load_meta(client) -> dict:
+def fetch_one(symbol: str) -> dict:
+    """Return meta dict for one symbol, or {} on failure (never raises)."""
     try:
-        return ((await r2_download(client, "us_company_meta.json")) or {}).get("stocks", {})
-    except Exception as e:
-        log.warning(f"  couldn't load us_company_meta.json ({e}); sector/industry/mcap blank")
+        i = yf.Ticker(symbol).info or {}
+    except Exception:
         return {}
-
-
-def company_block(sym, meta_stocks) -> dict:
-    m = meta_stocks.get(sym, {})
+    name = i.get("longName") or i.get("shortName")
+    if not name:
+        return {}
+    div = i.get("dividendYield")
+    first = i.get("firstTradeDateEpochUtc")
+    exch = i.get("exchange")
     return {
-        "name": m.get("name") or UNIVERSE.get(sym, {}).get("name"),
-        "exchangeCode": m.get("exchange"),
-        "exchangeName": m.get("exchangeName"),
-        "description": m.get("description"),
-        "startDate": m.get("startDate"),
+        "name":         name,
+        "sector":       i.get("sector"),
+        "industry":     i.get("industry"),
+        "marketCap":    i.get("marketCap") or i.get("totalAssets"),   # ETFs report AUM as totalAssets
+        "exchange":     exch,
+        "exchangeName": EXCHANGE_NAMES.get(exch, exch),
+        "country":      i.get("country"),
+        "website":      i.get("website"),
+        "employees":    i.get("fullTimeEmployees"),
+        "beta":         i.get("beta"),
+        "pe":           i.get("trailingPE"),
+        "fwdPe":        i.get("forwardPE"),
+        # yfinance has returned this both as a fraction (0.005) and as a percent (0.5); store percent
+        "divYield":     None if div is None else (round(div * 100, 4) if div < 0.2 else round(div, 4)),
+        "high52":       i.get("fiftyTwoWeekHigh"),
+        "low52":        i.get("fiftyTwoWeekLow"),
+        "avgVolume":    i.get("averageVolume"),
+        "sharesOut":    i.get("sharesOutstanding"),
+        "description":  i.get("longBusinessSummary"),
+        "startDate":    datetime.fromtimestamp(first, timezone.utc).date().isoformat() if first else None,
     }
 
 
-async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
-    try:
-        prev_feed = await r2_download(r2_client, "us_screener_feed.json") or {}
-    except Exception:
-        prev_feed = {}
-    prev_rows = {r["symbol"]: r for r in prev_feed.get("stocks", [])}
-
-    rows = []
-    for symbol in US_SYMBOLS:
-        indices = UNIVERSE.get(symbol, {}).get("indices", [])
-        info = latest_bars.get(symbol)
-        if not info:
-            if symbol in prev_rows:          # failed this run: keep yesterday's row
-                rows.append({**prev_rows[symbol], "indices": indices})
-            continue
-        last, prev = info["last"], info["prev"]
-        change_pct = ((last["c"] - prev["c"]) / prev["c"]) * 100 if prev and prev.get("c") else None
-        m = meta_stocks.get(symbol, {})
-        rows.append({
-            "symbol": symbol,
-            "name": m.get("name") or info.get("name") or UNIVERSE.get(symbol, {}).get("name") or symbol,
-            "indices": indices,
-            "exchange": m.get("exchangeName"),
-            "sector": m.get("sector"),
-            "industry": m.get("industry"),
-            "mcap": m.get("marketCap"),
-            "ltp": last["c"],
-            "pct_ch": None if change_pct is None else round(change_pct, 4),
-            "volume": last.get("v"),
-            "date": last["date"],
-        })
-
-    if not rows:
-        log.warning("  screener feed: nothing to write, skipping")
-        return
-    await r2_upload(r2_client, "us_screener_feed.json", {"updated": now_iso(), "count": len(rows), "stocks": rows})
-    log.info(f"  screener feed: uploaded ({len(rows)} symbols)")
+def fetch_all(symbols) -> dict:
+    results, pending = {}, list(symbols)
+    for attempt in range(1 + RETRY_PASSES):
+        if attempt:
+            log.info(f"  retry pass {attempt}: {len(pending)} symbols, waiting {20 * attempt}s")
+            time.sleep(20 * attempt)
+        with ThreadPoolExecutor(WORKERS) as ex:
+            for n, (sym, m) in enumerate(zip(pending, ex.map(fetch_one, pending)), 1):
+                if m:
+                    results[sym] = m
+                if n % LOG_EVERY == 0:
+                    log.info(f"  info {n}/{len(pending)} (ok so far: {len(results)})")
+        pending = [s for s in pending if s not in results]
+        if not pending:
+            break
+    return results
 
 
-# ---------------------------------------------------------------------------
-# Modes
-# ---------------------------------------------------------------------------
+async def main():
+    async with httpx.AsyncClient() as client:
+        await p.init_universe(client, rebuild=True)     # fresh index lists every run
+        symbols = p.US_SYMBOLS
 
-async def _gather_limited(coros, limit):
-    sem = asyncio.Semaphore(limit)
-    async def run(c):
-        async with sem:
-            return await c
-    return await asyncio.gather(*(run(c) for c in coros))
-
-
-async def _upload_full(r2_client, symbols, all_bars, meta_stocks, stats, latest_bars):
-    """Write complete per-symbol files (used by backfill and for brand-new symbols in daily)."""
-    done = [0]
-
-    async def upload(sym):
-        bars = all_bars[sym]
-        company = company_block(sym, meta_stocks)
+        # Read existing meta BEFORE the slow part; never overwrite a file we couldn't read
         try:
-            await r2_upload(r2_client, r2_filename(sym), {
-                "symbol": sym, "updated": now_iso(), "company": company,
-                "indices": UNIVERSE.get(sym, {}).get("indices", []), "bars": bars,
-            })
-            stats["ok"] += 1
-            latest_bars[sym] = {"name": company.get("name"), "last": bars[-1],
-                                "prev": bars[-2] if len(bars) > 1 else None}
+            existing = await r2_download(client, META_FILE) or {}
         except Exception as e:
-            log.error(f"  {sym}: {e}")
-            stats["failed"].append(sym)
-        done[0] += 1
-        if done[0] % LOG_EVERY == 0 or done[0] == len(symbols):
-            log.info(f"  uploaded {done[0]}/{len(symbols)}")
+            log.error(f"Couldn't read existing {META_FILE} ({e}); aborting to avoid clobbering it")
+            sys.exit(1)
 
-    await _gather_limited([upload(s) for s in symbols], UPLOAD_CONCURRENCY)
+        log.info(f"Meta: fetching {len(symbols)} symbols from Yahoo ({WORKERS} parallel)")
+        fresh = await asyncio.to_thread(fetch_all, symbols)
+        failed = [s for s in symbols if s not in fresh]
+        log.info(f"  Yahoo: got {len(fresh)}/{len(symbols)}")
+        if not fresh:
+            log.error("Nothing fetched; leaving existing meta file untouched")
+            sys.exit(1)
 
+        stocks = existing.get("stocks", {})
+        for sym in symbols:
+            merged = dict(stocks.get(sym, {}))
+            merged.update({k: v for k, v in fresh.get(sym, {}).items() if v is not None})
+            merged["indices"] = p.UNIVERSE[sym]["indices"]          # always current
+            merged.setdefault("name", p.UNIVERSE[sym].get("name"))
+            stocks[sym] = merged
+        for sym in stocks:                      # dropped from every index: clear stale tags
+            if sym not in p.UNIVERSE:
+                stocks[sym]["indices"] = []
+        existing.update({"updated": now_iso(), "count": len(stocks), "stocks": stocks})
+        await r2_upload(client, META_FILE, existing)
 
-async def run_backfill():
-    stats = {"ok": 0, "failed": []}
-    latest_bars = {}
-    async with httpx.AsyncClient() as r2_client:
-        await init_universe(r2_client)
-        log.info(f"Backfill: {BACKFILL_PERIOD} for {len(US_SYMBOLS)} symbols")
-        all_bars = await asyncio.to_thread(yahoo_bars, US_SYMBOLS, BACKFILL_PERIOD)
-        stats["failed"] = [s for s in US_SYMBOLS if s not in all_bars]
-        meta_stocks = await load_meta(r2_client)
-        await _upload_full(r2_client, list(all_bars), all_bars, meta_stocks, stats, latest_bars)
-        await generate_screener_feed(r2_client, latest_bars, meta_stocks)
-    return stats
-
-
-async def run_daily():
-    stats = {"ok": 0, "failed": []}
-    latest_bars = {}
-    async with httpx.AsyncClient() as r2_client:
-        await init_universe(r2_client)
-        log.info(f"Daily update: last {DAILY_PERIOD} for {len(US_SYMBOLS)} symbols")
-        all_bars = await asyncio.to_thread(yahoo_bars, US_SYMBOLS, DAILY_PERIOD)
-        stats["failed"] = [s for s in US_SYMBOLS if s not in all_bars]
-        meta_stocks = await load_meta(r2_client)
-        missing_files, done = [], [0]
-
-        async def update(sym):
-            try:
-                existing = await r2_download(r2_client, r2_filename(sym))
-                if existing is None:
-                    missing_files.append(sym)
-                    return
-                bars = merge_bars(existing.get("bars", []), all_bars[sym])
-                existing["bars"] = bars
-                existing["updated"] = now_iso()
-                existing["indices"] = UNIVERSE.get(sym, {}).get("indices", [])
-                if sym in meta_stocks:      # keep company block fresh as meta improves
-                    existing["company"] = {**(existing.get("company") or {}),
-                                           **{k: v for k, v in company_block(sym, meta_stocks).items() if v}}
-                await r2_upload(r2_client, r2_filename(sym), existing)
-                stats["ok"] += 1
-                latest_bars[sym] = {"name": (existing.get("company") or {}).get("name"),
-                                    "last": bars[-1], "prev": bars[-2] if len(bars) > 1 else None}
-            except Exception as e:
-                log.error(f"  {sym}: {e}")
-                stats["failed"].append(sym)
-            done[0] += 1
-            if done[0] % LOG_EVERY == 0:
-                log.info(f"  updated {done[0]}/{len(all_bars)}")
-
-        await _gather_limited([update(s) for s in all_bars], UPLOAD_CONCURRENCY)
-
-        # New index members (or first run): pull full history for them
-        if missing_files:
-            names = sorted(missing_files)
-            more = f" (+{len(names) - 20} more)" if len(names) > 20 else ""
-            log.info(f"  {len(names)} symbols have no file yet, backfilling: {', '.join(names[:20])}{more}")
-            new_bars = await asyncio.to_thread(yahoo_bars, missing_files, BACKFILL_PERIOD)
-            stats["failed"] += [s for s in missing_files if s not in new_bars]
-            await _upload_full(r2_client, list(new_bars), new_bars, meta_stocks, stats, latest_bars)
-
-        await generate_screener_feed(r2_client, latest_bars, meta_stocks)
-    return stats
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["backfill", "daily"], required=True)
-    args = parser.parse_args()
-
-    stats = asyncio.run({"backfill": run_backfill, "daily": run_daily}[args.mode]())
-    log.info(f"{args.mode} done: {stats['ok']} ok, {len(stats['failed'])} failed")
-    if stats["failed"]:
-        log.info("Failed symbols: " + ", ".join(sorted(stats["failed"])))
-    # Fail the GitHub Action (so you get an email) if a big chunk failed
-    if not US_SYMBOLS or len(stats["failed"]) > len(US_SYMBOLS) * 0.2:
+    log.info(f"Meta done: {len(fresh)} updated, {len(failed)} failed, {len(stocks)} total in file")
+    if failed:
+        log.info("Failed symbols (kept previous values): " + ", ".join(failed))
+    empty = [k for k, v in p.UNIVERSE_INDICES.items() if not v.get("count")]
+    if empty:
+        log.error(f"No constituents for: {', '.join(empty)} (Wikipedia + fallbacks failed) — check logs")
+    if len(failed) > len(symbols) * 0.2 or empty:
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
