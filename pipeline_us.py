@@ -5,7 +5,7 @@ US Stocks OHLC pipeline (Yahoo Finance via yfinance) for tradewithtech.in
 Drop-in replacement for the Tiingo version. Same R2 files, same JSON shape:
   us_ohlc_<SYMBOL>.json   -> {symbol, updated, company{...}, bars[{date,o,h,l,c,v}]}
   us_screener_feed.json   -> {updated, count, stocks[...]}
-  us_company_meta.json    -> {stocks{SYM:{name,sector,industry,marketCap}}}  (merged, backfill/meta only)
+  (us_company_meta.json is read for the screener but written only by pipeline_us_meta.py)
 
 Changes vs Tiingo version:
   - No API key, no 50 req/hour limit: all symbols come in ONE batched download.
@@ -16,9 +16,8 @@ Changes vs Tiingo version:
 Env vars (GitHub Actions secrets): WORKER_URL, WORKER_TOKEN
 
 Run modes:
-  python pipeline_us.py --mode backfill   # 3y history + company meta, overwrites per-symbol files
+  python pipeline_us.py --mode backfill   # 3y history + company info, overwrites per-symbol files
   python pipeline_us.py --mode daily      # last 10 days merged into existing files
-  python pipeline_us.py --mode meta       # only refresh us_company_meta.json
 """
 
 import os
@@ -180,19 +179,15 @@ def merge_bars(old, new):
 # Meta + screener
 # ---------------------------------------------------------------------------
 
-async def refresh_meta(r2_client, symbols) -> dict:
-    """Fetch info for each symbol and MERGE into us_company_meta.json (keeps entries for other symbols)."""
-    existing = await r2_download(r2_client, "us_company_meta.json") or {}
-    stocks = existing.get("stocks", {})
+async def fetch_company_infos(symbols) -> dict:
+    """Company block for per-symbol files (name/exchange/description/startDate).
+    Sector/industry/mcap for the screener come from us_company_meta.json, written by pipeline_us_meta.py."""
     infos = {}
     for sym in symbols:
         info = await asyncio.to_thread(yahoo_info, sym)
         if info.get("name"):
             infos[sym] = info
-            stocks[sym] = {k: info[k] for k in ("name", "sector", "industry", "marketCap")}
-    existing.update({"updated": now_iso(), "stocks": stocks})
-    await r2_upload(r2_client, "us_company_meta.json", existing)
-    log.info(f"  meta: {len(infos)}/{len(symbols)} symbols refreshed")
+    log.info(f"  company info: {len(infos)}/{len(symbols)} symbols")
     return infos
 
 
@@ -260,7 +255,7 @@ async def run_backfill():
     latest_bars = {}
 
     async with httpx.AsyncClient() as r2_client:
-        infos = await refresh_meta(r2_client, list(all_bars))
+        infos = await fetch_company_infos(list(all_bars))
 
         async def upload(sym):
             bars = all_bars[sym]
@@ -316,22 +311,16 @@ async def run_daily():
     return stats
 
 
-async def run_meta():
-    async with httpx.AsyncClient() as r2_client:
-        await refresh_meta(r2_client, US_SYMBOLS)
-    return {"ok": len(US_SYMBOLS), "failed": []}
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["backfill", "daily", "meta"], required=True)
+    parser.add_argument("--mode", choices=["backfill", "daily"], required=True)
     args = parser.parse_args()
 
-    stats = asyncio.run({"backfill": run_backfill, "daily": run_daily, "meta": run_meta}[args.mode]())
+    stats = asyncio.run({"backfill": run_backfill, "daily": run_daily}[args.mode]())
     log.info(f"{args.mode} done: {stats['ok']} ok, {len(stats['failed'])} failed")
     if stats["failed"]:
         log.info("Failed symbols: " + ", ".join(stats["failed"]))
