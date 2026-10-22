@@ -2,8 +2,11 @@
 us_universe.py
 Builds the list of US symbols to track + which index each one belongs to.
 
-Index membership isn't available from Yahoo (Yahoo only knows the EXCHANGE, e.g. NASDAQ/NYSE),
-so constituents are scraped from Wikipedia, which is kept current when indices rebalance.
+Index membership isn't available from Yahoo (Yahoo only knows the EXCHANGE, e.g. NASDAQ/NYSE).
+Sources, tried in order per index:
+  S&P 500 / 400 / 600 and Dow 30 -> official daily holdings of the SPDR ETF tracking it (SPY / MDY / SLY / DIA)
+  Nasdaq-100                     -> Nasdaq's own list API
+  then Wikipedia, then (S&P 500) a GitHub-hosted CSV.
 
 Output on R2: us_universe.json
   {
@@ -26,20 +29,28 @@ import pandas as pd
 log = logging.getLogger("universe")
 
 UNIVERSE_FILE = "us_universe.json"
-UA = {"User-Agent": "tradewithtech-pipeline/1.0 (https://tradewithtech.in)"}
-
-# key -> display name, Wikipedia page, valid member-count range, enabled
-# Turn on SP400 / SP600 to add mid caps and small caps (~1000 more symbols).
-INDICES = {
-    "SP500": ("S&P 500",            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", (480, 520), True),
-    "NDX":   ("Nasdaq-100",         "https://en.wikipedia.org/wiki/Nasdaq-100",                  (95, 110),  True),
-    "DJI":   ("Dow Jones 30",       "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average", (28, 32),   True),
-    "SP400": ("S&P MidCap 400",     "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", (380, 420), False),
-    "SP600": ("S&P SmallCap 600",   "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", (570, 630), False),
+WIKI_UA = {"User-Agent": "tradewithtech-pipeline/1.0 (https://tradewithtech.in) python-httpx"}
+BROWSER_UA = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Fallback for S&P 500 if Wikipedia fails (GitHub-hosted dataset)
-SP500_CSV = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+SSGA = "https://www.ssga.com/us/en/intermediary/library-content/products/fund-data/etfs/us/holdings-daily-us-en-{}.xlsx"
+WIKI = "https://en.wikipedia.org/w/api.php"
+
+# key -> display name, valid member-count range, enabled, [sources tried in order]
+# A source is (kind, arg): "ssga" = SPDR ETF daily holdings file, "nasdaq" = Nasdaq API list,
+# "wiki" = Wikipedia page, "csv" = GitHub CSV with Symbol/Security columns.
+# Turn on SP400 / SP600 to add mid caps and small caps (~1000 more symbols).
+INDICES = {
+    "SP500": ("S&P 500",          (480, 520), True,  [("ssga", "spy"), ("wiki", "List_of_S&P_500_companies"),
+                                                      ("csv", "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv")]),
+    "NDX":   ("Nasdaq-100",       (95, 110),  True,  [("nasdaq", "nasdaq100"), ("wiki", "Nasdaq-100")]),
+    "DJI":   ("Dow Jones 30",     (28, 32),   True,  [("ssga", "dia"), ("wiki", "Dow_Jones_Industrial_Average")]),
+    "SP400": ("S&P MidCap 400",   (380, 420), False, [("ssga", "mdy"), ("wiki", "List_of_S&P_400_companies")]),
+    "SP600": ("S&P SmallCap 600", (570, 630), False, [("ssga", "sly"), ("wiki", "List_of_S&P_600_companies")]),
+}
 
 # Always tracked, tagged "ETF" (index trackers — handy for charts/benchmarks)
 EXTRA_SYMBOLS = {"SPY": "SPDR S&P 500 ETF", "QQQ": "Invesco QQQ Trust", "DIA": "SPDR Dow Jones ETF"}
@@ -48,9 +59,11 @@ SYMBOL_RE = re.compile(r"^[A-Z]{1,5}(-[A-Z]{1,2})?$")
 
 
 def clean_symbol(s) -> str | None:
+    if s is None or (isinstance(s, float) and pd.isna(s)):
+        return None
     s = re.sub(r"\[.*?\]", "", str(s))            # footnotes like [1]
     s = s.split(":")[-1]                          # "NYSE: MMM" -> "MMM"
-    s = s.strip().upper().replace(".", "-")        # BRK.B -> BRK-B (Yahoo format)
+    s = s.strip().upper().replace(".", "-").replace("/", "-")   # BRK.B / BRK/B -> BRK-B (Yahoo format)
     return s if SYMBOL_RE.match(s) else None
 
 
@@ -58,49 +71,97 @@ def _flat(col) -> str:
     return " ".join(str(c) for c in col) if isinstance(col, tuple) else str(col)
 
 
-def parse_members(html: str, lo: int, hi: int) -> dict:
-    """Find the constituents table: has a Symbol/Ticker column and a member count within [lo, hi]."""
-    for df in pd.read_html(io.StringIO(html)):
+def _members_from_columns(df, sym_names, name_names) -> dict:
+    low = [_flat(c).lower().strip() for c in df.columns]
+    sym_i = next((i for i, c in enumerate(low) if c in sym_names), None)
+    if sym_i is None:
+        return {}
+    name_i = next((i for i, c in enumerate(low) if c in name_names), None)
+    out = {}
+    for _, row in df.iterrows():
+        sym = clean_symbol(row.iloc[sym_i])
+        if sym:
+            out[sym] = str(row.iloc[name_i]).strip() if name_i is not None else None
+    return out
+
+
+def parse_wiki_tables(html: str, lo: int, hi: int) -> tuple[dict, str]:
+    """Find the constituents table. Returns (members, diagnostic string)."""
+    tables = pd.read_html(io.StringIO(html))
+    diag = []
+    for df in tables:
         cols = [_flat(c) for c in df.columns]
-        low = [c.lower() for c in cols]
-        if any("added" in c or "removed" in c for c in low):     # skip "index changes" tables
+        diag.append(f"{len(df)}x{cols[:4]}")
+        if any("added" in c.lower() or "removed" in c.lower() for c in cols):   # index-changes tables
             continue
-        sym_i = next((i for i, c in enumerate(low) if c.strip() in ("symbol", "ticker", "ticker symbol")), None)
-        if sym_i is None:
-            continue
-        name_i = next((i for i, c in enumerate(low) if c.strip() in ("security", "company", "name", "company name")), None)
-        members = {}
-        for _, row in df.iterrows():
-            sym = clean_symbol(row.iloc[sym_i])
-            if sym:
-                members[sym] = str(row.iloc[name_i]).strip() if name_i is not None else None
+        members = _members_from_columns(df, ("symbol", "ticker", "ticker symbol"),
+                                        ("security", "company", "name", "company name"))
         if lo <= len(members) <= hi:
-            return members
-    return {}
+            return members, ""
+    return {}, f"{len(tables)} tables: " + "; ".join(diag[:6])
+
+
+def parse_ssga_xlsx(content: bytes) -> dict:
+    """SPDR daily holdings: a few metadata rows, then a header row with 'Ticker', then holdings, then disclaimers."""
+    raw = pd.read_excel(io.BytesIO(content), header=None)
+    hdr = next(i for i, row in raw.iterrows() if any(str(v).strip().lower() == "ticker" for v in row.values))
+    df = raw.iloc[hdr + 1:].copy()
+    df.columns = [str(v).strip() for v in raw.iloc[hdr].values]
+    return _members_from_columns(df, ("ticker",), ("name",))
+
+
+def parse_nasdaq_json(j: dict) -> dict:
+    d = j.get("data") or {}
+    rows = (d.get("data") or {}).get("rows") or d.get("rows") or []
+    out = {}
+    for r in rows:
+        sym = clean_symbol(r.get("symbol", ""))
+        if sym:
+            out[sym] = r.get("companyName")
+    return out
+
+
+async def _try_source(client, key, kind, arg, lo, hi) -> dict:
+    if kind == "ssga":
+        r = await client.get(SSGA.format(arg), headers=BROWSER_UA, timeout=60, follow_redirects=True)
+        r.raise_for_status()
+        return parse_ssga_xlsx(r.content)
+    if kind == "nasdaq":
+        r = await client.get(f"https://api.nasdaq.com/api/quote/list-type/{arg}",
+                             headers={**BROWSER_UA, "Origin": "https://www.nasdaq.com", "Referer": "https://www.nasdaq.com/"},
+                             timeout=30, follow_redirects=True)
+        r.raise_for_status()
+        return parse_nasdaq_json(r.json())
+    if kind == "wiki":
+        params = {"action": "parse", "page": arg, "prop": "text", "format": "json", "formatversion": "2", "redirects": "1"}
+        r = await client.get(WIKI, params=params, headers=WIKI_UA, timeout=30, follow_redirects=True)
+        r.raise_for_status()
+        j = r.json()
+        if "parse" not in j:
+            raise RuntimeError(f"API error: {str(j)[:200]}")
+        members, diag = parse_wiki_tables(j["parse"]["text"], lo, hi)
+        if not members:
+            log.warning(f"  {key}: wiki page had no constituents table — {diag}")
+        return members
+    if kind == "csv":
+        r = await client.get(arg, timeout=30, follow_redirects=True)
+        r.raise_for_status()
+        return _members_from_columns(pd.read_csv(io.StringIO(r.text)), ("symbol",), ("security", "name"))
+    raise ValueError(kind)
 
 
 async def scrape_index(client, key) -> tuple[dict, str]:
-    _, url, (lo, hi), _ = INDICES[key]
-    try:
-        r = await client.get(url, headers=UA, timeout=30, follow_redirects=True)
-        r.raise_for_status()
-        members = parse_members(r.text, lo, hi)
-        if members:
-            return members, "wikipedia"
-        log.warning(f"  {key}: no valid table on Wikipedia (expected {lo}-{hi} rows)")
-    except Exception as e:
-        log.warning(f"  {key}: Wikipedia failed ({e})")
-
-    if key == "SP500":
+    _, (lo, hi), _, sources = INDICES[key]
+    for kind, arg in sources:
         try:
-            r = await client.get(SP500_CSV, timeout=30)
-            r.raise_for_status()
-            df = pd.read_csv(io.StringIO(r.text))
-            members = {s: n for s, n in ((clean_symbol(a), b) for a, b in zip(df["Symbol"], df["Security"])) if s}
-            if lo <= len(members) <= hi:
-                return members, "github-datasets"
+            members = await _try_source(client, key, kind, arg, lo, hi)
         except Exception as e:
-            log.warning(f"  SP500: GitHub fallback failed ({e})")
+            log.warning(f"  {key}: {kind} failed ({type(e).__name__}: {str(e)[:200]})")
+            continue
+        if lo <= len(members) <= hi:
+            return members, kind
+        if members:
+            log.warning(f"  {key}: {kind} gave {len(members)} symbols, expected {lo}-{hi}; trying next source")
     return {}, "failed"
 
 
@@ -113,7 +174,7 @@ async def build_universe(client, r2_download, r2_upload, now_iso) -> dict:
     prev_syms = prev.get("symbols", {})
 
     members_by_index, index_info = {}, {}
-    for key, (name, _, _, enabled) in INDICES.items():
+    for key, (name, _, enabled, _) in INDICES.items():
         if not enabled:
             continue
         members, source = await scrape_index(client, key)
