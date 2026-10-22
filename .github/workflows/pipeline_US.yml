@@ -1,9 +1,9 @@
-name: US Stocks Pipeline (Tiingo OHLC + NASDAQ Meta)
+name: US Stocks Pipeline (Yahoo OHLC + Yahoo Meta)
 
 on:
   schedule:
-    - cron: "30 21 * * 1-5"   # 3:00 AM IST — daily OHLC update (Tiingo)
-    - cron: "45 21 * * 1-5"   # 3:15 AM IST — daily sector/industry/market cap (NASDAQ)
+    - cron: "30 21 * * 1-5"   # 3:00 AM IST — daily OHLC update (Yahoo, last 10 days merged)
+    - cron: "45 21 * * 1-5"   # 3:15 AM IST — daily sector/industry/market cap (Yahoo)
   workflow_dispatch:
     inputs:
       mode:
@@ -12,13 +12,19 @@ on:
         default: "daily"
         type: choice
         options:
-          - backfill   # pipeline_us.py --mode backfill (Tiingo, last 3 years OHLC)
-          - daily      # pipeline_us.py --mode daily (Tiingo, latest bar append)
-          - meta       # pipeline_us_meta.py (NASDAQ sector/industry/market cap)
+          - backfill   # pipeline_us.py --mode backfill (Yahoo, last 3 years adjusted OHLC)
+          - daily      # pipeline_us.py --mode daily (Yahoo, last 10 days merged — heals gaps)
+          - meta       # pipeline_us_meta.py (Yahoo sector/industry/market cap)
+
+# Don't let a manual backfill and a scheduled daily run write the same R2 files at once
+concurrency:
+  group: us-pipeline
+  cancel-in-progress: false
 
 jobs:
   run-pipeline:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -27,9 +33,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install httpx
 
       - name: Determine mode
         id: pick
@@ -42,15 +45,17 @@ jobs:
             echo "mode=meta" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Run Tiingo OHLC pipeline (backfill or daily)
+      - name: Install dependencies
+        run: pip install httpx "yfinance>=0.2.50" pandas
+
+      - name: Run Yahoo OHLC pipeline (backfill or daily)
         if: steps.pick.outputs.mode == 'backfill' || steps.pick.outputs.mode == 'daily'
         env:
-          TIINGO_API_KEY: ${{ secrets.TIINGO_API_KEY }}
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
         run: python pipeline_us.py --mode ${{ steps.pick.outputs.mode }}
 
-      - name: Run NASDAQ meta pipeline (sector/industry/market cap)
+      - name: Run Yahoo meta pipeline (sector/industry/market cap)
         if: steps.pick.outputs.mode == 'meta'
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
