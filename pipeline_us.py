@@ -26,6 +26,7 @@ import sys
 import json
 import time
 import asyncio
+import warnings
 import argparse
 import logging
 from datetime import datetime, timezone
@@ -39,6 +40,11 @@ import us_universe
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+# yfinance still uses pandas' deprecated inplace= calls; harmless, but floods the Actions log
+warnings.filterwarnings("ignore", message=r".*inplace keyword.*")
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"yfinance.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"yfinance.*")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
 log = logging.getLogger(__name__)
@@ -220,6 +226,40 @@ def company_block(sym, meta_stocks) -> dict:
     }
 
 
+# Trading-day lookbacks (approx: 5/week, 21/month)
+PERF_PERIODS = {"1w": 5, "1m": 21, "3m": 63, "6m": 126, "9m": 189, "12m": 252}
+# IBD-style RS score weights: most recent quarter counts double
+RS_WEIGHTS = {"3m": 0.4, "6m": 0.2, "9m": 0.2, "12m": 0.2}
+
+
+def compute_perf(bars) -> dict:
+    """Returns % change over each period + raw RS score (None where history is too short)."""
+    closes = [b["c"] for b in bars if b.get("c")]
+    out = {}
+    for k, n in PERF_PERIODS.items():
+        out[k] = round((closes[-1] / closes[-1 - n] - 1) * 100, 2) if len(closes) > n else None
+    rs_parts = [out[k] for k in RS_WEIGHTS]
+    out["rs_score"] = (round(sum(RS_WEIGHTS[k] * out[k] for k in RS_WEIGHTS), 4)
+                       if None not in rs_parts else None)
+    return out
+
+
+def rs_ratings(scores: dict, stock_syms: set) -> dict:
+    """Percentile-rank RS scores into 1-99. Ranked among stocks only; ETFs are rated against the same stock distribution."""
+    import bisect
+    pool = sorted(v for s, v in scores.items() if v is not None and s in stock_syms)
+    if not pool:
+        return {}
+    n = len(pool)
+    out = {}
+    for sym, v in scores.items():
+        if v is None:
+            continue
+        pct = bisect.bisect_left(pool, v) / max(n - 1, 1)     # 0..1, share of stocks this one beats
+        out[sym] = max(1, min(99, int(pct * 98) + 1))
+    return out
+
+
 async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
     try:
         prev_feed = await r2_download(r2_client, "us_screener_feed.json") or {}
@@ -250,7 +290,16 @@ async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
             "pct_ch": None if change_pct is None else round(change_pct, 4),
             "volume": last.get("v"),
             "date": last["date"],
+            **{f"ch_{k}": info["perf"][k] for k in PERF_PERIODS},
+            "rs_score": info["perf"]["rs_score"],
+            "rs_rating": None,      # filled below once all scores are known
         })
+
+    # RS rating: rank every row's score (fresh rows + kept-over rows from failed symbols)
+    stock_syms = {r["symbol"] for r in rows if r.get("indices") and r["indices"] != ["ETF"]}
+    ratings = rs_ratings({r["symbol"]: r.get("rs_score") for r in rows}, stock_syms)
+    for r in rows:
+        r["rs_rating"] = ratings.get(r["symbol"])
 
     if not rows:
         log.warning("  screener feed: nothing to write, skipping")
@@ -285,7 +334,7 @@ async def _upload_full(r2_client, symbols, all_bars, meta_stocks, stats, latest_
             })
             stats["ok"] += 1
             latest_bars[sym] = {"name": company.get("name"), "last": bars[-1],
-                                "prev": bars[-2] if len(bars) > 1 else None}
+                                "prev": bars[-2] if len(bars) > 1 else None, "perf": compute_perf(bars)}
         except Exception as e:
             log.error(f"  {sym}: {e}")
             stats["failed"].append(sym)
@@ -337,7 +386,8 @@ async def run_daily():
                 await r2_upload(r2_client, r2_filename(sym), existing)
                 stats["ok"] += 1
                 latest_bars[sym] = {"name": (existing.get("company") or {}).get("name"),
-                                    "last": bars[-1], "prev": bars[-2] if len(bars) > 1 else None}
+                                    "last": bars[-1], "prev": bars[-2] if len(bars) > 1 else None,
+                                    "perf": compute_perf(bars)}
             except Exception as e:
                 log.error(f"  {sym}: {e}")
                 stats["failed"].append(sym)
