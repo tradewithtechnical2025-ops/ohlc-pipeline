@@ -11,6 +11,7 @@ R2 files written:
 Read (not written): us_company_meta.json, us_universe.json
 
   - Prices are split/dividend ADJUSTED (no fake crashes on splits).
+  - Screener feed includes daily/weekly/monthly EMA + SMA values and signals.
   - Daily mode pulls the last 10 days and merges, so a missed run never leaves a gap.
   - A symbol newly added to an index gets its full history automatically on the next daily run.
 
@@ -29,6 +30,8 @@ import asyncio
 import warnings
 import argparse
 import logging
+import math
+from collections import deque
 from datetime import datetime, timezone
 
 import httpx
@@ -244,6 +247,94 @@ def compute_perf(bars) -> dict:
     return out
 
 
+
+# Versioned MA contract shared with us_stocks.html. W/M include the current
+# developing period, matching a chart's live weekly/monthly candle.
+MA_PERIODS = {"D": (10, 21, 50, 200), "W": (10, 30, 40), "M": (10, 20)}
+MA_SCHEMA_VERSION = 1
+
+
+def ma_closes(bars, timeframe):
+    """Deduplicate by date; last valid positive close wins; chronological output."""
+    daily = {}
+    for bar in bars:
+        try:
+            day = datetime.strptime(str(bar["date"]), "%Y-%m-%d").date()
+            close = float(bar["c"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(close) and close > 0:
+            daily[day] = close
+    buckets = {}
+    for day, close in sorted(daily.items()):
+        if timeframe == "W":
+            key = day.toordinal() - day.weekday()  # Monday, including year boundaries
+        elif timeframe == "M":
+            key = (day.year, day.month)
+        else:
+            key = day
+        buckets[key] = close
+    return list(buckets.values())
+
+
+def ma_series(closes, period, kind):
+    """SMA-seeded EMA; None until a full period exists. O(number of bars)."""
+    out, window, total, ema = [], deque(), 0.0, None
+    alpha = 2.0 / (period + 1)
+    for close in closes:
+        window.append(close)
+        total += close
+        if len(window) > period:
+            total -= window.popleft()
+        if len(window) < period:
+            out.append(None)
+            continue
+        if kind == "SMA":
+            value = total / period
+        else:
+            ema = total / period if ema is None else close * alpha + ema * (1 - alpha)
+            value = ema
+        out.append(value)
+    return out
+
+
+def compute_ma(bars):
+    """Current/previous MA, signed distance %, rising bars, fresh price cross.
+
+    Null means insufficient history. Signal comparisons use unrounded values.
+    Rising days on W/M mean weekly/monthly bars, including developing candles.
+    """
+    result = {"version": MA_SCHEMA_VERSION, "asof": max((str(b.get("date", "")) for b in bars), default=""),
+              "includes_developing_period": True, "timeframes": {}}
+    for tf, periods in MA_PERIODS.items():
+        closes = ma_closes(bars, tf)
+        block = {"bars": len(closes), "close": closes[-1] if closes else None}
+        for kind in ("EMA", "SMA"):
+            values = {}
+            for period in periods:
+                series = ma_series(closes, period, kind)
+                current = series[-1] if series else None
+                previous = series[-2] if len(series) > 1 else None
+                rising = 0
+                if current is not None:
+                    for i in range(len(series) - 1, 0, -1):
+                        if series[i - 1] is None or series[i] <= series[i - 1]:
+                            break
+                        rising += 1
+                values[str(period)] = {
+                    "value": round(current, 8) if current is not None else None,
+                    "previous": round(previous, 8) if previous is not None else None,
+                    "distance_pct": round((closes[-1] / current - 1) * 100, 6) if current else None,
+                    "above": closes[-1] > current if current is not None else None,
+                    "rising_bars": rising if current is not None else None,
+                    "price_cross_up": (closes[-1] > current and closes[-2] <= previous)
+                                      if previous is not None else None,
+                }
+            block[kind] = values
+        result["timeframes"][tf] = block
+    return result
+
+
 def rs_ratings(scores: dict, stock_syms: set) -> dict:
     """Percentile-rank RS scores into 1-99. Ranked among stocks only; ETFs are rated against the same stock distribution."""
     import bisect
@@ -293,6 +384,7 @@ async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
             **{f"ch_{k}": info["perf"][k] for k in PERF_PERIODS},
             "rs_score": info["perf"]["rs_score"],
             "rs_rating": None,      # filled below once all scores are known
+            "ma": info["ma"],
         })
 
     # RS rating: rank every row's score (fresh rows + kept-over rows from failed symbols)
@@ -304,7 +396,7 @@ async def generate_screener_feed(r2_client, latest_bars, meta_stocks):
     if not rows:
         log.warning("  screener feed: nothing to write, skipping")
         return
-    await r2_upload(r2_client, "us_screener_feed.json", {"updated": now_iso(), "count": len(rows), "stocks": rows})
+    await r2_upload(r2_client, "us_screener_feed.json", {"updated": now_iso(), "schema_version": 3, "ma_version": MA_SCHEMA_VERSION, "count": len(rows), "stocks": rows})
     log.info(f"  screener feed: uploaded ({len(rows)} symbols)")
 
 
@@ -334,7 +426,7 @@ async def _upload_full(r2_client, symbols, all_bars, meta_stocks, stats, latest_
             })
             stats["ok"] += 1
             latest_bars[sym] = {"name": company.get("name"), "last": bars[-1],
-                                "prev": bars[-2] if len(bars) > 1 else None, "perf": compute_perf(bars)}
+                                "prev": bars[-2] if len(bars) > 1 else None, "perf": compute_perf(bars), "ma": compute_ma(bars)}
         except Exception as e:
             log.error(f"  {sym}: {e}")
             stats["failed"].append(sym)
@@ -387,7 +479,7 @@ async def run_daily():
                 stats["ok"] += 1
                 latest_bars[sym] = {"name": (existing.get("company") or {}).get("name"),
                                     "last": bars[-1], "prev": bars[-2] if len(bars) > 1 else None,
-                                    "perf": compute_perf(bars)}
+                                    "perf": compute_perf(bars), "ma": compute_ma(bars)}
             except Exception as e:
                 log.error(f"  {sym}: {e}")
                 stats["failed"].append(sym)
