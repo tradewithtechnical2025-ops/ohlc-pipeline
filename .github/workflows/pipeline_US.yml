@@ -46,7 +46,7 @@ jobs:
           fi
 
       - name: Install dependencies
-        run: pip install httpx "yfinance>=0.2.50" pandas lxml openpyxl
+        run: pip install httpx "yfinance>=0.2.50" "pandas<4" lxml openpyxl
 
       - name: Run Yahoo OHLC pipeline (backfill or daily)
         if: steps.pick.outputs.mode == 'backfill' || steps.pick.outputs.mode == 'daily'
