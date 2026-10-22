@@ -1,137 +1,131 @@
 """
 pipeline_us_meta.py
-US Stocks Sector/Industry/Market Cap pipeline (NASDAQ Screener API) for tradewithtech.in
+US company meta (sector / industry / market cap) from Yahoo Finance -> us_company_meta.json on R2
 
-Free, no API key, no rate limit — pulls the full NASDAQ+NYSE listed-stock
-screener in one call and uploads a compact symbol -> {sector, industry,
-marketCap, name, country} map to R2 via the Worker.
+Replaces the Tiingo-based meta script. Output shape (read by the screener feed in pipeline_us.py):
+  {
+    "updated": "...Z",
+    "count": N,
+    "stocks": {
+      "AAPL": {"name", "sector", "industry", "marketCap", "exchange", "country",
+               "website", "employees", "beta", "pe", "fwdPe", "divYield",
+               "high52", "low52", "avgVolume", "sharesOut"},
+      ...
+    }
+  }
 
-This is a SEPARATE, low-frequency pipeline from pipeline_us.py (Tiingo OHLC).
-Sector/industry classification barely changes day to day, so this is meant
-to run weekly/monthly, not daily — no need to burn Tiingo's rate limit or
-combine with the OHLC pipeline.
+Existing entries are MERGED field by field: a field Yahoo didn't return this time keeps its old value,
+and fields this script doesn't know about are left untouched.
 
-Uploads: us_company_meta.json  (via WORKER_URL, same pattern as pipeline_nse.py)
+Symbols and Worker helpers come from pipeline_us.py so there's one list to maintain.
 
-Env vars required (already exist as GitHub Actions secrets):
-  WORKER_URL
-  WORKER_TOKEN
-
-Run:
-  python pipeline_us_meta.py
+Env vars: WORKER_URL, WORKER_TOKEN
+Run: python pipeline_us_meta.py
 """
 
-import os
-import json
+import sys
+import time
 import asyncio
 import logging
-from datetime import datetime
 
 import httpx
+import yfinance as yf
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
-log = logging.getLogger(__name__)
-logging.getLogger("httpx").setLevel(logging.WARNING)
+from pipeline_us import US_SYMBOLS, r2_upload, r2_download, now_iso
 
-WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
-WORKER_TOKEN = os.environ["WORKER_TOKEN"]
-WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
+log = logging.getLogger("meta")
 
-RETRY = 5
-
-# NASDAQ's public screener API — covers NASDAQ + NYSE + AMEX listed common stocks.
-# No API key needed, but it does need browser-like headers or it 403s.
-NASDAQ_SCREENER_URL = "https://api.nasdaq.com/api/screener/stocks"
-NASDAQ_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "application/json",
-}
+META_FILE = "us_company_meta.json"
+DELAY_SEC = 0.5     # between symbols, keeps Yahoo happy
+RETRY_PASSES = 2    # extra passes over symbols that failed
 
 
-async def fetch_screener(client: httpx.AsyncClient, limit: int = 10000):
-    params = {"tableonly": "true", "limit": str(limit), "download": "true"}
-    r = await client.get(NASDAQ_SCREENER_URL, params=params, headers=NASDAQ_HEADERS, timeout=60)
-    r.raise_for_status()
-    return r.json()
-
-
-def clean_name(raw_name):
-    """NASDAQ screener returns names like 'Apple Inc. Common Stock' or
-    'Meta Platforms Inc. Class A Common Stock' — strip the redundant
-    trailing 'Common Stock', but keep meaningful suffixes like
-    'Class A' (dual-class shares) or 'Warrant'/'Rights' (different
-    instrument, not the underlying common stock)."""
-    if not raw_name:
-        return raw_name
-    name = raw_name.strip()
-    if name.endswith(" Common Stock"):
-        name = name[: -len(" Common Stock")].strip()
-    return name
-
-
-def parse_market_cap(raw):
+def fetch_one(symbol: str) -> dict:
+    """Return meta dict for one symbol, or {} on failure (never raises)."""
     try:
-        val = float(raw)
-        return val if val > 0 else None
-    except (TypeError, ValueError):
-        return None
+        i = yf.Ticker(symbol).info or {}
+    except Exception as e:
+        log.warning(f"  {symbol}: {e}")
+        return {}
+    name = i.get("longName") or i.get("shortName")
+    if not name:
+        return {}
+    div = i.get("dividendYield")
+    return {
+        "name":      name,
+        "sector":    i.get("sector"),
+        "industry":  i.get("industry"),
+        "marketCap": i.get("marketCap"),
+        "exchange":  i.get("exchange"),
+        "country":   i.get("country"),
+        "website":   i.get("website"),
+        "employees": i.get("fullTimeEmployees"),
+        "beta":      i.get("beta"),
+        "pe":        i.get("trailingPE"),
+        "fwdPe":     i.get("forwardPE"),
+        # yfinance has returned this both as a fraction (0.005) and as a percent (0.5); store percent
+        "divYield":  None if div is None else (round(div * 100, 4) if div < 0.2 else round(div, 4)),
+        "high52":    i.get("fiftyTwoWeekHigh"),
+        "low52":     i.get("fiftyTwoWeekLow"),
+        "avgVolume": i.get("averageVolume"),
+        "sharesOut": i.get("sharesOutstanding"),
+    }
 
 
-async def r2_upload(client: httpx.AsyncClient, filename: str, data):
-    if not isinstance(data, (bytes, str)):
-        data = json.dumps(data)
-    if isinstance(data, str):
-        data = data.encode()
-    url = f"{WORKER_URL}?file={filename}"
-    last_err = None
-    for attempt in range(RETRY):
-        try:
-            r = await client.post(url, headers={**WORKER_HEADERS, "Content-Type": "application/json"}, content=data, timeout=90)
-        except httpx.RequestError as e:
-            last_err = e
-            log.warning(f"  Upload {filename}: {e}, retry {attempt + 1}")
-            await asyncio.sleep(2 ** attempt)
-            continue
-        if r.status_code == 200:
-            return
-        last_err = RuntimeError(f"Upload failed: HTTP {r.status_code}")
-        log.warning(f"  Upload {filename}: HTTP {r.status_code}, retry {attempt + 1}")
-        await asyncio.sleep(2 ** attempt)
-    raise last_err
+def fetch_all(symbols) -> dict:
+    results, pending = {}, list(symbols)
+    for attempt in range(1 + RETRY_PASSES):
+        if attempt:
+            log.info(f"  retry pass {attempt}: {len(pending)} symbols, waiting {15 * attempt}s")
+            time.sleep(15 * attempt)
+        failed = []
+        for sym in pending:
+            m = fetch_one(sym)
+            if m:
+                results[sym] = m
+            else:
+                failed.append(sym)
+            time.sleep(DELAY_SEC)
+        pending = failed
+        if not pending:
+            break
+    return results
 
 
 async def main():
+    log.info(f"Meta: {len(US_SYMBOLS)} symbols from Yahoo")
+    fresh = await asyncio.to_thread(fetch_all, US_SYMBOLS)
+    failed = [s for s in US_SYMBOLS if s not in fresh]
+    log.info(f"  Yahoo: got {len(fresh)}/{len(US_SYMBOLS)}")
+
+    if not fresh:
+        log.error("Nothing fetched; leaving existing meta file untouched")
+        sys.exit(1)
+
     async with httpx.AsyncClient() as client:
-        log.info("Fetching NASDAQ screener (sector/industry/market cap)...")
-        raw = await fetch_screener(client)
+        existing = await client_safe_download(client)
+        stocks = existing.get("stocks", {})
+        for sym, m in fresh.items():
+            merged = dict(stocks.get(sym, {}))
+            merged.update({k: v for k, v in m.items() if v is not None})
+            stocks[sym] = merged
+        existing.update({"updated": now_iso(), "count": len(stocks), "stocks": stocks})
+        await r2_upload(client, META_FILE, existing)
 
-        rows = (raw.get("data") or {}).get("rows") or []
-        log.info(f"Got {len(rows)} rows from NASDAQ screener")
+    log.info(f"Meta done: {len(fresh)} updated, {len(failed)} failed, {len(stocks)} total in file")
+    if failed:
+        log.info("Failed symbols (kept previous values): " + ", ".join(failed))
+    if len(failed) > len(US_SYMBOLS) // 2:
+        sys.exit(1)
 
-        meta = {}
-        skipped = 0
-        for row in rows:
-            symbol = (row.get("symbol") or "").strip()
-            if not symbol:
-                skipped += 1
-                continue
-            meta[symbol] = {
-                "name": clean_name(row.get("name")),
-                "sector": row.get("sector") or None,
-                "industry": row.get("industry") or None,
-                "marketCap": parse_market_cap(row.get("marketCap")),
-                "country": row.get("country") or None,
-                "ipoYear": row.get("ipoyear") or None,
-            }
 
-        payload = {
-            "updated": datetime.utcnow().isoformat() + "Z",
-            "count": len(meta),
-            "stocks": meta,
-        }
-
-        await r2_upload(client, "us_company_meta.json", payload)
-        log.info(f"Uploaded us_company_meta.json with {len(meta)} symbols ({skipped} skipped, no symbol)")
+async def client_safe_download(client) -> dict:
+    try:
+        return await r2_download(client, META_FILE) or {}
+    except Exception as e:
+        # Don't overwrite a file we couldn't read — we'd lose entries for symbols not in US_SYMBOLS
+        log.error(f"Couldn't read existing {META_FILE} ({e}); aborting to avoid clobbering it")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
