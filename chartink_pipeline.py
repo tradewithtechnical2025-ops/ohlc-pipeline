@@ -98,7 +98,7 @@ counts_backtest_scanners = {
     "Above50EMA": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and  daily close >  daily ema(  daily close , 50 ) ) )",
     "Below50EMA": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and  daily close <  daily ema(  daily close , 50 ) ) )",
     "Above200EMA": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and  daily close >  daily ema(  daily close , 200 ) ) )",
-    "Below200EMA": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and  daily close <  daily ema(  daily close , 20 ) ) )",
+    "Below200EMA": "( {166311} not(  1 > 0 ) ) and( {cash} (  daily close >  0 and  market cap >  1 and  daily close <  daily ema(  daily close , 200 ) ) )",
     "DCR70+": "( {cash} ( ( latest close - latest low ) / ( latest high - latest low ) * 100 > 70 and( {166311} not( latest close > 0 ) ) and( {45603} not( latest close > 0 ) ) and( {167068} not( latest close > 0 ) ) ) )",
     "DCR30-": "( {cash} ( ( latest close - latest low ) / ( latest high - latest low ) * 100 < 30 and( {166311} not( latest close > 0 ) ) and( {45603} not( latest close > 0 ) ) and( {167068} not( latest close > 0 ) ) ) )",
     "DCR30-70": "( {cash} ( ( latest close - latest low ) / ( latest high - latest low ) * 100 <= 70 and( latest close - latest low ) / ( latest high - latest low ) * 100 >= 30 and( {166311} not( latest close > 0 ) ) and( {45603} not( latest close > 0 ) ) and( {167068} not( latest close > 0 ) ) ) )",
@@ -257,59 +257,102 @@ def run_realtime_scanners():
 # ----------------------
 def run_backtest_scanners_counts():
     module = "Backtest Counts -> MarketData"
+    print("=== Running backtest scanners (counts -> MarketData) ===")
+    backtest_url = "https://chartink.com/backtest/process"
+    results = {}
+    failed = []
+    successful = []
+
+    # Preserve old values if Chartink rejects individual requests.
     try:
-        print("=== Running backtest scanners (counts -> MarketData) ===")
-        backtest_url = "https://chartink.com/backtest/process"
-        results = {}
-
-        with requests.session() as s:
-            try:
-                csrf = get_chartink_csrf(s)
-            except Exception as e:
-                raise RuntimeError(f"Could not fetch CSRF token for backtest counts: {e}")
-
-            header = {"x-csrf-token": csrf, "User-Agent": "Mozilla/5.0"}
-
-            for name, clause in counts_backtest_scanners.items():
-                print(f"📊 Backtesting (counts): {name}")
-                try:
-                    response = s.post(backtest_url, headers=header, data={"scan_clause": clause}, timeout=60)
-                    data = response.json()
-                    dates = data["metaData"][0]["tradeTimes"]
-                    stocks = data["aggregatedStockList"]
-
-                    for i, ts in enumerate(dates):
-                        # FIX: was datetime.fromtimestamp(ts / 1000) — naive
-                        # conversion using the runner's local tz (UTC on GH
-                        # Actions), which shifted the date back by one day.
-                        dt = epoch_ms_to_ist(ts)
-                        if dt not in results:
-                            results[dt] = {}
-                        try:
-                            count_val = len([stocks[i][j] for j in range(0, len(stocks[i]), 3)])
-                        except Exception:
-                            count_val = 0
-                        results[dt][f"{name}_Count"] = count_val
-                except Exception as e:
-                    print(f"❌ Error for backtest counts {name}: {e}")
-
-        if not results:
-            raise RuntimeError("No backtest count results to write.")
-
-        df_bt = pd.DataFrame.from_dict(results, orient='index').sort_index(ascending=False)
-        df_bt.index.name = "Date"
-        df_reset = df_bt.reset_index()
-        df_reset["Date"] = df_reset["Date"].astype(str)
-
-        marketdata_sheet.clear()
-        marketdata_sheet.update([df_reset.columns.tolist()] + df_reset.values.tolist())
-        print("✅ MarketData updated.")
-        log_status(module, f"Completed successfully at {now_ts()}")
+        old_rows = marketdata_sheet.get_all_records()
+        old_df = pd.DataFrame(old_rows)
+        if not old_df.empty and "Date" in old_df.columns:
+            old_df["Date"] = old_df["Date"].astype(str).str.slice(0, 10)
+            old_df = old_df.drop_duplicates(subset=["Date"], keep="first").set_index("Date")
+        else:
+            old_df = pd.DataFrame()
     except Exception as e:
-        tb = traceback.format_exc()
-        print(f"❌ {module} failed:", e)
-        log_status(module, f"ERROR: {e}")
-        print(tb)
+        print(f"⚠️ Could not read existing MarketData: {e}")
+        log_status(module, f"ERROR reading old data: {e}")
+        return
+
+    with requests.session() as session:
+        try:
+            csrf = get_chartink_csrf(session)
+        except Exception as e:
+            log_status(module, f"ERROR obtaining CSRF: {e}")
+            return
+        headers = {"x-csrf-token": csrf, "User-Agent": "Mozilla/5.0",
+                   "Referer": "https://chartink.com/backtest"}
+
+        for name, clause in counts_backtest_scanners.items():
+            print(f"📊 Backtesting (counts): {name}")
+            error = None
+            for attempt in range(1, 4):
+                try:
+                    response = session.post(backtest_url, headers=headers,
+                                            data={"scan_clause": clause}, timeout=60)
+                    response.raise_for_status()
+                    data = response.json()
+                    metadata = data.get("metaData")
+                    stocks = data.get("aggregatedStockList")
+                    if not isinstance(metadata, list) or not metadata or not isinstance(metadata[0], dict):
+                        raise ValueError(f"Missing metaData; HTTP {response.status_code}; "
+                                         f"response keys={list(data) if isinstance(data, dict) else type(data).__name__}; "
+                                         f"body={response.text[:250]!r}")
+                    dates = metadata[0].get("tradeTimes")
+                    if not isinstance(dates, list) or not isinstance(stocks, list):
+                        raise ValueError("Missing/invalid tradeTimes or aggregatedStockList")
+                    if len(dates) != len(stocks):
+                        raise ValueError(f"Date/stock list length mismatch: {len(dates)} vs {len(stocks)}")
+                    staged = {}
+                    for ts, group in zip(dates, stocks):
+                        if not isinstance(group, list) or len(group) % 3:
+                            raise ValueError("Unexpected aggregatedStockList group format")
+                        date = epoch_ms_to_ist(int(ts)).strftime("%Y-%m-%d")
+                        staged[date] = len(group) // 3
+                    for date, count in staged.items():
+                        results.setdefault(date, {})[f"{name}_Count"] = count
+                    successful.append(name)
+                    print(f"   ✅ {name}: {len(staged)} dates")
+                    error = None
+                    break
+                except Exception as e:
+                    error = str(e)
+                    print(f"   ⚠️ {name} attempt {attempt}/3: {error[:350]}")
+                    if attempt < 3:
+                        time.sleep(2 * attempt)
+                        if attempt == 2:
+                            try:
+                                headers["x-csrf-token"] = get_chartink_csrf(session)
+                            except Exception:
+                                pass
+            if error:
+                failed.append(name)
+                print(f"❌ {name} failed after retries; old values retained")
+            time.sleep(0.6)
+
+    if not successful:
+        print("❌ No valid backtest responses; MarketData left untouched")
+        log_status(module, "ERROR: all scanners failed; old sheet retained")
+        return
+
+    new_df = pd.DataFrame.from_dict(results, orient="index")
+    new_df.index.name = "Date"
+    # Existing values remain for dates/scanners not returned in this run.
+    merged = new_df.combine_first(old_df) if not old_df.empty else new_df
+    merged = merged.sort_index(ascending=False).reset_index()
+    merged = merged.astype(object).where(pd.notna(merged), "")
+    try:
+        marketdata_sheet.clear()
+        marketdata_sheet.update([merged.columns.tolist()] + merged.values.tolist())
+        msg = f"Updated {len(successful)}/{len(counts_backtest_scanners)} scanners; failed={failed}"
+        print(f"✅ MarketData {msg}")
+        log_status(module, msg)
+    except Exception as e:
+        print(f"❌ MarketData write failed: {e}")
+        log_status(module, f"ERROR writing sheet: {e}")
 
 # ----------------------
 # === Run Backtest Scanners (weekly) -> WeeklyData (counts per week)
