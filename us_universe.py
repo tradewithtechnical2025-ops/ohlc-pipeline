@@ -1,6 +1,10 @@
 """
 us_universe.py
-Builds the list of US symbols to track + which index each one belongs to.
+Builds index members plus monthly-screened liquid US stock additions.
+
+Defaults: price >= $5, prior 20 completed sessions average dollar volume >= $10m,
+average share volume >= 200,000. Existing index members are always retained.
+US_LIQUID_FORCE=1 forces a fresh liquidity scan; thresholds are environment settings.
 
 Index membership isn't available from Yahoo (Yahoo only knows the EXCHANGE, e.g. NASDAQ/NYSE).
 Sources, tried in order per index:
@@ -20,6 +24,12 @@ that index keeps its members from the previous us_universe.json — a bad scrape
 """
 
 import io
+import os
+import math
+import asyncio
+import time
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 import re
 import logging
 
@@ -165,6 +175,151 @@ async def scrape_index(client, key) -> tuple[dict, str]:
     return {}, "failed"
 
 
+
+# Broad-market additions are screened monthly; existing indices stay intact.
+# Directory documentation: https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs
+LIQUID_DIRECTORY = "https://www.nasdaqtrader.com/dynamic/SymDir/{}"
+NON_COMMON = re.compile(r"\b(warrants?|rights?|units?|preferred|preference|debentures?|notes?|bonds?|closed.end fund)\b|\bseries [A-Z]\b", re.I)
+
+
+def liquid_settings():
+    def number(key, default):
+        value = float(os.environ.get(key, default))
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be a positive finite number")
+        return value
+    return {"min_price": number("US_LIQUID_MIN_PRICE", 5),
+            "min_avg_dollar_volume": number("US_LIQUID_MIN_DOLLAR_VOLUME", 10_000_000),
+            "min_avg_volume": number("US_LIQUID_MIN_VOLUME", 200_000),
+            "lookback": 20, "refresh_days": number("US_LIQUID_REFRESH_DAYS", 30)}
+
+
+def parse_symbol_directory(text, nasdaq):
+    df = pd.read_csv(io.StringIO(text), sep="|", dtype=str, keep_default_na=False)
+    symbol_col = "Symbol" if nasdaq else "ACT Symbol"
+    if not {symbol_col, "Security Name", "ETF", "Test Issue"}.issubset(df.columns):
+        raise ValueError("Unexpected Nasdaq symbol-directory columns")
+    exchange_names = {"N": "NYSE", "A": "NYSE American", "P": "NYSE Arca", "Z": "Cboe BZX", "V": "IEX"}
+    out = {}
+    for _, row in df.iterrows():
+        raw, name = row[symbol_col], row["Security Name"]
+        if row["Test Issue"] != "N" or row["ETF"] != "N" or NON_COMMON.search(name):
+            continue
+        # Slash/period share classes are normalized; preferred/warrant suffixes
+        # with $, +, ^ etc. are excluded rather than guessed into Yahoo symbols.
+        if any(ch in raw for ch in "$+^=~"):
+            continue
+        sym = clean_symbol(raw)
+        if sym:
+            out[sym] = {"name": name, "exchange": "NASDAQ" if nasdaq else exchange_names.get(row.get("Exchange"), "")}
+    return out
+
+
+async def liquid_candidates(client):
+    result = {}
+    for file, nasdaq, minimum in (("nasdaqlisted.txt", True, 500), ("otherlisted.txt", False, 500)):
+        response = await client.get(LIQUID_DIRECTORY.format(file), headers=BROWSER_UA, timeout=60, follow_redirects=True)
+        response.raise_for_status()
+        rows = parse_symbol_directory(response.text, nasdaq)
+        if len(rows) < minimum:
+            raise ValueError(f"{file}: only {len(rows)} candidates; refusing incomplete directory")
+        result.update(rows)
+    return result
+
+
+def liquidity_from_frame(frame, settings, cutoff=None):
+    if frame is None or frame.empty or not {"Close", "Volume"}.issubset(frame.columns):
+        return None
+    data = frame[["Close", "Volume"]].copy().sort_index()
+    data = data[~data.index.duplicated(keep="last")]
+    cutoff = cutoff or completed_us_date()
+    data = data[[idx.date() <= cutoff for idx in data.index]]
+    recent = data.tail(settings["lookback"])
+    if len(recent) != settings["lookback"]:
+        return None
+    closes, volumes = pd.to_numeric(recent.Close, errors="coerce"), pd.to_numeric(recent.Volume, errors="coerce")
+    if not all(math.isfinite(float(v)) and float(v) > 0 for v in closes) or not all(math.isfinite(float(v)) and float(v) >= 0 for v in volumes):
+        return None
+    asof = recent.index[-1].date()
+    if (cutoff - asof).days > 5:
+        return None
+    last, avg_volume = float(closes.iloc[-1]), float(volumes.mean())
+    avg_dollars = float((closes * volumes).mean())
+    return {"price": round(last, 4), "avg_volume20": round(avg_volume, 2),
+            "avg_dollar_volume20": round(avg_dollars, 2), "asof": asof.isoformat(),
+            "passes": last >= settings["min_price"] and avg_volume >= settings["min_avg_volume"] and avg_dollars >= settings["min_avg_dollar_volume"]}
+
+
+def completed_us_date():
+    now = datetime.now(ZoneInfo("America/New_York"))
+    # Avoid intraday partial volume. After 17:00 ET the current session may be used.
+    return now.date() if now.hour >= 17 else now.date() - timedelta(days=1)
+
+
+def screen_liquid_candidates(candidates, settings):
+    import yfinance as yf  # already used by pipeline_us.py; no new data-provider key
+    qualified, observed = {}, set()
+    symbols = sorted(candidates)
+    for offset in range(0, len(symbols), 100):
+        chunk = symbols[offset:offset+100]
+        data = pd.DataFrame()
+        for attempt in range(3):
+            try:
+                data = yf.download(chunk, period="3mo", interval="1d", group_by="ticker",
+                                   auto_adjust=False, actions=False, threads=True, progress=False)
+                if not data.empty:
+                    break
+            except Exception as exc:
+                log.warning(f"  liquidity download: {type(exc).__name__}: {str(exc)[:100]}")
+            time.sleep(2 ** attempt)
+        for sym in chunk:
+            try:
+                frame = data[sym] if isinstance(data.columns, pd.MultiIndex) else data if len(chunk) == 1 else None
+            except KeyError:
+                continue
+            stats = liquidity_from_frame(frame, settings)
+            if stats is None:
+                continue
+            observed.add(sym)
+            if stats.pop("passes"):
+                qualified[sym] = {**candidates[sym], "liquidity": stats}
+        log.info(f"  liquidity: {min(offset+100,len(symbols))}/{len(symbols)}, {len(qualified)} qualified")
+        time.sleep(.5)
+    # A partial Yahoo response must not silently replace the last good broad list.
+    if len(observed) < len(symbols) * .75:
+        raise RuntimeError(f"Liquidity coverage too low: {len(observed)}/{len(symbols)}; keeping previous list")
+    return qualified, observed
+
+
+async def build_liquid_universe(client, previous, base_symbols, now_iso):
+    settings = liquid_settings()
+    previous_members = {s: {"name": v.get("name"), "exchange": v.get("exchange"), "liquidity": v.get("liquidity")}
+                        for s, v in previous.get("symbols", {}).items() if "LIQUID" in v.get("indices", []) and s not in base_symbols}
+    info = previous.get("liquid", {})
+    try:
+        checked = datetime.fromisoformat(info["updated"].replace("Z", "+00:00"))
+        fresh = (datetime.now(timezone.utc) - checked).total_seconds() < settings["refresh_days"] * 86400
+    except (KeyError, TypeError, ValueError):
+        fresh = False
+    if fresh and info.get("settings") == settings and os.environ.get("US_LIQUID_FORCE") != "1":
+        return previous_members, {**info, "source": "cached"}
+    try:
+        candidates = await liquid_candidates(client)
+        # Index members stay in the base universe; screen only incremental names.
+        candidates = {s: v for s, v in candidates.items() if s not in base_symbols}
+        qualified, observed = await asyncio.to_thread(screen_liquid_candidates, candidates, settings)
+        carried = 0
+        for sym, old in previous_members.items():
+            if sym in candidates and sym not in observed:
+                qualified[sym] = old
+                carried += 1
+        return qualified, {"updated": now_iso(), "settings": settings, "source": "nasdaq-directory+yahoo-20-session",
+                           "candidates": len(candidates), "observed": len(observed), "qualified": len(qualified), "carried": carried}
+    except Exception as exc:
+        log.warning(f"  liquidity expansion failed: {exc}; keeping {len(previous_members)} previous symbols")
+        return previous_members, {**info, "source": "previous" if previous_members else "unavailable", "error": str(exc)[:200]}
+
+
 async def build_universe(client, r2_download, r2_upload, now_iso) -> dict:
     """Scrape all enabled indices, merge with previous universe on failure, upload, return universe."""
     try:
@@ -194,10 +349,18 @@ async def build_universe(client, r2_download, r2_upload, now_iso) -> dict:
             entry["indices"].append(key)
     for sym, nm in EXTRA_SYMBOLS.items():
         symbols.setdefault(sym, {"name": nm, "indices": []})["indices"].append("ETF")
+    liquid_members, liquid_info = await build_liquid_universe(client, prev, set(symbols), now_iso)
+    for sym, details in liquid_members.items():
+        entry = symbols.setdefault(sym, {"name": details.get("name"), "indices": []})
+        if "LIQUID" not in entry["indices"]:
+            entry["indices"].append("LIQUID")
+        entry["exchange"] = details.get("exchange")
+        entry["liquidity"] = details.get("liquidity")
+    index_info["LIQUID"] = {"name": "Liquid US additions", "count": len(liquid_members), "source": liquid_info["source"]}
     for v in symbols.values():
         v["indices"].sort()
 
-    universe = {"updated": now_iso(), "indices": index_info, "symbols": dict(sorted(symbols.items()))}
+    universe = {"updated": now_iso(), "indices": index_info, "liquid": liquid_info, "symbols": dict(sorted(symbols.items()))}
 
     added = sorted(set(symbols) - set(prev_syms))
     removed = sorted(set(prev_syms) - set(symbols))
