@@ -25,6 +25,8 @@ Usage:
   python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
   python pipeline.py box_scan         # TwT Box Finder -> box_finder.json
   python pipeline.py box_scan_dryrun  # preview Box Finder without R2 writes
+  python pipeline.py public_alerts    # EOD summaries to the public Telegram group (run after ep_scan)
+  python pipeline.py public_alerts_dryrun  # print the messages, send nothing
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
   python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
@@ -6864,6 +6866,207 @@ async def run_box_scan(dry_run=False) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+# PUBLIC ALERTS — end-of-day summaries to the public Telegram group
+# (@twt_alerts, Topics on). One message per topic, built from screener_feed.json
+# (its per-stock "ev" events). Run after ep_scan:  python pipeline.py public_alerts
+#   Market Summary  breadth, new highs / lows, sectors
+#   Box Breakouts   ev "box" dated today
+#   52W High & ATH  ev "ath" / "h52" dated today
+#   Stage 2 Entries ev "stg" into stage 2 (weekly; each symbol posted once per week)
+#   EP & Gaps       ev "ep" today + gap-ups of at least PUBLIC_ALERT_GAP_MIN_PCT today
+#   Setups          ev "rcl" / "so" / "vcp" / "htf" / "mhtf" / "pb" dated today
+# Already-posted items are kept in R2 public_alerts_state.json so a re-run (or a
+# holiday run on the same data) does not post them again.
+# Liquidity filter keeps out illiquid names: 50-day average turnover >= PUBLIC_ALERT_MIN_TURNOVER_CR.
+# ══════════════════════════════════════════════════════════════
+PUBLIC_ALERT_MIN_TURNOVER_CR = 1.0     # "to" in screener_feed, crore per day
+PUBLIC_ALERT_MAX_ROWS = 10             # stocks listed per message; the rest as "+N more"
+PUBLIC_ALERT_GAP_MIN_PCT = 3.0
+PUBLIC_ALERT_STATE_DAYS = 20
+PUBLIC_ALERT_SITE = "https://tradewithtech.in"
+
+
+def _pa_esc(t):
+    return str(t if t is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _pa_line(row, extra=""):
+    sym = _pa_esc(row.get("trading_symbol") or row.get("symbol"))
+    pc = row.get("pct_ch")
+    pc_txt = f"{pc:+.1f}%" if isinstance(pc, (int, float)) else ""
+    rs = row.get("rs_rating")
+    rs_txt = f" · RS {int(rs)}" if isinstance(rs, (int, float)) else ""
+    return f"• <b>{sym}</b> {pc_txt}{rs_txt}" + (f" · {_pa_esc(extra)}" if extra else "")
+
+
+def _pa_block(title, items, date_txt, note=""):
+    """items: [(row, extra)] already sorted; returns message text or None."""
+    if not items:
+        return None
+    shown = items[:PUBLIC_ALERT_MAX_ROWS]
+    lines = [f"<b>{title}</b> — {date_txt}", ""]
+    lines += [_pa_line(r, x) for r, x in shown]
+    if len(items) > len(shown):
+        lines.append(f"… +{len(items) - len(shown)} more")
+    if note:
+        lines += ["", f"<i>{_pa_esc(note)}</i>"]
+    lines += ["", f'<a href="{PUBLIC_ALERT_SITE}">Full list on TradeWithTech</a> · not investment advice']
+    return "\n".join(lines)
+
+
+def _pa_rank(row):
+    rs = row.get("rs_rating")
+    return -(rs if isinstance(rs, (int, float)) else 0)
+
+
+def _build_public_alerts(feed, market_date, sent):
+    """Returns ([(topic_key, text)], new_sent_keys). sent = set of keys already posted."""
+    try:
+        date_txt = date.fromisoformat(market_date).strftime("%d %b %Y")
+    except ValueError:
+        date_txt = market_date
+    liquid = [r for r in feed if isinstance(r.get("to"), (int, float)) and r["to"] >= PUBLIC_ALERT_MIN_TURNOVER_CR]
+    new_keys, out = set(), []
+
+    def fresh(key):
+        return key not in sent and key not in new_keys
+
+    # ── market summary (once per market date) ──
+    key = f"market|{market_date}"
+    if fresh(key):
+        rows = [r for r in feed if r.get("date") == market_date and isinstance(r.get("pct_ch"), (int, float))]
+        if rows:
+            adv = sum(1 for r in rows if r["pct_ch"] > 0); dec = sum(1 for r in rows if r["pct_ch"] < 0)
+            nh = sum(1 for r in rows if r.get("new_52wh")); nl = sum(1 for r in rows if r.get("new_52wl"))
+            a50 = 100 * sum(1 for r in rows if r.get("above_50")) / len(rows)
+            a200 = 100 * sum(1 for r in rows if r.get("above_200")) / len(rows)
+            sec = {}
+            for r in rows:
+                if r.get("sector"): sec.setdefault(r["sector"], []).append(r["pct_ch"])
+            sec_avg = sorted(((s, sum(v) / len(v)) for s, v in sec.items() if len(v) >= 10), key=lambda x: -x[1])
+            lines = [f"<b>🌡 Market Summary</b> — {date_txt}", "",
+                     f"Advances / declines: <b>{adv}</b> / <b>{dec}</b>",
+                     f"New 52W highs / lows: <b>{nh}</b> / <b>{nl}</b>",
+                     f"Above EMA50: <b>{a50:.0f}%</b> · above EMA200: <b>{a200:.0f}%</b>"]
+            if sec_avg:
+                lines += ["", "Strongest sectors: " + ", ".join(f"{_pa_esc(s)} {v:+.1f}%" for s, v in sec_avg[:3]),
+                          "Weakest sectors: " + ", ".join(f"{_pa_esc(s)} {v:+.1f}%" for s, v in sec_avg[-3:][::-1])]
+            lines += ["", f'<a href="{PUBLIC_ALERT_SITE}">Open the screener</a>']
+            out.append(("market", "\n".join(lines))); new_keys.add(key)
+
+    def evs(row, types):
+        return [e for e in (row.get("ev") or []) if isinstance(e, list) and len(e) >= 2 and e[0] in types]
+
+    # ── box breakouts ──
+    items = []
+    for r in liquid:
+        for e in evs(r, ("box",)):
+            k = f"box|{r['symbol']}|{e[1]}"
+            if e[1] == market_date and fresh(k):
+                items.append((r, f"{e[2]}-candle base" if e[2] else "")); new_keys.add(k); break
+    out.append(("box", _pa_block("📦 Box Breakouts", sorted(items, key=lambda x: _pa_rank(x[0])), date_txt)))
+
+    # ── 52W high and ATH (ATH first) ──
+    ath, h52 = [], []
+    for r in liquid:
+        if any(e[1] == market_date for e in evs(r, ("ath",))) and fresh(f"ath|{r['symbol']}|{market_date}"):
+            ath.append((r, "ATH")); new_keys.add(f"ath|{r['symbol']}|{market_date}")
+        elif any(e[1] == market_date for e in evs(r, ("h52",))) and fresh(f"h52|{r['symbol']}|{market_date}"):
+            h52.append((r, "52W high")); new_keys.add(f"h52|{r['symbol']}|{market_date}")
+    items = sorted(ath, key=lambda x: _pa_rank(x[0])) + sorted(h52, key=lambda x: _pa_rank(x[0]))
+    out.append(("highs", _pa_block("🚀 New 52W High & ATH", items, date_txt,
+                                   f"{len(ath)} at an all-time high, {len(h52)} at a 52-week high" if items else "")))
+
+    # ── stage 2 entries (weekly; posted once per symbol and week) ──
+    items = []
+    for r in liquid:
+        for e in evs(r, ("stg",)):
+            lab = str(e[2] if len(e) > 2 else "")
+            k = f"stg|{r['symbol']}|{e[1]}"
+            if lab.endswith(">2") and fresh(k):
+                items.append((r, "Stage " + lab.replace(">", " → "))); new_keys.add(k); break
+    out.append(("stage2", _pa_block("🪜 Stage 2 Entries", sorted(items, key=lambda x: _pa_rank(x[0])), date_txt,
+                                    "Weinstein weekly stage")))
+
+    # ── EP and gap-ups ──
+    items = []
+    for r in liquid:
+        k = f"ep|{r['symbol']}|{market_date}"
+        if not fresh(k):
+            continue
+        is_ep = any(e[1] == market_date for e in evs(r, ("ep",)))
+        gp = r.get("gap_pct")
+        is_gap = (r.get("gap_date") == market_date and r.get("gap_direction") == "up"
+                  and isinstance(gp, (int, float)) and gp >= PUBLIC_ALERT_GAP_MIN_PCT)
+        if is_ep or is_gap:
+            extra = "EP" if is_ep else ""
+            if isinstance(gp, (int, float)) and r.get("gap_date") == market_date:
+                extra = (extra + " · " if extra else "") + f"gap {gp:+.1f}%"
+            items.append((r, extra)); new_keys.add(k)
+    items.sort(key=lambda x: (0 if x[1].startswith("EP") else 1, _pa_rank(x[0])))
+    out.append(("ep", _pa_block("⚡ EP & Gap-ups", items, date_txt)))
+
+    # ── setups ──
+    names = {"rcl": "EMA50 reclaim", "so": "Shakeout reclaim", "vcp": "VCP", "htf": "HTF", "mhtf": "Mini HTF", "pb": "Pullback"}
+    items = []
+    for r in liquid:
+        tags = []
+        for e in evs(r, tuple(names)):
+            k = f"{e[0]}|{r['symbol']}|{e[1]}"
+            if e[1] == market_date and fresh(k):
+                t = names[e[0]] + (f" ({e[2]})" if e[0] == "so" and len(e) > 2 and e[2] else "")
+                if t not in tags: tags.append(t)
+                new_keys.add(k)
+        if tags:
+            items.append((r, ", ".join(tags)))
+    out.append(("setups", _pa_block("🎯 Setups", sorted(items, key=lambda x: _pa_rank(x[0])), date_txt)))
+
+    return [(t, m) for t, m in out if m], new_keys
+
+
+async def run_public_alerts(dry_run=False) -> None:
+    from telegram_notify import send_public, PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID
+    async with httpx.AsyncClient() as client:
+        feed, state = await asyncio.gather(r2_download(client, "screener_feed.json"),
+                                           r2_download(client, "public_alerts_state.json"))
+        if not isinstance(feed, list) or not feed:
+            log.warning("Public alerts: screener_feed.json missing or empty — nothing sent")
+            return
+        market_date = max(str(r.get("as_of_date") or r.get("date") or "")[:10] for r in feed)
+        state = state if isinstance(state, dict) else {}
+        sent_map = state.get("sent") if isinstance(state.get("sent"), dict) else {}
+        msgs, new_keys = _build_public_alerts(feed, market_date, set(sent_map))
+        log.info(f"Public alerts for {market_date}: {len(msgs)} message(s), {len(new_keys)} new item(s)")
+        if dry_run:
+            for t, m in msgs:
+                log.info(f"--- topic {t} ---\n{m}")
+            return
+        if not TELEGRAM_PUBLIC_CHAT_ID:
+            log.warning("Public alerts: TELEGRAM_PUBLIC_CHAT_ID not set — nothing sent")
+            return
+        ok_topics = []
+        for t, m in msgs:
+            ok = False
+            for attempt in range(3):
+                if send_public(m, thread_id=PUBLIC_TOPICS.get(t)):
+                    ok = True; break
+                await asyncio.sleep(5 * (attempt + 1))
+            log.info(f"  topic {t}: {'sent' if ok else 'FAILED'}")
+            if ok: ok_topics.append(t)
+            await asyncio.sleep(2)
+        # remember only what reached Telegram; a failed topic is tried again next run
+        prefix = {"market": ("market",), "box": ("box",), "highs": ("ath", "h52"), "stage2": ("stg",),
+                  "ep": ("ep",), "setups": ("rcl", "so", "vcp", "htf", "mhtf", "pb")}
+        keep_types = {p for t in ok_topics for p in prefix.get(t, ())}
+        for k in new_keys:
+            if k.split("|", 1)[0] in keep_types:
+                sent_map[k] = market_date
+        cutoff = (date.fromisoformat(market_date) - timedelta(days=PUBLIC_ALERT_STATE_DAYS)).isoformat()
+        sent_map = {k: d for k, d in sent_map.items() if d >= cutoff}
+        await r2_upload(client, "public_alerts_state.json", json.dumps({"updated": market_date, "sent": sent_map}))
+
+
+# ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
@@ -6900,6 +7103,8 @@ if __name__ == "__main__":
         case "stage2_scan":   asyncio.run(run_stage2_scan())
         case "minervini_scan": asyncio.run(run_minervini_scan())
         case "box_scan": asyncio.run(run_box_scan())
+        case "public_alerts": asyncio.run(run_public_alerts())
+        case "public_alerts_dryrun": asyncio.run(run_public_alerts(dry_run=True))
         case "box_scan_dryrun": asyncio.run(run_box_scan(dry_run=True))
         case "weinstein_scan": asyncio.run(run_weinstein_scan())
         case "weinstein_scan_dryrun": asyncio.run(run_weinstein_scan(dry_run=True))
