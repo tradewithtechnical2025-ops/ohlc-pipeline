@@ -4,6 +4,8 @@ name: OHLC Pipeline Scans (Manual)
 # demand (VCP, Minervini Trend Template, Weinstein, Box Finder, EP, HLR, status, etc.)
 # without needing a separate .yml per mode.
 # Option values must be the exact pipeline.py mode names (no spaces).
+# public_alerts*: EOD summaries to the public Telegram group (@twt_alerts).
+#   public_alerts_dryrun = messages in the log only, public_alerts_ping = one test message per topic.
 on:
   workflow_dispatch:
     inputs:
@@ -28,6 +30,9 @@ on:
           - candle_scan
           - candle_scan_force
           - home_ticker
+          - public_alerts_dryrun
+          - public_alerts
+          - public_alerts_ping
 
 jobs:
   pipeline-scan:
@@ -42,7 +47,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install httpx numpy
+        run: pip install httpx numpy requests
 
       - name: Run pipeline.py (${{ inputs.mode }})
         env:
@@ -50,4 +55,7 @@ jobs:
           WORKER_URL:   ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_PUBLIC_CHAT_ID: ${{ secrets.TELEGRAM_PUBLIC_CHAT_ID }}
         run: python pipeline.py "${{ inputs.mode }}"
