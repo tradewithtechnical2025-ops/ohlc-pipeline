@@ -23,6 +23,8 @@ jobs:
           WORKER_TOKEN:       ${{ secrets.WORKER_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Circuit changes and FII / DII go to the public alerts group (@twt_alerts) topics
+          TELEGRAM_PUBLIC_CHAT_ID: ${{ secrets.TELEGRAM_PUBLIC_CHAT_ID }}
         run: python pipeline_nse.py
       - name: Telegram fallback on workflow failure
         if: failure()
