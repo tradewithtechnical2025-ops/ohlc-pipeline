@@ -843,19 +843,19 @@ def _fii_dii_message(snap: dict, hist: list, oi_snapshot) -> list:
     except (KeyError, ValueError):
         d, d_txt = None, str(snap.get("date"))
     lines = [f"<b>💰 FII / DII Activity</b> · {d_txt}", "<i>Cash market, ₹ crore (provisional)</i>", ""]
-    tbl = [f"{'':<5}{'Buy':>10}{'Sell':>10}{'Net':>9}"]
+    tbl = [f"{'':<4}{'Buy':>8}{'Sell':>8}{'Net':>8}"]   # about 28 characters: no wrap on a phone
     for name, e in (("FII", fii), ("DII", dii)):
         if e:
-            tbl.append(f"{name:<5}{e.get('buy', 0):>10,.0f}{e.get('sell', 0):>10,.0f}{e.get('net', 0):>+9,.0f}")
+            tbl.append(f"{name:<4}{e.get('buy', 0):>8,.0f}{e.get('sell', 0):>8,.0f}{e.get('net', 0):>+8,.0f}")
     lines.append("<pre>" + "\n".join(tbl) + "</pre>")
     rows = sorted((h for h in (hist or []) if isinstance(h, dict) and h.get("date")), key=lambda h: h["date"])
     last5 = rows[-5:]
     if last5:
-        trend = [f"{'Date':<7}{'FII':>9}{'DII':>9}"]
+        trend = [f"{'Date':<7}{'FII':>8}{'DII':>8}"]
         for h in last5:
             try: dl = date.fromisoformat(h["date"]).strftime("%d %b")
             except ValueError: dl = h["date"][5:]
-            trend.append(f"{dl:<7}{cr((h.get('fii') or {}).get('net')):>9}{cr((h.get('dii') or {}).get('net')):>9}")
+            trend.append(f"{dl:<7}{cr((h.get('fii') or {}).get('net')):>8}{cr((h.get('dii') or {}).get('net')):>8}")
         lines += ["", "<b>Last 5 sessions</b> (net)", "<pre>" + "\n".join(trend) + "</pre>"]
     if d:
         mtd = [h for h in rows if h["date"][:7] == d.isoformat()[:7]]
