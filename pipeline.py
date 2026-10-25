@@ -2729,7 +2729,14 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         today_close = closes[-1]  # None if stock didn't trade today
         pct_ch = round((today_close - prev_cls) / prev_cls * 100, 2) if today_close and prev_cls else None
         vol = volumes[-1] or 0
-        w52_highs=[v for v in highs[-252:] if v is not None]; w52_lows=[v for v in lows[-252:] if v is not None]
+        # 52-week high / low over the last 365 calendar days up to the latest candle (same as NSE /
+        # TradingView); 252 bars could reach further back than a year around holidays.
+        try:
+            w52_cut=(date.fromisoformat(str(dates[-1])[:10])-timedelta(days=365)).isoformat()
+            w52_start=next((i for i in range(n) if str(dates[i])[:10]>=w52_cut), max(0,n-252))
+        except (ValueError, TypeError):
+            w52_start=max(0,n-252)
+        w52_highs=[v for v in highs[w52_start:] if v is not None]; w52_lows=[v for v in lows[w52_start:] if v is not None]
         high52=max(w52_highs) if w52_highs else None; low52=min(w52_lows) if w52_lows else None
         whd52=round((ltp-high52)/high52*100,2) if high52 else None
         wld52=round((ltp-low52)/low52*100,2) if low52 else None
@@ -2966,6 +2973,160 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         feed.append(row)
     log.info(f"screener_feed: {len(feed)} stocks")
     return feed
+
+
+# ══════════════════════════════════════════════════════════════
+# STOCK EVENTS — "what is new" per stock, for the screener's NEW tag,
+# its hover list and (later) preset alerts. Each row gets
+#   "ev": [[type, date, detail], ...]   (newest first, key left out when empty)
+# covering the last EVENT_WINDOW_SESSIONS sessions of that stock.
+#   stg  Weinstein stage change      (weinstein_transitions.json, date = Monday of the week)
+#   box  Box Finder breakout          (box_finder.json box_history[].breakout_date)
+#   h52  new 52-week high             (OHLC, 365 calendar days, latest such day)
+#   ath  new all-time high            (ath_date)
+#   rcl  close reclaimed EMA50        (OHLC; crossed above from at/below and still above today)
+#   ep   episodic pivot               (EP signals, not Dead)
+#   pb / wpb / mpb  pullback D / W / M (signal dates)
+#   so   EMA shakeout reclaim         (shakeout_signals recovery_date)
+#   mv   new Minervini Trend Template pass
+#   vcp / htf / mhtf  state entry: on today, off in the previous session's feed
+# Events of earlier days are carried over from the previous history feed, so
+# state-entry events (vcp / htf / mv) stay listed for the whole window.
+# Workflow order: minervini_scan, weinstein_scan and box_scan run before ep_scan.
+# ══════════════════════════════════════════════════════════════
+EVENT_WINDOW_SESSIONS = 10
+
+
+def _ev_ema_series(closes, period):
+    out = [None] * len(closes); k = 2 / (period + 1); e = None; seen = []
+    for i, v in enumerate(closes):
+        if v is None:
+            out[i] = e; continue
+        if e is None:
+            seen.append(v)
+            if len(seen) == period: e = sum(seen) / period
+        else:
+            e = v * k + e * (1 - k)
+        out[i] = e
+    return out
+
+
+def _ev_ohlc(s, win_start_idx):
+    """New 52W high and EMA50 reclaim from one stock's OHLC -> list of events."""
+    out = []
+    dates, highs, closes = s.get("d") or [], s.get("h") or [], s.get("c") or []
+    n = len(dates)
+    if n < 60: return out
+    # latest session in the window whose high is >= every high of the previous 365 days
+    for i in range(n - 1, win_start_idx - 1, -1):
+        h = highs[i]
+        if h is None: continue
+        try: cut = (date.fromisoformat(str(dates[i])[:10]) - timedelta(days=365)).isoformat()
+        except (ValueError, TypeError): continue
+        j = bisect.bisect_left(dates, cut, 0, i)
+        prev = [v for v in highs[j:i] if v is not None]
+        if len(prev) >= 120 and h >= max(prev):
+            out.append(["h52", dates[i], round(h, 2)]); break
+    # EMA50 reclaim: latest cross from at/below to above inside the window, still above today
+    m = _ev_ema_series(closes, 50)
+    if closes[-1] is not None and m[-1] is not None and closes[-1] > m[-1]:
+        for i in range(n - 1, max(win_start_idx, 1) - 1, -1):
+            c0, c1, m0, m1 = closes[i - 1], closes[i], m[i - 1], m[i]
+            if None in (c0, c1, m0, m1): break
+            if c0 <= m0 and c1 > m1:
+                out.append(["rcl", dates[i], "EMA50"]); break
+    return out
+
+
+def _attach_stock_events(feed, all_data, today, prev_feed=None, wtrans=None, box_raw=None,
+                         mv_raw=None, ep_signals=None, pb_map=None, w_pb_map=None, m_pb_map=None,
+                         ema_shakeout_map=None):
+    prev_rows = {r.get("symbol"): r for r in (prev_feed or []) if isinstance(r, dict)}
+    prev_date = next((r.get("as_of_date") for r in (prev_feed or []) if isinstance(r, dict) and r.get("as_of_date")), None)
+    # stage changes by symbol: [(monday, "1>2"), ...]
+    stg = {}
+    for wk, rows in (wtrans or {}).items():
+        for t in rows or []:
+            sym = t.get("symbol")
+            if sym and t.get("from_stage") is not None and t.get("to_stage") is not None:
+                stg.setdefault(sym, []).append((wk, f"{t['from_stage']}>{t['to_stage']}"))
+    box_hist = (box_raw or {}).get("box_history") or {}
+    mv_new = set((mv_raw or {}).get("new_today") or [])
+    mv_date = (mv_raw or {}).get("updated") or today
+    ep_by = {}
+    for sig in ep_signals or []:
+        if sig.get("state") == "Dead" or not sig.get("ep_date"): continue
+        ep_by.setdefault(sig["symbol"], []).append(sig["ep_date"])
+    n_ev = 0
+    for row in feed:
+        sym = row["symbol"]; s = all_data.get(sym) or {}
+        dates = s.get("d") or []
+        if not dates: continue
+        wi = max(0, len(dates) - EVENT_WINDOW_SESSIONS)
+        wstart = str(dates[wi])[:10]
+        ev = []
+        ev += _ev_ohlc(s, wi)
+        for wk, lab in stg.get(sym, []):
+            try: wk_end = (date.fromisoformat(wk) + timedelta(days=4)).isoformat()
+            except (ValueError, TypeError): continue
+            if wk_end >= wstart: ev.append(["stg", wk, lab])
+        for b in box_hist.get(sym) or []:
+            bd = b.get("breakout_date")
+            if bd and bd >= wstart: ev.append(["box", bd, b.get("base_length_candles")])
+        if row.get("ath_date") and str(row["ath_date"])[:10] >= wstart:
+            ev.append(["ath", str(row["ath_date"])[:10], row.get("ath")])
+        for d in ep_by.get(sym, []):
+            if d >= wstart: ev.append(["ep", d, None])
+        d = ((pb_map or {}).get(sym) or {}).get("date")
+        if d and d >= wstart: ev.append(["pb", d, None])
+        d = ((w_pb_map or {}).get(sym) or {}).get("signal_date")
+        if d and d >= wstart: ev.append(["wpb", d, None])
+        d = ((m_pb_map or {}).get(sym) or {}).get("date")
+        if d and d >= wstart: ev.append(["mpb", d, None])
+        for cat, rec in ((ema_shakeout_map or {}).get(sym) or {}).items():
+            d = rec.get("recovery_date")
+            if d and d >= wstart: ev.append(["so", d, cat])
+        if sym in mv_new: ev.append(["mv", mv_date, None])
+        # state entry vs the previous session's feed (skipped when that feed is missing)
+        pr = prev_rows.get(sym)
+        if pr is not None and prev_date and prev_date < today:
+            if row.get("is_vcp") and not pr.get("is_vcp"): ev.append(["vcp", today, None])
+            if row.get("htf_status") and row.get("htf_status") != pr.get("htf_status"): ev.append(["htf", today, row.get("htf_status")])
+            if row.get("mini_htf_status") and row.get("mini_htf_status") != pr.get("mini_htf_status"): ev.append(["mhtf", today, row.get("mini_htf_status")])
+        # carry over the previous feed's events that are still inside the window
+        if pr is not None:
+            for e in pr.get("ev") or []:
+                if isinstance(e, list) and len(e) >= 2 and str(e[1]) >= wstart: ev.append(list(e))
+        seen, uniq = set(), []
+        for e in sorted(ev, key=lambda x: str(x[1]), reverse=True):
+            k = (e[0], str(e[1]))
+            if k in seen: continue
+            seen.add(k); uniq.append(e)
+        if uniq:
+            row["ev"] = uniq; n_ev += 1
+        else:
+            row.pop("ev", None)
+    log.info(f"Stock events: {n_ev} stocks with an event in the last {EVENT_WINDOW_SESSIONS} sessions")
+
+
+async def _load_event_sources(client, market_data_date):
+    """weinstein_transitions, box_finder, minervini and the previous session's history feed."""
+    wtrans, box_raw, mv_raw, manifest = await asyncio.gather(
+        r2_download(client, "weinstein_transitions.json"), r2_download(client, "box_finder.json"),
+        r2_download(client, "minervini_trend_template.json"), r2_download(client, "history/manifest.json"),
+        return_exceptions=True)
+    clean = lambda x: x if isinstance(x, dict) else None
+    prev_feed = None
+    dates = (clean(manifest) or {}).get("dates") or []
+    prev = [d for d in dates if d < market_data_date]
+    if prev:
+        try:
+            pf = await r2_download(client, f"history/screener_feed_{prev[-1]}.json")
+            prev_feed = pf if isinstance(pf, list) else None
+        except Exception as e:
+            log.warning(f"Stock events: previous feed {prev[-1]} not loaded: {e}")
+    return clean(wtrans), clean(box_raw), clean(mv_raw), prev_feed
+
 
 
 # ══════════════════════════════════════════════════════════════
@@ -3750,6 +3911,15 @@ async def run_ep_scan() -> None:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
             for sig in pr_signals:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
+
+            # ── per-stock events for the NEW tag (see _attach_stock_events) ──
+            try:
+                _wt, _bx, _mv, _pf = await _load_event_sources(client, market_data_date)
+                _attach_stock_events(screener_feed, all_data, market_data_date, prev_feed=_pf, wtrans=_wt,
+                                     box_raw=_bx, mv_raw=_mv, ep_signals=signals, pb_map=pb_map,
+                                     w_pb_map=w_pb_map, m_pb_map=m_pb_map, ema_shakeout_map=ema_shakeout_map)
+            except Exception as e:
+                log.warning(f"Stock events skipped: {e}")
 
             # ── Date confirmation for frontend. as_of_date is the latest
             # actual OHLC trading session, NOT the calendar day the job ran.
