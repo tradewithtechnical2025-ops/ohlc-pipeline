@@ -43,6 +43,8 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_RESULTS_CHAT_ID: ${{ secrets.TELEGRAM_RESULTS_CHAT_ID }}
+          # Results also go to the "Results" topic of the public alerts group (@twt_alerts)
+          TELEGRAM_PUBLIC_CHAT_ID: ${{ secrets.TELEGRAM_PUBLIC_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           REPROCESS_STALE_RESULTS: ${{ inputs.reprocess_stale && '1' || '0' }}
           MANUAL_RESULT_PDFS: ${{ inputs.manual_pdfs }}
