@@ -225,6 +225,37 @@
       "status": "done",
       "at": "2026-10-14 06:55",
       "attempts": 1
+    },
+    "eaaa-india-alternatives-limited-ipo": {
+      "status": "download_failed",
+      "at": "2026-10-25 15:08",
+      "attempts": 1,
+      "error": "HTTPStatusError: Client error '403 Forbidden' for url 'https://www.eaaa.in/wp-content/uploads/2026/09/Red-Herring-Prospectus.pdf'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/403"
+    },
+    "bls-polymers-limited-ipo": {
+      "status": "done",
+      "at": "2026-10-25 15:10",
+      "attempts": 1
+    },
+    "sfc-environmental-technologies-limited-ipo": {
+      "status": "done",
+      "at": "2026-10-25 15:13",
+      "attempts": 1
+    },
+    "mksons-fine-jewels-limited": {
+      "status": "done",
+      "at": "2026-10-25 15:15",
+      "attempts": 1
+    },
+    "bombay-coated-and-special-steels-limited-ipo": {
+      "status": "done",
+      "at": "2026-10-25 15:17",
+      "attempts": 1
+    },
+    "paras-healthcare-limited-ipo": {
+      "status": "done",
+      "at": "2026-10-25 15:20",
+      "attempts": 1
     }
   }
 }
