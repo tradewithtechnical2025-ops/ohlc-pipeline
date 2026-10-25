@@ -12,6 +12,7 @@ env:
   FINEDGE_TOKEN:      ${{ secrets.FINEDGE_TOKEN }}
   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+  TELEGRAM_PUBLIC_CHAT_ID: ${{ secrets.TELEGRAM_PUBLIC_CHAT_ID }}
 jobs:
   pipeline:
     runs-on: ubuntu-latest
@@ -118,7 +119,6 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py box_scan
-      # Home ticker reads scan outputs; keep after the scans.
       - name: EP Scan
         uses: nick-fields/retry@v3
         with:
@@ -126,6 +126,12 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py ep_scan
+      # EOD summaries to the public Telegram group; reads screener_feed.json from EP Scan.
+      # A failure here must not fail the workflow.
+      - name: Public Telegram Alerts
+        continue-on-error: true
+        run: python pipeline.py public_alerts
+      # Home ticker reads scan outputs; keep after the scans.
       - name: Home Page Ticker
         uses: nick-fields/retry@v3
         with:
