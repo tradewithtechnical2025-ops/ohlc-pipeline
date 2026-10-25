@@ -6996,21 +6996,23 @@ def _pa_market_from_internals(rows):
     win = [r for _, _, r in dated[-PUBLIC_ALERT_TREND_DAYS:]]
     def series(c): return [_pa_num(r.get(c)) for r in win]
     trows = []
-    for label, names in (("10 EMA", ["Above 10EMA", "10EMA"]), ("20 EMA", ["Above 20EMA", "20EMA"]),
-                         ("50 EMA", ["Above 50EMA", "50EMA"]), ("200 EMA", ["Above 200EMA", "200EMA"])):
+    # rows are kept to about 29 characters so the block does not wrap on a phone
+    def trow(label, ser, val_txt):
+        chg = f"{ser[-1] - ser[-2]:+.1f}" if len(ser) > 1 and ser[-2] is not None else ""
+        return f"{label:<7}{_pa_spark(ser)} {val_txt:>6}{chg:>5}"
+    for label, names in (("10EMA", ["Above 10EMA", "10EMA"]), ("20EMA", ["Above 20EMA", "20EMA"]),
+                         ("50EMA", ["Above 50EMA", "50EMA"]), ("200EMA", ["Above 200EMA", "200EMA"])):
         c = _pa_col(headers, names)
         if not c: continue
         ser = series(c)
         if ser[-1] is None: continue
-        chg = f"{ser[-1] - ser[-2]:+5.1f}" if len(ser) > 1 and ser[-2] is not None else ""
-        trows.append(f"{label:<8}{_pa_spark(ser)} {ser[-1]:6.1f}% {chg}")
+        trows.append(trow(label, ser, f"{ser[-1]:.1f}%"))
     c_ms = _pa_col(headers, ["Mswing", "MSwing", "MSWING", "M-Swing"])
     ms_line = None
     if c_ms:
         ser = series(c_ms)
         if ser[-1] is not None:
-            chg = f"{ser[-1] - ser[-2]:+5.1f}" if len(ser) > 1 and ser[-2] is not None else ""
-            trows.append(f"{'M-Swing':<8}{_pa_spark(ser)} {ser[-1]:6.1f}  {chg}")
+            trows.append(trow("MSwing", ser, f"{ser[-1]:.1f}"))
             full = [x for x in (_pa_num(r.get(c_ms)) for _, _, r in dated) if x is not None]
             v = full[-1]; sma9 = sum(full[-9:]) / len(full[-9:])
             zone = "🟢 strong" if v >= 50 and v >= sma9 else "🟡 mixed" if v >= 50 or v >= sma9 else "🔴 weak"
@@ -7020,12 +7022,11 @@ def _pa_market_from_internals(rows):
         hs, ls = series(c_h), series(c_l)
         net = [(a - b) if a is not None and b is not None else None for a, b in zip(hs, ls)]
         if net[-1] is not None:
-            chg = f"{net[-1] - net[-2]:+5.1f}" if len(net) > 1 and net[-2] is not None else ""
-            trows.append(f"{'Net H-L':<8}{_pa_spark(net)} {net[-1]:+6.1f}% {chg}")
+            trows.append(trow("NetH-L", net, f"{net[-1]:+.1f}%"))
     if trows:
         n = len(win)
-        head = f"{'':<8}{(str(n) + 'd trend'):<{n}} {'today':>7} {'1d':>5}"
-        lines += [f"<b>📈 Breadth</b> · % of stocks, last {n} sessions (oldest → today)",
+        head = f"{'':<7}{(str(n) + 'd trend'):<{n}} {'now':>6}{'1d':>5}"
+        lines += [f"<b>📈 Breadth</b> · % of stocks · last {n} days",
                   "<pre>" + "\n".join([head] + trows) + "</pre>"]
     if ms_line:
         lines.append(ms_line)
