@@ -3844,57 +3844,96 @@ async def run_ep_scan() -> None:
 # HLR + PULLBACK SCAN
 # ══════════════════════════════════════════════════════════════
 
-def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullback_pct=5.0,ema_proximity_pct=1.0,max_candle_range_pct=6.0):
+def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullback_pct=5.0,ema_proximity_pct=1.0,max_range_atr=1.5,
+                     max_retrace_pct=61.8,min_pb_bars=2,max_pb_bars=12,max_bars_from_pb_low=2,
+                     new_high_lookback=50,min_ema_gap_pct=1.5,ema50_slope_bars=20,min_ema50_slope_pct=2.0):
+    """Daily pullback, same rules as the TwT Pullback script v3.4.
+
+    Swing high = highest high since the last confirmed swing low (known on the day it is made).
+    Signal on the latest bar when: swing >= 10%, pullback 5%+ deep, <= 61.8% retrace, 2-12 bars
+    old, its lowest low made in the last 2 bars, low/close within 1% of EMA10/21 (or a reversal
+    through it), EMA10/21 > EMA50 and close > EMA21, EMA50 rising 5 bars, flat-base guard
+    (swing high is a 50-bar high, EMA21 1.5%+ over EMA50, EMA50 up 2%+ in 20 bars),
+    candle range < 1.5 x ATR%(14), 3-day volume under the 20-day average, MACD line > 0.
+    Any candle colour and close position.
+    """
     signals=[]
+    L=length_pull
     for sym,s in all_data.items():
         dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
-        if n<60 or not _check_liquidity(volumes,closes,n): continue
-        ema10=_calc_ema(closes,10); ema21=_calc_ema(closes,21); ema50=_calc_ema(closes,50)
-        if any(v is None for v in [ema10[-1],ema21[-1],ema50[-1]]): continue
-        ema12=_calc_ema(closes,12); ema26=_calc_ema(closes,26)
-        macd_line=[(ema12[i]-ema26[i]) if ema12[i] is not None and ema26[i] is not None else None for i in range(n)]
-        if len([v for v in macd_line if v is not None])<9: continue
-        macd_arr=[v if v is not None else 0.0 for v in macd_line]
-        macd_signal=_calc_ema(macd_arr,9)
-        last_swing_high_price=last_swing_high_bar=last_swing_low_price=last_swing_low_bar=None
-        for i in range(length_pull,n-length_pull):
-            if all(highs[i]>=highs[i-k] for k in range(1,length_pull+1) if highs[i-k] is not None) and \
-               all(highs[i]>=highs[i+k] for k in range(1,length_pull+1) if highs[i+k] is not None):
-                last_swing_high_price=highs[i]; last_swing_high_bar=i
-            if all(lows[i]<=lows[i-k] for k in range(1,length_pull+1) if lows[i-k] is not None) and \
-               all(lows[i]<=lows[i+k] for k in range(1,length_pull+1) if lows[i+k] is not None):
-                last_swing_low_price=lows[i]; last_swing_low_bar=i
-        if last_swing_high_price is None or last_swing_low_price is None: continue
+        if n<80 or not _check_liquidity(volumes,closes,n): continue
         i=n-1
-        if last_swing_high_bar is None or last_swing_low_bar is None: continue
-        if last_swing_high_bar<=last_swing_low_bar: continue
-        if closes[i] is None or highs[i] is None or lows[i] is None: continue
-        if last_swing_low_price<=0 or last_swing_high_price<=0: continue  # bad/zero price data
-        swing_range_pct=(last_swing_high_price-last_swing_low_price)/last_swing_low_price*100
+        if any(x[i] is None for x in (highs,lows,closes)): continue
+        H=[h if h is not None else c for h,c in zip(highs,closes)]
+        Lo=[l if l is not None else c for l,c in zip(lows,closes)]
+        if any(c is None for c in closes[-120:]): continue
+        ema10=_calc_ema(closes,10); ema21=_calc_ema(closes,21); ema50=_calc_ema(closes,50)
+        ema12=_calc_ema(closes,12); ema26=_calc_ema(closes,26)
+        if any(v is None for v in (ema10[i],ema21[i],ema50[i],ema12[i],ema26[i])): continue
+        if ema50[i-ema50_slope_bars] is None or any(ema50[i-k] is None for k in range(6)): continue
+        macd_line=[(ema12[k]-ema26[k]) if ema12[k] is not None and ema26[k] is not None else None for k in range(n)]
+        macd_signal=_calc_ema([v if v is not None else 0.0 for v in macd_line],9)
+
+        # ---- walk the bars: swing low, swing high since it, pullback low ----
+        swing_low=0.0; leg_high=0.0; leg_high_idx=0; pb_low=None; pb_low_idx=0
+        for t in range(n):
+            j=t-L
+            pl=(j-L>=0 and all(Lo[j]<Lo[k] for k in range(j-L,j)) and all(Lo[j]<=Lo[k] for k in range(j+1,t+1)))
+            if pl:
+                swing_low=Lo[j]
+                win=H[t-L:t+1]; leg_high=max(win)
+                leg_high_idx=t-L+max(k for k,v in enumerate(win) if v==leg_high)
+            elif H[t]>=leg_high:
+                leg_high=H[t]; leg_high_idx=t
+            if pl or leg_high_idx==t or pb_low is None:
+                pb_low=Lo[t]; pb_low_idx=t
+            elif Lo[t]<=pb_low:
+                pb_low=Lo[t]; pb_low_idx=t
+        if swing_low<=0 or leg_high<=0 or pb_low is None: continue
+
+        # ---- conditions on the latest bar ----
+        swing_range_pct=(leg_high-swing_low)/swing_low*100
         if swing_range_pct<min_swing_range_pct: continue
-        pullback_pct=(last_swing_high_price-lows[i])/last_swing_high_price*100
-        if pullback_pct<min_pullback_pct: continue
-        e10=ema10[i]; e21=ema21[i]
-        near_ema10=abs(lows[i]-e10)/e10*100<=ema_proximity_pct or abs(closes[i]-e10)/e10*100<=ema_proximity_pct
-        near_ema21=abs(lows[i]-e21)/e21*100<=ema_proximity_pct or abs(closes[i]-e21)/e21*100<=ema_proximity_pct
-        reversal_ema10=lows[i]<e10 and closes[i]>e10; reversal_ema21=lows[i]<e21 and closes[i]>e21
+        pb_bars=i-leg_high_idx
+        pullback_pct=(leg_high-pb_low)/leg_high*100
+        retrace_pct=(leg_high-pb_low)/(leg_high-swing_low)*100 if leg_high>swing_low else 100
+        if not (i-pb_low_idx<=max_bars_from_pb_low and pullback_pct>=min_pullback_pct
+                and retrace_pct<=max_retrace_pct and pb_low>swing_low
+                and min_pb_bars<=pb_bars<=max_pb_bars): continue
+        e10=ema10[i]; e21=ema21[i]; e50=ema50[i]
+        near_ema10=abs(Lo[i]-e10)/e10*100<=ema_proximity_pct or abs(closes[i]-e10)/e10*100<=ema_proximity_pct
+        near_ema21=abs(Lo[i]-e21)/e21*100<=ema_proximity_pct or abs(closes[i]-e21)/e21*100<=ema_proximity_pct
+        reversal_ema10=Lo[i]<e10 and closes[i]>e10; reversal_ema21=Lo[i]<e21 and closes[i]>e21
         if not(near_ema10 or near_ema21 or reversal_ema10 or reversal_ema21): continue
-        e50=ema50[i]
         if not(e21>e50 and e10>e50 and closes[i]>e21): continue
-        if i<5 or any(ema50[i-k] is None for k in range(6)): continue
         if not all(ema50[i-k]>ema50[i-k-1] for k in range(5)): continue
-        candle_range_pct=(highs[i]-lows[i])/lows[i]*100 if lows[i]>0 else 0
-        if candle_range_pct>=max_candle_range_pct: continue
-        if macd_line[i] is None or macd_signal[i] is None: continue
-        if macd_line[i]<macd_signal[i]: continue
+        # flat-base guard
+        if leg_high<max(H[i-new_high_lookback+1:i+1]): continue
+        if (e21-e50)/e50*100<min_ema_gap_pct: continue
+        e50_old=ema50[i-ema50_slope_bars]
+        if e50_old<=0 or (e50-e50_old)/e50_old*100<min_ema50_slope_pct: continue
+        # candle size vs the stock's own ATR% (Wilder ATR 14)
+        atr=None
+        for t in range(1,n):
+            tr=max(H[t]-Lo[t],abs(H[t]-closes[t-1]),abs(Lo[t]-closes[t-1]))
+            atr=tr if atr is None else (atr*13+tr)/14
+        if not atr or closes[i]<=0 or Lo[i]<=0: continue
+        candle_range_pct=(H[i]-Lo[i])/Lo[i]*100
+        if candle_range_pct>=max_range_atr*atr/closes[i]*100: continue
+        # volume dry-up and momentum
+        v3=[v for v in volumes[i-2:i+1] if v is not None]; v20=[v for v in volumes[i-19:i+1] if v is not None]
+        if len(v3)<3 or len(v20)<20 or sum(v3)/3>=sum(v20)/20: continue
+        if macd_line[i] is None or macd_line[i]<=0: continue
         ema_touch="Reversal" if (reversal_ema10 or reversal_ema21) else "Near EMA10" if near_ema10 else "Near EMA21"
         signals.append({"symbol":sym,"date":dates[i],"close":round(closes[i],2),
-            "swing_high":round(last_swing_high_price,2),"swing_low":round(last_swing_low_price,2),
+            "swing_high":round(leg_high,2),"swing_low":round(swing_low,2),
             "swing_range_pct":round(swing_range_pct,2),"pullback_pct":round(pullback_pct,2),
+            "retrace_pct":round(retrace_pct,2),"pb_bars":pb_bars,
             "ema10":round(e10,2),"ema21":round(e21,2),"ema50":round(e50,2),
             "ema_touch":ema_touch,"candle_range_pct":round(candle_range_pct,2),
-            "macd":round(macd_line[i],4),"macd_signal":round(macd_signal[i],4)})
+            "macd":round(macd_line[i],4),"macd_signal":round(macd_signal[i],4) if macd_signal[i] is not None else None})
     return signals
+
 
 def _detect_pullback_tf(all_data, tf="W", ema_periods=(10, 30), length_pull=2,
                          min_swing_range_pct=10.0, min_pullback_pct=5.0,
@@ -5560,7 +5599,20 @@ TRANSITION_LABELS = {
     (1, 4): "Failed Base — resumed Declining without breaking out",
     (2, 4): "Sharp Reversal — Advancing straight to Declining",
     (4, 2): "Sharp Reversal — Declining straight to Advancing",
+    # Reachable since the flat-phase rule looks at where the range sits
+    # (near the 2-year high = topping, far below it = basing).
+    (1, 3): "Range near highs — Basing to Topping",
+    (4, 3): "Flat near highs — Declining to Topping",
 }
+
+# Stage 1 / 3 -> 4 needs a weekly close below the range low (lowest low of
+# the previous BASE_LOOKBACK_WEEKS); a falling 30-week EMA alone is not enough.
+BASE_LOOKBACK_WEEKS = 30
+NEAR_BASE_LOW_PCT = 10.0      # close within this % above the range low -> near_base_low warning
+# A flat phase is Topping (3) when the range high is within this % of the
+# highest high of the last HIGH_LOOKBACK_WEEKS, otherwise Basing (1).
+TOPPING_NEAR_HIGH_PCT = 15.0
+HIGH_LOOKBACK_WEEKS = 104
 
 
 def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
@@ -5595,6 +5647,16 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     and all(x is not None for x in wh[i-swing_lookback:i]) else None)
         low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
                    and all(x is not None for x in wl[i-swing_lookback:i]) else None)
+        # Range of the last BASE_LOOKBACK_WEEKS (this week excluded) and the
+        # highest high of the last HIGH_LOOKBACK_WEEKS.
+        base_win_l = [x for x in wl[max(0, i-BASE_LOOKBACK_WEEKS):i] if x is not None]
+        base_win_h = [x for x in wh[max(0, i-BASE_LOOKBACK_WEEKS):i] if x is not None]
+        long_win_h = [x for x in wh[max(0, i-HIGH_LOOKBACK_WEEKS):i] if x is not None]
+        base_low = min(base_win_l) if i >= swing_lookback and base_win_l else None
+        range_high = max(base_win_h) if i >= swing_lookback and base_win_h else None
+        high_long = max(long_win_h) if i >= swing_lookback and long_win_h else None
+        near_highs = bool(range_high is not None and high_long is not None
+                          and range_high >= high_long * (1 - TOPPING_NEAR_HIGH_PCT / 100))
         raw_bo = (price is not None and high_ref is not None and price > high_ref)
         aligned = (e10 is not None and e30 is not None and e10 > e30
                    and slope is not None and slope > flat_threshold_pct
@@ -5639,10 +5701,23 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     stage = 2
                     last_direction = 2
             elif slope < -flat_threshold_pct and price < e30:
-                stage = 4
-                last_direction = 4
+                # From Basing / Topping, Stage 4 needs the range low to break
+                # (checked below); a falling EMA alone keeps the current phase.
+                if stage not in (1, 3):
+                    stage = 4
+                    last_direction = 4
             elif abs(slope) <= flat_threshold_pct and abs(distance) <= 12:
-                if last_direction == 4:
+                # Flat phase: a range near the 2-year high is Topping, a range
+                # far below it is Basing (not only the last trend direction,
+                # which misses advances that never qualified as Stage 2).
+                if range_high is not None and high_long is not None:
+                    if near_highs:
+                        stage = 3
+                        last_direction = 2
+                    else:
+                        stage = 1
+                        last_direction = 4
+                elif last_direction == 4:
                     stage = 1
                 elif last_direction == 2:
                     stage = 3
@@ -5662,11 +5737,21 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
             else:
                 below_base_streak = 0
             if below_base_streak >= 2:
-                stage = 1
-                last_direction = 4  # Flat EMA remains basing, not topping.
+                # Back inside the range: Topping when the range sits near the
+                # 2-year high, otherwise Basing.
+                stage = 3 if near_highs else 1
+                last_direction = 2 if near_highs else 4
                 return_to_base = True
         if return_to_base and not enter_stage2 and stage in (2, 3):
-            stage = 1
+            stage = 3 if near_highs else 1
+        # Basing / Topping -> Declining: a weekly close below the range low.
+        if (stage in (1, 3) and base_low is not None and price is not None
+                and price < base_low):
+            stage = 4
+            last_direction = 4
+        near_base_low = bool(stage in (1, 3) and base_low is not None
+                             and price is not None
+                             and price <= base_low * (1 + NEAR_BASE_LOW_PCT / 100))
         if stage != prev:
             stage_start = i if stage is not None else None
         candidate = bool(stage != 2 and slope is not None
@@ -5686,6 +5771,7 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
             'close': price, 'ema30': e30, 'ema10': e10, 'slope_pct': slope,
             'stage2_candidate': candidate, 'volume_confirmed': volume_confirmed,
             'high_ref': high_ref, 'low_ref': low_ref,
+            'base_low': base_low, 'near_base_low': near_base_low,
         })
     return records
 
@@ -5732,6 +5818,8 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
             'stage2_candidate': r['stage2_candidate'],
             'volume_confirmed': r['volume_confirmed'],
             'ema30_slope_pct': round(r['slope_pct'],3) if r['slope_pct'] is not None else None,
+            'base_low': round(r['base_low'],2) if r['base_low'] is not None else None,
+            'near_base_low': r['near_base_low'],
         })
     breadth_history = [{'week': w, **{f'stage{k}': c[k] for k in (1,2,3,4)}}
                        for w,c in sorted(breadth.items())]
@@ -5775,6 +5863,8 @@ async def backup_weinstein_history(client, signals):
             "ema30": s["ema30"],
             "ema10": s["ema10"],
             "early_stage2": s["early_stage2"],
+            "base_low": s.get("base_low"),
+            "near_base_low": s.get("near_base_low", False),
         }
         for s in signals
     }
@@ -5883,7 +5973,8 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                 columns = ["symbol", "week", "stage", "stage_name", "prev_stage",
                            "weeks_in_stage", "close", "ema10", "ema30",
                            "ema30_slope_pct", "stage_change", "transition_type",
-                           "stage2_candidate", "volume_confirmed"]
+                           "stage2_candidate", "volume_confirmed",
+                           "base_low", "near_base_low"]
                 with out.open("w", newline="", encoding="utf-8") as fh:
                     writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
                     writer.writeheader()
