@@ -5269,7 +5269,20 @@ TRANSITION_LABELS = {
     (1, 4): "Failed Base — resumed Declining without breaking out",
     (2, 4): "Sharp Reversal — Advancing straight to Declining",
     (4, 2): "Sharp Reversal — Declining straight to Advancing",
+    # Reachable since the flat-phase rule looks at where the range sits
+    # (near the 2-year high = topping, far below it = basing).
+    (1, 3): "Range near highs — Basing to Topping",
+    (4, 3): "Flat near highs — Declining to Topping",
 }
+
+# Stage 1 / 3 -> 4 needs a weekly close below the range low (lowest low of
+# the previous BASE_LOOKBACK_WEEKS); a falling 30-week EMA alone is not enough.
+BASE_LOOKBACK_WEEKS = 30
+NEAR_BASE_LOW_PCT = 10.0      # close within this % above the range low -> near_base_low warning
+# A flat phase is Topping (3) when the range high is within this % of the
+# highest high of the last HIGH_LOOKBACK_WEEKS, otherwise Basing (1).
+TOPPING_NEAR_HIGH_PCT = 15.0
+HIGH_LOOKBACK_WEEKS = 104
 
 
 def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
@@ -5304,6 +5317,16 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     and all(x is not None for x in wh[i-swing_lookback:i]) else None)
         low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
                    and all(x is not None for x in wl[i-swing_lookback:i]) else None)
+        # Range of the last BASE_LOOKBACK_WEEKS (this week excluded) and the
+        # highest high of the last HIGH_LOOKBACK_WEEKS.
+        base_win_l = [x for x in wl[max(0, i-BASE_LOOKBACK_WEEKS):i] if x is not None]
+        base_win_h = [x for x in wh[max(0, i-BASE_LOOKBACK_WEEKS):i] if x is not None]
+        long_win_h = [x for x in wh[max(0, i-HIGH_LOOKBACK_WEEKS):i] if x is not None]
+        base_low = min(base_win_l) if i >= swing_lookback and base_win_l else None
+        range_high = max(base_win_h) if i >= swing_lookback and base_win_h else None
+        high_long = max(long_win_h) if i >= swing_lookback and long_win_h else None
+        near_highs = bool(range_high is not None and high_long is not None
+                          and range_high >= high_long * (1 - TOPPING_NEAR_HIGH_PCT / 100))
         raw_bo = (price is not None and high_ref is not None and price > high_ref)
         aligned = (e10 is not None and e30 is not None and e10 > e30
                    and slope is not None and slope > flat_threshold_pct
@@ -5348,10 +5371,23 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
                     stage = 2
                     last_direction = 2
             elif slope < -flat_threshold_pct and price < e30:
-                stage = 4
-                last_direction = 4
+                # From Basing / Topping, Stage 4 needs the range low to break
+                # (checked below); a falling EMA alone keeps the current phase.
+                if stage not in (1, 3):
+                    stage = 4
+                    last_direction = 4
             elif abs(slope) <= flat_threshold_pct and abs(distance) <= 12:
-                if last_direction == 4:
+                # Flat phase: a range near the 2-year high is Topping, a range
+                # far below it is Basing (not only the last trend direction,
+                # which misses advances that never qualified as Stage 2).
+                if range_high is not None and high_long is not None:
+                    if near_highs:
+                        stage = 3
+                        last_direction = 2
+                    else:
+                        stage = 1
+                        last_direction = 4
+                elif last_direction == 4:
                     stage = 1
                 elif last_direction == 2:
                     stage = 3
@@ -5371,11 +5407,21 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
             else:
                 below_base_streak = 0
             if below_base_streak >= 2:
-                stage = 1
-                last_direction = 4  # Flat EMA remains basing, not topping.
+                # Back inside the range: Topping when the range sits near the
+                # 2-year high, otherwise Basing.
+                stage = 3 if near_highs else 1
+                last_direction = 2 if near_highs else 4
                 return_to_base = True
         if return_to_base and not enter_stage2 and stage in (2, 3):
-            stage = 1
+            stage = 3 if near_highs else 1
+        # Basing / Topping -> Declining: a weekly close below the range low.
+        if (stage in (1, 3) and base_low is not None and price is not None
+                and price < base_low):
+            stage = 4
+            last_direction = 4
+        near_base_low = bool(stage in (1, 3) and base_low is not None
+                             and price is not None
+                             and price <= base_low * (1 + NEAR_BASE_LOW_PCT / 100))
         if stage != prev:
             stage_start = i if stage is not None else None
         candidate = bool(stage != 2 and slope is not None
@@ -5395,6 +5441,7 @@ def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
             'close': price, 'ema30': e30, 'ema10': e10, 'slope_pct': slope,
             'stage2_candidate': candidate, 'volume_confirmed': volume_confirmed,
             'high_ref': high_ref, 'low_ref': low_ref,
+            'base_low': base_low, 'near_base_low': near_base_low,
         })
     return records
 
@@ -5441,6 +5488,8 @@ def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
             'stage2_candidate': r['stage2_candidate'],
             'volume_confirmed': r['volume_confirmed'],
             'ema30_slope_pct': round(r['slope_pct'],3) if r['slope_pct'] is not None else None,
+            'base_low': round(r['base_low'],2) if r['base_low'] is not None else None,
+            'near_base_low': r['near_base_low'],
         })
     breadth_history = [{'week': w, **{f'stage{k}': c[k] for k in (1,2,3,4)}}
                        for w,c in sorted(breadth.items())]
@@ -5486,6 +5535,8 @@ async def backup_weinstein_history(client, signals):
             "early_stage2": s["early_stage2"],
             "stage2_candidate": s.get("stage2_candidate", False),
             "volume_confirmed": s.get("volume_confirmed"),
+            "base_low": s.get("base_low"),
+            "near_base_low": s.get("near_base_low", False),
         }
         for s in signals
     }
@@ -5594,7 +5645,8 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
                 columns = ["symbol", "week", "stage", "stage_name", "prev_stage",
                            "weeks_in_stage", "close", "ema10", "ema30",
                            "ema30_slope_pct", "stage_change", "transition_type",
-                           "stage2_candidate", "volume_confirmed"]
+                           "stage2_candidate", "volume_confirmed",
+                           "base_low", "near_base_low"]
                 with out.open("w", newline="", encoding="utf-8") as fh:
                     writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
                     writer.writeheader()
