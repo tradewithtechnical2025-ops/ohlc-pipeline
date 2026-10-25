@@ -48,6 +48,8 @@ PUBLIC_TOPICS = {
     "stage2":  8,
     "ep":      10,
     "setups":  11,
+    "circuit": 33,
+    "fiidii":  35,
 }
 
 PIPELINE_EMOJIS = {
