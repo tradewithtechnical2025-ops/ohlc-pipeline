@@ -30,6 +30,26 @@ if TELEGRAM_BOT_TOKEN.lower().startswith("bot"):
     TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN[3:]
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
+# Public alerts group (topics / forum supergroup) and its own bot. Pipeline status
+# messages keep using TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID (private group).
+TELEGRAM_PUBLIC_BOT_TOKEN = os.environ.get("TELEGRAM_PUBLIC_BOT_TOKEN", "").strip()
+if TELEGRAM_PUBLIC_BOT_TOKEN.lower().startswith("bot"):
+    TELEGRAM_PUBLIC_BOT_TOKEN = TELEGRAM_PUBLIC_BOT_TOKEN[3:]
+TELEGRAM_PUBLIC_CHAT_ID   = os.environ.get("TELEGRAM_PUBLIC_CHAT_ID", "").strip()
+
+# Topic ids in the public group (the first number in a message link, t.me/twt_alerts/<topic>/<msg>).
+# Announcements is the General topic: messages to it are sent without a topic id.
+PUBLIC_TOPICS = {
+    "announcements": None,
+    "market":  5,
+    "results": 2,
+    "box":     4,
+    "highs":   6,
+    "stage2":  8,
+    "ep":      10,
+    "setups":  11,
+}
+
 PIPELINE_EMOJIS = {
     "pipeline":                   "📊",
     "pipeline_master":            "🗂️",
@@ -46,7 +66,8 @@ PIPELINE_EMOJIS = {
 # Low-level send
 # ──────────────────────────────────────────────
 
-def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
+def send_message(text: str, silent: bool = False, chat_id: str = "",
+                 thread_id: int | None = None, bot_token: str = "") -> bool:
     """
     Send a plain-text Telegram message. Returns True on success.
 
@@ -55,20 +76,29 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
     like financial-results alerts, so they don't mix with pipeline status
     notifications in the main channel). Falls back to TELEGRAM_CHAT_ID if
     not given.
+
+    thread_id: topic id inside a group with Topics on (the "5" in t.me/group/5/12);
+    the message goes to that topic instead of General.
+    bot_token: optional override (e.g. the public alerts bot); falls back to
+    TELEGRAM_BOT_TOKEN.
     """
     target_chat_id = str(chat_id or TELEGRAM_CHAT_ID).strip()
-    if not TELEGRAM_BOT_TOKEN or not target_chat_id:
+    token = str(bot_token or TELEGRAM_BOT_TOKEN).strip()
+    if token.lower().startswith("bot"):
+        token = token[3:]
+    if not token or not target_chat_id:
         print("[telegram_notify] Token or chat_id missing — skipping notification.")
         return False
     try:
         resp = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            f"https://api.telegram.org/bot{token}/sendMessage",
             json={
                 "chat_id":                  target_chat_id,
                 "text":                     text,
                 "parse_mode":               "HTML",
                 "disable_notification":     silent,
                 "disable_web_page_preview": True,
+                **({"message_thread_id": int(thread_id)} if thread_id else {}),
             },
             timeout=10,
         )
@@ -88,13 +118,14 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
                       f"Update the chat id secret to {new_id}.")
                 target_chat_id = str(new_id)
                 resp = requests.post(
-                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    f"https://api.telegram.org/bot{token}/sendMessage",
                     json={
                         "chat_id":                  target_chat_id,
                         "text":                     text,
                         "parse_mode":               "HTML",
                         "disable_notification":     silent,
                         "disable_web_page_preview": True,
+                        **({"message_thread_id": int(thread_id)} if thread_id else {}),
                     },
                     timeout=10,
                 )
@@ -106,12 +137,13 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
         if resp.status_code == 400 and "parse entities" in resp.text.lower():
             print("[telegram_notify] HTML not accepted by Telegram — resending as plain text")
             resp = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                f"https://api.telegram.org/bot{token}/sendMessage",
                 json={
                     "chat_id":                  target_chat_id,
                     "text":                     text,
                     "disable_notification":     silent,
                     "disable_web_page_preview": True,
+                    **({"message_thread_id": int(thread_id)} if thread_id else {}),
                 },
                 timeout=10,
             )
@@ -123,8 +155,8 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
         except Exception:
             reason = resp.text[:200]
         hint = {
-            404: "bot token is wrong, revoked or empty — check the TELEGRAM_BOT_TOKEN secret",
-            400: "check the chat id (channel ids start with -100) and the message HTML",
+            404: "bot token is wrong, revoked or empty — check the bot token secret",
+            400: "check the chat id (channel / supergroup ids start with -100), the topic id and the message HTML",
             403: "the bot is not a member/admin of this chat or was blocked",
             401: "bot token is not valid",
         }.get(resp.status_code, "")
@@ -134,6 +166,12 @@ def send_message(text: str, silent: bool = False, chat_id: str = "") -> bool:
     except Exception as exc:
         print(f"[telegram_notify] Failed to send message: {exc.__class__.__name__}")
         return False
+
+
+def send_public(text: str, thread_id: int | None = None, silent: bool = False) -> bool:
+    """Send to the public alerts group (TELEGRAM_PUBLIC_*), into one topic."""
+    return send_message(text, silent=silent, chat_id=TELEGRAM_PUBLIC_CHAT_ID,
+                        thread_id=thread_id, bot_token=TELEGRAM_PUBLIC_BOT_TOKEN)
 
 
 # ──────────────────────────────────────────────
