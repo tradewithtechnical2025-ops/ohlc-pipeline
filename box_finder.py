@@ -4,6 +4,13 @@
 A box's resistance is fixed at its confirmed swing high. Its support follows
 subsequent candle lows, until a breakout or the maximum 30% depth is exceeded.
 Each box has its own lifecycle; a newer pivot never suppresses an older box.
+
+Same rules as the TwT BO Signal script v1.5:
+- a box starts at the FIRST touch of its resistance (EXTEND_BACK);
+- after a breakout, a close up to RETEST_BAND under the top is a retest, a close
+  further back inside within FAIL_WINDOW bars is a failed breakout (poke);
+- a poke raises the top to the highest CLOSE of the poke, never to a wick;
+- up to three nested boxes are kept (outer, middle, inner).
 """
 import numpy as np
 
@@ -15,7 +22,11 @@ SAME_TOP_TOL = .02     # boxes whose tops are this close are the same resistance
 MERGE_GAP = 5          # a same-top box starting within this many bars after a breakout continues it
 FAIL_WINDOW = 5        # a breakout that closes back below the top within this many bars failed (poke)
 POKE_MAX = .05         # total poke allowance above the box's ORIGINAL top; beyond it a move is a real breakout
+RETEST_BAND = .02      # a close up to 2% under the top after a breakout is a retest, not a failed breakout
 POKE_CLOSE_MAX = .02   # a poke only closes marginally above the top; a stronger close is a real breakout
+EXTEND_BACK = 160      # how far back to look for the first touch of the same resistance
+EXTEND_LOW_TOL = .02   # the walk back stops at a low more than this under the swing low
+MAX_NEST = 2           # a box may sit inside at most this many other boxes (three levels in all)
 
 
 def cons(closes, top, start):
@@ -44,9 +55,9 @@ def prune(boxes):
        - same top (SAME_TOP_TOL) starting within MERGE_GAP bars after the older
          box's breakout -> one box: the older start, the newer top and status.
     2. Boxes shorter than MIN_BASE_CANDLES are dropped.
-    3. Nesting: keep a box and the boxes directly inside it, but drop boxes
-       that sit inside two or more other boxes (inside = starts later, ends no
-       later, top not higher, bottom not lower).
+    3. Nesting: keep up to three levels (outer, middle, inner); drop boxes
+       that sit inside more than MAX_NEST other boxes (inside = starts later,
+       ends no later, top not higher, bottom not lower).
     """
     def top_at(a, t):
         cur = a['top_hist'][0][1]
@@ -80,12 +91,12 @@ def prune(boxes):
         elif action[0] == 'merge':
             a = out[action[1]]
             m = dict(b)
-            m['i'], m['j'] = a['i'], a['j']
+            m['i'], m['j'], m['start'] = a['i'], a['j'], a['start']
             m['top_hist'] = a['top_hist'] + b['top_hist']
             if a['bot'] < b['bot']:
                 m['bot'], m['low_idx'] = a['bot'], a['low_idx']
             m['depth'] = (m['top'] - m['bot']) / m['top']
-            m['base_length_candles'] = m['last'] - m['i'] + 1
+            m['base_length_candles'] = m['last'] - m['start'] + 1
             if m['depth'] > MAX_DEPTH + 1e-10:
                 out.append(b)  # too deep as one box: keep them separate
             else:
@@ -93,9 +104,9 @@ def prune(boxes):
     out = [b for b in out if b['base_length_candles'] >= MIN_BASE_CANDLES]
 
     def inside(b, a):
-        return (a is not b and a['i'] <= b['i'] and a['last'] >= b['last']
+        return (a is not b and a['start'] <= b['start'] and a['last'] >= b['last']
                 and a['top'] >= b['top'] and a['bot'] <= b['bot'])
-    return [b for b in out if sum(1 for a in out if inside(b, a)) <= 1]
+    return [b for b in out if sum(1 for a in out if inside(b, a)) <= MAX_NEST]
 
 
 def detect(a):
@@ -131,6 +142,23 @@ def detect(a):
         # An upper breakout freezes the box; exceeding 30% depth retires it.
         low = initial_low
         low_idx = j
+
+        # Start the box at the FIRST touch of the same resistance: walk back from
+        # the swing high while no close went above the top and no low went more
+        # than EXTEND_LOW_TOL under the swing low; the earliest high within
+        # SAME_TOP_TOL of the top starts the box (it must stay within MAX_DEPTH).
+        start = i
+        run_low, run_idx = low, low_idx
+        for k in range(i - 1, max(-1, i - 1 - EXTEND_BACK), -1):
+            if c[k] > top * (1 + BREAKOUT_BUFFER) or l[k] < initial_low * (1 - EXTEND_LOW_TOL):
+                break
+            if l[k] < run_low:
+                run_low, run_idx = float(l[k]), k
+            if h[k] >= top * (1 - SAME_TOP_TOL):
+                if (top - run_low) / top > MAX_DEPTH + 1e-10:
+                    break
+                start, low, low_idx = k, run_low, run_idx
+
         breakout = None
         overdepth = None
         skip_until = -1
@@ -150,11 +178,12 @@ def detect(a):
                 # POKE_CLOSE_MAX above the top / POKE_MAX above the box's
                 # original top (pokes do not stack). Wicks may reach POKE_MAX.
                 # The box then continues with its top
-                # raised to the poke high (or to the highest close when the
-                # high is a big wick beyond POKE_MAX).
+                # raised to the highest close of the poke (wicks are ignored).
                 back, hi_max, cl_max = None, top, top
                 for u in range(t, min(n, t + FAIL_WINDOW + 1)):
-                    if u > t and c[u] < top:
+                    # a close back below the top only fails the breakout when it is clearly
+                    # back inside the box; a close within RETEST_BAND of the top is a retest
+                    if u > t and c[u] < top * (1 - RETEST_BAND):
                         back = u
                         break
                     hi_max = max(hi_max, float(h[u]))
@@ -163,7 +192,7 @@ def detect(a):
                 if back is None or cl_max > cap or cl_max > top * (1 + POKE_CLOSE_MAX):
                     breakout = t
                     break
-                top = max(top, hi_max if hi_max <= cap else cl_max)
+                top = max(top, cl_max)
                 top_hist.append((t, top))
                 skip_until = back
                 if (top - low) / top > MAX_DEPTH + 1e-10:
@@ -183,8 +212,8 @@ def detect(a):
         # The breakout / depth-exceed bar is not part of the base.
         end_idx = breakout if breakout is not None else overdepth
         last = end_idx - 1 if end_idx is not None else n - 1
-        base_length_candles = last - i + 1  # trading bars from the swing-high bar to the last base bar
-        boxes.append(dict(i=i, j=j, last=last, top0=float(h[i]), top_hist=top_hist, base_length_candles=base_length_candles, top=top, bot=low, low_idx=low_idx,
+        base_length_candles = last - start + 1  # trading bars from the first touch to the last base bar
+        boxes.append(dict(i=i, start=start, j=j, last=last, top0=float(h[i]), top_hist=top_hist, base_length_candles=base_length_candles, top=top, bot=low, low_idx=low_idx,
                           bo=breakout, overdepth=overdepth, state=state,
                           cons=window, depth=(top-low)/top))
 
@@ -224,7 +253,8 @@ def build_box_finder(all_data, asof=None):
         dates = stock['d']
         def encode(b):
             return {
-                'start_date': dates[b['i']],
+                'start_date': dates[b['start']],
+                'swing_high_date': dates[b['i']],
                 'base_length_candles': int(b['base_length_candles']),
                 'swing_low_date': dates[b['j']],
                 'lower_updated_date': dates[b['low_idx']],
@@ -242,7 +272,7 @@ def build_box_finder(all_data, asof=None):
         close = float(stock['c'][-1])
         results.append({
             'symbol': symbol, 'date': dates[-1], 'status': status,
-            'start_date': dates[chosen['i']],
+            'start_date': dates[chosen['start']],
             'base_length_candles': int(chosen['base_length_candles']),
             'upper': round(float(chosen['top']), 4),
             'lower': round(float(chosen['bot']), 4),
