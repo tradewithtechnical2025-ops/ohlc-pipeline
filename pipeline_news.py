@@ -13,7 +13,12 @@ import httpx
 try:
     from telegram_notify import send_message
 except ImportError:
-    def send_message(text, silent=False, chat_id=""): pass
+    def send_message(text, silent=False, chat_id="", thread_id=None, bot_token=""): return False
+try:
+    from telegram_notify import send_public, PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID
+except ImportError:
+    def send_public(text, thread_id=None, silent=False): return False
+    PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID = {}, ""
 
 # Separate channel for financial-results alerts, so they don't mix with
 # pipeline status notifications in the main TELEGRAM_CHAT_ID channel.
@@ -3710,7 +3715,15 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print(f"  Sending {len(groups)} Telegram message(s) ({len(parsed_new_for_telegram)} filings grouped)...")
         telegram_syms = [(g[0].get("meta", {}) or {}).get("symbol") for g in groups if g]
         print(f"    symbols: {', '.join(s for s in telegram_syms if s)}")
-        if not TELEGRAM_RESULTS_CHAT_ID:
+        # Targets: the "Results" topic of the public alerts group (TELEGRAM_PUBLIC_CHAT_ID) and,
+        # if TELEGRAM_RESULTS_CHAT_ID is still set, the old private results group as well.
+        # Remove the TELEGRAM_RESULTS_CHAT_ID secret to stop the private copy.
+        targets = []
+        if TELEGRAM_PUBLIC_CHAT_ID:
+            targets.append(("public", lambda m: send_public(m, thread_id=PUBLIC_TOPICS.get("results"))))
+        if TELEGRAM_RESULTS_CHAT_ID or not targets:
+            targets.append(("private", lambda m: send_message(m, chat_id=TELEGRAM_RESULTS_CHAT_ID)))
+        if not TELEGRAM_RESULTS_CHAT_ID and not TELEGRAM_PUBLIC_CHAT_ID:
             print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
                   "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
                   "Set TELEGRAM_RESULTS_CHAT_ID to send these to a separate channel.")
@@ -3727,21 +3740,25 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         for group in groups:
             sym = group[0].get("meta", {}).get("symbol") if group else "?"
             msg = _telegram_result_message(group)
-            for attempt in range(SEND_RETRIES):
-                try:
-                    send_message(msg, chat_id=TELEGRAM_RESULTS_CHAT_ID)
-                    break
-                except Exception as e:
-                    is_last = attempt == SEND_RETRIES - 1
-                    is_rate_limit = "429" in str(e)
-                    if is_last:
-                        print(f"  ⚠ Telegram send failed for {sym} after {SEND_RETRIES} attempts: {e}")
+            # send_message / send_public return False instead of raising (429 flood limit
+            # included), so a False result is retried with a growing wait.
+            for tname, send in targets:
+                for attempt in range(SEND_RETRIES):
+                    try:
+                        ok = send(msg)
+                        err = "" if ok else "send returned False"
+                    except Exception as e:
+                        ok, err = False, str(e)
+                    if ok:
                         break
-                    wait = (10 if is_rate_limit else 3) * (attempt + 1)
-                    print(f"  ⚠ Telegram send for {sym} failed ({e}), retrying in {wait}s "
+                    if attempt == SEND_RETRIES - 1:
+                        print(f"  ⚠ Telegram send ({tname}) failed for {sym} after {SEND_RETRIES} attempts: {err}")
+                        break
+                    wait = 10 * (attempt + 1)
+                    print(f"  ⚠ Telegram send ({tname}) for {sym} failed ({err}), retrying in {wait}s "
                           f"(attempt {attempt+1}/{SEND_RETRIES})...")
                     await asyncio.sleep(wait)
-            await asyncio.sleep(2)
+                await asyncio.sleep(2)
 
     # Guarantee every item actually parsed/notified THIS run survives the
     # cap, regardless of its timestamp quality — a bad or zero
