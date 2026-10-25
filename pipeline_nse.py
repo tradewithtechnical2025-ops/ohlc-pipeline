@@ -48,7 +48,12 @@ except ImportError:
         def success(self, *a, **k): pass
         def failure(self, exc, reraise=True, **k):
             if reraise: raise exc
-    def send_message(text, silent=False): pass
+    def send_message(text, silent=False, **k): return False
+try:
+    from telegram_notify import send_public, PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID
+except ImportError:
+    def send_public(text, thread_id=None, silent=False): return False
+    PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID = {}, ""
 
 from collections import defaultdict
 
@@ -805,6 +810,68 @@ def _band_dir(chg: dict) -> str:
         return "down"
 
 
+def _send_alert(lines: list, topic: str) -> None:
+    """Sends to the public alerts group topic (TELEGRAM_PUBLIC_CHAT_ID) or, when that
+    is not set, to the private status chat as before. Long lists are split into
+    several messages (Telegram's limit is 4096 characters)."""
+    chunks, cur = [], []
+    for ln in lines:
+        if cur and len("\n".join(cur + [ln])) > 3800:
+            chunks.append(cur); cur = [lines[0] + " (cont.)", ""]
+        cur.append(ln)
+    if cur: chunks.append(cur)
+    for i, ch in enumerate(chunks):
+        text = "\n".join(ch)
+        ok = False
+        for attempt in range(3):
+            ok = send_public(text, thread_id=PUBLIC_TOPICS.get(topic)) if TELEGRAM_PUBLIC_CHAT_ID else send_message(text)
+            if ok: break
+            time.sleep(5 * (attempt + 1))
+        print(f"  Telegram {topic} {i+1}/{len(chunks)}: {'sent' if ok else 'FAILED'}")
+        time.sleep(1.5)
+
+
+def _fii_dii_message(snap: dict, hist: list, oi_snapshot) -> list:
+    """FII/DII cash (Rs Cr) for the day, last 5 sessions and month to date, plus FII index-futures
+    long % from participant OI when it is for the same day."""
+    def cr(v):
+        return f"{v:+,.0f}" if isinstance(v, (int, float)) else "—"
+    fii, dii = snap.get("fii") or {}, snap.get("dii") or {}
+    try:
+        d = date.fromisoformat(snap["date"])
+        d_txt = d.strftime("%a %d %b %Y")
+    except (KeyError, ValueError):
+        d, d_txt = None, str(snap.get("date"))
+    lines = [f"<b>💰 FII / DII Activity</b> · {d_txt}", "<i>Cash market, ₹ crore (provisional)</i>", ""]
+    tbl = [f"{'':<5}{'Buy':>10}{'Sell':>10}{'Net':>9}"]
+    for name, e in (("FII", fii), ("DII", dii)):
+        if e:
+            tbl.append(f"{name:<5}{e.get('buy', 0):>10,.0f}{e.get('sell', 0):>10,.0f}{e.get('net', 0):>+9,.0f}")
+    lines.append("<pre>" + "\n".join(tbl) + "</pre>")
+    rows = sorted((h for h in (hist or []) if isinstance(h, dict) and h.get("date")), key=lambda h: h["date"])
+    last5 = rows[-5:]
+    if last5:
+        trend = [f"{'Date':<7}{'FII':>9}{'DII':>9}"]
+        for h in last5:
+            try: dl = date.fromisoformat(h["date"]).strftime("%d %b")
+            except ValueError: dl = h["date"][5:]
+            trend.append(f"{dl:<7}{cr((h.get('fii') or {}).get('net')):>9}{cr((h.get('dii') or {}).get('net')):>9}")
+        lines += ["", "<b>Last 5 sessions</b> (net)", "<pre>" + "\n".join(trend) + "</pre>"]
+    if d:
+        mtd = [h for h in rows if h["date"][:7] == d.isoformat()[:7]]
+        if mtd:
+            f_m = sum(((h.get("fii") or {}).get("net") or 0) for h in mtd)
+            d_m = sum(((h.get("dii") or {}).get("net") or 0) for h in mtd)
+            lines.append(f"Month to date ({d.strftime('%b')}): FII <b>{cr(f_m)}</b> · DII <b>{cr(d_m)}</b>")
+    if oi_snapshot and oi_snapshot.get("date") == snap.get("date"):
+        f = (oi_snapshot.get("participants") or {}).get("FII") or {}
+        lo, sh = f.get("fut_idx_long") or 0, f.get("fut_idx_short") or 0
+        if lo + sh:
+            lines.append(f"FII index futures: <b>{lo / (lo + sh) * 100:.0f}% long</b> ({lo:,} long / {sh:,} short)")
+    lines += ["", '<a href="https://tradewithtech.in">FII / DII on TradeWithTech</a>']
+    return lines
+
+
 def _band_sort_val(chg: dict) -> int:
     """
     Sort key for circuit-band Telegram alert ordering. `to` is usually a
@@ -1103,9 +1170,11 @@ async def run():
                                                            schema_v=1, ensure_ascii=False))
 
             # ── Band-change history ─────────────────────────────────────────────────
+            band_changes_new = 0
             if changes:
                 effective_date_str = chg_date.isoformat()
                 b3 = merge_band_changes_history(band_changes_hist, changes, effective_date_str)
+                band_changes_new = b3
                 if b3:
                     print(f"  Band-change history: +{b3} new entries ({effective_date_str})")
                     upload_tasks.append(upload_with_manifest(
@@ -1139,6 +1208,7 @@ async def run():
                 print("  ⚠ No OI snapshot — skipping OI uploads")
 
             # ── FII/DII cash snapshot + history ─────────────────────────────────────
+            fii_dii_new_day = False
             if fii_dii_snapshot and fii_dii_snapshot.get("date"):
                 fd_date_str = fii_dii_snapshot["date"]
 
@@ -1153,6 +1223,7 @@ async def run():
                               f"({fii_dii_hist[0]['date']} → {fii_dii_hist[-1]['date']})")
                 else:
                     fii_dii_hist = merge_oi_history(fii_dii_hist, fii_dii_snapshot, max_days=FII_DII_HISTORY_DAYS)
+                    fii_dii_new_day = True
                     upload_tasks.append(upload_with_manifest(client, r2_put, "nse_fii_dii_hist.json", fii_dii_hist,
                                                                schema_v=1, extra_meta={"day_count": len(fii_dii_hist)},
                                                                ensure_ascii=False))
@@ -1201,7 +1272,9 @@ async def run():
                     print(f"  ⚠ screener_feed.json deliv patch failed: {e} — will retry next run")
 
         # ── Circuit change Telegram alert ──────────────────────────────
-        if changes:
+        # Sent only when this run added new band changes to the history, so a re-run
+        # on the same day does not post the same list again.
+        if changes and band_changes_new:
             increased = {s: c for s, c in changes.items() if _band_dir(c) == "up"}
             decreased = {s: c for s, c in changes.items() if _band_dir(c) == "down"}
             msg_lines = ["🔔 <b>NSE Circuit Changes</b>", f"Next day: <code>{chg_date.isoformat()}</code>"]
@@ -1215,7 +1288,11 @@ async def run():
                 msg_lines.append("🔴 <b>Band Decreased</b>")
                 for sym, chg in sorted(decreased.items(), key=lambda x: _band_sort_val(x[1]), reverse=True):
                     msg_lines.append(f"<code>{sym}</code>: {chg.get('from')}% → {chg.get('to')}%")
-            send_message("\n".join(msg_lines))
+            _send_alert(msg_lines, "circuit")
+
+        # ── FII / DII Telegram alert (once per new trading day) ─────────
+        if fii_dii_new_day:
+            _send_alert(_fii_dii_message(fii_dii_snapshot, fii_dii_hist, oi_snapshot), "fiidii")
 
         status.set("bands", len(bands))
         status.set("circuit_changes", len(changes))
