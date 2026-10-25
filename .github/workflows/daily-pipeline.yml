@@ -95,13 +95,8 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline.py candle_scan
-      - name: EP Scan
-        uses: nick-fields/retry@v3
-        with:
-          timeout_minutes: 10
-          max_attempts: 3
-          retry_wait_seconds: 15
-          command: python pipeline.py ep_scan
+      # Minervini, Weinstein and Box Finder read only OHLC; they run before EP Scan so
+      # screener_feed (built in EP Scan) gets today's stage / box breakouts for its events.
       - name: Minervini Trend Template Scan
         uses: nick-fields/retry@v3
         with:
@@ -124,6 +119,13 @@ jobs:
           retry_wait_seconds: 15
           command: python pipeline.py box_scan
       # Home ticker reads scan outputs; keep after the scans.
+      - name: EP Scan
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline.py ep_scan
       - name: Home Page Ticker
         uses: nick-fields/retry@v3
         with:
