@@ -1,6 +1,11 @@
 name: NSE Pipeline
 on:
   workflow_dispatch:
+    inputs:
+      force_alerts:
+        description: 'Send the circuit-change and FII/DII Telegram alerts even if already sent'
+        type: boolean
+        default: false
 env:
   PYTHONUNBUFFERED: "1"
 jobs:
@@ -25,6 +30,7 @@ jobs:
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           # Circuit changes and FII / DII go to the public alerts group (@twt_alerts) topics
           TELEGRAM_PUBLIC_CHAT_ID: ${{ secrets.TELEGRAM_PUBLIC_CHAT_ID }}
+          FORCE_ALERTS: ${{ inputs.force_alerts && '1' || '0' }}
         run: python pipeline_nse.py
       - name: Telegram fallback on workflow failure
         if: failure()
