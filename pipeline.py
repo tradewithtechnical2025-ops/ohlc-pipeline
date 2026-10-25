@@ -27,6 +27,7 @@ Usage:
   python pipeline.py box_scan_dryrun  # preview Box Finder without R2 writes
   python pipeline.py public_alerts    # EOD summaries to the public Telegram group (run after ep_scan)
   python pipeline.py public_alerts_dryrun  # print the messages, send nothing
+  python pipeline.py public_alerts_ping    # one test message to every topic of the public group
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
   python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
@@ -6869,7 +6870,7 @@ async def run_box_scan(dry_run=False) -> None:
 # PUBLIC ALERTS — end-of-day summaries to the public Telegram group
 # (@twt_alerts, Topics on). One message per topic, built from screener_feed.json
 # (its per-stock "ev" events). Run after ep_scan:  python pipeline.py public_alerts
-#   Market Summary  breadth, new highs / lows, sectors
+#   Market Summary  internals.json (Market Internals page): MA breadth, M-Swing, net A/D, 52W H/L, Stage 2
 #   Box Breakouts   ev "box" dated today
 #   52W High & ATH  ev "ath" / "h52" dated today
 #   Stage 2 Entries ev "stg" into stage 2 (weekly; each symbol posted once per week)
@@ -6919,7 +6920,138 @@ def _pa_rank(row):
     return -(rs if isinstance(rs, (int, float)) else 0)
 
 
-def _build_public_alerts(feed, market_date, sent):
+# Market Summary from internals.json (the rows behind the Market Internals page:
+# MA Breadth, M-Swing, Net A/D, 52W H/L, Stage 2). Column names are matched the
+# same way the page does (exact or contains, case-insensitive).
+def _pa_col(headers, names):
+    up = [h.strip().upper() for h in headers]
+    for exact in (True, False):          # exact name first, then "contains"
+        for n in names:
+            n = n.upper()
+            for i, h in enumerate(up):
+                if (h == n) if exact else (n in h and not h.startswith("BELOW")):
+                    return headers[i]
+    return None
+
+
+def _pa_num(v):
+    if v is None: return None
+    if isinstance(v, (int, float)): return float(v)
+    t = re.sub(r"[^0-9.\-]", "", str(v))
+    try: return float(t) if t not in ("", "-", ".") else None
+    except ValueError: return None
+
+
+def _pa_row_date(v):
+    s = str(v or "").strip()
+    try: return date.fromisoformat(s[:10])
+    except ValueError: pass
+    for fmt in ("%d/%m/%y", "%d-%m-%y", "%d-%m-%Y", "%d/%m/%Y", "%d %b %Y", "%d-%b-%Y", "%d %B %Y", "%b %d, %Y", "%d-%b-%y", "%d %b %y"):
+        try: return datetime.strptime(s, fmt).date()
+        except ValueError: pass
+    return None
+
+
+PUBLIC_ALERT_TREND_DAYS = 10
+_PA_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _pa_spark(vals, lo=None, hi=None, min_range=8.0):
+    """One block character per value, scaled to the series' own min / max (at least min_range wide)."""
+    v = [x for x in vals if x is not None]
+    if not v: return ""
+    lo = min(v) if lo is None else lo; hi = max(v) if hi is None else hi
+    if hi - lo < min_range:   # small moves stay small instead of filling the whole height
+        mid = (hi + lo) / 2; lo, hi = mid - min_range / 2, mid + min_range / 2
+    if hi - lo < 1e-9: return _PA_SPARK[3] * len(vals)
+    out = ""
+    for x in vals:
+        if x is None: out += " "; continue
+        k = int(round((min(hi, max(lo, x)) - lo) / (hi - lo) * (len(_PA_SPARK) - 1)))
+        out += _PA_SPARK[k]
+    return out
+
+
+def _pa_bar(p, width=10):
+    p = max(0.0, min(100.0, p or 0.0)); n = int(round(p / 100 * width))
+    return "▓" * n + "░" * (width - n)
+
+
+def _pa_market_from_internals(rows):
+    """Returns (date_iso, text) or (None, None)."""
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    if not rows: return None, None
+    headers = list(rows[0].keys())
+    c_date = _pa_col(headers, ["Date", "DATE"])
+    if not c_date: return None, None
+    dated = [(_pa_row_date(r.get(c_date)), i, r) for i, r in enumerate(rows)]
+    dated = [x for x in dated if x[0]]
+    if not dated: return None, None
+    dated.sort(key=lambda x: (x[0], x[1]))
+    d_last, _, last = dated[-1]
+    prev = dated[-2][2] if len(dated) > 1 else {}
+    lines = [f"<b>🌡 Market Internals</b> · {d_last.strftime('%a %d %b %Y')}", ""]
+
+    # trend table: last PUBLIC_ALERT_TREND_DAYS sessions, oldest -> today, one block per day
+    win = [r for _, _, r in dated[-PUBLIC_ALERT_TREND_DAYS:]]
+    def series(c): return [_pa_num(r.get(c)) for r in win]
+    trows = []
+    for label, names in (("10 EMA", ["Above 10EMA", "10EMA"]), ("20 EMA", ["Above 20EMA", "20EMA"]),
+                         ("50 EMA", ["Above 50EMA", "50EMA"]), ("200 EMA", ["Above 200EMA", "200EMA"])):
+        c = _pa_col(headers, names)
+        if not c: continue
+        ser = series(c)
+        if ser[-1] is None: continue
+        chg = f"{ser[-1] - ser[-2]:+5.1f}" if len(ser) > 1 and ser[-2] is not None else ""
+        trows.append(f"{label:<8}{_pa_spark(ser)} {ser[-1]:6.1f}% {chg}")
+    c_ms = _pa_col(headers, ["Mswing", "MSwing", "MSWING", "M-Swing"])
+    ms_line = None
+    if c_ms:
+        ser = series(c_ms)
+        if ser[-1] is not None:
+            chg = f"{ser[-1] - ser[-2]:+5.1f}" if len(ser) > 1 and ser[-2] is not None else ""
+            trows.append(f"{'M-Swing':<8}{_pa_spark(ser)} {ser[-1]:6.1f}  {chg}")
+            full = [x for x in (_pa_num(r.get(c_ms)) for _, _, r in dated) if x is not None]
+            v = full[-1]; sma9 = sum(full[-9:]) / len(full[-9:])
+            zone = "🟢 strong" if v >= 50 and v >= sma9 else "🟡 mixed" if v >= 50 or v >= sma9 else "🔴 weak"
+            ms_line = f"<b>⚡ M-Swing</b> {v:.2f} · 9 SMA {sma9:.2f} ({'above' if v >= sma9 else 'below'}) · {zone}"
+    c_h, c_l = _pa_col(headers, ["52WH"]), _pa_col(headers, ["52WL"])
+    if c_h and c_l:
+        hs, ls = series(c_h), series(c_l)
+        net = [(a - b) if a is not None and b is not None else None for a, b in zip(hs, ls)]
+        if net[-1] is not None:
+            chg = f"{net[-1] - net[-2]:+5.1f}" if len(net) > 1 and net[-2] is not None else ""
+            trows.append(f"{'Net H-L':<8}{_pa_spark(net)} {net[-1]:+6.1f}% {chg}")
+    if trows:
+        n = len(win)
+        head = f"{'':<8}{(str(n) + 'd trend'):<{n}} {'today':>7} {'1d':>5}"
+        lines += [f"<b>📈 Breadth</b> · % of stocks, last {n} sessions (oldest → today)",
+                  "<pre>" + "\n".join([head] + trows) + "</pre>"]
+    if ms_line:
+        lines.append(ms_line)
+
+    extra = []
+    # internals.json: Advances / Declines are stock counts; 52WH / 52WL / Stage 2 are % of stocks
+    c_a, c_d = _pa_col(headers, ["Advances"]), _pa_col(headers, ["Declines"])
+    if c_a and c_d and _pa_num(last.get(c_a)) is not None and _pa_num(last.get(c_d)) is not None:
+        extra.append(f"Advances / declines <b>{_pa_num(last.get(c_a)):.0f} / {_pa_num(last.get(c_d)):.0f}</b>")
+    c_h, c_l = _pa_col(headers, ["52WH"]), _pa_col(headers, ["52WL"])
+    if c_h and c_l and _pa_num(last.get(c_h)) is not None and _pa_num(last.get(c_l)) is not None:
+        _nh, _nl = _pa_num(last.get(c_h)), _pa_num(last.get(c_l))
+        extra.append(f"At 52W high / low <b>{_nh:.1f}% / {_nl:.1f}%</b>")
+    c_s2 = _pa_col(headers, ["Stage 2", "STAGE 2", "STAGE2"])
+    if c_s2 and _pa_num(last.get(c_s2)) is not None:
+        extra.append(f"In Stage 2 <b>{_pa_num(last.get(c_s2)):.1f}%</b>")
+    if extra:
+        lines += [""] + ["• " + x for x in extra]
+
+    if len(lines) <= 2:
+        return None, None
+    lines += ["", f'<a href="{PUBLIC_ALERT_SITE}">Market Internals on TradeWithTech</a>']
+    return d_last.isoformat(), "\n".join(lines)
+
+
+def _build_public_alerts(feed, market_date, sent, internals=None):
     """Returns ([(topic_key, text)], new_sent_keys). sent = set of keys already posted."""
     try:
         date_txt = date.fromisoformat(market_date).strftime("%d %b %Y")
@@ -6931,9 +7063,20 @@ def _build_public_alerts(feed, market_date, sent):
     def fresh(key):
         return key not in sent and key not in new_keys
 
-    # ── market summary (once per market date) ──
+    # ── market summary (once per date): Market Internals rows; screener_feed only as a fallback ──
+    m_date, m_text = _pa_market_from_internals(internals) if internals else (None, None)
+    if m_text and m_date != market_date:
+        # internals.json has not reached today's session yet: send nothing rather than an old day
+        log.warning(f"Public alerts: internals.json latest date {m_date} != market date {market_date} — Market Summary skipped")
+        m_text, internals_stale = None, True
+    else:
+        internals_stale = False
+    if m_text:
+        key = f"mi|{m_date}"
+        if fresh(key):
+            out.append(("market", m_text)); new_keys.add(key)
     key = f"market|{market_date}"
-    if fresh(key):
+    if not m_text and not internals_stale and fresh(key):
         rows = [r for r in feed if r.get("date") == market_date and isinstance(r.get("pct_ch"), (int, float))]
         if rows:
             adv = sum(1 for r in rows if r["pct_ch"] > 0); dec = sum(1 for r in rows if r["pct_ch"] < 0)
@@ -7024,18 +7167,33 @@ def _build_public_alerts(feed, market_date, sent):
     return [(t, m) for t, m in out if m], new_keys
 
 
+def run_public_alerts_ping() -> None:
+    """Sends one short test message to every topic of the public group (checks chat id and topic ids)."""
+    from telegram_notify import send_public, PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID
+    if not TELEGRAM_PUBLIC_CHAT_ID:
+        log.warning("Public alerts ping: TELEGRAM_PUBLIC_CHAT_ID not set")
+        return
+    for t, tid in PUBLIC_TOPICS.items():
+        ok = send_public(f"🔧 Test message for topic <b>{t}</b> — please ignore.", thread_id=tid, silent=True)
+        log.info(f"  ping {t} (topic {tid}): {'sent' if ok else 'FAILED'}")
+
+
 async def run_public_alerts(dry_run=False) -> None:
     from telegram_notify import send_public, PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID
     async with httpx.AsyncClient() as client:
-        feed, state = await asyncio.gather(r2_download(client, "screener_feed.json"),
-                                           r2_download(client, "public_alerts_state.json"))
+        feed, state, internals = await asyncio.gather(r2_download(client, "screener_feed.json"),
+                                                      r2_download(client, "public_alerts_state.json"),
+                                                      r2_download(client, "internals.json"))
         if not isinstance(feed, list) or not feed:
             log.warning("Public alerts: screener_feed.json missing or empty — nothing sent")
             return
         market_date = max(str(r.get("as_of_date") or r.get("date") or "")[:10] for r in feed)
         state = state if isinstance(state, dict) else {}
         sent_map = state.get("sent") if isinstance(state.get("sent"), dict) else {}
-        msgs, new_keys = _build_public_alerts(feed, market_date, set(sent_map))
+        if not isinstance(internals, list) or not internals:
+            log.warning("Public alerts: internals.json missing — Market Summary falls back to screener_feed")
+            internals = None
+        msgs, new_keys = _build_public_alerts(feed, market_date, set(sent_map), internals=internals)
         log.info(f"Public alerts for {market_date}: {len(msgs)} message(s), {len(new_keys)} new item(s)")
         if dry_run:
             for t, m in msgs:
@@ -7055,7 +7213,7 @@ async def run_public_alerts(dry_run=False) -> None:
             if ok: ok_topics.append(t)
             await asyncio.sleep(2)
         # remember only what reached Telegram; a failed topic is tried again next run
-        prefix = {"market": ("market",), "box": ("box",), "highs": ("ath", "h52"), "stage2": ("stg",),
+        prefix = {"market": ("market", "mi"), "box": ("box",), "highs": ("ath", "h52"), "stage2": ("stg",),
                   "ep": ("ep",), "setups": ("rcl", "so", "vcp", "htf", "mhtf", "pb")}
         keep_types = {p for t in ok_topics for p in prefix.get(t, ())}
         for k in new_keys:
@@ -7105,6 +7263,7 @@ if __name__ == "__main__":
         case "box_scan": asyncio.run(run_box_scan())
         case "public_alerts": asyncio.run(run_public_alerts())
         case "public_alerts_dryrun": asyncio.run(run_public_alerts(dry_run=True))
+        case "public_alerts_ping": run_public_alerts_ping()
         case "box_scan_dryrun": asyncio.run(run_box_scan(dry_run=True))
         case "weinstein_scan": asyncio.run(run_weinstein_scan())
         case "weinstein_scan_dryrun": asyncio.run(run_weinstein_scan(dry_run=True))
