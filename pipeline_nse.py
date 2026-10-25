@@ -891,21 +891,26 @@ async def run():
     try:
         today    = date.today()
         next_day = next_trading_day(today)
-        print(f"Today: {today}  |  Next trading day: {next_day}")
+        # Daily files are looked up from the last trading day: on a weekend / holiday NSE can
+        # still serve a file under that date (a copy of the previous session), which would be
+        # stored as a fake extra day (seen: sec_bhavdata_full_25102026 on a Sunday).
+        last_session = today if is_trading_day(today) else prev_trading_day(today)
+        force_alerts = os.environ.get("FORCE_ALERTS", "0").strip().lower() in ("1", "true", "yes")
+        print(f"Today: {today}  |  Last session: {last_session}  |  Next trading day: {next_day}")
 
         nse = make_nse_session()
 
         # ── 1. sec_list — today's circuit bands ───────────────────────────────────
         print("\n[1] sec_list (today's bands)...")
         sec_rows, sec_date = fetch_with_fallback(
-            nse, f"{NSE_BASE}/sec_list_{{}}.csv", today, direction="prev"
+            nse, f"{NSE_BASE}/sec_list_{{}}.csv", last_session, direction="prev"
         )
 
         # ── 1b. sec_bhavdata_full — delivery % (same-day companion to sec_list) ──
         print("\n[1b] sec_bhavdata_full (delivery %)...")
         try:
             bhav_rows, bhav_date = fetch_with_fallback(
-                nse, f"{BHAV_BASE}/sec_bhavdata_full_{{}}.csv", today, direction="prev"
+                nse, f"{BHAV_BASE}/sec_bhavdata_full_{{}}.csv", last_session, direction="prev"
             )
             deliv_map = parse_bhavdata_deliv(bhav_rows)
             print(f"  Delivery data: {len(deliv_map)} symbols  ({bhav_date})")
@@ -934,7 +939,7 @@ async def run():
         # ── 5. Participant OI — fallback up to 5 previous trading days ────────────
         print(f"\n[5] fao_participant_oi (today: {today})...")
         try:
-            oi_rows, oi_date = fetch_oi_with_fallback(nse, today, max_tries=5)
+            oi_rows, oi_date = fetch_oi_with_fallback(nse, last_session, max_tries=5)
             print(f"  Participant OI date resolved to: {oi_date}")
         except RuntimeError:
             print("  ⚠ fao_participant_oi not available — skipping OI update")
@@ -1118,6 +1123,14 @@ async def run():
             oi_hist            = oi_hist            or []
             fii_dii_hist       = fii_dii_hist       or []
             deliv_hist         = deliv_hist         or []
+            # drop entries stored under a weekend / holiday date (copies of the previous session)
+            deliv_hist_cleaned = False
+            _bad = [e.get("date") for e in deliv_hist if isinstance(e, dict) and e.get("date")
+                    and not is_trading_day(date.fromisoformat(e["date"]))]
+            if _bad:
+                deliv_hist = [e for e in deliv_hist if not (isinstance(e, dict) and e.get("date") in _bad)]
+                print(f"  Deliv history: removed non-trading-day entries {_bad}")
+                deliv_hist_cleaned = True
 
             upload_tasks = []
 
@@ -1242,6 +1255,10 @@ async def run():
                 existing_dv_dates = {e["date"] for e in deliv_hist}
                 if dv_date_str in existing_dv_dates:
                     print(f"  ✓ Deliv history: {dv_date_str} already present — history unchanged")
+                    if deliv_hist_cleaned:
+                        upload_tasks.append(upload_with_manifest(client, r2_put, "nse_deliv_hist.json", deliv_hist,
+                                                                   schema_v=1, extra_meta={"day_count": len(deliv_hist)},
+                                                                   ensure_ascii=False))
                     if deliv_hist:
                         print(f"    Data available: {len(deliv_hist)} days  "
                               f"({deliv_hist[0]['date']} → {deliv_hist[-1]['date']})")
@@ -1274,7 +1291,7 @@ async def run():
         # ── Circuit change Telegram alert ──────────────────────────────
         # Sent only when this run added new band changes to the history, so a re-run
         # on the same day does not post the same list again.
-        if changes and band_changes_new:
+        if changes and (band_changes_new or force_alerts):
             increased = {s: c for s, c in changes.items() if _band_dir(c) == "up"}
             decreased = {s: c for s, c in changes.items() if _band_dir(c) == "down"}
             msg_lines = ["🔔 <b>NSE Circuit Changes</b>", f"Next day: <code>{chg_date.isoformat()}</code>"]
@@ -1291,7 +1308,7 @@ async def run():
             _send_alert(msg_lines, "circuit")
 
         # ── FII / DII Telegram alert (once per new trading day) ─────────
-        if fii_dii_new_day:
+        if fii_dii_new_day or (force_alerts and fii_dii_snapshot and fii_dii_snapshot.get("date")):
             _send_alert(_fii_dii_message(fii_dii_snapshot, fii_dii_hist, oi_snapshot), "fiidii")
 
         status.set("bands", len(bands))
