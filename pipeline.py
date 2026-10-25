@@ -7110,12 +7110,22 @@ def _build_public_alerts(feed, market_date, sent, internals=None):
     out.append(("box", _pa_block("📦 Box Breakouts", sorted(items, key=lambda x: _pa_rank(x[0])), date_txt)))
 
     # ── 52W high and ATH (ATH first) ──
+    # One stock is posted once per day in this topic (as ATH or as 52W high, never both / twice).
+    # Stocks without an RS rating (listed for less than about a year) are left out: their
+    # "52W high / ATH" is only the high since listing. An ATH must also be a new 52W high today,
+    # which drops rows whose stored ATH date is wrong (ath_data.json seeding / adjustments).
     ath, h52 = [], []
     for r in liquid:
-        if any(e[1] == market_date for e in evs(r, ("ath",))) and fresh(f"ath|{r['symbol']}|{market_date}"):
-            ath.append((r, "ATH")); new_keys.add(f"ath|{r['symbol']}|{market_date}")
-        elif any(e[1] == market_date for e in evs(r, ("h52",))) and fresh(f"h52|{r['symbol']}|{market_date}"):
-            h52.append((r, "52W high")); new_keys.add(f"h52|{r['symbol']}|{market_date}")
+        sym = r["symbol"]
+        keys = (f"hi|{sym}|{market_date}", f"ath|{sym}|{market_date}", f"h52|{sym}|{market_date}")
+        if not all(fresh(k) for k in keys) or not isinstance(r.get("rs_rating"), (int, float)):
+            continue
+        is_ath = any(e[1] == market_date for e in evs(r, ("ath",))) and r.get("new_52wh")
+        is_h52 = any(e[1] == market_date for e in evs(r, ("h52",)))
+        if is_ath:
+            ath.append((r, "ATH")); new_keys.add(keys[0])
+        elif is_h52:
+            h52.append((r, "52W high")); new_keys.add(keys[0])
     items = sorted(ath, key=lambda x: _pa_rank(x[0])) + sorted(h52, key=lambda x: _pa_rank(x[0]))
     out.append(("highs", _pa_block("🚀 New 52W High & ATH", items, date_txt,
                                    f"{len(ath)} at an all-time high, {len(h52)} at a 52-week high" if items else "")))
@@ -7213,7 +7223,7 @@ async def run_public_alerts(dry_run=False) -> None:
             if ok: ok_topics.append(t)
             await asyncio.sleep(2)
         # remember only what reached Telegram; a failed topic is tried again next run
-        prefix = {"market": ("market", "mi"), "box": ("box",), "highs": ("ath", "h52"), "stage2": ("stg",),
+        prefix = {"market": ("market", "mi"), "box": ("box",), "highs": ("hi", "ath", "h52"), "stage2": ("stg",),
                   "ep": ("ep",), "setups": ("rcl", "so", "vcp", "htf", "mhtf", "pb")}
         keep_types = {p for t in ok_topics for p in prefix.get(t, ())}
         for k in new_keys:
