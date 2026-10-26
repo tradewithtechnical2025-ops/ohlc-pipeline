@@ -33,6 +33,8 @@ on:
           - public_alerts_dryrun
           - public_alerts
           - public_alerts_ping
+          - user_alerts_dryrun
+          - user_alerts
 
 jobs:
   pipeline-scan:
