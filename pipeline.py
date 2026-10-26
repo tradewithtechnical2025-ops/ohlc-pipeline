@@ -3171,6 +3171,100 @@ async def archive_screener_feed_history(client, screener_feed, today, keep_days=
 
 
 # ══════════════════════════════════════════════════════════════
+# SIGNAL LEDGER — history/signals_<date>.json (Historical Screener plan, Phase 2)
+# One compact record per session of every scan hit per stock, including the scans
+# whose own files keep only "today" (Box status, VCP, HTF, shakeout, EP state, stage,
+# Minervini). With it a past date (History mode, +NEW, preset alerts) can answer
+# "was X a VCP / Box BO / Stage 2 on that day" instead of reading today's files.
+# Written by ep_scan after every other scan of the day has run (see the workflow order).
+# Keys per stock (only the ones that are set):
+#   box  [status, depth %, dist %, length, start]  status: BO | NBO (Near BO) | CNB (Consolidation near BO) | BF (Box forming)
+#   stg  Weinstein stage (1-4)          stw  weeks in that stage
+#   mv   1 = Minervini Trend Template pass       mvn  1 = new pass today
+#   ep   EP state (not Dead)            epd  its EP date      ept  EP type
+#   vcp  1
+#   htf / mhtf  [status, pole gain %, flag end date]   (HTF / Mini HTF, latest flag)
+#   so   {category: recovery date}       sop  [pause, clean, pause days]
+#   pb / wpb / mpb  1 = daily / weekly / monthly pullback
+#   hlr / whlr  HLR state (daily / weekly)
+#   pat  patterns of the day (same strings as the feed's "patterns")
+# ══════════════════════════════════════════════════════════════
+LEDGER_BOX_CODE = {"BO": "BO", "Near BO": "NBO", "Consolidation Near BO": "CNB", "Box Forming": "BF"}
+
+
+def _r1(v):
+    try: return round(float(v), 1)
+    except (TypeError, ValueError): return None
+
+
+def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, ep_signals=None,
+                         htf_map=None, ema_shakeout_map=None):
+    out = {}
+    def put(sym, k, v):
+        if v is None or v is False or v == "" or v == [] or v == {}: return
+        out.setdefault(sym, {})[k] = v
+    # Box Finder: current status of every stock with a live box (depth like base_scan.js)
+    hist = (box_raw or {}).get("box_history") or {}
+    for st in (box_raw or {}).get("stocks") or []:
+        sym, code = st.get("symbol"), LEDGER_BOX_CODE.get(st.get("status"))
+        if not sym or not code: continue
+        depth = None
+        for b in reversed(hist.get(sym) or []):
+            if b.get("start_date") == st.get("start_date") and abs((b.get("upper") or 0) - (st.get("upper") or 0)) < 1e-6:
+                depth = b.get("depth_pct"); break
+        if depth is None and (st.get("upper") or 0) > 0 and (st.get("lower") or 0) > 0:
+            depth = (st["upper"] - st["lower"]) / st["upper"] * 100
+        put(sym, "box", [code, _r1(depth), _r1(st.get("distance_pct")), st.get("base_length_candles"), st.get("start_date")])
+    # Weinstein stage (weekly scan)
+    for x in (stages_raw or {}).get("signals") or []:
+        if x.get("symbol") and x.get("stage") in (1, 2, 3, 4):
+            put(x["symbol"], "stg", x["stage"]); put(x["symbol"], "stw", x.get("weeks_in_stage"))
+    # Minervini Trend Template
+    mv_new = set((mv_raw or {}).get("new_today") or [])
+    for x in (mv_raw or {}).get("signals") or []:
+        if x.get("symbol"):
+            put(x["symbol"], "mv", 1)
+            if x["symbol"] in mv_new: put(x["symbol"], "mvn", 1)
+    # EP: latest EP of the stock that is not Dead
+    for sig in sorted(ep_signals or [], key=lambda z: z.get("ep_date") or ""):
+        sym = sig.get("symbol")
+        if not sym or sig.get("state") == "Dead" or not sig.get("ep_date"): continue
+        put(sym, "ep", sig.get("state") or "Live"); put(sym, "epd", sig.get("ep_date")); put(sym, "ept", sig.get("ep_type"))
+    # HTF / Mini HTF (latest flag of each)
+    for sym, cats in (htf_map or {}).items():
+        for cat, key in (("HTF", "htf"), ("MiniHTF", "mhtf")):
+            r = (cats or {}).get(cat)
+            if r: put(sym, key, [r.get("status"), _r1(r.get("pole_gain_pct")), r.get("flag_end_date")])
+    # Shakeout: recovery date per category (the screener checks recovery_date == the day)
+    for sym, cats in (ema_shakeout_map or {}).items():
+        so = {cat: rec.get("recovery_date") for cat, rec in (cats or {}).items() if rec.get("recovery_date")}
+        put(sym, "so", so)
+    # Everything the feed row already knows for the day
+    for row in feed or []:
+        sym = row.get("symbol")
+        if not sym: continue
+        if row.get("is_vcp"): put(sym, "vcp", 1)
+        if row.get("shakeout_pause"): put(sym, "sop", [1, 1 if row.get("shakeout_pause_clean") else 0, row.get("shakeout_pause_days")])
+        if row.get("pullback"): put(sym, "pb", 1)
+        if row.get("w_pullback"): put(sym, "wpb", 1)
+        if row.get("m_pullback"): put(sym, "mpb", 1)
+        put(sym, "hlr", row.get("hlr_state")); put(sym, "whlr", row.get("w_hlr_state"))
+        pats = [p for p in str(row.get("patterns") or "").split("||") if p]
+        put(sym, "pat", pats)
+    return {"v": 1, "date": day, "updated": day, "count": len(out), "stocks": out}
+
+
+async def archive_signal_ledger(client, ledger, day):
+    fname = f"history/signals_{day}.json"
+    try:   # never fail ep_scan over the ledger
+        body = json.dumps(ledger, separators=(",", ":"))
+        await r2_upload(client, fname, body)
+        log.info(f"  🗄  ledger: saved {fname}  ({ledger.get('count', 0)} stocks, {len(body) // 1024} KB)")
+    except Exception as e:
+        log.warning(f"  ledger upload failed ({fname}): {e}")
+
+
+# ══════════════════════════════════════════════════════════════
 # run_ep_scan
 # ══════════════════════════════════════════════════════════════
 
@@ -3918,6 +4012,7 @@ async def run_ep_scan() -> None:
                 if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
 
             # ── per-stock events for the NEW tag (see _attach_stock_events) ──
+            _bx = _mv = None   # also used by the signal ledger below
             try:
                 _wt, _bx, _mv, _pf = await _load_event_sources(client, market_data_date)
                 _attach_stock_events(screener_feed, all_data, market_data_date, prev_feed=_pf, wtrans=_wt,
@@ -3948,6 +4043,15 @@ async def run_ep_scan() -> None:
                 dash_stages if isinstance(dash_stages, dict) else {},
                 cls_map_ep,
                 dash_ipo if isinstance(dash_ipo, dict) else {})
+            # ── signal ledger of the day (Phase 2 of the Historical Screener plan) ──
+            signal_ledger = None
+            try:
+                signal_ledger = _build_signal_ledger(
+                    screener_feed, market_data_date, box_raw=_bx,
+                    stages_raw=dash_stages if isinstance(dash_stages, dict) else None,
+                    mv_raw=_mv, ep_signals=signals, htf_map=htf_map, ema_shakeout_map=ema_shakeout_map)
+            except Exception as e:
+                log.warning(f"Signal ledger skipped: {e}")
             log.info(f"dash_summary: {dash_summary['highs52Count']} 52W highs, {len(dash_summary['volShockers'])} vol shockers, "
                      f"{len(dash_summary['sectors'])} sectors, {len(dash_summary['industries'])} industries, "
                      f"{len(dash_summary['ipos'])} IPO listings")
@@ -3994,6 +4098,7 @@ async def run_ep_scan() -> None:
                                           schema_v=1, extra_meta={}),
                 backup_pattern_history(client,screener_feed,market_data_date,gap_new=gap_new,gap_filled=gap_filled),
                 archive_screener_feed_history(client, screener_feed, market_data_date),
+                *([archive_signal_ledger(client, signal_ledger, market_data_date)] if signal_ledger else []),
             )
             extra_uploads=[]
             for fname,obj in (("index_ma_history.json",index_ma_history),
