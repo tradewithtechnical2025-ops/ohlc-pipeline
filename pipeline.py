@@ -30,6 +30,7 @@ Usage:
   python pipeline.py public_alerts_ping    # one test message to every topic of the public group
   python pipeline.py user_alerts      # personal price / line alerts to linked Telegram chats (run after ep_scan)
   python pipeline.py user_alerts_dryrun  # same, log only
+  python pipeline.py ledger_backfill [FROM] [TO] [--force]  # history/signals_<date>.json for past snapshot days
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
   python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
@@ -3252,6 +3253,103 @@ def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, 
         pats = [p for p in str(row.get("patterns") or "").split("||") if p]
         put(sym, "pat", pats)
     return {"v": 1, "date": day, "updated": day, "count": len(out), "stocks": out}
+
+
+# ── Backfill for the days that already have a feed snapshot ──────────────
+#   python pipeline.py ledger_backfill [FROM] [TO] [--force]
+# Rebuilds history/signals_<D>.json for every date in history/manifest.json (or FROM..TO)
+# from files that already keep the past: the day's feed snapshot (VCP, pullback, HLR,
+# patterns, HTF status, shakeout pause), weinstein_stage_history.json (week on/before D),
+# minervini_history_<year>.json, shakeout_signals.json and ep_signals.json (dated signals).
+# No scan is re-run. What cannot be known for D is left out and listed in "partial":
+#   box       Box Finder status needs box_finder re-run on the cut OHLC (Phase 3)
+#   ep_state  only the EP date / type; Runner / Watch / Dead is today's, not D's
+#   stg / mv  no stage week / Minervini entry on or before D
+# Dates that already have a ledger are skipped unless --force.
+def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None, ep_raw=None):
+    out = {}
+    partial = ["box", "ep_state"]
+    def put(sym, k, v):
+        if v is None or v is False or v == "" or v == [] or v == {}: return
+        out.setdefault(sym, {})[k] = v
+    # feed snapshot of the day
+    for row in feed or []:
+        sym = row.get("symbol")
+        if not sym: continue
+        if row.get("is_vcp"): put(sym, "vcp", 1)
+        if row.get("htf_status"): put(sym, "htf", [row.get("htf_status"), _r1(row.get("htf_pole_gain")), None])
+        if row.get("mini_htf_status"): put(sym, "mhtf", [row.get("mini_htf_status"), _r1(row.get("mini_htf_pole_gain")), None])
+        if row.get("shakeout_pause"): put(sym, "sop", [1, 1 if row.get("shakeout_pause_clean") else 0, row.get("shakeout_pause_days")])
+        if row.get("pullback"): put(sym, "pb", 1)
+        if row.get("w_pullback"): put(sym, "wpb", 1)
+        if row.get("m_pullback"): put(sym, "mpb", 1)
+        put(sym, "hlr", row.get("hlr_state")); put(sym, "whlr", row.get("w_hlr_state"))
+        put(sym, "pat", [p for p in str(row.get("patterns") or "").split("||") if p])
+    # Weinstein: the latest week on or before the day (keys are Mondays)
+    weeks = sorted(w for w in (stage_hist or {}) if w <= day)
+    if weeks:
+        for sym, r in (stage_hist[weeks[-1]] or {}).items():
+            if isinstance(r, dict): put(sym, "stg", r.get("stage")); put(sym, "stw", r.get("weeks_in_stage"))
+            elif isinstance(r, int): put(sym, "stg", r)
+    else: partial.append("stg")
+    # Minervini: the day's own entry (+ new vs the prior stored date)
+    if mv_hist and day in mv_hist:
+        today_syms = set(_mv_hist_symbols(mv_hist[day]))
+        prior = sorted(d for d in mv_hist if d < day)
+        prior_syms = set(_mv_hist_symbols(mv_hist[prior[-1]])) if prior else None
+        for sym in today_syms:
+            put(sym, "mv", 1)
+            if prior_syms is not None and sym not in prior_syms: put(sym, "mvn", 1)
+    else: partial.append("mv")
+    # Shakeout: per category the latest recovery on or before the day
+    so = {}
+    for sig in (shakeout_raw or {}).get("signals") or []:
+        sym, rd = sig.get("symbol"), sig.get("recovery_date")
+        if not sym or not rd or rd > day: continue
+        cat = "Combo" if sig.get("compound") else f"EMA{(sig.get('ema_periods') or [0])[0]}"
+        if rd > so.setdefault(sym, {}).get(cat, ""): so[sym][cat] = rd
+    for sym, cats in so.items(): put(sym, "so", cats)
+    # EP: latest EP dated on or before the day (state unknown for the past)
+    for sig in sorted((ep_raw or {}).get("signals") or [], key=lambda z: z.get("ep_date") or ""):
+        sym, ed = sig.get("symbol"), sig.get("ep_date")
+        if not sym or not ed or ed > day: continue
+        put(sym, "epd", ed); put(sym, "ept", sig.get("ep_type"))
+    return {"v": 1, "date": day, "updated": today_ist(), "src": "backfill", "partial": partial, "count": len(out), "stocks": out}
+
+
+async def run_ledger_backfill(date_from=None, date_to=None, force=False) -> None:
+    log.info(f"━━━ Signal ledger backfill  {date_from or 'start'} → {date_to or 'end'}{'  (force)' if force else ''} ━━━")
+    async with httpx.AsyncClient() as client:
+        manifest = await r2_download(client, "history/manifest.json")
+        dates = sorted((manifest or {}).get("dates") or [])
+        dates = [d for d in dates if (not date_from or d >= date_from) and (not date_to or d <= date_to)]
+        if not dates:
+            log.info("No snapshot dates in range — nothing to do"); return
+        stage_hist, shakeout_raw, ep_raw = await asyncio.gather(
+            r2_download(client, "weinstein_stage_history.json"), r2_download(client, "shakeout_signals.json"),
+            r2_download(client, "ep_signals.json"))
+        mv_by_year = {}
+        for y in sorted({d[:4] for d in dates}):
+            h = await r2_download(client, f"minervini_history_{y}.json")
+            mv_by_year[y] = h if isinstance(h, dict) else {}
+        done = skipped = missing = 0
+        for d in dates:
+            if not force:
+                try:
+                    if await r2_download(client, f"history/signals_{d}.json"):
+                        skipped += 1; continue
+                except Exception: pass
+            feed = await r2_download(client, f"history/screener_feed_{d}.json")
+            if not isinstance(feed, list) or not feed:
+                log.warning(f"  {d}: no feed snapshot — skipped"); missing += 1; continue
+            ledger = _backfill_ledger(feed, d, stage_hist=stage_hist if isinstance(stage_hist, dict) else None,
+                                      mv_hist=mv_by_year.get(d[:4]), shakeout_raw=shakeout_raw if isinstance(shakeout_raw, dict) else None,
+                                      ep_raw=ep_raw if isinstance(ep_raw, dict) else None)
+            await archive_signal_ledger(client, ledger, d)
+            log.info(f"  {d}: {ledger['count']} stocks, partial={ledger['partial']}")
+            done += 1
+            del feed
+        log.info(f"━━━ Ledger backfill complete: {done} written, {skipped} already there, {missing} without a snapshot ━━━")
 
 
 async def archive_signal_ledger(client, ledger, day):
@@ -7517,6 +7615,10 @@ if __name__ == "__main__":
         case "public_alerts": asyncio.run(run_public_alerts())
         case "public_alerts_dryrun": asyncio.run(run_public_alerts(dry_run=True))
         case "public_alerts_ping": run_public_alerts_ping()
+        case "ledger_backfill":
+            _a = [x for x in sys.argv[2:] if not x.startswith("--")]
+            asyncio.run(run_ledger_backfill(_a[0] if len(_a) > 0 else None, _a[1] if len(_a) > 1 else None,
+                                            force="--force" in sys.argv))
         case "user_alerts": asyncio.run(run_user_alerts())
         case "user_alerts_dryrun": asyncio.run(run_user_alerts(dry_run=True))
         case "box_scan_dryrun": asyncio.run(run_box_scan(dry_run=True))
