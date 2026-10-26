@@ -12,8 +12,11 @@ concurrency:
   cancel-in-progress: false
 env:
   PYTHON_VERSION: "3.11"
-  WORKER_URL:   ${{ secrets.WORKER_URL }}
-  WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+  # pipeline.py reads all four at start-up (the backfill itself uses only WORKER_URL / WORKER_TOKEN)
+  UPSTOX_TOKEN:  ${{ secrets.UPSTOX_TOKEN }}
+  WORKER_URL:    ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN:  ${{ secrets.WORKER_TOKEN }}
+  FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 jobs:
