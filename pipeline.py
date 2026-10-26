@@ -7646,7 +7646,14 @@ async def _pa_run_screener(snaps):
     if not email or not password:
         raise RuntimeError("TWT_BOT_EMAIL / TWT_BOT_PASSWORD secrets are not set")
     async with async_playwright() as p:
-        browser = await p.chromium.launch()
+        # GitHub's Ubuntu runners already have Google Chrome and its libraries: use it (no download).
+        # Elsewhere fall back to Playwright's own Chromium (python -m playwright install chromium).
+        try:
+            browser = await p.chromium.launch(channel="chrome")
+            log.info("Preset alerts: using the installed Google Chrome")
+        except Exception as e:
+            log.info(f"Preset alerts: Google Chrome not available ({str(e)[:80]}), using Playwright Chromium")
+            browser = await p.chromium.launch()
         ctx = await browser.new_context(viewport={"width": 1500, "height": 900}, locale="en-IN", timezone_id="Asia/Kolkata")
         page = await ctx.new_page()
         page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))
