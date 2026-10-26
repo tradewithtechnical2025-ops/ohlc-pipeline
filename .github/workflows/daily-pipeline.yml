@@ -135,6 +135,17 @@ jobs:
       - name: User Telegram Alerts
         continue-on-error: true
         run: python pipeline.py user_alerts
+      # Preset alerts: the screener's own filters run in a headless browser signed in as the bot account
+      # (Pro, verified email). Needs secrets TWT_BOT_EMAIL / TWT_BOT_PASSWORD. Must not fail the workflow.
+      - name: Preset Telegram Alerts
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          TWT_BOT_EMAIL:    ${{ secrets.TWT_BOT_EMAIL }}
+          TWT_BOT_PASSWORD: ${{ secrets.TWT_BOT_PASSWORD }}
+        run: |
+          pip install playwright
+          python pipeline.py preset_alerts
       # Home ticker reads scan outputs; keep after the scans.
       - name: Home Page Ticker
         uses: nick-fields/retry@v3
