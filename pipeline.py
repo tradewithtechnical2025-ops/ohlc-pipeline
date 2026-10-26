@@ -3357,6 +3357,128 @@ def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None
     return {"v": 1, "date": day, "updated": today_ist(), "src": "backfill", "partial": partial, "count": len(out), "stocks": out}
 
 
+def _session_date(last_dates):
+    """The session most series end on (ties: the later one)."""
+    from collections import Counter
+    c = Counter(d for d in last_dates if d)
+    if not c: return None
+    top = max(c.values())
+    return max(d for d, n in c.items() if n == top)
+
+
+def _trading_days(all_data, min_share=0.3):
+    """Days that are real sessions: a bar on that day in at least min_share of the stocks
+    that were listed then. Holidays / weekends with a stray bar or two drop out."""
+    from collections import Counter
+    c, first = Counter(), []
+    for s in all_data.values():
+        d = [str(x)[:10] for x in (s.get("d") or []) if x]
+        if not d: continue
+        c.update(set(d)); first.append(d[0])
+    first.sort()
+    import bisect
+    out = set()
+    for day, n in c.items():
+        listed = bisect.bisect_right(first, day)          # series that had started by then
+        if listed and n >= max(5, min_share * listed): out.add(day)
+    return out
+
+
+def _feed_session(feed, all_data, real):
+    """Which session a saved screener_feed really holds. Newer files carry the market date on every
+    row ("date"); older ones are matched by LTP against the OHLC closes."""
+    from collections import Counter
+    c = Counter(str(r.get("date") or r.get("as_of_date") or "")[:10] for r in feed if isinstance(r, dict))
+    c.pop("", None)
+    if c:
+        d = _session_date(list(c.elements()))
+        if d in real: return d
+    votes = Counter()
+    for r in feed[:400]:
+        if not isinstance(r, dict): continue
+        s = all_data.get(r.get("symbol") or r.get("stock") or "")
+        try: ltp = float(r.get("ltp"))
+        except (TypeError, ValueError): continue
+        if not s or not ltp: continue
+        for d, cl in zip(s.get("d") or [], s.get("c") or []):
+            if cl and abs(cl - ltp) <= max(0.011, ltp * 0.0005): votes[str(d)[:10]] += 1
+    if not votes: return None
+    d, n = votes.most_common(1)[0]
+    return d if d in real else None
+
+
+async def run_history_cleanup(apply=False) -> None:
+    """Every History snapshot is checked for the session its data really holds (not the name it was
+    saved under). Each trading session then keeps exactly one snapshot:
+      - a file saved on a holiday / weekend holding Friday's data becomes Friday's snapshot when
+        Friday has none, or when Friday's own file holds older data (e.g. Thursday's);
+      - when two files hold the same session, the one saved later wins (it ran on fuller data);
+      - names that end up with no data of their own leave the list.
+    The signal ledger saved with a file moves with it. Dry run by default; --apply writes."""
+    log.info(f"━━━ History cleanup {'(APPLY)' if apply else '(dry run — nothing is written)'} ━━━")
+    async with httpx.AsyncClient() as client:
+        manifest = await r2_download(client, "history/manifest.json")
+        if not isinstance(manifest, dict) or not manifest.get("dates"):
+            log.info("No manifest / no dates"); return
+        dates = sorted(set(manifest["dates"]))
+        all_data = await download_all_chunks(client)
+        real = _trading_days(all_data)
+        if not real:
+            log.warning("Could not work out trading days from OHLC — stopping"); return
+        lo = min(real)
+        holds = {}                                   # saved name -> session its data holds
+        for d in dates:
+            if d < lo: holds[d] = d; continue         # older than the OHLC window: cannot check, keep as is
+            feed = await r2_download(client, f"history/screener_feed_{d}.json")
+            holds[d] = _feed_session(feed, all_data, real) if isinstance(feed, list) and feed else None
+        # best file per session: the file saved under that session's own name when it really holds that
+        # session; otherwise the latest save that holds it
+        best = {}
+        for d in dates:                               # ascending: a later save replaces an earlier one
+            h = holds[d]
+            if h and best.get(h) != h: best[h] = d
+        keep = set(best)
+        changes = []
+        for d in dates:
+            h = holds[d]
+            wd = date.fromisoformat(d).strftime("%a")
+            if h is None:
+                changes.append(f"  {d} ({wd}): file missing / unreadable — removed from the list")
+            elif h == d and best[h] == d:
+                continue
+            elif best[h] == d:
+                why = f" (its own file holds {holds[h]}'s data)" if holds.get(h) else (" (its own file is missing)" if h in dates else "")
+                changes.append(f"  {d} ({wd}): holds {h}'s data — becomes the {h} snapshot{why}")
+            elif d in best:
+                changes.append(f"  {d} ({wd}): its file holds {h}'s data (stale) — replaced by the file saved on {best[d]}")
+            else:
+                changes.append(f"  {d} ({wd}): holds {h}'s data, {h} already has its own file — removed from the list")
+        for line in changes: log.info(line)
+        moves = [(src, ses) for ses, src in best.items() if src != ses]
+        if not changes:
+            log.info(f"All {len(dates)} snapshots hold their own session — nothing to fix"); return
+        log.info(f"{len(changes)} change(s); manifest {len(dates)} → {len(keep)} dates")
+        if not apply:
+            log.info("Dry run — run with --apply to write"); return
+        for src, ses in moves:
+            feed = await r2_download(client, f"history/screener_feed_{src}.json")
+            await r2_upload(client, f"history/screener_feed_{ses}.json", json.dumps(feed))
+            try:
+                led = await r2_download(client, f"history/signals_{src}.json")
+                if isinstance(led, dict) and led.get("stocks"):
+                    led["date"] = ses
+                    await r2_upload(client, f"history/signals_{ses}.json", json.dumps(led, separators=(",", ":")))
+                else:
+                    log.info(f"  {ses}: no ledger saved with that file — run ledger_backfill {ses} {ses} --force"
+                             " (a ledger already saved under that date was written with the old file)")
+            except Exception as e:
+                log.warning(f"  {ses}: ledger not moved ({e}) — run ledger_backfill {ses} {ses} --force")
+        manifest["dates"] = sorted(keep)
+        manifest["cleaned"] = date.today().isoformat()
+        await r2_upload(client, "history/manifest.json", json.dumps(manifest))
+        log.info(f"✓ manifest saved: {len(keep)} dates (old files stay in R2 but are no longer listed)")
+
+
 async def run_ledger_backfill(date_from=None, date_to=None, force=False) -> None:
     log.info(f"━━━ Signal ledger backfill  {date_from or 'start'} → {date_to or 'end'}{'  (force)' if force else ''} ━━━")
     async with httpx.AsyncClient() as client:
@@ -3734,7 +3856,9 @@ async def run_ep_scan() -> None:
                 for series in all_data.values()
                 if isinstance(series, dict) and series.get("d")
             ]
-            market_data_date = max(_market_dates) if _market_dates else today
+            # v2: the session most stocks end on — one stray bar (a bad tick on a holiday / weekend) in a
+            # single series used to move the whole snapshot onto a non-trading day
+            market_data_date = _session_date(_market_dates) or today
             log.info(f"Market data as-of date: {market_data_date} (run date: {today})")
 
             screener={}
@@ -7987,6 +8111,7 @@ if __name__ == "__main__":
             _a = [x for x in sys.argv[2:] if not x.startswith("--")]
             asyncio.run(run_ledger_backfill(_a[0] if len(_a) > 0 else None, _a[1] if len(_a) > 1 else None,
                                             force="--force" in sys.argv))
+        case "history_cleanup": asyncio.run(run_history_cleanup(apply="--apply" in sys.argv))   # dry run unless --apply
         case "preset_alerts": asyncio.run(run_preset_alerts())   # --force: resend today (testing)
         case "preset_alerts_dryrun": asyncio.run(run_preset_alerts(dry_run=True))
         case "user_alerts": asyncio.run(run_user_alerts())
