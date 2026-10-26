@@ -1,0 +1,37 @@
+name: Signal ledger backfill (manual)
+# Builds history/signals_<date>.json for past days that have a feed snapshot (pipeline.py ledger_backfill).
+# Put this file in .github/workflows/. Leave From / To empty for every snapshot date.
+on:
+  workflow_dispatch:
+    inputs:
+      date_from: { description: "From date (YYYY-MM-DD), empty = first snapshot", required: false, default: "" }
+      date_to:   { description: "To date (YYYY-MM-DD), empty = last snapshot", required: false, default: "" }
+      force:     { description: "Rewrite dates that already have a ledger", type: boolean, required: false, default: false }
+concurrency:
+  group: twt-pipeline
+  cancel-in-progress: false
+env:
+  PYTHON_VERSION: "3.11"
+  WORKER_URL:   ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install Dependencies
+        run: pip install httpx requests numpy
+      - name: Ledger backfill
+        run: |
+          FROM="${{ github.event.inputs.date_from }}"; TO="${{ github.event.inputs.date_to }}"
+          if [ -z "$FROM" ]; then FROM="0000-00-00"; fi
+          if [ -z "$TO" ]; then TO="9999-12-31"; fi
+          FORCE=""; if [ "${{ github.event.inputs.force }}" = "true" ]; then FORCE="--force"; fi
+          python pipeline.py ledger_backfill "$FROM" "$TO" $FORCE
