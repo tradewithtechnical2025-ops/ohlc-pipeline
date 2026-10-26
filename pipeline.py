@@ -7621,7 +7621,8 @@ _PA_EVAL_JS = """async (snaps) => {
       await new Promise(function (r) { setTimeout(r, 40); });
       var rows = getFiltered() || [];
       out[key] = { ok: true, rows: rows.map(function (s) {
-        return [s.stock, s.ltp == null ? null : +s.ltp, s.ch == null ? null : +s.ch, s.rs == null ? null : +s.rs, s.sector || '', s.industry || ''];
+        var tv = (s.exchange || 'NSE') + ':' + String(s.trading_symbol || s.stock).replace(/,/g, '');
+        return [s.stock, s.ltp == null ? null : +s.ltp, s.ch == null ? null : +s.ch, s.rs == null ? null : +s.rs, s.sector || '', s.industry || '', tv];
       }) };
     } catch (e) { out[key] = { ok: false, err: String((e && e.message) || e) }; }
   }
@@ -7697,43 +7698,63 @@ def _pa_esc(t):
 def _pa_csv(rows, new_set, out_set):
     import csv, io
     buf = io.StringIO(); w = csv.writer(buf)
-    w.writerow(["Symbol", "Status", "LTP", "Change %", "RS", "Sector", "Industry"])
+    w.writerow(["Symbol", "TradingView", "Status", "LTP", "Change %", "RS", "Sector", "Industry"])
     for r in rows:
-        w.writerow([r[0], "new" if r[0] in new_set else "", r[1], r[2], r[3], r[4], r[5]])
+        w.writerow([r[0], _pa_tv(r), "new" if r[0] in new_set else "", r[1], r[2], r[3], r[4], r[5]])
     for sym in sorted(out_set):
-        w.writerow([sym, "left", "", "", "", "", ""])
+        w.writerow([sym, "", "left", "", "", "", "", ""])
     return buf.getvalue().encode("utf-8")
 
 
-def _pa_message(a, day, rows, new_rows, out_syms):
+def _pa_tv(r):
+    """TradingView symbol, e.g. NSE:SBC / BSE:SSPRL (rows from older runs have no 7th field)."""
+    return r[6] if len(r) > 6 and r[6] else f"NSE:{r[0]}"
+
+
+def _pa_message(a, day, rows, new_rows, out_syms, out_tv=None):
+    """Names go in <code> blocks as NSE:SYM,BSE:SYM,... : one tap copies them in Telegram, and TradingView's
+    watchlist import takes the comma list as is. Long lists are cut to fit Telegram's 4096 characters
+    (the CSV file has everything)."""
     try: d_txt = date.fromisoformat(day).strftime("%d %b")
     except ValueError: d_txt = day
     name = _pa_esc(a.get("pname") or a.get("name") or "Preset")
-    line = lambda r: f"• <b>{_pa_esc(r[0])}</b>  ₹{r[1]:,.2f}" + (f"  RS {int(r[3])}" if r[3] is not None else "") if r[1] is not None else f"• <b>{_pa_esc(r[0])}</b>"
     by_rs = lambda lst: sorted(lst, key=lambda r: -(r[3] or 0))
-    if a.get("pmode") == "full":
-        head = [f"🔔 <b>Preset · {name}</b> · {d_txt}", f"{len(rows)} stock{'s' if len(rows) != 1 else ''}" + (f" (✨ {len(new_rows)} new, {len(out_syms)} left)" if (new_rows or out_syms) else "")]
-        body = []
-        if new_rows:
-            body.append("✨ " + ", ".join(_pa_esc(r[0]) for r in by_rs(new_rows)[:PA_SHOW_MAX]) + (f" +{len(new_rows) - PA_SHOW_MAX}" if len(new_rows) > PA_SHOW_MAX else ""))
-        rest = [r for r in by_rs(rows) if r[0] not in {x[0] for x in new_rows}]
-        if rest:
-            body.append(", ".join(_pa_esc(r[0]) for r in rest[:PA_SHOW_MAX]) + (f" +{len(rest) - PA_SHOW_MAX}" if len(rest) > PA_SHOW_MAX else ""))
-        if out_syms:
-            body.append("Left: " + ", ".join(_pa_esc(s) for s in sorted(out_syms)[:PA_SHOW_MAX]) + (f" +{len(out_syms) - PA_SHOW_MAX}" if len(out_syms) > PA_SHOW_MAX else ""))
+    full = a.get("pmode") == "full"
+    new_ids = {x[0] for x in new_rows}
+    groups = []   # (label, [tv symbols])
+    if full:
+        if new_rows: groups.append(("✨ New", [_pa_tv(r) for r in by_rs(new_rows)]))
+        rest = [r for r in by_rs(rows) if r[0] not in new_ids]
+        if rest: groups.append(("In the list" if new_rows else None, [_pa_tv(r) for r in rest]))
+        if out_syms: groups.append(("Left", sorted((out_tv or {}).get(s0, f"NSE:{s0}") for s0 in out_syms)))
+        head = [f"🔔 <b>Preset · {name}</b> · {d_txt}",
+                f"{len(rows)} stock{'s' if len(rows) != 1 else ''}" + (f" (✨ {len(new_rows)} new, {len(out_syms)} left)" if (new_rows or out_syms) else "")]
     else:
-        head = [f"🔔 <b>Preset · {name}</b> · {d_txt}", f"{len(new_rows)} new stock{'s' if len(new_rows) != 1 else ''} today (total {len(rows)})"]
-        shown = by_rs(new_rows)[:PA_SHOW_MAX]
-        body = [line(r) for r in shown]
-        if len(new_rows) > PA_SHOW_MAX: body.append(f"… +{len(new_rows) - PA_SHOW_MAX} more (file attached)")
-    lines = head + ([""] + body if body else [])
+        groups.append((None, [_pa_tv(r) for r in by_rs(new_rows)]))
+        head = [f"🔔 <b>Preset · {name}</b> · {d_txt}",
+                f"{len(new_rows)} new stock{'s' if len(new_rows) != 1 else ''} today (total {len(rows)})"]
+    tail = []
     if a.get("exp"):
-        try: lines.append(f"Until {date.fromisoformat(str(a['exp'])[:10]).strftime('%d %b')}")
+        try: tail.append(f"Until {date.fromisoformat(str(a['exp'])[:10]).strftime('%d %b')}")
         except ValueError: pass
-    if a.get("msg"): lines += ["", f"📝 {_pa_esc(a['msg'])}"]
-    lines += ["", f'<a href="{PA_SITE_URL}{PA_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
-    text = "\n".join(lines)
-    return text[:4000]
+    if a.get("msg"): tail += ["", f"📝 {_pa_esc(a['msg'])}"]
+    tail += ["", f'<a href="{PA_SITE_URL}{PA_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
+
+    def build(cap):
+        out = list(head)
+        for label, syms in groups:
+            shown = syms[:cap]
+            more = len(syms) - len(shown)
+            out.append("")
+            if label: out.append(f"{label}" + (f" ({len(syms)})" if full else ""))
+            out.append("<code>" + _pa_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else ""))
+        return "\n".join(out + tail)
+    cap = 200
+    text = build(cap)
+    while len(text) > 3900 and cap > 5:   # stay inside Telegram's limit without cutting a tag
+        cap = cap * 2 // 3
+        text = build(cap)
+    return text
 
 
 async def _pa_send_document(client, chat_id, filename, data, caption=None):
@@ -7780,10 +7801,11 @@ async def run_preset_alerts(dry_run=False) -> None:
                 log.warning(f"  {a['id']}: previous session not available — skipped"); continue
             new_rows = [x for x in rows if yset is not None and x[0] not in yset]
             out_syms = (yset - syms) if yset is not None else set()
+            out_tv = {x[0]: _pa_tv(x) for x in (y.get("rows") or [])} if y.get("ok") else {}
             if a.get("pmode") != "full" and not new_rows:
                 continue                                    # nothing entered today
-            msg = _pa_message(a, today_day, rows, new_rows, out_syms)
-            big = len(rows) > PA_SHOW_MAX if a.get("pmode") == "full" else len(new_rows) > PA_SHOW_MAX
+            msg = _pa_message(a, today_day, rows, new_rows, out_syms, out_tv)
+            big = "more (CSV)" in msg or len(rows if a.get("pmode") == "full" else new_rows) > 100
             if dry_run:
                 log.info(f"--- {a.get('uid')} {a.get('pname')} ({len(rows)} rows, {len(new_rows)} new, {len(out_syms)} left){' + CSV' if big else ''} ---\n{msg}")
                 continue
