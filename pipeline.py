@@ -3200,13 +3200,9 @@ def _r1(v):
     except (TypeError, ValueError): return None
 
 
-def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, ep_signals=None,
-                         htf_map=None, ema_shakeout_map=None):
+def _ledger_box_entries(box_raw):
+    """box_finder.json payload -> {symbol: [status code, depth %, distance %, length, start]}."""
     out = {}
-    def put(sym, k, v):
-        if v is None or v is False or v == "" or v == [] or v == {}: return
-        out.setdefault(sym, {})[k] = v
-    # Box Finder: current status of every stock with a live box (depth like base_scan.js)
     hist = (box_raw or {}).get("box_history") or {}
     for st in (box_raw or {}).get("stocks") or []:
         sym, code = st.get("symbol"), LEDGER_BOX_CODE.get(st.get("status"))
@@ -3217,7 +3213,33 @@ def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, 
                 depth = b.get("depth_pct"); break
         if depth is None and (st.get("upper") or 0) > 0 and (st.get("lower") or 0) > 0:
             depth = (st["upper"] - st["lower"]) / st["upper"] * 100
-        put(sym, "box", [code, _r1(depth), _r1(st.get("distance_pct")), st.get("base_length_candles"), st.get("start_date")])
+        out[sym] = [code, _r1(depth), _r1(st.get("distance_pct")), st.get("base_length_candles"), st.get("start_date")]
+    return out
+
+
+def _ohlc_asof(all_data, day, keep=400, dkeys=None):
+    """Every stock's series cut at `day` (its last `keep` bars; box_finder looks back at most 320).
+    dkeys: {symbol: ['YYYY-MM-DD', ...]} built once by the caller when cutting at many dates."""
+    out = {}
+    for sym, s in all_data.items():
+        d = s.get("d") or []
+        if not d: continue
+        dk = dkeys.get(sym) if dkeys else None
+        i = bisect.bisect_right(dk if dk is not None else [str(x)[:10] for x in d], day)
+        if i <= 0: continue
+        lo = max(0, i - keep)
+        out[sym] = {k: (v[lo:i] if isinstance(v, list) and len(v) == len(d) else v) for k, v in s.items()}
+    return out
+
+
+def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, ep_signals=None,
+                         htf_map=None, ema_shakeout_map=None):
+    out = {}
+    def put(sym, k, v):
+        if v is None or v is False or v == "" or v == [] or v == {}: return
+        out.setdefault(sym, {})[k] = v
+    # Box Finder: current status of every stock with a live box (depth like base_scan.js)
+    for sym, entry in _ledger_box_entries(box_raw).items(): put(sym, "box", entry)
     # Weinstein stage (weekly scan)
     for x in (stages_raw or {}).get("signals") or []:
         if x.get("symbol") and x.get("stage") in (1, 2, 3, 4):
@@ -3264,13 +3286,14 @@ def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, 
 # patterns, HTF status, shakeout pause), weinstein_stage_history.json (week on/before D),
 # minervini_history_<year>.json, shakeout_signals.json and ep_signals.json (dated signals).
 # No scan is re-run. What cannot be known for D is left out and listed in "partial":
-#   box       Box Finder status needs box_finder re-run on the cut OHLC (Phase 3)
+#   box       only when box_finder.py cannot be imported; otherwise Box Finder is re-run on the
+#             daily OHLC cut at D (build_box_finder, same rules as box_scan; ~5 s per date)
 #   ep_state  only the EP date / type; Runner / Watch / Dead is today's, not D's
 #   stg / mv  no stage week / Minervini entry on or before D
 # Dates that already have a ledger are skipped unless --force.
-def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None, ep_raw=None):
+def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None, ep_raw=None, box_raw=None):
     out = {}
-    partial = ["box", "ep_state"]
+    partial = ["ep_state"] + ([] if box_raw else ["box"])
     def put(sym, k, v):
         if v is None or v is False or v == "" or v == [] or v == {}: return
         out.setdefault(sym, {})[k] = v
@@ -3316,6 +3339,8 @@ def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None
         sym, ed = sig.get("symbol"), sig.get("ep_date")
         if not sym or not ed or ed > day: continue
         put(sym, "epd", ed); put(sym, "ept", sig.get("ep_type"))
+    # Box Finder re-run on the OHLC cut at the day (same rules as the daily box_scan)
+    for sym, entry in _ledger_box_entries(box_raw).items(): put(sym, "box", entry)
     return {"v": 1, "date": day, "updated": today_ist(), "src": "backfill", "partial": partial, "count": len(out), "stocks": out}
 
 
@@ -3334,19 +3359,29 @@ async def run_ledger_backfill(date_from=None, date_to=None, force=False) -> None
         for y in sorted({d[:4] for d in dates}):
             h = await r2_download(client, f"minervini_history_{y}.json")
             mv_by_year[y] = h if isinstance(h, dict) else {}
+        try:
+            from box_finder import build_box_finder
+        except Exception as e:
+            build_box_finder = None
+            log.warning(f"box_finder not available ({e}) — ledgers without Box status")
+        all_data = await download_all_chunks(client) if build_box_finder else {}
+        dkeys = {sym: [str(x)[:10] for x in (s.get("d") or [])] for sym, s in all_data.items()}
         done = skipped = missing = 0
         for d in dates:
-            if not force:
-                try:
-                    if await r2_download(client, f"history/signals_{d}.json"):
-                        skipped += 1; continue
-                except Exception: pass
+            try: old = await r2_download(client, f"history/signals_{d}.json")
+            except Exception: old = None
+            if old and (not force or old.get("src") != "backfill"):
+                skipped += 1; continue          # a ledger written by ep_scan that day is never replaced
             feed = await r2_download(client, f"history/screener_feed_{d}.json")
             if not isinstance(feed, list) or not feed:
                 log.warning(f"  {d}: no feed snapshot — skipped"); missing += 1; continue
+            box_raw = None
+            if build_box_finder:
+                try: box_raw = build_box_finder(_ohlc_asof(all_data, d, dkeys=dkeys), asof=d)
+                except Exception as e: log.warning(f"  {d}: box_finder failed: {e}")
             ledger = _backfill_ledger(feed, d, stage_hist=stage_hist if isinstance(stage_hist, dict) else None,
                                       mv_hist=mv_by_year.get(d[:4]), shakeout_raw=shakeout_raw if isinstance(shakeout_raw, dict) else None,
-                                      ep_raw=ep_raw if isinstance(ep_raw, dict) else None)
+                                      ep_raw=ep_raw if isinstance(ep_raw, dict) else None, box_raw=box_raw)
             await archive_signal_ledger(client, ledger, d)
             log.info(f"  {d}: {ledger['count']} stocks, partial={ledger['partial']}")
             done += 1
@@ -7588,15 +7623,15 @@ async def run_user_alerts(dry_run=False) -> None:
 #   yesterday: the previous session in History mode (loadHistoryDate; history_asof.js cuts the OHLC and
 #              reads that day's signal ledger)
 # "new" mode sends the stocks that entered the list today; "full" sends the whole list every day with the
-# entered / left ones marked. Lists longer than PA_SHOW_MAX also come as a CSV file.
+# entered / left ones marked. Lists longer than PR_SHOW_MAX also come as a CSV file.
 # One evaluation per distinct snapshot, however many users share the preset.
 # ══════════════════════════════════════════════════════════════
-PA_SHOW_MAX = 30
-PA_SITE_URL = os.environ.get("TWT_SITE_URL", "https://tradewithtech.in").rstrip("/")
-PA_SCREENER_PATH = os.environ.get("TWT_SCREENER_PATH", "/screener")
+PR_SHOW_MAX = 30
+PR_SITE_URL = os.environ.get("TWT_SITE_URL", "https://tradewithtech.in").rstrip("/")
+PR_SCREENER_PATH = os.environ.get("TWT_SCREENER_PATH", "/screener")
 
 # readiness: data, OHLC chunks and the filter entry points of the screener page
-_PA_READY_JS = """() => {
+_PR_READY_JS = """() => {
   try {
     if (typeof getFiltered !== 'function' || typeof applyFilterSnapshot !== 'function') return false;
     if (typeof allStocks === 'undefined' || !allStocks || allStocks.length < 100) return false;
@@ -7605,7 +7640,7 @@ _PA_READY_JS = """() => {
   } catch (e) { return false; }
 }"""
 # slower side data (box finder, HTF, shakeout): waited for, but not required
-_PA_EXTRAS_JS = """() => {
+_PR_EXTRAS_JS = """() => {
   try {
     var box = typeof window.bscanReady !== 'function' || window.bscanReady();
     var htf = typeof _htfLoaded === 'undefined' || _htfLoaded;
@@ -7613,7 +7648,7 @@ _PA_EXTRAS_JS = """() => {
     return box && htf && so;
   } catch (e) { return true; }
 }"""
-_PA_EVAL_JS = """async (snaps) => {
+_PR_EVAL_JS = """async (snaps) => {
   var out = {};
   for (var key in snaps) {
     try {
@@ -7630,7 +7665,7 @@ _PA_EVAL_JS = """async (snaps) => {
 }"""
 
 
-async def _pa_wait(page, js, timeout_s, label, required=True):
+async def _pr_wait(page, js, timeout_s, label, required=True):
     try:
         await page.wait_for_function(js, timeout=timeout_s * 1000, polling=1000)
         return True
@@ -7640,7 +7675,7 @@ async def _pa_wait(page, js, timeout_s, label, required=True):
         return False
 
 
-async def _pa_run_screener(snaps):
+async def _pr_run_screener(snaps):
     """snaps: {key: snapshot}. Returns (today_day, prev_day, today{key: res}, prev{key: res})."""
     from playwright.async_api import async_playwright
     email, password = os.environ.get("TWT_BOT_EMAIL"), os.environ.get("TWT_BOT_PASSWORD")
@@ -7660,22 +7695,22 @@ async def _pa_run_screener(snaps):
         page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))
         page.on("pageerror", lambda e: log.warning(f"  page error: {str(e)[:200]}"))
         # 1. sign in (Firebase on the login page), then open the screener
-        await page.goto(f"{PA_SITE_URL}/login", wait_until="domcontentloaded", timeout=90000)
-        await _pa_wait(page, "() => !!(window.firebase && firebase.auth)", 60, "firebase on /login")
+        await page.goto(f"{PR_SITE_URL}/login", wait_until="domcontentloaded", timeout=90000)
+        await _pr_wait(page, "() => !!(window.firebase && firebase.auth)", 60, "firebase on /login")
         info = await page.evaluate("""async ([e, p]) => {
             var c = await firebase.auth().signInWithEmailAndPassword(e, p);
             return { verified: !!(c.user && c.user.emailVerified) };
         }""", [email, password])
         if not info.get("verified"):
             raise RuntimeError("the bot account's email is not verified — the screener would redirect to /verify-email")
-        await page.goto(f"{PA_SITE_URL}{PA_SCREENER_PATH}", wait_until="domcontentloaded", timeout=90000)
+        await page.goto(f"{PR_SITE_URL}{PR_SCREENER_PATH}", wait_until="domcontentloaded", timeout=90000)
         if "/login" in page.url or "verify-email" in page.url:
             raise RuntimeError(f"not signed in on the screener (landed on {page.url})")
-        await _pa_wait(page, _PA_READY_JS, 300, "screener data")
-        await _pa_wait(page, _PA_EXTRAS_JS, 90, "box / HTF / shakeout", required=False)
+        await _pr_wait(page, _PR_READY_JS, 300, "screener data")
+        await _pr_wait(page, _PR_EXTRAS_JS, 90, "box / HTF / shakeout", required=False)
         await page.wait_for_timeout(3000)
         today_day = str(await page.evaluate("() => window._dataAsOfDate"))[:10]
-        today = await page.evaluate(_PA_EVAL_JS, snaps)
+        today = await page.evaluate(_PR_EVAL_JS, snaps)
         # 2. the previous session in History mode
         prev_day = await page.evaluate("""async (d) => {
             var ds = await _historyFetchManifest(true);
@@ -7684,61 +7719,61 @@ async def _pa_run_screener(snaps):
         prev = {}
         if prev_day:
             await page.evaluate("async (d) => { await loadHistoryDate(d); }", prev_day)
-            await _pa_wait(page, f"() => typeof _historyMode !== 'undefined' && _historyMode && String(_historyDate).slice(0, 10) === '{prev_day}'", 120, "history date")
+            await _pr_wait(page, f"() => typeof _historyMode !== 'undefined' && _historyMode && String(_historyDate).slice(0, 10) === '{prev_day}'", 120, "history date")
             await page.wait_for_timeout(2000)
-            prev = await page.evaluate(_PA_EVAL_JS, snaps)
+            prev = await page.evaluate(_PR_EVAL_JS, snaps)
         await browser.close()
         return today_day, prev_day, today, prev
 
 
-def _pa_esc(t):
+def _pr_esc(t):
     return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _pa_csv(rows, new_set, out_set):
+def _pr_csv(rows, new_set, out_set):
     import csv, io
     buf = io.StringIO(); w = csv.writer(buf)
     w.writerow(["Symbol", "TradingView", "Status", "LTP", "Change %", "RS", "Sector", "Industry"])
     for r in rows:
-        w.writerow([r[0], _pa_tv(r), "new" if r[0] in new_set else "", r[1], r[2], r[3], r[4], r[5]])
+        w.writerow([r[0], _pr_tv(r), "new" if r[0] in new_set else "", r[1], r[2], r[3], r[4], r[5]])
     for sym in sorted(out_set):
         w.writerow([sym, "", "left", "", "", "", "", ""])
     return buf.getvalue().encode("utf-8")
 
 
-def _pa_tv(r):
+def _pr_tv(r):
     """TradingView symbol, e.g. NSE:SBC / BSE:SSPRL (rows from older runs have no 7th field)."""
     return r[6] if len(r) > 6 and r[6] else f"NSE:{r[0]}"
 
 
-def _pa_message(a, day, rows, new_rows, out_syms, out_tv=None):
+def _pr_message(a, day, rows, new_rows, out_syms, out_tv=None):
     """Names go in <code> blocks as NSE:SYM,BSE:SYM,... : one tap copies them in Telegram, and TradingView's
     watchlist import takes the comma list as is. Long lists are cut to fit Telegram's 4096 characters
     (the CSV file has everything)."""
     try: d_txt = date.fromisoformat(day).strftime("%d %b")
     except ValueError: d_txt = day
-    name = _pa_esc(a.get("pname") or a.get("name") or "Preset")
+    name = _pr_esc(a.get("pname") or a.get("name") or "Preset")
     by_rs = lambda lst: sorted(lst, key=lambda r: -(r[3] or 0))
     full = a.get("pmode") == "full"
     new_ids = {x[0] for x in new_rows}
     groups = []   # (label, [tv symbols])
     if full:
-        if new_rows: groups.append(("✨ New", [_pa_tv(r) for r in by_rs(new_rows)]))
+        if new_rows: groups.append(("✨ New", [_pr_tv(r) for r in by_rs(new_rows)]))
         rest = [r for r in by_rs(rows) if r[0] not in new_ids]
-        if rest: groups.append(("In the list" if new_rows else None, [_pa_tv(r) for r in rest]))
+        if rest: groups.append(("In the list" if new_rows else None, [_pr_tv(r) for r in rest]))
         if out_syms: groups.append(("Left", sorted((out_tv or {}).get(s0, f"NSE:{s0}") for s0 in out_syms)))
         head = [f"🔔 <b>Preset · {name}</b> · {d_txt}",
                 f"{len(rows)} stock{'s' if len(rows) != 1 else ''}" + (f" (✨ {len(new_rows)} new, {len(out_syms)} left)" if (new_rows or out_syms) else "")]
     else:
-        groups.append((None, [_pa_tv(r) for r in by_rs(new_rows)]))
+        groups.append((None, [_pr_tv(r) for r in by_rs(new_rows)]))
         head = [f"🔔 <b>Preset · {name}</b> · {d_txt}",
                 f"{len(new_rows)} new stock{'s' if len(new_rows) != 1 else ''} today (total {len(rows)})"]
     tail = []
     if a.get("exp"):
         try: tail.append(f"Until {date.fromisoformat(str(a['exp'])[:10]).strftime('%d %b')}")
         except ValueError: pass
-    if a.get("msg"): tail += ["", f"📝 {_pa_esc(a['msg'])}"]
-    tail += ["", f'<a href="{PA_SITE_URL}{PA_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
+    if a.get("msg"): tail += ["", f"📝 {_pr_esc(a['msg'])}"]
+    tail += ["", f'<a href="{PR_SITE_URL}{PR_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
 
     def build(cap):
         out = list(head)
@@ -7747,7 +7782,7 @@ def _pa_message(a, day, rows, new_rows, out_syms, out_tv=None):
             more = len(syms) - len(shown)
             out.append("")
             if label: out.append(f"{label}" + (f" ({len(syms)})" if full else ""))
-            out.append("<code>" + _pa_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else ""))
+            out.append("<code>" + _pr_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else ""))
         return "\n".join(out + tail)
     cap = 200
     text = build(cap)
@@ -7757,7 +7792,7 @@ def _pa_message(a, day, rows, new_rows, out_syms, out_tv=None):
     return text
 
 
-async def _pa_send_document(client, chat_id, filename, data, caption=None):
+async def _pr_send_document(client, chat_id, filename, data, caption=None):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token: return False
     try:
@@ -7770,9 +7805,9 @@ async def _pa_send_document(client, chat_id, filename, data, caption=None):
 
 
 async def run_preset_alerts(dry_run=False, force=False) -> None:
-    """force: ignore "already sent for this session" (testing; PA_FORCE=1 or --force)."""
+    """force: ignore "already sent for this session" (testing; PR_FORCE=1 or --force)."""
     from telegram_notify import send_message
-    force = force or os.environ.get("PA_FORCE") == "1" or "--force" in sys.argv
+    force = force or os.environ.get("PR_FORCE") == "1" or "--force" in sys.argv
     async with httpx.AsyncClient() as client:
         r = await client.get(f"{WORKER_URL}/alerts/active", headers=WORKER_HEADERS, timeout=60)
         if r.status_code != 200:
@@ -7787,7 +7822,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
             k = json.dumps(snap, sort_keys=True)
             key_of[a["id"]] = k; snaps[k] = snap
         log.info(f"Preset alerts: {len(snaps)} distinct preset(s) to evaluate")
-        today_day, prev_day, today, prev = await _pa_run_screener(snaps)
+        today_day, prev_day, today, prev = await _pr_run_screener(snaps)
         log.info(f"Preset alerts: today {today_day}, previous session {prev_day}")
         fired = []
         for a in alerts:
@@ -7806,11 +7841,11 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 log.warning(f"{tag} previous session not available — skipped"); continue
             new_rows = [x for x in rows if yset is not None and x[0] not in yset]
             out_syms = (yset - syms) if yset is not None else set()
-            out_tv = {x[0]: _pa_tv(x) for x in (y.get("rows") or [])} if y.get("ok") else {}
+            out_tv = {x[0]: _pr_tv(x) for x in (y.get("rows") or [])} if y.get("ok") else {}
             log.info(f"{tag} {len(rows)} today, {len(new_rows)} new, {len(out_syms)} left")
             if a.get("pmode") != "full" and not new_rows:
                 log.info(f"{tag} no new stocks — nothing to send"); continue
-            msg = _pa_message(a, today_day, rows, new_rows, out_syms, out_tv)
+            msg = _pr_message(a, today_day, rows, new_rows, out_syms, out_tv)
             big = "more (CSV)" in msg or len(rows if a.get("pmode") == "full" else new_rows) > 100
             if dry_run:
                 log.info(f"--- {a.get('uid')} {a.get('pname')} ({len(rows)} rows, {len(new_rows)} new, {len(out_syms)} left){' + CSV' if big else ''} ---\n{msg}")
@@ -7819,7 +7854,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
             if ok and big:
                 fname = re.sub(r"[^A-Za-z0-9_-]+", "_", str(a.get("pname") or "preset"))[:40] + f"_{today_day}.csv"
                 csv_rows = rows if a.get("pmode") == "full" else new_rows
-                await _pa_send_document(client, a.get("chat_id"), fname, _pa_csv(csv_rows, {x[0] for x in new_rows}, out_syms if a.get("pmode") == "full" else set()))
+                await _pr_send_document(client, a.get("chat_id"), fname, _pr_csv(csv_rows, {x[0] for x in new_rows}, out_syms if a.get("pmode") == "full" else set()))
             if ok:
                 fired.append({"uid": a["uid"], "id": a["id"], "day": today_day, "price": len(rows), "level": len(new_rows)})
             else:
