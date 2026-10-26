@@ -24,7 +24,7 @@ env:
 jobs:
   preset_alerts:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,7 +34,7 @@ jobs:
       - name: Install
         run: |
           pip install httpx requests numpy playwright
-          python -m playwright install --with-deps chromium
+          # the runner's own Google Chrome is used; no browser download or apt packages needed
       - name: Preset alerts
         run: |
           if [ "${{ github.event.inputs.send }}" = "true" ]; then python pipeline.py preset_alerts; else python pipeline.py preset_alerts_dryrun; fi
