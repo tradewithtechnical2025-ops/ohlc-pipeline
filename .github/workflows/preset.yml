@@ -8,6 +8,11 @@ on:
         type: boolean
         required: false
         default: false
+      force:
+        description: "Send again even if today's message was already sent (testing)"
+        type: boolean
+        required: false
+        default: false
 concurrency:
   group: twt-pipeline
   cancel-in-progress: false
@@ -37,4 +42,5 @@ jobs:
           # the runner's own Google Chrome is used; no browser download or apt packages needed
       - name: Preset alerts
         run: |
-          if [ "${{ github.event.inputs.send }}" = "true" ]; then python pipeline.py preset_alerts; else python pipeline.py preset_alerts_dryrun; fi
+          F=""; if [ "${{ github.event.inputs.force }}" = "true" ]; then F="--force"; fi
+          if [ "${{ github.event.inputs.send }}" = "true" ]; then python pipeline.py preset_alerts $F; else python pipeline.py preset_alerts_dryrun $F; fi
