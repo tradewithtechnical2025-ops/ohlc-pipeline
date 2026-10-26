@@ -7769,8 +7769,10 @@ async def _pa_send_document(client, chat_id, filename, data, caption=None):
         log.warning(f"  sendDocument failed: {e}"); return False
 
 
-async def run_preset_alerts(dry_run=False) -> None:
+async def run_preset_alerts(dry_run=False, force=False) -> None:
+    """force: ignore "already sent for this session" (testing; PA_FORCE=1 or --force)."""
     from telegram_notify import send_message
+    force = force or os.environ.get("PA_FORCE") == "1" or "--force" in sys.argv
     async with httpx.AsyncClient() as client:
         r = await client.get(f"{WORKER_URL}/alerts/active", headers=WORKER_HEADERS, timeout=60)
         if r.status_code != 200:
@@ -7791,19 +7793,23 @@ async def run_preset_alerts(dry_run=False) -> None:
         for a in alerts:
             k = key_of.get(a["id"])
             t, y = today.get(k) or {}, prev.get(k) or {}
+            tag = f"  {a['id']} ({a.get('pname')}, {a.get('pmode') or 'new'}):"
             if not t.get("ok"):
-                log.warning(f"  {a['id']} ({a.get('pname')}): {t.get('err') or 'not evaluated'}"); continue
-            if a.get("exp") and today_day > str(a["exp"])[:10]: continue
-            if a.get("last_day") and today_day <= str(a["last_day"])[:10]: continue
+                log.warning(f"{tag} {t.get('err') or 'not evaluated'}"); continue
+            if a.get("exp") and today_day > str(a["exp"])[:10]:
+                log.info(f"{tag} expired on {a['exp']} — skipped"); continue
+            if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
+                log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
             rows = t["rows"]; syms = {x[0] for x in rows}
             yset = {x[0] for x in (y.get("rows") or [])} if y.get("ok") else None
             if yset is None and a.get("pmode") != "full":
-                log.warning(f"  {a['id']}: previous session not available — skipped"); continue
+                log.warning(f"{tag} previous session not available — skipped"); continue
             new_rows = [x for x in rows if yset is not None and x[0] not in yset]
             out_syms = (yset - syms) if yset is not None else set()
             out_tv = {x[0]: _pa_tv(x) for x in (y.get("rows") or [])} if y.get("ok") else {}
+            log.info(f"{tag} {len(rows)} today, {len(new_rows)} new, {len(out_syms)} left")
             if a.get("pmode") != "full" and not new_rows:
-                continue                                    # nothing entered today
+                log.info(f"{tag} no new stocks — nothing to send"); continue
             msg = _pa_message(a, today_day, rows, new_rows, out_syms, out_tv)
             big = "more (CSV)" in msg or len(rows if a.get("pmode") == "full" else new_rows) > 100
             if dry_run:
@@ -7869,7 +7875,7 @@ if __name__ == "__main__":
             _a = [x for x in sys.argv[2:] if not x.startswith("--")]
             asyncio.run(run_ledger_backfill(_a[0] if len(_a) > 0 else None, _a[1] if len(_a) > 1 else None,
                                             force="--force" in sys.argv))
-        case "preset_alerts": asyncio.run(run_preset_alerts())
+        case "preset_alerts": asyncio.run(run_preset_alerts())   # --force: resend today (testing)
         case "preset_alerts_dryrun": asyncio.run(run_preset_alerts(dry_run=True))
         case "user_alerts": asyncio.run(run_user_alerts())
         case "user_alerts_dryrun": asyncio.run(run_user_alerts(dry_run=True))
