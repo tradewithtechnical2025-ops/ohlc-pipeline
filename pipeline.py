@@ -3288,12 +3288,15 @@ def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, 
 # No scan is re-run. What cannot be known for D is left out and listed in "partial":
 #   box       only when box_finder.py cannot be imported; otherwise Box Finder is re-run on the
 #             daily OHLC cut at D (build_box_finder, same rules as box_scan; ~5 s per date)
-#   ep_state  only the EP date / type; Runner / Watch / Dead is today's, not D's
+#   ep_state  only when the EP detector failed: normally _detect_ep runs on the OHLC cut at D, so the
+#             EP state (Watch / Runner / Consolidation / Pullback) is the one of that day
 #   stg / mv  no stage week / Minervini entry on or before D
 # Dates that already have a ledger are skipped unless --force.
-def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None, ep_raw=None, box_raw=None):
+def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None, ep_raw=None, box_raw=None, ep_day=None):
+    """ep_day: _detect_ep() run on the OHLC cut at the day (EP state as it was that day); without it
+    only the EP date / type from today's ep_signals.json is known."""
     out = {}
-    partial = ["ep_state"] + ([] if box_raw else ["box"])
+    partial = ([] if ep_day is not None else ["ep_state"]) + ([] if box_raw else ["box"])
     def put(sym, k, v):
         if v is None or v is False or v == "" or v == [] or v == {}: return
         out.setdefault(sym, {})[k] = v
@@ -3334,11 +3337,21 @@ def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None
         cat = "Combo" if sig.get("compound") else f"EMA{(sig.get('ema_periods') or [0])[0]}"
         if rd > so.setdefault(sym, {}).get(cat, ""): so[sym][cat] = rd
     for sym, cats in so.items(): put(sym, "so", cats)
-    # EP: latest EP dated on or before the day (state unknown for the past)
-    for sig in sorted((ep_raw or {}).get("signals") or [], key=lambda z: z.get("ep_date") or ""):
-        sym, ed = sig.get("symbol"), sig.get("ep_date")
-        if not sym or not ed or ed > day: continue
-        put(sym, "epd", ed); put(sym, "ept", sig.get("ep_type"))
+    # EP: with ep_day, the detector's own result for that day (state included, Dead left out, same as the
+    # live ledger); the type (Earnings / Event / Normal) comes from today's ep_signals.json for the same EP.
+    # Without it: latest EP dated on or before the day, state unknown.
+    types = {(z.get("symbol"), z.get("ep_date")): z.get("ep_type") for z in (ep_raw or {}).get("signals") or []}
+    if ep_day is not None:
+        for sig in sorted(ep_day, key=lambda z: z.get("ep_date") or ""):
+            sym, ed = sig.get("symbol"), sig.get("ep_date")
+            if not sym or not ed or sig.get("state") == "Dead": continue
+            put(sym, "ep", sig.get("state") or "Live"); put(sym, "epd", ed)
+            put(sym, "ept", types.get((sym, ed)) or sig.get("ep_type"))
+    else:
+        for sig in sorted((ep_raw or {}).get("signals") or [], key=lambda z: z.get("ep_date") or ""):
+            sym, ed = sig.get("symbol"), sig.get("ep_date")
+            if not sym or not ed or ed > day: continue
+            put(sym, "epd", ed); put(sym, "ept", sig.get("ep_type"))
     # Box Finder re-run on the OHLC cut at the day (same rules as the daily box_scan)
     for sym, entry in _ledger_box_entries(box_raw).items(): put(sym, "box", entry)
     return {"v": 1, "date": day, "updated": today_ist(), "src": "backfill", "partial": partial, "count": len(out), "stocks": out}
@@ -3364,7 +3377,7 @@ async def run_ledger_backfill(date_from=None, date_to=None, force=False) -> None
         except Exception as e:
             build_box_finder = None
             log.warning(f"box_finder not available ({e}) — ledgers without Box status")
-        all_data = await download_all_chunks(client) if build_box_finder else {}
+        all_data = await download_all_chunks(client)   # Box Finder and the EP detector run on it, cut per date
         dkeys = {sym: [str(x)[:10] for x in (s.get("d") or [])] for sym, s in all_data.items()}
         done = skipped = missing = 0
         for d in dates:
@@ -3375,13 +3388,17 @@ async def run_ledger_backfill(date_from=None, date_to=None, force=False) -> None
             feed = await r2_download(client, f"history/screener_feed_{d}.json")
             if not isinstance(feed, list) or not feed:
                 log.warning(f"  {d}: no feed snapshot — skipped"); missing += 1; continue
-            box_raw = None
-            if build_box_finder:
-                try: box_raw = build_box_finder(_ohlc_asof(all_data, d, dkeys=dkeys), asof=d)
+            box_raw = ep_day = None
+            cut = _ohlc_asof(all_data, d, dkeys=dkeys) if all_data else None
+            if build_box_finder and cut:
+                try: box_raw = build_box_finder(cut, asof=d)
                 except Exception as e: log.warning(f"  {d}: box_finder failed: {e}")
+            if cut:
+                try: ep_day = _detect_ep(cut)        # EP state on that day (same detector as ep_scan)
+                except Exception as e: log.warning(f"  {d}: EP detector failed: {e}")
             ledger = _backfill_ledger(feed, d, stage_hist=stage_hist if isinstance(stage_hist, dict) else None,
                                       mv_hist=mv_by_year.get(d[:4]), shakeout_raw=shakeout_raw if isinstance(shakeout_raw, dict) else None,
-                                      ep_raw=ep_raw if isinstance(ep_raw, dict) else None, box_raw=box_raw)
+                                      ep_raw=ep_raw if isinstance(ep_raw, dict) else None, box_raw=box_raw, ep_day=ep_day)
             await archive_signal_ledger(client, ledger, d)
             log.info(f"  {d}: {ledger['count']} stocks, partial={ledger['partial']}")
             done += 1
