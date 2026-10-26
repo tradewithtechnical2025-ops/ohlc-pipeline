@@ -3416,6 +3416,63 @@ async def archive_signal_ledger(client, ledger, day):
         log.warning(f"  ledger upload failed ({fname}): {e}")
 
 
+# ── Group RS rank history that keeps growing ───────────────────
+# sector_group_rs_history.json / industry_rs_history.json are rebuilt each day from
+# rs_history.json, so they only cover the last ~180 sessions. This file keeps every day:
+# each run merges the current window into history/group_rs_full.json (same snapshot shape:
+# {"date":"1-Feb-26","groups":{name:{stocks,rs60,rs70,rs80,rs90,avg_rs}}}) plus the
+# rank of each group on that day. The RS Dashboard reads it for past dates and the
+# "where was this sector when" timeline.
+GROUP_RS_FULL_FILE = "history/group_rs_full.json"
+
+def _grp_label_iso(label):
+    from datetime import datetime as _dt
+    try: return _dt.strptime(str(label), "%d-%b-%y").strftime("%Y-%m-%d")
+    except Exception:
+        try: return _dt.fromisoformat(str(label)[:10]).strftime("%Y-%m-%d")
+        except Exception: return None
+
+def _grp_with_rank(snap):
+    g = snap.get("groups") or {}
+    order = sorted(g.keys(), key=lambda k: -(g[k].get("avg_rs") or 0))
+    out = {}
+    for i, k in enumerate(order):
+        v = dict(g[k]); v["rank"] = i + 1; out[k] = v
+    return {"date": snap.get("date"), "groups": out}
+
+def _merge_group_rs_full(old, sector_hist, industry_hist):
+    old = old if isinstance(old, dict) else {}
+    res = {"version": 1}
+    for key, cur in (("sector", sector_hist), ("industry", industry_hist)):
+        by = {}
+        for s in (old.get(key) or []):
+            iso = _grp_label_iso(s.get("date"))
+            if iso and s.get("groups"): by[iso] = s
+        for s in (cur or []):
+            iso = _grp_label_iso(s.get("date"))
+            if iso and s.get("groups"): by[iso] = _grp_with_rank(s)     # today's numbers win
+        res[key] = [by[d] for d in sorted(by)]
+    res["from"] = res["sector"][0]["date"] if res["sector"] else None
+    res["to"] = res["sector"][-1]["date"] if res["sector"] else None
+    res["days"] = len(res["sector"])
+    return res
+
+async def archive_group_rs_full(client, sector_hist, industry_hist):
+    try:   # never fail ep_scan over this file
+        if not sector_hist: return
+        try:
+            old = await r2_download(client, GROUP_RS_FULL_FILE)
+        except Exception as e:
+            log.warning(f"  group RS history: could not read the old file ({e}); not overwriting it")
+            return
+        merged = _merge_group_rs_full(old, sector_hist, industry_hist)
+        body = json.dumps(merged, separators=(",", ":"))
+        await r2_upload(client, GROUP_RS_FULL_FILE, body)
+        log.info(f"  🗄  group RS history: {merged['days']} days ({merged['from']} → {merged['to']}), {len(body)//1024} KB")
+    except Exception as e:
+        log.warning(f"  group RS history skipped: {e}")
+
+
 # ══════════════════════════════════════════════════════════════
 # run_ep_scan
 # ══════════════════════════════════════════════════════════════
@@ -4251,6 +4308,7 @@ async def run_ep_scan() -> None:
                 backup_pattern_history(client,screener_feed,market_data_date,gap_new=gap_new,gap_filled=gap_filled),
                 archive_screener_feed_history(client, screener_feed, market_data_date),
                 *([archive_signal_ledger(client, signal_ledger, market_data_date)] if signal_ledger else []),
+                archive_group_rs_full(client, sector_group_rs_history, industry_rs_history),
             )
             extra_uploads=[]
             for fname,obj in (("index_ma_history.json",index_ma_history),
@@ -7671,6 +7729,8 @@ _PR_EVAL_JS = """async (snaps) => {
     try {
       applyFilterSnapshot(JSON.parse(JSON.stringify(snaps[key])));
       await new Promise(function (r) { setTimeout(r, 40); });
+      // "RS N days ago" filter (rs_then.js): wait for rs_history.json before filtering
+      if (typeof window.twtRsThenReady === 'function') await window.twtRsThenReady();
       var rows = getFiltered() || [];
       out[key] = { ok: true, rows: rows.map(function (s) {
         var tv = (s.exchange || 'NSE') + ':' + String(s.trading_symbol || s.stock).replace(/,/g, '');
