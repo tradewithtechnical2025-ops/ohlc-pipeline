@@ -28,6 +28,8 @@ Usage:
   python pipeline.py public_alerts    # EOD summaries to the public Telegram group (run after ep_scan)
   python pipeline.py public_alerts_dryrun  # print the messages, send nothing
   python pipeline.py public_alerts_ping    # one test message to every topic of the public group
+  python pipeline.py user_alerts      # personal price / line alerts to linked Telegram chats (run after ep_scan)
+  python pipeline.py user_alerts_dryrun  # same, log only
   python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
   python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
   python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
@@ -7236,6 +7238,102 @@ async def run_public_alerts(dry_run=False) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+# USER ALERTS — personal price / line alerts on Telegram (run after ep_scan)
+#   python pipeline.py user_alerts          check and send
+#   python pipeline.py user_alerts_dryrun   log only
+# The Worker keeps the alerts users set on the chart (D1, synced by the browser) and the
+# Telegram chat of users who connected Telegram. Rule (same as the chart): an "above" alert
+# fires when the day's close is >= its level, "below" when <= it; once fired it stays off.
+# A line alert's level today = the straight line through its two dated points, extended
+# bar by bar to the latest session. Alerts are only checked on sessions on/after the day
+# they were created. Only alerts whose message reached Telegram are marked fired.
+# ══════════════════════════════════════════════════════════════
+
+def _ua_level(alert, dates, last_i):
+    if alert.get("kind") == "level":
+        v = alert.get("level")
+        return float(v) if isinstance(v, (int, float)) and v > 0 else None
+    if alert.get("kind") == "line":
+        try:
+            i0 = bisect.bisect_left(dates, str(alert["p0d"])); i1 = bisect.bisect_left(dates, str(alert["p1d"]))
+            p0, p1 = float(alert["p0p"]), float(alert["p1p"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if i0 >= len(dates) or i1 >= len(dates) or i0 == i1:
+            return None
+        return p0 + (p1 - p0) / (i1 - i0) * (last_i - i0)
+    return None
+
+
+def _ua_check(alerts, all_data):
+    """Returns [(alert, day, close, level)] for alerts that fire on the latest session."""
+    hits = []
+    for a in alerts:
+        s = all_data.get(a.get("sym")) or {}
+        dates, closes = s.get("d") or [], s.get("c") or []
+        last_i = next((i for i in range(len(closes) - 1, -1, -1) if closes[i] is not None), None)
+        if last_i is None:
+            continue
+        day = str(dates[last_i])[:10]
+        if day < str(a.get("created") or "")[:10]:
+            continue
+        level = _ua_level(a, [str(d)[:10] for d in dates], last_i)
+        if level is None or level <= 0:
+            continue
+        close = float(closes[last_i])
+        if (a.get("dir") == "above" and close >= level) or (a.get("dir") == "below" and close <= level):
+            hits.append((a, day, close, level))
+    return hits
+
+
+def _ua_message(a, day, close, level):
+    try: d_txt = date.fromisoformat(day).strftime("%d %b %Y")
+    except ValueError: d_txt = day
+    sym = str(a.get("sym", "")).replace("&", "&amp;").replace("<", "&lt;")
+    word = "above" if a.get("dir") == "above" else "below"
+    src = "trendline" if a.get("kind") == "line" else "level"
+    lines = [f"🔔 <b>Price alert · {sym}</b>",
+             f"Closed {word} the {src} <b>₹{level:,.2f}</b>",
+             f"Close ₹{close:,.2f} · {d_txt}"]
+    if a.get("name"):
+        lines.append(f"<i>{str(a['name']).replace('&', '&amp;').replace('<', '&lt;')}</i>")
+    lines += ["", '<a href="https://tradewithtech.in">Open the chart on TradeWithTech</a>']
+    return "\n".join(lines)
+
+
+async def run_user_alerts(dry_run=False) -> None:
+    from telegram_notify import send_message
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{WORKER_URL}/alerts/active", headers=WORKER_HEADERS, timeout=60)
+        if r.status_code != 200:
+            log.warning(f"User alerts: /alerts/active answered HTTP {r.status_code} — nothing checked")
+            return
+        alerts = (r.json() or {}).get("alerts") or []
+        log.info(f"User alerts: {len(alerts)} active alert(s) of linked users")
+        if not alerts:
+            return
+        all_data = await download_all_chunks(client)
+        hits = _ua_check(alerts, all_data)
+        log.info(f"User alerts: {len(hits)} fired")
+        fired = []
+        for a, day, close, level in hits:
+            msg = _ua_message(a, day, close, level)
+            if dry_run:
+                log.info(f"--- {a.get('uid')} {a.get('sym')} ---\n{msg}")
+                continue
+            ok = send_message(msg, chat_id=str(a.get("chat_id")))
+            if ok:
+                fired.append({"uid": a["uid"], "id": a["id"], "day": day, "price": round(close, 2), "level": round(level, 2)})
+            else:
+                log.warning(f"  alert {a.get('id')} ({a.get('sym')}): Telegram send failed — will retry next run")
+            await asyncio.sleep(0.05)
+        if fired:
+            r2 = await client.post(f"{WORKER_URL}/alerts/fired", headers={**WORKER_HEADERS, "Content-Type": "application/json"},
+                                   content=json.dumps({"fired": fired}), timeout=60)
+            log.info(f"User alerts: marked {len(fired)} fired (HTTP {r2.status_code})")
+
+
+# ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
@@ -7275,6 +7373,8 @@ if __name__ == "__main__":
         case "public_alerts": asyncio.run(run_public_alerts())
         case "public_alerts_dryrun": asyncio.run(run_public_alerts(dry_run=True))
         case "public_alerts_ping": run_public_alerts_ping()
+        case "user_alerts": asyncio.run(run_user_alerts())
+        case "user_alerts_dryrun": asyncio.run(run_user_alerts(dry_run=True))
         case "box_scan_dryrun": asyncio.run(run_box_scan(dry_run=True))
         case "weinstein_scan": asyncio.run(run_weinstein_scan())
         case "weinstein_scan_dryrun": asyncio.run(run_weinstein_scan(dry_run=True))
