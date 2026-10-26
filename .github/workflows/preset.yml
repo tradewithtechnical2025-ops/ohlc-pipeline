@@ -1,0 +1,40 @@
+name: Preset alerts test (manual)
+# Runs pipeline.py preset_alerts_dryrun (or a real send) on its own. Put this file in .github/workflows/.
+on:
+  workflow_dispatch:
+    inputs:
+      send:
+        description: "Really send to Telegram (off = dry run, log only)"
+        type: boolean
+        required: false
+        default: false
+concurrency:
+  group: twt-pipeline
+  cancel-in-progress: false
+env:
+  PYTHON_VERSION: "3.11"
+  UPSTOX_TOKEN:       ${{ secrets.UPSTOX_TOKEN }}
+  WORKER_URL:         ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN:       ${{ secrets.WORKER_TOKEN }}
+  FINEDGE_TOKEN:      ${{ secrets.FINEDGE_TOKEN }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+  TWT_BOT_EMAIL:      ${{ secrets.TWT_BOT_EMAIL }}
+  TWT_BOT_PASSWORD:   ${{ secrets.TWT_BOT_PASSWORD }}
+jobs:
+  preset_alerts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: |
+          pip install httpx requests numpy playwright
+          python -m playwright install --with-deps chromium
+      - name: Preset alerts
+        run: |
+          if [ "${{ github.event.inputs.send }}" = "true" ]; then python pipeline.py preset_alerts; else python pipeline.py preset_alerts_dryrun; fi
