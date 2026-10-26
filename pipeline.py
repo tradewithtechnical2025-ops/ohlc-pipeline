@@ -7247,6 +7247,10 @@ async def run_public_alerts(dry_run=False) -> None:
 # A line alert's level today = the straight line through its two dated points, extended
 # bar by bar to the latest session. Alerts are only checked on sessions on/after the day
 # they were created. Only alerts whose message reached Telegram are marked fired.
+# v2 (chart 5.8.43+): cond "cross" fires when the close gets to the other side of the level
+# from `side` (the side it was on); trig "daily" sends at most one message per session and
+# stays active (the Worker keeps it, last_day = last message); exp = last session checked;
+# msg = the user's note, added to the message.
 # ══════════════════════════════════════════════════════════════
 
 def _ua_level(alert, dates, last_i):
@@ -7265,8 +7269,20 @@ def _ua_level(alert, dates, last_i):
     return None
 
 
+def _ua_hit(a, close, level):
+    """(fires, side after this close). side is only tracked for crossing alerts."""
+    cond = a.get("cond") or a.get("dir")
+    if cond == "cross":
+        ref = a.get("side") if a.get("side") in ("above", "below") else ("below" if a.get("dir") == "above" else "above")
+        hit = close >= level if ref == "below" else close <= level
+        return hit, (("above" if ref == "below" else "below") if hit else ref)
+    if cond == "above":
+        return close >= level, None
+    return close <= level, None
+
+
 def _ua_check(alerts, all_data):
-    """Returns [(alert, day, close, level)] for alerts that fire on the latest session."""
+    """Returns [(alert, day, close, level, side)] for alerts that fire on the latest session."""
     hits = []
     for a in alerts:
         s = all_data.get(a.get("sym")) or {}
@@ -7277,26 +7293,49 @@ def _ua_check(alerts, all_data):
         day = str(dates[last_i])[:10]
         if day < str(a.get("created") or "")[:10]:
             continue
+        if a.get("exp") and day > str(a["exp"])[:10]:
+            continue                                     # expired: the page drops it on its next sync
+        if a.get("last_day") and day <= str(a["last_day"])[:10]:
+            continue                                     # already sent for this session (daily)
         level = _ua_level(a, [str(d)[:10] for d in dates], last_i)
         if level is None or level <= 0:
             continue
         close = float(closes[last_i])
-        if (a.get("dir") == "above" and close >= level) or (a.get("dir") == "below" and close <= level):
-            hits.append((a, day, close, level))
+        hit, side = _ua_hit(a, close, level)
+        if hit:
+            hits.append((a, day, close, level, side))
     return hits
 
 
-def _ua_message(a, day, close, level):
+def _ua_esc(t):
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ua_message(a, day, close, level, side=None):
     try: d_txt = date.fromisoformat(day).strftime("%d %b %Y")
     except ValueError: d_txt = day
-    sym = str(a.get("sym", "")).replace("&", "&amp;").replace("<", "&lt;")
-    word = "above" if a.get("dir") == "above" else "below"
+    sym = _ua_esc(a.get("sym", ""))
+    cond = a.get("cond") or a.get("dir")
+    if cond == "cross":
+        word = "crossed above" if side == "above" else "crossed below"
+    else:
+        word = "closed above" if cond == "above" else "closed below"
     src = "trendline" if a.get("kind") == "line" else "level"
-    lines = [f"🔔 <b>Price alert · {sym}</b>",
-             f"Closed {word} the {src} <b>₹{level:,.2f}</b>",
+    tag = a.get("tag") if a.get("tag") in ("Target", "Stop Loss") else None
+    title = "Stop loss" if tag == "Stop Loss" else (tag or "Price alert")
+    lines = [f"🔔 <b>{title} · {sym}</b>",
+             f"{word[0].upper() + word[1:]} the {src} <b>₹{level:,.2f}</b>",
              f"Close ₹{close:,.2f} · {d_txt}"]
-    if a.get("name"):
-        lines.append(f"<i>{str(a['name']).replace('&', '&amp;').replace('<', '&lt;')}</i>")
+    if a.get("name") and a.get("name") != a.get("tag"):
+        lines.append(f"<i>{_ua_esc(a['name'])}</i>")
+    if a.get("trig") == "daily":
+        until = ""
+        if a.get("exp"):
+            try: until = " until " + date.fromisoformat(str(a["exp"])[:10]).strftime("%d %b")
+            except ValueError: until = ""
+        lines.append(f"Every day{until}")
+    if a.get("msg"):
+        lines += ["", f"📝 {_ua_esc(a['msg'])}"]
     lines += ["", '<a href="https://tradewithtech.in">Open the chart on TradeWithTech</a>']
     return "\n".join(lines)
 
@@ -7316,14 +7355,14 @@ async def run_user_alerts(dry_run=False) -> None:
         hits = _ua_check(alerts, all_data)
         log.info(f"User alerts: {len(hits)} fired")
         fired = []
-        for a, day, close, level in hits:
-            msg = _ua_message(a, day, close, level)
+        for a, day, close, level, side in hits:
+            msg = _ua_message(a, day, close, level, side)
             if dry_run:
                 log.info(f"--- {a.get('uid')} {a.get('sym')} ---\n{msg}")
                 continue
             ok = send_message(msg, chat_id=str(a.get("chat_id")))
             if ok:
-                fired.append({"uid": a["uid"], "id": a["id"], "day": day, "price": round(close, 2), "level": round(level, 2)})
+                fired.append({"uid": a["uid"], "id": a["id"], "day": day, "price": round(close, 2), "level": round(level, 2), "side": side})
             else:
                 log.warning(f"  alert {a.get('id')} ({a.get('sym')}): Telegram send failed — will retry next run")
             await asyncio.sleep(0.05)
