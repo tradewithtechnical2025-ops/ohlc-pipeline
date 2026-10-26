@@ -1,0 +1,35 @@
+name: History cleanup (manual)
+# Takes holiday / weekend dates out of the History list (history/manifest.json).
+# First run with "apply" off: the log lists what would change. Then run again with "apply" on.
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Write the changes (off = dry run, log only)"
+        type: boolean
+        required: false
+        default: false
+concurrency:
+  group: twt-pipeline
+  cancel-in-progress: false
+env:
+  PYTHON_VERSION: "3.11"
+  UPSTOX_TOKEN:       ${{ secrets.UPSTOX_TOKEN }}
+  WORKER_URL:         ${{ secrets.WORKER_URL }}
+  WORKER_TOKEN:       ${{ secrets.WORKER_TOKEN }}
+  FINEDGE_TOKEN:      ${{ secrets.FINEDGE_TOKEN }}
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Install
+        run: pip install httpx requests numpy
+      - name: History cleanup
+        run: |
+          if [ "${{ github.event.inputs.apply }}" = "true" ]; then python pipeline.py history_cleanup --apply; else python pipeline.py history_cleanup; fi
