@@ -1,287 +1,7930 @@
 #!/usr/bin/env python3
-"""TwT Box Finder: independent confirmed 9-bar swing boxes with dynamic lows.
-
-A box's resistance is fixed at its confirmed swing high. Its support follows
-subsequent candle lows, until a breakout or the maximum 30% depth is exceeded.
-Each box has its own lifecycle; a newer pivot never suppresses an older box.
-
-Same rules as the TwT BO Signal script v1.5:
-- a box starts at the FIRST touch of its resistance (EXTEND_BACK);
-- after a breakout, a close up to RETEST_BAND under the top is a retest, a close
-  further back inside within FAIL_WINDOW bars is a failed breakout (poke);
-- a poke raises the top to the highest CLOSE of the poke, never to a wick;
-- up to three nested boxes are kept (outer, middle, inner).
 """
-import numpy as np
+NSE OHLC + Fundamentals Pipeline — GitHub Actions
+OHLC source: Upstox API (adjusted prices, TV-matching)
+Fundamentals source: Finedge API
 
-MAX_DEPTH = .30
-MIN_INITIAL_DEPTH = .055
-BREAKOUT_BUFFER = .0025
-MIN_BASE_CANDLES = 9  # a box must hold at least this many bars (swing high .. bar before BO)
-SAME_TOP_TOL = .02     # boxes whose tops are this close are the same resistance
-MERGE_GAP = 5          # a same-top box starting within this many bars after a breakout continues it
-FAIL_WINDOW = 5        # a breakout that closes back below the top within this many bars failed (poke)
-POKE_MAX = .05         # total poke allowance above the box's ORIGINAL top; beyond it a move is a real breakout
-RETEST_BAND = .02      # a close up to 2% under the top after a breakout is a retest, not a failed breakout
-POKE_CLOSE_MAX = .02   # a poke only closes marginally above the top; a stronger close is a real breakout
-EXTEND_BACK = 160      # how far back to look for the first touch of the same resistance
-EXTEND_LOW_TOL = .02   # the walk back stops at a low more than this under the swing low
-MAX_NEST = 2           # a box may sit inside at most this many other boxes (three levels in all)
+Usage:
+  python pipeline.py daily
+  python pipeline.py today
+  python pipeline.py full
+  python pipeline.py status
+  python pipeline.py fund_daily
+  python pipeline.py fund_full
+  python pipeline.py fund_full_1..10
+  python pipeline.py finedge_daily   # standalone Finedge OHLC snapshot → own R2 history
+  python pipeline.py ep_scan
+  python pipeline.py hlr_scan
+  python pipeline.py pattern_scan
+  python pipeline.py pattern_scan_force   # bypass trading-day gate (use after holiday-list fixes)
+  python pipeline.py candle_scan          # candlestick patterns -> candle_patterns.json + candle_pattern_stats.json
+  python pipeline.py candle_scan_force    # same, bypassing the trading-day gate
+  python pipeline.py home_ticker          # home page ticker -> home_ticker.json (run after all scans)
+  python pipeline.py vcp_scan
+  python pipeline.py stage2_scan
+  python pipeline.py minervini_scan   # full 8-point Trend Template (stage2 + RS Rating >= 70)
+  python pipeline.py box_scan         # TwT Box Finder -> box_finder.json
+  python pipeline.py box_scan_dryrun  # preview Box Finder without R2 writes
+  python pipeline.py public_alerts    # EOD summaries to the public Telegram group (run after ep_scan)
+  python pipeline.py public_alerts_dryrun  # print the messages, send nothing
+  python pipeline.py public_alerts_ping    # one test message to every topic of the public group
+  python pipeline.py user_alerts      # personal price / line alerts to linked Telegram chats (run after ep_scan)
+  python pipeline.py user_alerts_dryrun  # same, log only
+  python pipeline.py ledger_backfill [FROM] [TO] [--force]  # history/signals_<date>.json for past snapshot days
+  python pipeline.py preset_alerts    # users' screener preset alerts to Telegram (Playwright + bot account; after ep_scan)
+  python pipeline.py preset_alerts_dryrun  # same, log only
+  python pipeline.py weinstein_scan   # original Weinstein 4-stage analysis (weekly SMA30)
+  python pipeline.py weinstein_scan_dryrun   # same, but prints real symbol names/stages to log, no R2 writes
+  python pipeline.py weinstein_debug SYMBOL  # week-by-week close/ema30/slope/stage for ONE symbol, no R2 writes
+  python pipeline.py ath_backfill   # one-time All-Time-High full-history backfill (see ATH section)
+  python pipeline.py ath_reset      # wipes ath_data.json -- use once to recover from pre-fix seeding, then re-run ath_backfill
+"""
+
+import asyncio
+import bisect
+import calendar
+import json
+import logging
+import os
+import re
+import sys
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import httpx
+from r2_manifest import upload_str_with_manifest
+from breadth_returns import build_index_ma_history, build_group_returns_history
+from structure_scan import build_structure_map
+from structure_history import build_index_structure_history
+
+# ── Telegram notify ──
+try:
+    from telegram_notify import PipelineStatus
+except ImportError:
+    class PipelineStatus:
+        def __init__(self, name): self.name = name
+        def add(self, *a, **k): pass
+        def set(self, *a, **k): pass
+        def warn(self, msg): pass
+        def success(self, *a, **k): pass
+        def failure(self, exc, reraise=True, **k):
+            if reraise: raise exc
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+UPSTOX_TOKEN  = os.environ["UPSTOX_TOKEN"]
+WORKER_URL    = os.environ["WORKER_URL"].rstrip("/")
+WORKER_TOKEN  = os.environ["WORKER_TOKEN"]
+FINEDGE_TOKEN = os.environ["FINEDGE_TOKEN"]
+
+UPSTOX_BASE  = "https://api.upstox.com/v2"
+FINEDGE_BASE = "https://data.finedgeapi.com/api/v1"
+
+ROLLING_DAYS       = 1100
+R2_CHUNKS          = 8
+CONCURRENCY        = 5
+RATE_DELAY         = 0.4
+RETRY              = 5
+FUND_CONCURRENCY   = 4
+FINEDGE_DELAY      = 0.25
+
+# ── Finedge daily-OHLC (standalone system — does NOT touch Upstox OHLC) ──
+FINEDGE_QUOTE_URL      = "https://data.finedgeapi.com/api/v2/quote"
+FINEDGE_OHLC_BATCH     = 100   # max symbols per call (non-premium limit)
+FINEDGE_OHLC_CONCURRENCY = 3
+FINEDGE_OHLC_DELAY     = 0.3
+FINEDGE_OHLC_CHUNKS    = 4     # separate chunk count from Upstox R2_CHUNKS
+
+HERE = Path(__file__).parent
+
+with open(HERE / "nse_holidays.json") as f:
+    NSE_HOLIDAYS: set[str] = set(json.load(f))
+
+WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
+
+def _upstox_headers():
+    return {"Accept": "application/json", "Authorization": f"Bearer {UPSTOX_TOKEN}"}
+
+ISIN_MAP:     dict[str, str] = {}
+BSE_ISIN_MAP: dict[str, str] = {}
+BSE_META:     dict[str, dict] = {}
+
+INDEX_SYMBOLS = {
+    "nifty50"    : "NIFTY50",
+    "nifty500"   : "NIF500",
+    "smallmid400": "NIFMID400",
+}
+
+# ══════════════════════════════════════════════════════════════
+# INSTRUMENT MAP  (BOD instruments file — no rate limit)
+# ══════════════════════════════════════════════════════════════
+
+NSE_BOD_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+BSE_BOD_URL = "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"
 
 
-def cons(closes, top, start):
-    """Count consolidation only after this box's confirmed swing low."""
-    c = np.asarray(closes, dtype=float)
-    for w in range(min(15, len(c) - start), 6, -1):
-        x = c[-w:]
-        near = np.mean((x >= top * .95) & (x <= top * 1.003))
-        last = np.mean((x[-5:] >= top * .95) & (x[-5:] <= top * 1.003))
-        if (0 <= (top - c[-1]) / top <= .05
-                and (max(x) - min(x)) / top <= .05
-                and near >= .7 and last >= .8
-                and (np.mean(x[-3:]) - np.mean(x[:3])) / top >= -.015):
-            return w
-    return 0
+def _parse_bod_instruments(instruments, segment) -> dict[str, str]:
+    """Parse BOD instruments list into {trading_symbol → instrument_key} map."""
+    NSE_SUFFIXES = ("-EQ","-BE","-BL","-SM","-IL","-IV","-W1","-W2","-W3","-W4","-W5")
+    sym_map = {}
+    for inst in instruments:
+        if inst.get("segment") != segment: continue
+        if segment == "NSE_EQ":
+            itype = inst.get("instrument_type", "")
+            if itype in ("SG","GB","TB","GS","CE","PE","FF","MF"): continue
+        tsym = (inst.get("trading_symbol") or "").upper()
+        ikey = inst.get("instrument_key")
+        if not tsym or not ikey: continue
+        sym_map[tsym] = ikey
+        for suffix in NSE_SUFFIXES:
+            if tsym.endswith(suffix):
+                base = tsym[:-len(suffix)]
+                if base and base not in sym_map:
+                    sym_map[base] = ikey
+                break
+    return sym_map
 
 
-def prune(boxes):
-    """Remove redundant boxes.
-
-    1. Same resistance as an older box:
-       - the swing high forms while the older box is running and is within
-         -SAME_TOP_TOL .. +POKE_MAX of the older box's top at that bar (or its
-         poke-raised top ends up there) -> part of the older box, dropped
-         (a clearly lower high is an inner base);
-       - same top (SAME_TOP_TOL) starting within MERGE_GAP bars after the older
-         box's breakout -> one box: the older start, the newer top and status.
-    2. Boxes shorter than MIN_BASE_CANDLES are dropped.
-    3. Nesting: keep up to three levels (outer, middle, inner); drop boxes
-       that sit inside more than MAX_NEST other boxes (inside = starts later,
-       ends no later, top not higher, bottom not lower).
+async def _load_bod_map(client, url, segment) -> dict[str, str]:
     """
-    def top_at(a, t):
-        cur = a['top_hist'][0][1]
-        for bar, val in a['top_hist']:
-            if bar <= t:
-                cur = val
-        return cur
+    Downloads Upstox BOD instruments .json.gz.
+    Falls back to cached ikey_map.json from R2 if download fails.
+    """
+    import gzip
 
-    out = []
-    for b in sorted(boxes, key=lambda x: x['i']):
-        action = None
-        for k, a in enumerate(out):
-            if a['overdepth'] is not None:
-                continue
-            if a['i'] <= b['i'] <= a['last']:
-                # b's swing high forms while a is running: same resistance
-                # (or a small poke over it) -> b is part of a.
-                # Also when pokes later lift b's top up to a's top: compare
-                # b's final top with a's top at b's last bar.
-                ratio = b['top0'] / top_at(a, b['i']) - 1
-                ratio_end = b['top'] / top_at(a, min(b['last'], a['last'])) - 1
-                if -SAME_TOP_TOL <= ratio <= POKE_MAX or -SAME_TOP_TOL <= ratio_end <= POKE_MAX:
-                    action = ('drop', k)
-                    break
-            elif (a['bo'] is not None and a['last'] < b['i'] <= a['last'] + 1 + MERGE_GAP
-                  and abs(a['top'] - b['top0']) / max(a['top'], b['top0']) <= SAME_TOP_TOL):
-                action = ('merge', k)
-                break
-        if action is None:
-            out.append(b)
-        elif action[0] == 'merge':
-            a = out[action[1]]
-            m = dict(b)
-            m['i'], m['j'], m['start'] = a['i'], a['j'], a['start']
-            m['top_hist'] = a['top_hist'] + b['top_hist']
-            if a['bot'] < b['bot']:
-                m['bot'], m['low_idx'] = a['bot'], a['low_idx']
-            m['depth'] = (m['top'] - m['bot']) / m['top']
-            m['base_length_candles'] = m['last'] - m['start'] + 1
-            if m['depth'] > MAX_DEPTH + 1e-10:
-                out.append(b)  # too deep as one box: keep them separate
-            else:
-                out[action[1]] = m
-    out = [b for b in out if b['base_length_candles'] >= MIN_BASE_CANDLES]
-
-    def inside(b, a):
-        return (a is not b and a['start'] <= b['start'] and a['last'] >= b['last']
-                and a['top'] >= b['top'] and a['bot'] <= b['bot'])
-    return [b for b in out if sum(1 for a in out if inside(b, a)) <= MAX_NEST]
-
-
-def detect(a):
-    h = np.asarray(a['h'], dtype=float)
-    l = np.asarray(a['l'], dtype=float)
-    c = np.asarray(a['c'], dtype=float)
-    n = len(c)
-    if n < 40 or len(h) != n or len(l) != n:
-        return [], None
-    begin = max(4, n - 160)
-    sh = [i for i in range(begin, n - 4)
-          if h[i] > max(h[i-4:i]) and h[i] > max(h[i+1:i+5])]
-    sl = [j for j in range(begin, n - 4)
-          if l[j] < min(l[j-4:j]) and l[j] < min(l[j+1:j+5])]
-    boxes = []
-    for i in sh:
-        js = [j for j in sl if j > i and j + 4 < n]
-        if not js:
-            continue
-        j = js[0]
-        top = float(h[i])
-        initial_low = float(l[j])
-        initial_depth = (top - initial_low) / top
-        if top <= 0 or not MIN_INITIAL_DEPTH <= initial_depth <= MAX_DEPTH:
-            continue
-        # Price already broke out above this swing high before the swing low
-        # that starts the box was confirmed: there is no base here.
-        if any(c[t] > top * (1 + POKE_CLOSE_MAX) for t in range(i + 1, j + 1)):
-            continue
-
-        # A box starts once its first subsequent swing low is confirmed.
-        # It then tracks the lowest actual candle LOW, not the close.
-        # An upper breakout freezes the box; exceeding 30% depth retires it.
-        low = initial_low
-        low_idx = j
-
-        # Start the box at the FIRST touch of the same resistance: walk back from
-        # the swing high while no close went above the top and no low went more
-        # than EXTEND_LOW_TOL under the swing low; the earliest high within
-        # SAME_TOP_TOL of the top starts the box (it must stay within MAX_DEPTH).
-        start = i
-        run_low, run_idx = low, low_idx
-        for k in range(i - 1, max(-1, i - 1 - EXTEND_BACK), -1):
-            if c[k] > top * (1 + BREAKOUT_BUFFER) or l[k] < initial_low * (1 - EXTEND_LOW_TOL):
-                break
-            if l[k] < run_low:
-                run_low, run_idx = float(l[k]), k
-            if h[k] >= top * (1 - SAME_TOP_TOL):
-                if (top - run_low) / top > MAX_DEPTH + 1e-10:
-                    break
-                start, low, low_idx = k, run_low, run_idx
-
-        breakout = None
-        overdepth = None
-        skip_until = -1
-        top_hist = [(i, top)]  # (bar, top) whenever a poke raises the top
-        for t in range(j + 1, n):
-            if l[t] < low:
-                low = float(l[t])
-                low_idx = t
-            if (top - low) / top > MAX_DEPTH + 1e-10:
-                overdepth = t
-                break
-            if t < skip_until:
-                continue
-            if t >= j + 4 and c[t] > top * (1 + BREAKOUT_BUFFER):
-                # Failed breakout (poke): within FAIL_WINDOW bars a close is
-                # back below the top, and closes never went more than
-                # POKE_CLOSE_MAX above the top / POKE_MAX above the box's
-                # original top (pokes do not stack). Wicks may reach POKE_MAX.
-                # The box then continues with its top
-                # raised to the highest close of the poke (wicks are ignored).
-                back, hi_max, cl_max = None, top, top
-                for u in range(t, min(n, t + FAIL_WINDOW + 1)):
-                    # a close back below the top only fails the breakout when it is clearly
-                    # back inside the box; a close within RETEST_BAND of the top is a retest
-                    if u > t and c[u] < top * (1 - RETEST_BAND):
-                        back = u
-                        break
-                    hi_max = max(hi_max, float(h[u]))
-                    cl_max = max(cl_max, float(c[u]))
-                cap = top_hist[0][1] * (1 + POKE_MAX)  # pokes never lift the top past this
-                if back is None or cl_max > cap or cl_max > top * (1 + POKE_CLOSE_MAX):
-                    breakout = t
-                    break
-                top = max(top, cl_max)
-                top_hist.append((t, top))
-                skip_until = back
-                if (top - low) / top > MAX_DEPTH + 1e-10:
-                    overdepth = t
-                    break
-        if overdepth is not None:
-            # Historical box remains visible in box_history but never active.
-            state = 'Depth Exceeded'
-        elif breakout is not None:
-            state = 'BO'
-        else:
-            distance = (top - c[-1]) / top
-            window = cons(c, top, j + 4)
-            state = ('Consolidation Near BO' if window else
-                     'Near BO' if 0 <= distance <= .02 else 'Box Forming')
-        window = cons(c, top, j + 4) if state == 'Consolidation Near BO' else 0
-        # The breakout / depth-exceed bar is not part of the base.
-        end_idx = breakout if breakout is not None else overdepth
-        last = end_idx - 1 if end_idx is not None else n - 1
-        base_length_candles = last - start + 1  # trading bars from the first touch to the last base bar
-        boxes.append(dict(i=i, start=start, j=j, last=last, top0=float(h[i]), top_hist=top_hist, base_length_candles=base_length_candles, top=top, bot=low, low_idx=low_idx,
-                          bo=breakout, overdepth=overdepth, state=state,
-                          cons=window, depth=(top-low)/top))
-
-    # Only remove true duplicate pivot identities, never nearby independent boxes.
-    kept = list({(b['i'], b['j']): b for b in boxes}.values())
-    kept = prune(kept)
-    # Show the dominant recent resistance, rather than the smallest newest nested box.
-    # Independent boxes still remain in history and evolve separately.
-    recent = [b for b in kept if b['bo'] is None and b['overdepth'] is None
-              and b['i'] >= n - 90]
-    active = max(recent, key=lambda b: (b['top'], b['i'])) if recent else next(
-        (b for b in reversed(kept) if b['bo'] is None and b['overdepth'] is None), None)
-    return kept, active
-
-
-def select_box(stock):
-    if len(stock.get('c', [])) < 40:
-        return [], None, None
-    boxes, active = detect(stock)
-    today = len(stock['c']) - 1
-    fresh = [b for b in boxes if b['bo'] == today]
-    if fresh:
-        chosen = max(fresh, key=lambda b: b['i'])
-        return boxes, chosen, 'BO'
-    return boxes, active, active['state'] if active else None
-
-
-def build_box_finder(all_data, asof=None):
-    results, history = [], {}
-    for symbol, stock in sorted(all_data.items()):
+    # Try downloading BOD file
+    for attempt in range(RETRY):
         try:
-            boxes, chosen, status = select_box(stock)
-        except (ValueError, TypeError, IndexError, ZeroDivisionError):
-            continue
-        if not boxes:
-            continue
-        dates = stock['d']
-        def encode(b):
-            return {
-                'start_date': dates[b['start']],
-                'swing_high_date': dates[b['i']],
-                'base_length_candles': int(b['base_length_candles']),
-                'swing_low_date': dates[b['j']],
-                'lower_updated_date': dates[b['low_idx']],
-                'upper': round(float(b['top']), 4),
-                'lower': round(float(b['bot']), 4),
-                'depth_pct': round(float(b['depth']) * 100, 2),
-                'breakout_date': dates[b['bo']] if b['bo'] is not None else None,
-                'depth_exceeded_date': dates[b['overdepth']] if b['overdepth'] is not None else None,
-                'consolidation_candles': int(b['cons']),
-                'status': b['state'],
+            r = await client.get(url, headers=_upstox_headers(), timeout=60, follow_redirects=True)
+        except httpx.RequestError as e:
+            log.warning(f"  BOD download error ({e}), retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        if r.status_code != 200:
+            log.warning(f"  BOD {url} → HTTP {r.status_code}, retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        try:
+            instruments = json.loads(gzip.decompress(r.content))
+        except Exception as e:
+            log.warning(f"  BOD decompress error: {e}"); break
+        sym_map = _parse_bod_instruments(instruments, segment)
+        log.info(f"  BOD {segment}: {len(sym_map)} instruments")
+        return sym_map
+
+    log.warning(f"  BOD {segment} failed — falling back to cached ikey_map.json")
+    return {}  # caller will use cache
+
+
+async def build_isin_map(client):
+    log.info("Building instrument map…")
+
+    # Download classification.json from R2 first (always needed)
+    log.info("Fetching classification.json from R2…")
+    master = await r2_download(client, "classification.json")
+    if not master or not isinstance(master, list):
+        raise RuntimeError("classification.json missing or invalid in R2!")
+
+    # Try BOD files + cached map concurrently
+    nse_bod_task = asyncio.create_task(_load_bod_map(client, NSE_BOD_URL, "NSE_EQ"))
+    bse_bod_task = asyncio.create_task(_load_bod_map(client, BSE_BOD_URL, "BSE_EQ"))
+    cache_task   = asyncio.create_task(r2_download(client, "ikey_map.json"))
+
+    nse_bod, bse_bod, cached = await asyncio.gather(nse_bod_task, bse_bod_task, cache_task)
+
+    # If BOD failed, use cached map
+    if not nse_bod and isinstance(cached, dict):
+        log.info(f"  Using cached ikey_map.json ({len(cached.get('nse',{}))} NSE entries)")
+        nse_bod = cached.get("nse", {})
+        bse_bod = cached.get("bse", {})
+
+    nse_map = {}; bse_map = {}; bse_meta_raw = {}
+    nse_miss = []; bse_miss = []
+
+    for stock in master:
+        sym      = str(stock.get("symbol", "")).strip().upper()
+        exchange = str(stock.get("exchange", "")).strip()
+        name     = str(stock.get("name", "")).strip()
+        if not sym: continue
+        if exchange == "NSE":
+            ikey = nse_bod.get(sym)
+            if ikey: nse_map[sym] = ikey
+            else: nse_miss.append(sym)
+        elif exchange == "BSE":
+            bse_meta_raw[sym] = {"name": name}
+            # BSE-exclusive stocks from classification.json almost always
+            # have a numeric "symbol" (Finedge's stock-symbols master leaves
+            # BSE-only companies' symbol blank, so it falls back to the
+            # numeric bse_code — see pipeline_classification.py). bse_bod
+            # is keyed by real alphabetic trading symbols from the BOD file,
+            # so a numeric symbol never matches there. Try "symbol" first
+            # (covers any BSE stock that DOES have a real Finedge symbol),
+            # then fall back to "trading_symbol" (the Upstox-sourced real
+            # trading symbol classification.json also carries) so these
+            # stocks actually resolve to an instrument_key instead of all
+            # landing in bse_miss and silently never getting OHLC.
+            trading_sym = str(stock.get("trading_symbol") or "").strip().upper()
+            ikey = bse_bod.get(sym) or (bse_bod.get(trading_sym) if trading_sym else None)
+            if ikey: bse_map[sym] = ikey
+            else: bse_miss.append(sym)
+
+    log.info(f"✓ NSE: {len(nse_map)} resolved, {len(nse_miss)} not found")
+    log.info(f"✓ BSE: {len(bse_map)} resolved, {len(bse_miss)} not found")
+    if nse_miss: log.info(f"  NSE missing sample: {nse_miss[:10]}")
+
+    # Save fresh map to R2 cache whenever BOD succeeded
+    if nse_bod and len(nse_map) > 100:
+        cache_payload = json.dumps({"nse": nse_bod, "bse": bse_bod})
+        await r2_upload(client, "ikey_map.json", cache_payload)
+        log.info(f"  ikey_map.json cached to R2")
+
+    return nse_map, bse_map, bse_meta_raw
+
+
+# ══════════════════════════════════════════════════════════════
+# TRADING CALENDAR
+# ══════════════════════════════════════════════════════════════
+
+def today_ist() -> str:
+    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+
+def is_trading_day(d: str) -> bool:
+    dt = date.fromisoformat(d)
+    return dt.weekday() < 5 and d not in NSE_HOLIDAYS
+
+def last_trading_day() -> str:
+    dt = date.fromisoformat(today_ist())
+    for _ in range(14):
+        if is_trading_day(dt.isoformat()): return dt.isoformat()
+        dt -= timedelta(days=1)
+    raise RuntimeError("No trading day in last 14 days")
+
+def prev_trading_day(d: str) -> str:
+    dt = date.fromisoformat(d) - timedelta(days=1)
+    for _ in range(14):
+        if is_trading_day(dt.isoformat()): return dt.isoformat()
+        dt -= timedelta(days=1)
+    raise RuntimeError(f"No prev trading day before {d}")
+
+def rolling_cutoff(anchor: str) -> str:
+    return (date.fromisoformat(anchor) - timedelta(days=ROLLING_DAYS)).isoformat()
+
+def _subtract_months(d: date, months: int) -> date:
+    """Calendar-correct month subtraction (04/09 -1mo -> 04/08, clamps day to
+    target month length e.g. 31/03 -1mo -> 28/02 or 29/02 on leap years)."""
+    total = d.month - 1 - months
+    year = d.year + total // 12
+    month = total % 12 + 1
+    last_day = calendar.monthrange(year, month)[1]
+    return date(year, month, min(d.day, last_day))
+
+def _calendar_lookback_close(dates, closes, anchor_date: str, months: int):
+    """Close price on the nearest available trading day ON OR BEFORE
+    (anchor_date - `months` calendar months). `dates` must be sorted
+    ascending ISO strings. Returns None if no such day exists in range."""
+    target = _subtract_months(date.fromisoformat(anchor_date), months).isoformat()
+    pos = bisect.bisect_right(dates, target) - 1
+    if pos < 0:
+        return None
+    return closes[pos]
+
+def _is_week_complete(today_d: str) -> bool:
+    """True agar today_d ke baad is ISO week mein koi trading day nahi bacha."""
+    dt_today = date.fromisoformat(today_d)
+    iso_year, iso_week, iso_weekday = dt_today.isocalendar()
+    for delta in range(1, 8 - iso_weekday + 1):  # Sunday tak check
+        candidate = dt_today + timedelta(days=delta)
+        if candidate.isocalendar()[:2] != (iso_year, iso_week):
+            break
+        if is_trading_day(candidate.isoformat()):
+            return False
+    return True
+
+def _is_month_complete(today_d: str) -> bool:
+    """True agar today_d ke baad is calendar month mein koi trading day nahi bacha."""
+    dt_today = date.fromisoformat(today_d)
+    next_month_start = date(dt_today.year + 1, 1, 1) if dt_today.month == 12 else date(dt_today.year, dt_today.month + 1, 1)
+    d = dt_today + timedelta(days=1)
+    while d < next_month_start:
+        if is_trading_day(d.isoformat()): return False
+        d += timedelta(days=1)
+    return True
+
+def _build_tf_series(dates, highs, lows, closes, volumes, tf):
+    """
+    Resamples daily OHLCV into weekly ('W') or monthly ('M') bars, dropping the
+    current in-progress period unless it's already complete (same rule the
+    weekly-pattern scanner already uses, via _is_week_complete).
+    Returns (period_labels, highs, lows, closes, volumes) — all in chronological order.
+    """
+    agg = {}
+    key_fn = (lambda d: date.fromisoformat(d).isocalendar()[:2]) if tf == "W" else (lambda d: d[:7])
+    for d, h, l, c, v in zip(dates, highs, lows, closes, volumes):
+        if h is None or l is None or c is None: continue
+        k = key_fn(d)
+        if k not in agg: agg[k] = {"h": h, "l": l, "c": c, "v": v or 0}
+        else:
+            agg[k]["h"] = max(agg[k]["h"], h); agg[k]["l"] = min(agg[k]["l"], l)
+            agg[k]["c"] = c; agg[k]["v"] += v or 0
+    if not agg or not dates: return [], [], [], [], []
+    today_d = dates[-1]
+    if tf == "W":
+        current_key = date.fromisoformat(today_d).isocalendar()[:2]
+        complete = _is_week_complete(today_d)
+    else:
+        current_key = today_d[:7]
+        complete = _is_month_complete(today_d)
+    keys = sorted(k for k in agg if (k <= current_key if complete else k < current_key))
+    return ([str(k) for k in keys],
+            [agg[k]["h"] for k in keys], [agg[k]["l"] for k in keys],
+            [agg[k]["c"] for k in keys], [agg[k]["v"] for k in keys])
+
+# ══════════════════════════════════════════════════════════════
+# UPSTOX OHLC FETCHERS
+# ══════════════════════════════════════════════════════════════
+
+async def fetch_ohlc(client, sem, sym, instrument_key, from_date, to_date):
+    """
+    Upstox daily historical — 1 year per call max.
+    Splits into yearly chunks automatically.
+    """
+    ranges = []
+    f = date.fromisoformat(from_date)
+    t = date.fromisoformat(to_date)
+    cur = f
+    while cur <= t:
+        year_end = date(cur.year, 12, 31)
+        chunk_end = min(year_end, t)
+        ranges.append((cur.isoformat(), chunk_end.isoformat()))
+        cur = date(cur.year + 1, 1, 1)
+
+    all_candles = {}
+    for chunk_from, chunk_to in ranges:
+        url = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/day/{chunk_to}/{chunk_from}"
+        for attempt in range(RETRY):
+            async with sem:
+                await asyncio.sleep(RATE_DELAY)
+                try:
+                    r = await client.get(url, headers=_upstox_headers(), timeout=30)
+                except httpx.RequestError as e:
+                    log.warning(f"{sym}: network error ({e}), retry {attempt+1}")
+                    await asyncio.sleep(2 ** attempt); continue
+            if r.status_code == 401: log.error("❌ UPSTOX_TOKEN invalid"); sys.exit(1)
+            if r.status_code == 429:
+                wait = 30 * (attempt + 1)
+                log.warning(f"{sym}: 429 — {wait}s"); await asyncio.sleep(wait); continue
+            if r.status_code in (502, 503, 504): await asyncio.sleep(2 ** attempt); continue
+            if r.status_code in (404, 400): break
+            if r.status_code != 200: break
+            try: payload = r.json()
+            except: break
+            for row in (payload.get("data") or {}).get("candles") or []:
+                d_str = str(row[0])[:10]
+                if from_date <= d_str <= to_date:
+                    all_candles[d_str] = {"d":d_str,"o":row[1],"h":row[2],"l":row[3],"c":row[4],"v":row[5],"oi":0}
+            break
+
+    if not all_candles: return sym, None
+    return sym, sorted(all_candles.values(), key=lambda x: x["d"])
+
+
+async def fetch_ohlc_bulk(client, ikey_map: dict[str, str], batch_size=500) -> dict[str, dict]:
+    """
+    Upstox OHLC Quotes V3 — bulk fetch live OHLC for all stocks in 1-3 calls.
+    ikey_map: {symbol → instrument_key}
+    Returns: {symbol → candle_dict}
+    """
+    today = today_ist()
+    url = "https://api.upstox.com/v3/market-quote/ohlc"
+    results = {}
+    items = list(ikey_map.items())
+
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i+batch_size]
+        ikeys = ",".join(ikey for _, ikey in batch)
+        for attempt in range(RETRY):
+            try:
+                r = await client.get(url, headers=_upstox_headers(),
+                                     params={"instrument_key": ikeys, "interval": "1d"},
+                                     timeout=30)
+            except httpx.RequestError as e:
+                log.warning(f"  OHLC bulk error ({e}), retry {attempt+1}")
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code == 401: log.error("❌ UPSTOX_TOKEN invalid"); sys.exit(1)
+            if r.status_code == 429:
+                await asyncio.sleep(30 * (attempt+1)); continue
+            if r.status_code in (502,503,504):
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code != 200:
+                log.warning(f"  OHLC bulk HTTP {r.status_code}: {r.text[:200]}")
+                break
+            try:
+                raw = r.json()
+                log.info(f"  OHLC bulk raw keys: {list(raw.keys())} status={raw.get('status')}")
+                if i == 0:
+                    # Log first item of data to understand structure
+                    data_raw = raw.get("data") or {}
+                    if data_raw:
+                        first_key = next(iter(data_raw))
+                        log.info(f"  OHLC bulk sample key={first_key} val={str(data_raw[first_key])[:300]}")
+                    else:
+                        log.warning(f"  OHLC bulk data empty, full response: {str(raw)[:500]}")
+                data = raw.get("data") or {}
+            except: break
+
+            # Response key format: "NSE_EQ:SYMBOL" (colon + trading symbol)
+            # Also build instrument_token → symbol map as fallback
+            itoken_to_sym = {}
+            for sym, ikey in batch:
+                # instrument_key = "NSE_EQ|ISIN", instrument_token in response = "NSE_EQ|ISIN"
+                itoken_to_sym[ikey] = sym
+
+            for resp_key, quote in data.items():
+                # Try 1: "NSE_EQ:SYMBOL" → extract symbol after colon
+                sym = None
+                if ":" in resp_key:
+                    trading_sym = resp_key.split(":", 1)[1].upper()
+                    # Find in our batch by trading symbol
+                    sym = next((s for s, _ in batch if s == trading_sym), None)
+                # Try 2: instrument_token field in quote
+                if not sym:
+                    itoken = quote.get("instrument_token") or ""
+                    sym = itoken_to_sym.get(itoken)
+                if not sym: continue
+
+                live = quote.get("live_ohlc") or {}
+                if not live: continue
+                o = live.get("open"); h = live.get("high")
+                l = live.get("low");  c = live.get("close")
+                vol = live.get("volume") or quote.get("volume") or 0
+                if None in (o, h, l, c): continue
+                results[sym] = {"d": today, "o": o, "h": h, "l": l, "c": c, "v": vol, "oi": 0}
+            log.info(f"  OHLC bulk [{min(i+batch_size,len(items))}/{len(items)}]: {len(results)} fetched")
+            break
+
+    return results
+
+
+# ══════════════════════════════════════════════════════════════
+# R2 HELPERS
+# ══════════════════════════════════════════════════════════════
+
+async def r2_upload(client, filename, data):
+    # FIX: this had zero retry logic — a single dropped/reset connection to
+    # the Worker (httpx.ReadError etc., which does happen on GitHub Actions
+    # runners) crashed the entire pipeline run immediately. Every other
+    # network call in this file (Upstox, Finedge, BOD) already retries with
+    # exponential backoff via the RETRY constant — this brings r2_upload in
+    # line with that same pattern instead of being the one exception.
+    if isinstance(data, str): data = data.encode()
+    url = f"{WORKER_URL}?file={filename}"
+    last_err=None
+    for attempt in range(RETRY):
+        try:
+            r = await client.post(url, headers={**WORKER_HEADERS,"Content-Type":"application/json"}, content=data, timeout=90)
+        except httpx.RequestError as e:
+            last_err=e; log.warning(f"  Upload {filename}: network error ({e}), retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        if r.status_code == 200:
+            log.info(f"  ↑ {filename} ({len(data)/1024:.1f} KB)")
+            return
+        last_err=RuntimeError(f"Upload failed {filename}: HTTP {r.status_code}")
+        log.warning(f"  Upload {filename}: HTTP {r.status_code}, retry {attempt+1}")
+        await asyncio.sleep(2 ** attempt)
+    raise last_err
+
+async def r2_download(client, filename):
+    # Same retry fix as r2_upload — was a single-shot GET with no
+    # resilience to a dropped connection.
+    url = f"{WORKER_URL}/{filename}"
+    last_err=None
+    for attempt in range(RETRY):
+        try:
+            r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
+        except httpx.RequestError as e:
+            last_err=e; log.warning(f"  Download {filename}: network error ({e}), retry {attempt+1}")
+            await asyncio.sleep(2 ** attempt); continue
+        if r.status_code == 404: return None
+        if r.status_code == 200:
+            log.info(f"  ↓ {filename} ({len(r.content)/1024:.0f} KB)")
+            return r.json()
+        last_err=RuntimeError(f"Download failed {filename}: HTTP {r.status_code}")
+        log.warning(f"  Download {filename}: HTTP {r.status_code}, retry {attempt+1}")
+        await asyncio.sleep(2 ** attempt)
+    raise last_err
+
+async def r2_download_fund(client) -> dict:
+    url = f"{WORKER_URL}/fundamentals.json"
+    r = await client.get(url, headers=WORKER_HEADERS, timeout=90)
+    if r.status_code == 404: log.info("fundamentals.json not found — starting fresh"); return {}
+    if r.status_code != 200: raise RuntimeError(f"Download failed: HTTP {r.status_code}")
+    data = r.json()
+    if isinstance(data, list): return {d["symbol"]:d for d in data if d.get("symbol")}
+    if isinstance(data, dict): return data.get("stocks", data)
+    return {}
+
+async def r2_upload_fund(client, data: dict) -> None:
+    arr = list(data.values()); payload = json.dumps(arr)
+    url = f"{WORKER_URL}?file=fundamentals.json"
+    r = await client.post(url, headers={**WORKER_HEADERS,"Content-Type":"application/json"}, content=payload.encode(), timeout=120)
+    if r.status_code != 200: raise RuntimeError(f"Upload failed: HTTP {r.status_code}")
+    log.info(f"  ↑ fundamentals.json ({len(payload)/1024:.1f} KB)")
+
+async def save_result_calendar(client, by_date: dict, keep_days=365):
+    """Merges a {date_str: [symbols]} batch into the persisted result_calendar.json."""
+    try: existing = await r2_download(client, "result_calendar.json"); cal = existing if isinstance(existing, dict) else {}
+    except: cal = {}
+    for date_str, syms in by_date.items():
+        merged = set(cal.get(date_str, [])) | set(syms)
+        cal[date_str] = sorted(merged)
+    today = today_ist()
+    cutoff = (date.fromisoformat(today)-timedelta(days=keep_days)).isoformat()
+    cal = {d:v for d,v in cal.items() if d >= cutoff}
+    await upload_str_with_manifest(client, r2_upload, "result_calendar.json", json.dumps(cal),
+                                    schema_v=1, extra_meta={"date_count": len(cal)})
+
+async def download_all_chunks(client) -> dict:
+    tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_data = {}
+    for i, res in enumerate(results):
+        if isinstance(res, Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
+        elif res and "stocks" in res: all_data.update(res["stocks"])
+    log.info(f"Master: {len(all_data)} stocks across {R2_CHUNKS} chunks")
+    return all_data
+
+async def upload_all_chunks(client, all_data, today):
+    symbols = sorted(all_data.keys()); n = len(symbols)
+    size = (n + R2_CHUNKS - 1) // R2_CHUNKS; tasks = []
+    for i in range(R2_CHUNKS):
+        chunk_syms = symbols[i*size:(i+1)*size]; chunk = {s: all_data[s] for s in chunk_syms}
+        payload = json.dumps({"updated":today,"chunk":i+1,"total":R2_CHUNKS,"stocks":chunk})
+        tasks.append(upload_str_with_manifest(
+            client, r2_upload, f"ohlc_{i+1}.json", payload,
+            schema_v=1, extra_meta={"chunk": i+1, "total": R2_CHUNKS, "stock_count": len(chunk_syms)}
+        ))
+    # ohlc_index.json: symbol -> chunk number, written in the same run as the
+    # chunks so the two always agree. dashboard.html reads it to fetch only the
+    # one chunk a chart needs instead of all R2_CHUNKS files.
+    ohlc_index = {s: i + 1 for i in range(R2_CHUNKS) for s in symbols[i*size:(i+1)*size]}
+    tasks.append(upload_str_with_manifest(
+        client, r2_upload, "ohlc_index.json",
+        json.dumps({"updated": today, "total": R2_CHUNKS, "map": ohlc_index}),
+        schema_v=1, extra_meta={"stock_count": n}
+    ))
+    await asyncio.gather(*tasks)
+    log.info(f"✓ {R2_CHUNKS} chunks + ohlc_index.json uploaded ({n} stocks)")
+
+
+# ══════════════════════════════════════════════════════════════
+# ATH (All-Time High) — separate from rolling ohlc_*.json window
+# ══════════════════════════════════════════════════════════════
+
+ATH_BACKFILL_FROM_DATE = "2000-01-01"  # generously early; NSE electronic
+                                        # records don't go back further for
+                                        # virtually any currently-listed stock
+
+# Much higher than the daily job's CONCURRENCY=5 -- that value is tuned for
+# a small daily delta fetch, not a one-time 25-year backfill across 1800
+# symbols. If you see 429 (rate-limit) errors climbing in the log, lower
+# this back down; if it's clean, you can likely push it even higher.
+ATH_BACKFILL_CONCURRENCY = 5  # was 10 -- still hit 429s; matching the daily job's known-safe CONCURRENCY=5 exactly
+
+async def r2_download_ath(client) -> dict:
+    data = await r2_download(client, "ath_data.json")
+    if isinstance(data, dict) and "stocks" in data:
+        return data["stocks"]
+    return data if isinstance(data, dict) else {}
+
+async def r2_upload_ath(client, ath_data: dict, today: str) -> None:
+    payload = json.dumps({"updated": today, "count": len(ath_data), "stocks": ath_data})
+    await r2_upload(client, "ath_data.json", payload)
+
+def _update_ath_from_delta(ath_data: dict, delta: dict, today: str) -> int:
+    """
+    Cheap incremental ATH maintenance — NO extra Upstox calls. `delta` is
+    the {symbol: candle} dict run_daily()/run_today() already compute for
+    today's session; just compares each candle's high against the stored
+    ATH and bumps it if today set a new record.
+
+    New symbols (not yet in ath_data — e.g. run_ath_backfill hasn't reached
+    this symbol yet, or hasn't been run at all) get seeded here with
+    today's high, tagged "source": "seed" so run_ath_backfill knows this
+    is NOT a real backfilled value and must still fetch full history for
+    it — without this tag, a seeded entry looks identical to a properly
+    backfilled one, and run_ath_backfill's "already have it" resumability
+    check would skip it forever, permanently stuck on a too-low ATH.
+    The tag is preserved (not wiped) on later incremental bumps to an
+    already-seeded entry, until run_ath_backfill actually processes it
+    and overwrites it with a real value (which carries no "source" key).
+    """
+    updated = 0
+    for sym, candle in delta.items():
+        h = candle.get("h")
+        if h is None: continue
+        existing = ath_data.get(sym)
+        if existing is None:
+            ath_data[sym] = {"ath": round(h, 2), "ath_date": candle["d"], "source": "seed"}
+            updated += 1
+        elif h > existing["ath"]:
+            existing["ath"] = round(h, 2)
+            existing["ath_date"] = candle["d"]
+            # NOTE: mutate in place, don't replace the dict -- replacing it
+            # would silently drop an existing "source": "seed" tag.
+            updated += 1
+    return updated
+
+
+async def run_ath_reset() -> None:
+    """
+    One-off recovery tool: wipes ath_data.json back to empty, so the next
+    run_ath_backfill() treats EVERY symbol as missing and recomputes from
+    full history. Needed once, to clean up any symbols that were seeded
+    by _update_ath_from_delta() BEFORE the "source": "seed" tagging fix
+    existed (those entries have no tag to distinguish them from a real
+    backfilled value, so run_ath_backfill can't tell they need a retry —
+    resetting is the only fully-safe way to guarantee no wrong value
+    survives). Safe to run even mid-backfill: everything already correctly
+    backfilled just gets recomputed to the same correct value next run.
+    """
+    status = PipelineStatus("run_ath_reset")
+    try:
+        async with httpx.AsyncClient() as client:
+            await r2_upload_ath(client, {}, today_ist())
+        log.info("✓ ath_data.json reset to empty — run 'ath_backfill' next to rebuild from scratch")
+        status.success()
+    except Exception as e:
+        status.failure(e)
+
+
+async def run_ath_backfill() -> None:
+    """
+    ONE-TIME (or occasional, for newly-listed symbols) job: fetches each
+    stock's FULL history from Upstox — from ATH_BACKFILL_FROM_DATE, NOT the
+    rolling ROLLING_DAYS window used by run_daily/run_full — and computes
+    its All-Time High. Stored separately in its own small ath_data.json,
+    not merged into ohlc_*.json — keeping full 25-year history for every
+    stock just for one number would bloat the main OHLC store many times
+    over for no benefit.
+
+    Resumable: symbols already present in ath_data.json are skipped, so a
+    re-run only fetches what's missing (new listings, or ones that failed
+    last time). Re-run this periodically as new symbols get added to
+    classification.json — daily maintenance after that is free (folded
+    into run_daily/run_today via _update_ath_from_delta, no extra calls).
+    """
+    status = PipelineStatus("run_ath_backfill")
+    try:
+        today = today_ist()
+        log.info(f"━━━ ATH Backfill  (from {ATH_BACKFILL_FROM_DATE}) ━━━")
+        sem = asyncio.Semaphore(ATH_BACKFILL_CONCURRENCY)
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
+
+            ath_data = await r2_download_ath(client)
+            missing = [
+                sym for sym in all_ikeys
+                if sym not in ath_data or ath_data[sym].get("source") == "seed"
+            ]
+            already_real = len(ath_data) - sum(1 for v in ath_data.values() if v.get("source") == "seed")
+            log.info(f"Universe: {len(all_ikeys)}  Already have (real): {already_real}  Missing/seed-only: {len(missing)}")
+            if not missing:
+                log.info("✅ All symbols already backfilled!")
+                status.success(); return
+
+            done = 0; failed = []
+            for i in range(0, len(missing), 50):
+                batch = missing[i:i+50]
+                results = await asyncio.gather(*[
+                    fetch_ohlc(client, sem, sym, all_ikeys[sym], ATH_BACKFILL_FROM_DATE, today)
+                    for sym in batch
+                ])
+                for sym, candles in results:
+                    if not candles:
+                        failed.append(sym); continue
+                    valid = [c for c in candles if c.get("h") is not None]
+                    if not valid:
+                        failed.append(sym); continue
+                    best = max(valid, key=lambda c: c["h"])
+                    ath_data[sym] = {"ath": round(best["h"], 2), "ath_date": best["d"]}
+                    done += 1
+                pct = min(i+50, len(missing))
+                log.info(f"  {pct}/{len(missing)}  ✓{done}  ✗{len(failed)}")
+                if pct % 200 == 0 or pct == len(missing):
+                    await r2_upload_ath(client, ath_data, today)   # checkpoint
+
+            await r2_upload_ath(client, ath_data, today)
+            log.info(f"✓ {done} backfilled  ✗ {len(failed)} failed")
+            if failed:
+                sample = failed[:20]
+                log.info(f"  Failed (re-run to retry): {sample}{'…' if len(failed) > 20 else ''}")
+        status.success()
+        log.info("━━━ ATH Backfill complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# DATA HELPERS
+# ══════════════════════════════════════════════════════════════
+
+def build_stock_obj(candles):
+    return {k:[c[k] for c in candles] for k in ("d","o","h","l","c","v","oi")}
+
+def apply_rolling_window(all_data, cutoff):
+    dropped = 0
+    for s in all_data.values():
+        keep = [i for i,d in enumerate(s["d"]) if d >= cutoff]
+        dropped += len(s["d"]) - len(keep)
+        for k in s: s[k] = [s[k][i] for i in keep]
+    return dropped
+
+def _sort_stock(s):
+    order = sorted(range(len(s["d"])), key=lambda i: s["d"][i])
+    for k in s: s[k] = [s[k][i] for i in order]
+
+def merge_candles_into(all_data, sym, candles, cutoff):
+    if sym not in all_data: all_data[sym] = {k:[] for k in ("d","o","h","l","c","v","oi")}
+    s = all_data[sym]; existing = set(s["d"]); added = 0
+    for c in candles:
+        if c["d"] < cutoff or c["d"] in existing: continue
+        for k in s: s[k].append(c[k])
+        existing.add(c["d"]); added += 1
+    if added: _sort_stock(s)
+    return added
+
+def upsert_candle(all_data, sym, c):
+    if sym not in all_data: all_data[sym] = {k:[] for k in ("d","o","h","l","c","v","oi")}
+    s = all_data[sym]
+    if c["d"] in s["d"]:
+        idx = s["d"].index(c["d"])
+        for k in ("o","h","l","c","v","oi"): s[k][idx] = c[k]
+    else:
+        for k in s: s[k].append(c[k])
+        _sort_stock(s)
+
+
+# ══════════════════════════════════════════════════════════════
+# OHLC PIPELINE MODES
+# ══════════════════════════════════════════════════════════════
+
+MIN_HISTORY_DAYS = 260  # ~1 trading year — covers EMA200, RS 252-day lookback, 52W high/low
+
+async def run_daily() -> None:
+    status = PipelineStatus("run_daily")
+    try:
+        today = today_ist()
+        prev = prev_trading_day(today); cutoff = rolling_cutoff(today)
+        log.info(f"━━━ Daily  {prev} → {today}  cutoff {cutoff} ━━━")
+        sem = asyncio.Semaphore(CONCURRENCY)
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
+            live = set(all_ikeys)
+
+            all_data = await download_all_chunks(client)
+
+            # Needs backfill = never tracked OR suspiciously little history —
+            # this covers genuinely-new entrants AND stocks already bitten by
+            # the old 1-day-only merge bug sitting in the store right now.
+            needs_backfill = {
+                sym for sym in live
+                if len((all_data.get(sym) or {}).get("d", [])) < MIN_HISTORY_DAYS
             }
-        history[symbol] = [encode(b) for b in boxes]
-        if chosen is None:
+            existing = live - needs_backfill
+
+            if needs_backfill:
+                sample = sorted(needs_backfill)[:15]
+                log.info(f"🆕 {len(needs_backfill)} symbol(s) need deep backfill ({cutoff} → {today}): {sample}{'…' if len(needs_backfill) > 15 else ''}")
+
+            async def _fetch_for(symbols, from_date):
+                tasks = [fetch_ohlc(client, sem, sym, all_ikeys[sym], from_date, today) for sym in symbols]
+                return await asyncio.gather(*tasks)
+
+            backfill_results, incremental_results = await asyncio.gather(
+                _fetch_for(needs_backfill, cutoff),
+                _fetch_for(existing, prev),
+            )
+            fetched = {sym: c for sym, c in [*backfill_results, *incremental_results] if c}
+            log.info(f"✓ {len(fetched)} fetched  ✗ {len(live) - len(fetched)} no data")
+
+            pruned = [s for s in list(all_data) if s not in live]
+            for s in pruned: del all_data[s]
+            if pruned: log.info(f"🗑  Pruned {len(pruned)} stocks")
+
+            total_new = 0; delta = {}
+            for sym, candles in fetched.items():
+                total_new += merge_candles_into(all_data, sym, candles, cutoff)
+                today_c = next((c for c in candles if c["d"] == today), None)
+                if today_c: delta[sym] = today_c
+            log.info(f"Merged: {total_new} new  Delta: {len(delta)}")
+            dropped = apply_rolling_window(all_data, cutoff)
+            log.info(f"Rolling: dropped {dropped} old candles")
+
+            ath_data = await r2_download_ath(client)
+            ath_updated = _update_ath_from_delta(ath_data, delta, today)
+            log.info(f"ATH: {ath_updated} new record(s) today")
+
+            await asyncio.gather(
+                upload_all_chunks(client, all_data, today),
+                upload_str_with_manifest(client, r2_upload, "ohlc_delta.json",
+                                          json.dumps({"date": today, "stocks": delta}),
+                                          schema_v=1, extra_meta={"stock_count": len(delta)}),
+                r2_upload_ath(client, ath_data, today),
+            )
+        status.success()
+        log.info("━━━ Daily complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+async def run_today() -> None:
+    status = PipelineStatus("run_today")
+    try:
+        today = today_ist()
+        if not is_trading_day(today):
+            log.info(f"⏭  {today} not a trading day — skipping (avoids stale/stuck live-quote data being stamped as today)")
+            return
+        log.info(f"━━━ Today  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
+            log.info(f"Universe: {len(all_ikeys)} stocks")
+
+            # Fetch chunks + bulk OHLC concurrently
+            fetched, all_data = await asyncio.gather(
+                fetch_ohlc_bulk(client, all_ikeys),
+                download_all_chunks(client),
+            )
+            log.info(f"Fetched today candles: {len(fetched)}")
+
+            if not fetched:
+                log.warning("⚠ No candles fetched — market may be closed or API issue")
+
+            for sym, c in fetched.items():
+                upsert_candle(all_data, sym, c)
+
+            delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
+
+            ath_data = await r2_download_ath(client)
+            ath_updated = _update_ath_from_delta(ath_data, delta, today)
+            log.info(f"ATH: {ath_updated} new record(s) today")
+
+            await asyncio.gather(
+                upload_all_chunks(client, all_data, today),
+                upload_str_with_manifest(client, r2_upload, "ohlc_delta.json",
+                                          json.dumps({"date": today, "stocks": delta}),
+                                          schema_v=1, extra_meta={"stock_count": len(delta)}),
+                r2_upload_ath(client, ath_data, today),
+            )
+            log.info(f"✅ delta: {len(delta)} stocks")
+        status.success()
+        log.info("━━━ Today complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+async def run_full() -> None:
+    status = PipelineStatus("run_full")
+    try:
+        today = last_trading_day()
+        start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
+        cutoff = start
+        sem = asyncio.Semaphore(CONCURRENCY); all_data = {}; failed = []
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_sym_list = list(ISIN_MAP.items()) + list(BSE_ISIN_MAP.items())
+            log.info(f"━━━ Full Load  {start} → {today}  ({len(all_sym_list)} stocks) ━━━")
+            for i in range(0, len(all_sym_list), 50):
+                chunk = all_sym_list[i:i+50]
+                results = await asyncio.gather(*[fetch_ohlc(client,sem,sym,ikey,start,today) for sym,ikey in chunk])
+                for sym, candles in results:
+                    if candles:
+                        filtered = [c for c in candles if c["d"] >= cutoff]
+                        if filtered: all_data[sym] = build_stock_obj(filtered)
+                    else: failed.append(sym)
+                pct = min(i+50, len(all_sym_list))
+                log.info(f"  {pct}/{len(all_sym_list)}  OK:{len(all_data)}  Failed:{len(failed)}")
+                if pct % 500 == 0: await upload_all_chunks(client, all_data, today)
+            log.info(f"✓ {len(all_data)} loaded  ✗ {len(failed)} failed")
+            if failed: (HERE/"failed_stocks.txt").write_text("\n".join(failed))
+            apply_rolling_window(all_data, cutoff)
+            await asyncio.gather(
+                upload_all_chunks(client, all_data, today),
+                upload_str_with_manifest(client, r2_upload, "ohlc_all.json",
+                                          json.dumps({"updated":today,"stocks":all_data}),
+                                          schema_v=1, extra_meta={"stock_count": len(all_data)}),
+            )
+        status.success()
+        log.info("━━━ Full load complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+async def run_backfill_missing(symbols_arg: str | None = None) -> None:
+    """Targeted repair for the 'many stocks missing OHLC after the last run'
+    situation — refetches ONLY the affected symbols and merges them into the
+    existing R2 chunks, instead of re-running the whole run_full() (slow,
+    and briefly blanks every symbol's data while it rebuilds).
+
+    Symbol source, in priority order:
+      1. symbols_arg — a comma-separated list passed on the command line
+      2. failed_stocks.txt in HERE, if present (written by run_full() on failure)
+      3. any symbol in the ISIN map that's either absent from the current
+         R2 data entirely, or has fewer than MIN_HISTORY_DAYS candles
+         (a common sign of a partial/interrupted fetch)
+
+    Duplicate-candle safety: this reuses merge_candles_into(), the same
+    function run_daily() uses for its own gap-fill. It merges by date —
+    for each symbol it builds a set of dates already on file and only
+    appends candles whose date isn't already in that set — so re-running
+    this command (even repeatedly, even overlapping date ranges) can only
+    ever fill gaps or leave things unchanged, never duplicate a candle."""
+    status = PipelineStatus("run_backfill_missing")
+    try:
+        today = last_trading_day()
+        start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
+        cutoff = start
+        sem = asyncio.Semaphore(CONCURRENCY)
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            ikey_map = {**ISIN_MAP, **BSE_ISIN_MAP}
+
+            all_data = await download_all_chunks(client)
+
+            if symbols_arg:
+                targets = [s.strip() for s in symbols_arg.split(",") if s.strip()]
+            elif (HERE / "failed_stocks.txt").exists():
+                targets = [s.strip() for s in (HERE / "failed_stocks.txt").read_text().splitlines() if s.strip()]
+                log.info(f"Using failed_stocks.txt: {len(targets)} symbols")
+            else:
+                targets = [sym for sym in ikey_map
+                           if sym not in all_data or len(all_data[sym].get("d", [])) < MIN_HISTORY_DAYS]
+                log.info(f"Auto-detected {len(targets)} symbols missing or under {MIN_HISTORY_DAYS} candles")
+
+            targets = [s for s in targets if s in ikey_map]
+            if not targets:
+                log.info("Nothing to backfill — all target symbols already have full history")
+                status.success(); return
+
+            log.info(f"━━━ Backfill  {start} → {today}  ({len(targets)} symbols) ━━━")
+            ok = 0; failed = []
+            for i in range(0, len(targets), 50):
+                chunk = targets[i:i+50]
+                results = await asyncio.gather(*[
+                    fetch_ohlc(client, sem, sym, ikey_map[sym], start, today) for sym in chunk
+                ])
+                for sym, candles in results:
+                    if candles:
+                        added = merge_candles_into(all_data, sym, candles, cutoff)
+                        ok += 1
+                        log.info(f"  {sym}: +{added} candle(s)")
+                    else:
+                        failed.append(sym)
+                pct = min(i+50, len(targets))
+                log.info(f"  {pct}/{len(targets)}  OK:{ok}  Failed:{len(failed)}")
+
+            apply_rolling_window(all_data, cutoff)
+            await upload_all_chunks(client, all_data, today)
+
+            if failed:
+                (HERE / "failed_stocks.txt").write_text("\n".join(failed))
+                log.warning(f"  {len(failed)} still failed — rewritten to failed_stocks.txt for the next run")
+            elif (HERE / "failed_stocks.txt").exists():
+                (HERE / "failed_stocks.txt").unlink()  # everything backfilled — clear the retry list
+
+        status.success()
+        log.info(f"━━━ Backfill complete — {ok} symbols updated, {len(failed)} still failing ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+async def run_status() -> None:
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(*[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)], return_exceptions=True)
+    print(f"\n{'File':<20} {'Stocks':>7}  {'From':>12}  {'To':>12}  {'Updated':>12}")
+    print("─"*70); total = 0
+    for i, res in enumerate(results):
+        fname = f"ohlc_{i+1}.json"
+        if isinstance(res, Exception) or res is None: print(f"{fname:<20}  ERROR"); continue
+        stocks = res.get("stocks", {})
+        if not stocks: print(f"{fname:<20}  (empty)"); continue
+        s0 = next(iter(stocks.values())); total += len(stocks)
+        print(f"{fname:<20} {len(stocks):>7}  {s0['d'][0]:>12}  {s0['d'][-1]:>12}  {res.get('updated','?'):>12}")
+    print(f"\nTotal: {total} stocks\n")
+
+
+# ══════════════════════════════════════════════════════════════
+# FINEDGE API  (fundamentals only — OHLC replaced by Upstox)
+# ══════════════════════════════════════════════════════════════
+
+async def _finedge_get(client, sem, path, params):
+    params["token"] = FINEDGE_TOKEN
+    url = f"{FINEDGE_BASE}/{path}"
+    async with sem:
+        for attempt in range(RETRY):
+            await asyncio.sleep(FINEDGE_DELAY)
+            try: r = await client.get(url, params=params, timeout=30)
+            except httpx.RequestError as e:
+                log.warning(f"  Finedge network error: {e}, retry {attempt+1}")
+                await asyncio.sleep(2**attempt); continue
+            if r.status_code == 401: log.error("❌ FINEDGE TOKEN INVALID"); sys.exit(1)
+            if r.status_code == 429: log.warning("  rate limit — 20s"); await asyncio.sleep(20); continue
+            if r.status_code in (502,503,504): await asyncio.sleep(2**attempt); continue
+            if r.status_code != 200 or not r.text.strip(): return None
+            try: return r.json()
+            except: return None
+    return None
+
+def _fmt_period_end(period_end) -> str:
+    if not period_end: return ""
+    MONTHS = ["","Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    s = str(int(period_end))
+    if len(s) == 8:
+        m = int(s[4:6])
+        return f"{MONTHS[m]} {s[:4]}" if 1 <= m <= 12 else s
+    return str(period_end)
+
+async def _finedge_financials(client, sem, sym, code, period):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"financials/{sym}", {"statement_type":stype,"statement_code":code,"period":period})
+        rows = (d or {}).get("financials", [])
+        if rows: return rows
+    return None
+
+async def _finedge_basic(client, sem, sym):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"basic-financials/{sym}", {"statement_type":stype,"statement_code":"pl"})
+        rows = (d or {}).get("ratios", [])
+        if rows: return rows
+    return None
+
+async def _finedge_ratios_pr(client, sem, sym):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type":stype,"ratio_type":"pr"})
+        rows = (d or {}).get("ratios", [])
+        if rows: return rows
+    return None
+
+async def _finedge_ratios_le(client, sem, sym):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type":stype,"ratio_type":"le"})
+        rows = (d or {}).get("ratios", [])
+        if rows: return rows
+    return None
+
+async def _finedge_ratios_li(client, sem, sym):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type":stype,"ratio_type":"li"})
+        rows = (d or {}).get("ratios", [])
+        if rows: return rows
+    return None
+
+async def _finedge_ratios_ef(client, sem, sym):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"ratios/{sym}", {"statement_type":stype,"ratio_type":"ef"})
+        rows = (d or {}).get("ratios", [])
+        if rows: return rows
+    return None
+
+async def _finedge_shareholding(client, sem, sym):
+    d = await _finedge_get(client, sem, f"shareholdings/pattern/{sym}", {"period":"quarterly"})
+    if not d: return None
+    columns = d.get("columns", []); rows = d.get("rows", [])
+    if not columns or not rows: return None
+    n_qtrs = min(8, len(columns)); qtrs = columns[:n_qtrs]
+    def get_row(*names):
+        for name in names:
+            r = next((x for x in rows if name.lower() in x.get("catagory","").lower()), None)
+            if r is None: continue
+            data = r.get("data", {})
+            if isinstance(data, dict): return [data.get(q) for q in qtrs]
+            elif isinstance(data, list): return list(data[:n_qtrs])
+        return []
+    fii=get_row("institutionsforeign","foreign","fii"); dii=get_row("institutionsdomestic","domestic","dii")
+    public=get_row("noninstitutions","public","retail"); govt=get_row("goverment","government"); promoter=get_row("promoter")
+    if not any(v is not None for v in promoter):
+        promoter_computed = []
+        for i in range(n_qtrs):
+            vals=[fii[i] if i<len(fii) else None,dii[i] if i<len(dii) else None,
+                  public[i] if i<len(public) else None,govt[i] if i<len(govt) else 0]
+            if all(v is not None for v in vals[:3]): promoter_computed.append(round(100-sum(v or 0 for v in vals),2))
+            else: promoter_computed.append(None)
+        promoter = promoter_computed
+    def _first(lst): return next((v for v in lst if v is not None), None)
+    return {"sh_quarters":qtrs,"sh_promoter":promoter,"sh_fii":fii,"sh_dii":dii,"sh_public":public,
+            "promoter":_first(promoter),"fii":_first(fii),"dii":_first(dii),"public":_first(public),
+            "promoter_ch":(round(promoter[0]-promoter[1],2) if len(promoter)>=2 and promoter[0] is not None and promoter[1] is not None else None)}
+
+async def _finedge_profile(client, sem, sym):
+    d = await _finedge_get(client, sem, f"company-profile/{sym}", {})
+    if not d: return None
+    return {"name":d.get("name",""),"sector":d.get("sector",""),"industry":d.get("industry",""),
+            "sub_industry":d.get("sub_industry",""),"macro_sector":d.get("macro_sector",""),
+            "market_cap":d.get("market_cap"),"bse_code":d.get("bse_code",""),
+            "description":d.get("description",""),"website":d.get("website","")}
+
+async def _finedge_growth_metrics(client, sem, sym):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"financial-metrics/{sym}", {"statement_type":stype,"ratio_type":"gr"})
+        fm = (d or {}).get("financial_metrics")
+        if fm: return fm
+    return None
+
+async def _finedge_annual_price_ratios(client, sem, sym):
+    for stype in ("c","s"):
+        d = await _finedge_get(client, sem, f"annual-price-ratios/{sym}", {"statement_type":stype})
+        rows = (d or {}).get("price_ratios", [])
+        if rows: return rows
+    return None
+
+
+async def fetch_one_fundamental(client, sem, sym, isin=""):
+    (pl_qtr,pl_ann,bs_ann,cf_ann,basic,prof_ratios,sh,profile,growth,ann_pr,ratios_le,ratios_li,ratios_ef) = await asyncio.gather(
+        _finedge_financials(client,sem,sym,"pl","quarterly"),_finedge_financials(client,sem,sym,"pl","annual"),
+        _finedge_financials(client,sem,sym,"bs","annual"),_finedge_financials(client,sem,sym,"cf","annual"),
+        _finedge_basic(client,sem,sym),_finedge_ratios_pr(client,sem,sym),_finedge_shareholding(client,sem,sym),
+        _finedge_profile(client,sem,sym),_finedge_growth_metrics(client,sem,sym),_finedge_annual_price_ratios(client,sem,sym),
+        _finedge_ratios_le(client,sem,sym),_finedge_ratios_li(client,sem,sym),_finedge_ratios_ef(client,sem,sym),
+    )
+    if not any([pl_qtr,pl_ann,bs_ann,cf_ann]): return sym, None
+    obj = {"symbol":sym,"updated":today_ist(),"source":"finedge"}
+    if profile: obj.update({"name":profile.get("name",""),"sector":profile.get("sector",""),
+        "industry":profile.get("industry",""),"sub_industry":profile.get("sub_industry",""),
+        "macro_sector":profile.get("macro_sector",""),"market_cap":profile.get("market_cap"),
+        "bse_code":profile.get("bse_code",""),"description":profile.get("description",""),"website":profile.get("website","")})
+    div_payout_by_year = {}; shares_by_year = {}
+    if basic:
+        ttm = basic[0]
+        obj.update({"ebit":ttm.get("ebit"),"ebitda":ttm.get("ebitda"),"operating_revenue":ttm.get("operatingRevenue"),
+            "operating_profit":ttm.get("operatingProfit"),"shares_outstanding":ttm.get("dilutedSharesOutstanding")})
+        for row in basic:
+            yr = row.get("year")
+            if yr is not None:
+                if row.get("dividendPayout") is not None: div_payout_by_year[yr]=row["dividendPayout"]
+                if row.get("dilutedSharesOutstanding") is not None: shares_by_year[yr]=row["dilutedSharesOutstanding"]
+    if pl_qtr:
+        obj["pl_quarterly"]=[{"header":_fmt_period_end(q.get("period_end")) or q.get("header",""),
+            "period_end":q.get("period_end"),"sales":q.get("revenueFromOperations"),"expenses":q.get("expenses"),
+            "pbt":q.get("profitBeforeTax"),"pat":q.get("profitLossForPeriod"),"eps":q.get("eps"),
+            "depreciation":q.get("depreciationAndAmortisation"),"finance_costs":q.get("financeCosts"),
+            "tax":q.get("taxExpense"),"other_income":q.get("otherIncome")} for q in pl_qtr[:12]]
+    if pl_ann:
+        obj["pl_annual"]=[{"header":_fmt_period_end(q.get("period_end")) or q.get("header",""),
+            "year":q.get("year"),"sales":q.get("revenueFromOperations"),"expenses":q.get("expenses"),
+            "pbt":q.get("profitBeforeTax"),"pat":q.get("profitLossForPeriod"),"eps":q.get("eps"),
+            "depreciation":q.get("depreciationAndAmortisation"),"finance_costs":q.get("financeCosts"),
+            "other_income":q.get("otherIncome"),"dividend_payout":div_payout_by_year.get(q.get("year")),
+            "shares":shares_by_year.get(q.get("year"))} for q in pl_ann[:5]]
+    if bs_ann:
+        obj["bs_annual"]=[{"header":_fmt_period_end(q.get("period_end")) or q.get("header",""),
+            "year":q.get("year"),"total_assets":q.get("assets"),"equity_capital":q.get("equityCapital"),
+            "reserves":q.get("reserves"),"borrowings_current":q.get("borrowingsCurrent"),
+            "borrowings_noncurrent":q.get("borrowingsNoncurrent"),
+            "borrowings_total":(q.get("borrowingsCurrent") or 0)+(q.get("borrowingsNoncurrent") or 0),
+            "cash":q.get("cashAndCashEquivalents"),"current_assets":q.get("currentAssets"),
+            "current_liabilities":q.get("currentLiabilities"),"fixed_assets":q.get("propertyPlantAndEquipmentNet"),
+            "investments":q.get("investments")} for q in bs_ann[:5]]
+    if cf_ann:
+        obj["cf_annual"]=[{"header":_fmt_period_end(q.get("period_end")) or q.get("header",""),
+            "year":q.get("year"),"cfo":q.get("cashFlowsFromOperatingActivities"),
+            "cfi":q.get("cashFlowsFromInvestingActivities"),"cff":q.get("cashFlowsFromFinancingActivities"),
+            "net_cf":q.get("netCashFlow"),"capex":q.get("purchaseOfPPEClassifiedAsInvesting"),
+            "fcf":((q.get("cashFlowsFromOperatingActivities") or 0)+(q.get("purchaseOfPPEClassifiedAsInvesting") or 0))
+                  if q.get("cashFlowsFromOperatingActivities") is not None else None} for q in cf_ann[:5]]
+    if prof_ratios:
+        obj["ratios_annual"]=[{"header":r.get("header",""),"year":r.get("year"),
+            "gross_margin":r.get("grossMargin"),"ebit_margin":r.get("ebitMargin"),
+            "ebitda_margin":r.get("ebitdaMargin"),"net_margin":r.get("netMargin"),
+            "operating_margin":r.get("operatingMargin"),"roe":r.get("returnOnEquity"),
+            "roa":r.get("returnOnAsset"),"roce":r.get("returnOnCapital"),
+            "pretax_margin":r.get("preTaxMargin"),"tax_rate":r.get("effectiveTaxRate")} for r in prof_ratios[:5]]
+    if sh:
+        obj.update({"promoter":sh.get("promoter"),"fii":sh.get("fii"),"dii":sh.get("dii"),
+            "public":sh.get("public"),"promoter_ch":sh.get("promoter_ch"),
+            "sh_quarters":sh.get("sh_quarters",[]),"sh_promoter":sh.get("sh_promoter",[]),
+            "sh_fii":sh.get("sh_fii",[]),"sh_dii":sh.get("sh_dii",[]),"sh_public":sh.get("sh_public",[])})
+    if growth:
+        obj.update({"revenue_cagr_3y":growth.get("revenueGrowth3years"),"revenue_cagr_5y":growth.get("revenueGrowth5years"),
+            "pat_cagr_3y":growth.get("netIncomeGrowth3years"),"pat_cagr_5y":growth.get("netIncomeGrowth5years"),
+            "eps_cagr_3y":growth.get("epsGrowth3years"),"eps_cagr_5y":growth.get("epsGrowth5years"),
+            "ebitda_cagr_3y":growth.get("EBITDAGrowth3years"),"ebitda_cagr_5y":growth.get("EBITDAGrowth5years"),
+            "cfo_cagr_3y":growth.get("cfoGrowth3years"),"fcf_cagr_3y":growth.get("freeCashFlowGrowth3Years"),
+            "share_dilution_3y":growth.get("dilutedSharesGrowth3years"),"share_dilution_5y":growth.get("dilutedSharesGrowth5years")})
+    if ann_pr:
+        obj["price_ratios_annual"]=[{"header":r.get("header",""),"year":r.get("year"),
+            "avg_price":r.get("average_price"),"pe":r.get("pe"),"pb":r.get("pb"),
+            "ps":r.get("ps"),"pfcf":r.get("pfcf") or None} for r in ann_pr[:5] if r.get("year") and r.get("pe")]
+    if ratios_le:
+        obj["ratios_leverage"]=[{"header":r.get("header",""),"year":r.get("year"),
+            "de_ratio":r.get("totalDebtToEquity"),"lt_de_ratio":r.get("longTermDebtToEquity"),
+            "financial_leverage":r.get("financialLeverage"),"debt_to_assets":r.get("totalDebttoAssets"),
+            "debt_to_fcf":r.get("totalDebtTofcf")} for r in ratios_le[:6] if r.get("year") and r.get("header")!="TTM"]
+    if ratios_li:
+        obj["ratios_liquidity"]=[{"header":r.get("header",""),"year":r.get("year"),
+            "current_ratio":r.get("currentRatio"),"quick_ratio":r.get("quickRatio"),
+            "interest_coverage":r.get("interestCoverage")} for r in ratios_li[:6] if r.get("year") and r.get("header")!="TTM"]
+    if ratios_ef:
+        obj["ratios_efficiency"]=[{"header":r.get("header",""),"year":r.get("year"),
+            "asset_turnover":r.get("assetTurnover"),"inventory_turnover":r.get("inventoryTurnover"),
+            "receivable_turnover":r.get("receivableTurnover"),"cash_conversion_cycle":r.get("cashConversionCycle"),
+            "debtor_days":r.get("debtorDays"),"inventory_days":r.get("inventoryDays"),
+            "days_payable":r.get("daysPayable")} for r in ratios_ef[:6] if r.get("year") and r.get("header")!="TTM"]
+    if obj.get("pl_quarterly"): obj["eps_diluted"]=obj["pl_quarterly"][0].get("eps")
+    if obj.get("bs_annual"):
+        bs0=obj["bs_annual"][0]; eq_cap=bs0.get("equity_capital") or 0; res=bs0.get("reserves") or 0
+        borr=bs0.get("borrowings_total") or 0; cash=bs0.get("cash") or 0; shares=obj.get("shares_outstanding") or 0
+        obj["book_value_ps"]=round((eq_cap+res)/shares,2) if shares else None
+        obj["net_debt"]=round(borr-cash) if (borr or cash) else None
+    return sym, obj
+
+
+# ══════════════════════════════════════════════════════════════
+# FINEDGE DAILY OHLC  (standalone system — separate storage from Upstox)
+#
+# Finedge /v2/quote only gives a live/current-day snapshot, no history.
+# So every day we fetch today's snapshot and APPEND it into our own
+# rolling per-symbol series, stored in its own R2 chunk files
+# (finedge_ohlc_1.json..finedge_ohlc_N.json). Upstox ohlc_*.json chunks
+# are never read or written by any function in this section.
+# ══════════════════════════════════════════════════════════════
+
+def _finedge_quote_batches(symbols):
+    """Split symbol list into ≤FINEDGE_OHLC_BATCH-sized groups."""
+    for i in range(0, len(symbols), FINEDGE_OHLC_BATCH):
+        yield symbols[i:i + FINEDGE_OHLC_BATCH]
+
+async def _finedge_quote_fetch(client, sem, symbols):
+    """One /v2/quote call for up to FINEDGE_OHLC_BATCH symbols.
+    Returns {symbol: {open_price, high_price, low_price, current_price, volume, ...}}"""
+    params = {"symbol": symbols, "token": FINEDGE_TOKEN}  # array param → httpx sends symbol=A&symbol=B&symbol=C
+    async with sem:
+        for attempt in range(RETRY):
+            await asyncio.sleep(FINEDGE_OHLC_DELAY)
+            try:
+                r = await client.get(FINEDGE_QUOTE_URL, params=params, timeout=30)
+            except httpx.RequestError as e:
+                log.warning(f"  Finedge quote network error: {e}, retry {attempt+1}")
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code == 401:
+                log.error("❌ FINEDGE TOKEN INVALID"); sys.exit(1)
+            if r.status_code == 429:
+                log.warning("  Finedge quote rate limit — 20s"); await asyncio.sleep(20); continue
+            if r.status_code in (502, 503, 504):
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code != 200 or not r.text.strip():
+                log.warning(f"  Finedge quote batch failed: HTTP {r.status_code}")
+                return {}
+            try:
+                data = r.json()
+                return data if isinstance(data, dict) else {}
+            except Exception as e:
+                log.warning(f"  Finedge quote parse error: {e}")
+                return {}
+    return {}
+
+async def fetch_finedge_quotes_all(client, symbols) -> dict:
+    """Fetches /v2/quote for the full symbol universe, batched + concurrent."""
+    sem = asyncio.Semaphore(FINEDGE_OHLC_CONCURRENCY)
+    batches = list(_finedge_quote_batches(symbols))
+    results = await asyncio.gather(*[_finedge_quote_fetch(client, sem, b) for b in batches])
+    merged = {}
+    for batch, res in zip(batches, results):
+        merged.update(res)
+        if len(res) < len(batch) * 0.5:
+            log.warning(f"  Finedge batch: sent {len(batch)}, got {len(res)} — possible param/delimiter issue")
+    log.info(f"Finedge quote: {len(merged)}/{len(symbols)} symbols returned")
+    return merged
+
+def _finedge_quote_to_candle(today: str, q: dict):
+    """Maps a /v2/quote record to our OHLC candle shape. Close = current_price
+    (final EOD close once market has closed for the day)."""
+    o, h, l, c = q.get("open_price"), q.get("high_price"), q.get("low_price"), q.get("current_price")
+    if None in (o, h, l, c):
+        return None
+    return {"d": today, "o": o, "h": h, "l": l, "c": c, "v": q.get("volume")}
+
+def upsert_finedge_candle(all_data, sym, candle):
+    """Same upsert semantics as Upstox's upsert_candle, but on the
+    finedge-only series (no 'oi' field — Finedge quote has no open interest)."""
+    if sym not in all_data:
+        all_data[sym] = {k: [] for k in ("d", "o", "h", "l", "c", "v")}
+    s = all_data[sym]
+    if candle["d"] in s["d"]:
+        idx = s["d"].index(candle["d"])
+        for k in ("o", "h", "l", "c", "v"): s[k][idx] = candle[k]
+    else:
+        for k in s: s[k].append(candle[k])
+        order = sorted(range(len(s["d"])), key=lambda i: s["d"][i])
+        for k in s: s[k] = [s[k][i] for i in order]
+
+async def download_finedge_chunks(client) -> dict:
+    tasks = [r2_download(client, f"finedge_ohlc_{i+1}.json") for i in range(FINEDGE_OHLC_CHUNKS)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    all_data = {}
+    for i, res in enumerate(results):
+        if isinstance(res, Exception): log.warning(f"  finedge_ohlc_{i+1}.json error: {res}")
+        elif res and "stocks" in res: all_data.update(res["stocks"])
+    log.info(f"Finedge OHLC master: {len(all_data)} stocks across {FINEDGE_OHLC_CHUNKS} chunks")
+    return all_data
+
+async def upload_finedge_chunks(client, all_data, today):
+    symbols = sorted(all_data.keys()); n = len(symbols)
+    size = (n + FINEDGE_OHLC_CHUNKS - 1) // FINEDGE_OHLC_CHUNKS; tasks = []
+    for i in range(FINEDGE_OHLC_CHUNKS):
+        chunk_syms = symbols[i*size:(i+1)*size]; chunk = {s: all_data[s] for s in chunk_syms}
+        payload = json.dumps({"updated": today, "chunk": i+1, "total": FINEDGE_OHLC_CHUNKS, "stocks": chunk})
+        tasks.append(upload_str_with_manifest(
+            client, r2_upload, f"finedge_ohlc_{i+1}.json", payload,
+            schema_v=1, extra_meta={"chunk": i+1, "total": FINEDGE_OHLC_CHUNKS, "stock_count": len(chunk_syms)}
+        ))
+    await asyncio.gather(*tasks)
+    log.info(f"✓ {FINEDGE_OHLC_CHUNKS} Finedge OHLC chunks uploaded ({n} stocks)")
+
+async def run_finedge_daily() -> None:
+    """Standalone daily job: snapshot today's OHLC from Finedge /v2/quote
+    and append it to our own rolling history in finedge_ohlc_*.json.
+    Completely independent of the Upstox ohlc_*.json chunks/pipeline."""
+    status = PipelineStatus("run_finedge_daily")
+    try:
+        today = today_ist()
+        if not is_trading_day(today):
+            log.info(f"⏭  {today} not a trading day — skipping Finedge daily")
+            return
+        log.info(f"━━━ Finedge Daily  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            symbols = sorted(ISIN_MAP.keys())  # NSE trading symbols, matches Finedge's "ITC"-style keys
+            log.info(f"Universe: {len(symbols)} NSE symbols")
+
+            quotes, all_data = await asyncio.gather(
+                fetch_finedge_quotes_all(client, symbols),
+                download_finedge_chunks(client),
+            )
+
+            delta = {}
+            for sym, q in quotes.items():
+                candle = _finedge_quote_to_candle(today, q)
+                if candle is None: continue
+                upsert_finedge_candle(all_data, sym, candle)
+                delta[sym] = candle
+
+            log.info(f"✅ Finedge candles today: {len(delta)}")
+            await asyncio.gather(
+                upload_finedge_chunks(client, all_data, today),
+                upload_str_with_manifest(client, r2_upload, "finedge_ohlc_delta.json",
+                                          json.dumps({"date": today, "stocks": delta}),
+                                          schema_v=1, extra_meta={"stock_count": len(delta)}),
+            )
+        status.success()
+        log.info("━━━ Finedge Daily complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# NSE HOLIDAY CALENDAR — sync nse_holidays.json from Finedge
+# ══════════════════════════════════════════════════════════════
+
+def _extract_holiday_dates(payload) -> set[str]:
+    """Pulls a flat set of ISO date strings ('YYYY-MM-DD') out of the Finedge
+    /holidays-calendar response. Confirmed schema: a bare JSON list of
+    {"description": ..., "trading_date": "26-Jan-2026", "week_day": "Monday"}
+    objects — 'trading_date' is 'DD-Mon-YYYY'. Also tolerates a few
+    alternate shapes (dict-wrapped list, ISO-format dates, other common key
+    names) in case Finedge changes the response later. Non-parseable entries
+    are skipped, not fatal — the caller decides if zero results is acceptable."""
+    def _as_date_str(v) -> str | None:
+        if not v: return None
+        s = str(v).strip()
+        if len(s) == 10 and s[4] == "-" and s[7] == "-":  # 'YYYY-MM-DD'
+            try: date.fromisoformat(s); return s
+            except ValueError: return None
+        try:  # 'DD-Mon-YYYY', e.g. '26-Jan-2026' — Finedge's actual format
+            return datetime.strptime(s, "%d-%b-%Y").date().isoformat()
+        except ValueError:
+            return None
+
+    rows = payload
+    if isinstance(payload, dict):
+        for key in ("holidays", "data", "results", "holiday_list", "calendar"):
+            if isinstance(payload.get(key), list):
+                rows = payload[key]; break
+        else:
+            rows = list(payload.values()) if all(isinstance(v, (dict, str)) for v in payload.values()) else []
+
+    out: set[str] = set()
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if isinstance(row, str):
+            d = _as_date_str(row)
+            if d: out.add(d)
             continue
-        close = float(stock['c'][-1])
-        results.append({
-            'symbol': symbol, 'date': dates[-1], 'status': status,
-            'start_date': dates[chosen['start']],
-            'base_length_candles': int(chosen['base_length_candles']),
-            'upper': round(float(chosen['top']), 4),
-            'lower': round(float(chosen['bot']), 4),
-            'close': round(close, 4),
-            'distance_pct': round(100 * (float(chosen['top']) - close) / float(chosen['top']), 2),
-            'consolidation_candles': int(chosen['cons']),
-            'retained_boxes': len(boxes),
-        })
+        if not isinstance(row, dict):
+            continue
+        segment = str(row.get("segment") or row.get("exchange") or row.get("category") or "").lower()
+        if segment and not any(tag in segment for tag in ("nse", "equity", "cash", "cm")) and \
+           any(tag in segment for tag in ("commodity", "currency", "mcx", "fo_only", "derivative")):
+            continue  # skip clearly non-cash-equity segments when the field disambiguates
+        for key in ("trading_date", "date", "holiday_date", "holidayDate"):
+            d = _as_date_str(row.get(key))
+            if d: out.add(d); break
+    return out
+
+
+async def run_update_holidays() -> None:
+    """Fetches the NSE holiday calendar from Finedge and merges any new dates
+    into nse_holidays.json (union with what's already there — never removes
+    dates). This is the fix for is_trading_day() silently treating an actual
+    exchange holiday as a trading day because the static JSON file had gone
+    stale (e.g. missing 2026-09-16)."""
+    status = PipelineStatus("run_update_holidays")
+    try:
+        log.info("━━━ NSE Holiday Calendar Sync ━━━")
+        sem = asyncio.Semaphore(1)
+        async with httpx.AsyncClient() as client:
+            payload = await _finedge_get(client, sem, "holidays-calendar", {})
+
+        if payload is None:
+            log.error("❌ Finedge holidays-calendar returned nothing — leaving nse_holidays.json untouched")
+            status.failure(RuntimeError("empty holidays-calendar response"))
+            return
+
+        fetched = _extract_holiday_dates(payload)
+        if not fetched:
+            log.error(f"❌ Could not parse any dates out of the Finedge response — "
+                      f"raw payload shape: {type(payload).__name__}, "
+                      f"keys={list(payload.keys()) if isinstance(payload, dict) else 'n/a'}. "
+                      f"Update _extract_holiday_dates() to match the real schema.")
+            status.failure(RuntimeError("unparseable holidays-calendar response"))
+            return
+
+        existing = set(NSE_HOLIDAYS)
+        merged = existing | fetched
+        new_dates = sorted(merged - existing)
+
+        if new_dates:
+            with open(HERE / "nse_holidays.json", "w") as f:
+                json.dump(sorted(merged), f, indent=2)
+            log.info(f"✅ nse_holidays.json updated: {len(new_dates)} new date(s) added: {new_dates}")
+        else:
+            log.info(f"✅ nse_holidays.json already up to date ({len(existing)} dates, "
+                      f"{len(fetched)} confirmed from Finedge)")
+
+        status.success()
+        log.info("━━━ Holiday Calendar Sync complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# RESULTS CALENDAR + FUND PIPELINE
+# ══════════════════════════════════════════════════════════════
+
+async def get_result_calendar_finedge(client, days_ahead=7) -> dict:
+    """Fetches the full upcoming-results window from Finedge, grouped by date.
+    Returns {date_str: [symbols, ...]} — every date in the window, not just today.
+    This gives result_calendar.json a built-in buffer: even if a run is missed
+    or Finedge is briefly down, symbols reporting on nearby dates are already
+    captured from earlier runs."""
+    today = today_ist()
+    to_date = (date.fromisoformat(today) + timedelta(days=days_ahead)).isoformat()
+    sem = asyncio.Semaphore(1)
+    d = await _finedge_get(client, sem, "results-calendar", {"from_date": today, "to_date": to_date})
+    if not d or not isinstance(d, list): log.warning("Finedge results calendar — empty or error"); return {}
+    by_date = {}
+    for item in d:
+        sym = item.get("symbol"); dt = item.get("expected_result_date")
+        if sym and dt: by_date.setdefault(dt, set()).add(sym)
+    by_date = {dt: sorted(syms) for dt, syms in by_date.items()}
+    total = sum(len(v) for v in by_date.values())
+    log.info(f"Finedge calendar: {len(by_date)} dates, {total} entries")
+    return by_date
+
+async def run_fund_daily(lookback_days=2) -> None:
+    """Fetches fundamentals for today's result-day symbols, PLUS a rolling
+    lookback of the last `lookback_days` days. This exists because Finedge's
+    own data only gets updated overnight — a symbol whose result was announced
+    today may still return stale (pre-result) data on today's fetch. Re-checking
+    the last couple of days catches these stragglers automatically once Finedge
+    finally updates, without needing a separate night-run job."""
+    status = PipelineStatus("run_fund_daily")
+    try:
+        today = today_ist()
+        if not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        log.info(f"━━━ Fundamentals Daily  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            by_date = await get_result_calendar_finedge(client)
+            if by_date: await save_result_calendar(client, by_date)
+
+            today_d = date.fromisoformat(today)
+            lookback_dates = [(today_d - timedelta(days=i)).isoformat() for i in range(lookback_days + 1)]
+            symbols = sorted({s for d in lookback_dates for s in by_date.get(d, [])})
+            if not symbols: log.info("No results today/recent — exiting"); return
+            log.info(f"  Checking {len(symbols)} symbols across {lookback_dates}")
+
+            fund_data = await r2_download_fund(client)
+            sem = asyncio.Semaphore(FUND_CONCURRENCY)
+            results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in symbols if sym in ISIN_MAP])
+            ok = stale = 0
+            for sym, data in results:
+                if data:
+                    old_q = (fund_data.get(sym, {}).get("pl_quarterly") or [{}])[0].get("period_end")
+                    new_q = (data.get("pl_quarterly") or [{}])[0].get("period_end")
+                    if sym in fund_data and old_q == new_q:
+                        stale += 1; log.info(f"  ⏳ {sym}: still stale (latest quarter unchanged: {old_q})")
+                    else:
+                        ok += 1; log.info(f"  ✓ {sym}: updated ({old_q} → {new_q})")
+                    fund_data[sym] = data
+                else:
+                    log.warning(f"  ✗ {sym}: no data")
+            await r2_upload_fund(client, fund_data)
+        status.success()
+        log.info(f"━━━ Fundamentals Daily complete — ✓{ok} updated  ⏳{stale} still stale ━━━")
+    except Exception as e:
+        status.failure(e)
+
+async def run_fund_full(part=0) -> None:
+    status = PipelineStatus("run_fund_full")
+    try:
+        TOTAL_PARTS = 10; BATCH_SIZE = 20
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            nse_symbols = list(ISIN_MAP.keys()); total = len(nse_symbols)
+            part_size = (total+TOTAL_PARTS-1)//TOTAL_PARTS
+            if part == 0: start_idx,end_idx,label = 0,total,"Full"
+            else: start_idx=(part-1)*part_size; end_idx=min(part*part_size,total); label=f"Part {part}/{TOTAL_PARTS}"
+            chunk = nse_symbols[start_idx:end_idx]
+            log.info(f"━━━ Fund Full {label}  ({len(chunk)} stocks) ━━━")
+            ETF_ENDSWITH = ("ETF","BEES","LIQUID","GILT","IETF","MMQS","TOTAL")
+            ETF_CONTAINS = ("NIFTY","BANKEX","MSCIN")
+            def _is_etf(sym): s=sym.upper(); return any(s.endswith(k) for k in ETF_ENDSWITH) or any(k in s for k in ETF_CONTAINS)
+            equity_chunk = [sym for sym in chunk if not _is_etf(sym)]
+            skipped_etf = len(chunk)-len(equity_chunk)
+            if skipped_etf: log.info(f"Skipping {skipped_etf} ETFs")
+            fund_data = await r2_download_fund(client)
+            missing = [sym for sym in equity_chunk if sym not in fund_data]
+            log.info(f"Already done: {len(equity_chunk)-len(missing)}  Remaining: {len(missing)}")
+            if not missing: log.info("✅ All stocks already fetched!"); return
+            sem = asyncio.Semaphore(FUND_CONCURRENCY); ok = failed = 0
+            for i in range(0, len(missing), BATCH_SIZE):
+                batch = missing[i:i+BATCH_SIZE]
+                results = await asyncio.gather(*[fetch_one_fundamental(client,sem,sym) for sym in batch])
+                for sym, data in results:
+                    if data: fund_data[sym]=data; ok+=1
+                    else: failed+=1; log.warning(f"  ✗ {sym}: no data")
+                pct = min(i+BATCH_SIZE, len(missing))
+                log.info(f"  {pct}/{len(missing)}  ✓{ok}  ✗{failed}")
+                if pct % 100 == 0 or pct == len(missing):
+                    log.info("  💾 Checkpoint upload…"); await r2_upload_fund(client, fund_data)
+        status.success()
+        log.info(f"━━━ Fund Full {label} complete — ✓{ok}  ✗{failed} ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# ALL SCANNERS + EP SCAN + HLR + PATTERNS  (unchanged from original)
+# Copy exact code from original pipeline.py
+# ══════════════════════════════════════════════════════════════
+
+def _check_liquidity(volumes, closes, n, min_turnover=3_00_00_000):
+    lookback = min(50, n)
+    if lookback < 20: return True
+    vols = [v for v in volumes[-lookback:] if v is not None]
+    prices = [c for c in closes[-lookback:] if c is not None and c > 0]
+    if len(vols) < 20 or len(prices) < 20: return False
+    return (sum(vols)/len(vols) * sum(prices)/len(prices)) >= min_turnover
+
+def _calc_rsi(closes, period=14):
+    if len(closes) < period + 1: return None
+    gains = []; losses = []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]; gains.append(max(d, 0)); losses.append(max(-d, 0))
+    avg_gain = sum(gains[:period]) / period; avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain*(period-1)+gains[i])/period; avg_loss = (avg_loss*(period-1)+losses[i])/period
+    if avg_loss == 0: return 100.0
+    return round(100 - 100/(1+avg_gain/avg_loss), 2)
+
+def _calc_ema(closes, period):
+    if len(closes) < period: return [None]*len(closes)
+    ema=[None]*len(closes); k=2/(period+1)
+    seed_vals=[v for v in closes[:period] if v is not None]
+    if not seed_vals: return ema
+    ema[period-1]=sum(seed_vals)/len(seed_vals)
+    for i in range(period, len(closes)):
+        c=closes[i]; ema[i]=c*k+ema[i-1]*(1-k) if c is not None else ema[i-1]
+    return ema
+
+def _calculate_rs(all_data, history_days=30):
+    all_syms=list(all_data.keys()); result={}; day_scores={}
+    for sym, s in all_data.items():
+        closes=s["c"]; n=len(closes); scores=[]
+        for day_offset in range(history_days, -1, -1):
+            idx=n-1-day_offset
+            if idx < 63: scores.append(None); continue
+            def ret(lookback):
+                prev_idx=idx-lookback
+                if prev_idx<0: return None
+                prev=closes[prev_idx]; c=closes[idx]
+                if not prev or c is None: return None
+                return (c-prev)/prev*100
+            p63=ret(63); p126=ret(126); p189=ret(189); p252=ret(252)
+            if p252 is not None and p189 is not None and p126 is not None and p63 is not None: composite=(p63*2+p126+p189+p252)/5
+            elif p189 is not None and p126 is not None and p63 is not None: composite=(p63*2+p126+p189)/4
+            elif p126 is not None and p63 is not None: composite=(p63*2+p126)/3
+            elif p63 is not None: composite=p63
+            else: scores.append(None); continue
+            scores.append(composite)
+        day_scores[sym]=scores
+    n_days=history_days+1; rs_history={sym:[] for sym in all_syms}
+    for d in range(n_days):
+        day_composites={sym:day_scores[sym][d] for sym in all_syms if day_scores[sym][d] is not None}
+        if not day_composites:
+            for sym in all_syms: rs_history[sym].append(None); continue
+        sorted_syms=sorted(day_composites, key=lambda x:day_composites[x]); total=len(sorted_syms)
+        ranks={sym:round((i+1)/total*99) for i,sym in enumerate(sorted_syms)}
+        for sym in all_syms: rs_history[sym].append(ranks.get(sym))
+    final_composites={sym:day_scores[sym][-1] for sym in all_syms if day_scores[sym][-1] is not None}
+    final_sorted=sorted(final_composites, key=lambda x:final_composites[x]); final_total=len(final_sorted)
+    final_rank_pos={sym:i+1 for i,sym in enumerate(final_sorted)}
+    for sym in all_syms:
+        hist=rs_history[sym]; current_rs=next((v for v in reversed(hist) if v is not None), None)
+        result[sym]={"rs":current_rs,"rs_rank":final_rank_pos.get(sym),"rs_total":final_total,"history":hist}
+    return result
+
+def _build_rs_history_json(all_data, rs_data):
+    from datetime import date as dt
+    sample_sym=max(all_data.keys(), key=lambda s:len(all_data[s].get("d",[])))
+    dates=all_data[sample_sym]["d"]; n=len(dates)
+    history_len=len(next(iter(rs_data.values()))["history"]); start_idx=n-history_len
+    def fmt_date(d_str): return dt.fromisoformat(d_str).strftime("%-d-%b-%y")
+    date_labels=[(i,fmt_date(dates[start_idx+i])) for i in range(history_len) if 0<=start_idx+i<n]
+    rows=[]
+    for sym, v in rs_data.items():
+        row={"Stock Name":sym}
+        for i,label in date_labels:
+            if v["history"][i] is not None: row[label]=v["history"][i]
+        rows.append(row)
+    return rows
+
+def _build_index_close_map(history, daily_close, today):
+    close_map = {}
+    for row in (history or []):
+        d=row.get("date"); c=row.get("close")
+        if d and c is not None: close_map[d]=c
+    if daily_close is not None and today not in close_map: close_map[today]=daily_close
+    return close_map
+
+def _calculate_mansfield_rs(all_data, index_maps):
+    NHL=50; NHL_SHORT=21; result={}
+    for sym, s in all_data.items():
+        dates=s["d"]; closes=s["c"]; highs=s["h"]; n=len(dates)
+        if n < NHL+1: result[sym]={};  continue
+        stock_metrics={}
+        for idx_key, close_map in index_maps.items():
+            rs_line=[]
+            for i,(d,c) in enumerate(zip(dates,closes)):
+                idx_c=close_map.get(d); rs_line.append(round(c/idx_c,6) if c and idx_c else None)
+            m=len(rs_line)
+            if m<NHL+1: stock_metrics[idx_key]={}; continue
+            current_rs=next((v for v in reversed(rs_line) if v is not None), None)
+            valid_50=[v for v in rs_line[-NHL:] if v is not None]; valid_21=[v for v in rs_line[-NHL_SHORT:] if v is not None]
+            rs_nh_50=bool(valid_50 and current_rs is not None and current_rs>=max(valid_50))
+            rs_nl_50=bool(valid_50 and current_rs is not None and current_rs<=min(valid_50))
+            rs_nh_21=bool(valid_21 and current_rs is not None and current_rs>=max(valid_21))
+            rs_nl_21=bool(valid_21 and current_rs is not None and current_rs<=min(valid_21))
+            valid_h_50=[v for v in highs[-NHL:] if v is not None]; valid_h_21=[v for v in highs[-NHL_SHORT:] if v is not None]
+            last_close=next((v for v in reversed(closes) if v is not None), None)
+            price_nh_50=bool(valid_h_50 and last_close is not None and last_close>=max(valid_h_50))
+            price_nh_21=bool(valid_h_21 and last_close is not None and last_close>=max(valid_h_21))
+            stock_metrics[idx_key]={"rs_val":current_rs,"rs_nh_21":rs_nh_21,"rs_nl_21":rs_nl_21,
+                "rs_div_21":rs_nh_21 and not price_nh_21,"rs_nh_50":rs_nh_50,"rs_nl_50":rs_nl_50,"rs_div_50":rs_nh_50 and not price_nh_50}
+        result[sym]=stock_metrics
+    return result
+
+# ══════════════════════════════════════════════════════════════
+# PATCH — pipeline.py mein _build_group_rs_history() ko isse REPLACE karein
+#
+# Bug: date_cols sirf rs_history_json[0] (pehli row) se nikalte the.
+#      Agar pehla stock new listing hai (<63 din data → poori history None),
+#      toh us row mein sirf "Stock Name" hota hai → date_cols=[] → output []
+#      → sector_group_rs_history.json / industry_rs_history.json 0.0 KB.
+#
+# Fix: sabse zyada keys wali row (full history) se date columns derive karo,
+#      + empty hone par warning log.
+# ══════════════════════════════════════════════════════════════
+
+def _build_group_rs_history(classification, rs_history_json, field_name):
+    if not classification or not isinstance(classification, list): return []
+    group_map={}
+    for s in classification:
+        sym=s.get("symbol"); group=s.get(field_name)
+        if not sym or not group: continue
+        group_map.setdefault(group,[]).append(sym)
+    if not rs_history_json: return []
+    # FIX: pehli row pe bharosa mat karo — woh new-listing ho sakti hai jiski
+    # poori history None hai (sirf "Stock Name" key). Sabse zyada date
+    # columns wali row choose karo taaki full date range mile.
+    sample=max(rs_history_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_rs_history({field_name}): no date columns found — empty output")
+        return []
+    output=[]
+    for dt in date_cols:
+        stocks={}
+        for row in rs_history_json:
+            sym=row.get("Stock Name"); rs=row.get(dt)
+            if sym and rs is not None: stocks[sym]=rs
+        groups={}
+        for group,syms in group_map.items():
+            valid=rs60=rs70=rs80=rs90=0; rs_sum=0
+            for sym in syms:
+                rs=stocks.get(sym)
+                if rs is None: continue
+                valid+=1; rs_sum+=rs
+                if rs>=60: rs60+=1
+                if rs>=70: rs70+=1
+                if rs>=80: rs80+=1
+                if rs>=90: rs90+=1
+            if valid<5: continue
+            groups[group]={"stocks":valid,"rs60":round(rs60/valid*100,1),"rs70":round(rs70/valid*100,1),
+                "rs80":round(rs80/valid*100,1),"rs90":round(rs90/valid*100,1),"avg_rs":round(rs_sum/valid,1)}
+        output.append({"date":dt,"groups":groups})
+    return output
+
+def _calculate_mswing(all_data, history_days=90):
+    result={}
+    for sym, s in all_data.items():
+        closes=s["c"]; n=len(closes); history=[]
+        for day_offset in range(history_days,-1,-1):
+            idx=n-1-day_offset
+            c_now=closes[idx] if idx>=0 else None
+            if c_now is None: history.append(None); continue
+            c5  = closes[idx-5]  if idx>=5  else None
+            c10 = closes[idx-10] if idx>=10 else None
+            c20 = closes[idx-20] if idx>=20 else None
+            c50 = closes[idx-50] if idx>=50 else None
+            try:
+                if c50 and c20:                                   # full history -> 20 & 50
+                    val=(c_now-c20)/c20*100/20+(c_now-c50)/c50*100/50
+                elif c20 and c10:                                 # no 50d    -> 20 & 10
+                    val=(c_now-c10)/c10*100/10+(c_now-c20)/c20*100/20
+                elif c10 and c5:                                  # no 20d    -> 5 & 10
+                    val=(c_now-c5)/c5*100/5+(c_now-c10)/c10*100/10
+                else:
+                    val=None
+            except ZeroDivisionError:
+                val=None
+            history.append(round(val,4) if val is not None else None)
+        valid=[v for v in history[-9:] if v is not None]
+        result[sym]={"mswing":history[-1] if history else None,"mswing_avg9":round(sum(valid)/len(valid),4) if valid else None,"mswing_history":history}
+    return result
+
+def _build_mswing_json(all_data, mswing_data):
+    from datetime import date as dt
+    sample_sym=max(all_data.keys(), key=lambda s:len(all_data[s].get("d",[])))
+    dates=all_data[sample_sym]["d"]; n=len(dates)
+    history_len=len(next(iter(mswing_data.values()))["mswing_history"]); start_idx=n-history_len
+    def fmt_date(d_str): return dt.fromisoformat(d_str).strftime("%-d-%b-%y")
+    date_labels=[(i,fmt_date(dates[start_idx+i])) for i in range(history_len) if 0<=start_idx+i<n]
+    rows=[]
+    for sym, v in mswing_data.items():
+        row={"Stock Name":sym}
+        for i,label in date_labels:
+            if v["mswing_history"][i] is not None: row[label]=v["mswing_history"][i]
+        rows.append(row)
+    return rows
+
+# ══════════════════════════════════════════════════════════════
+# NEW — Sector/industry group history for MSwing, mirroring
+# _build_group_rs_history() exactly (same shape: {"date":..,"groups":{group:{...}}}),
+# just with MSwing-appropriate buckets instead of RS's 60/70/80/90 percentile
+# breakpoints. MSwing is a raw momentum value (not a 0-99 percentile), so the
+# buckets here are ">=0" (bullish), ">=1", ">=2", ">=3" (strengthening
+# momentum) — adjust these threshold numbers freely if a different cutoff
+# reads better once you see real data.
+# ══════════════════════════════════════════════════════════════
+def _build_group_mswing_history(classification, mswing_history_json, field_name):
+    if not classification or not isinstance(classification, list): return []
+    group_map={}
+    for s in classification:
+        sym=s.get("symbol"); group=s.get(field_name)
+        if not sym or not group: continue
+        group_map.setdefault(group,[]).append(sym)
+    if not mswing_history_json: return []
+    sample=max(mswing_history_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_mswing_history({field_name}): no date columns found — empty output")
+        return []
+    output=[]
+    for dtc in date_cols:
+        stocks={}
+        for row in mswing_history_json:
+            sym=row.get("Stock Name"); val=row.get(dtc)
+            if sym and val is not None: stocks[sym]=val
+        groups={}
+        for group,syms in group_map.items():
+            valid=pos=ge1=ge2=ge3=0; val_sum=0
+            for sym in syms:
+                val=stocks.get(sym)
+                if val is None: continue
+                valid+=1; val_sum+=val
+                if val>=0: pos+=1
+                if val>=1: ge1+=1
+                if val>=2: ge2+=1
+                if val>=3: ge3+=1
+            if valid<5: continue
+            groups[group]={"stocks":valid,"mswing_pos":round(pos/valid*100,1),"mswing_ge1":round(ge1/valid*100,1),
+                "mswing_ge2":round(ge2/valid*100,1),"mswing_ge3":round(ge3/valid*100,1),"avg_mswing":round(val_sum/valid,4)}
+        output.append({"date":dtc,"groups":groups})
+    return output
+
+# ══════════════════════════════════════════════════════════════
+# NEW — Same treatment for MA. Since there's no existing day-by-day
+# "close vs MA" history array (mtf_ma_map only holds *today's* snapshot),
+# this computes one from scratch using the full EMA/SMA series (_calc_ema /
+# _calc_sma already return the whole array, so this is a single pass per
+# stock, not per-day recomputation). Defaulted to Daily EMA50 — the most
+# commonly referenced trend-health MA elsewhere in this file (screener_feed's
+# 'above_50' field). Swap ma_type="sma" for SMA, or change `period` for a
+# different length (e.g. period=200 for the long-term trend gate).
+# ══════════════════════════════════════════════════════════════
+def _calculate_ma_above_history(all_data, period=50, ma_type="ema", history_days=180):
+    ma_fn=_calc_ema if ma_type=="ema" else _calc_sma
+    result={}
+    for sym, s in all_data.items():
+        closes=s["c"]; n=len(closes)
+        ma_arr=ma_fn(closes, period)
+        history=[]
+        for day_offset in range(history_days,-1,-1):
+            idx=n-1-day_offset
+            if idx<0 or idx>=len(ma_arr): history.append(None); continue
+            c_now=closes[idx]; ma_val=ma_arr[idx]
+            if c_now is None or ma_val is None: history.append(None)
+            else: history.append(1 if c_now>ma_val else 0)
+        result[sym]={"above_ma":history[-1] if history else None,"history":history}
+    return result
+
+def _build_ma_history_json(all_data, ma_data):
+    from datetime import date as dt
+    sample_sym=max(all_data.keys(), key=lambda s:len(all_data[s].get("d",[])))
+    dates=all_data[sample_sym]["d"]; n=len(dates)
+    history_len=len(next(iter(ma_data.values()))["history"]); start_idx=n-history_len
+    def fmt_date(d_str): return dt.fromisoformat(d_str).strftime("%-d-%b-%y")
+    date_labels=[(i,fmt_date(dates[start_idx+i])) for i in range(history_len) if 0<=start_idx+i<n]
+    rows=[]
+    for sym, v in ma_data.items():
+        row={"Stock Name":sym}
+        for i,label in date_labels:
+            if v["history"][i] is not None: row[label]=v["history"][i]
+        rows.append(row)
+    return rows
+
+def _build_group_ma_history(classification, ma_history_json, field_name, label="pct_above_ema50"):
+    if not classification or not isinstance(classification, list): return []
+    group_map={}
+    for s in classification:
+        sym=s.get("symbol"); group=s.get(field_name)
+        if not sym or not group: continue
+        group_map.setdefault(group,[]).append(sym)
+    if not ma_history_json: return []
+    sample=max(ma_history_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_ma_history({field_name}): no date columns found — empty output")
+        return []
+    output=[]
+    for dtc in date_cols:
+        stocks={}
+        for row in ma_history_json:
+            sym=row.get("Stock Name"); val=row.get(dtc)
+            if sym and val is not None: stocks[sym]=val
+        groups={}
+        for group,syms in group_map.items():
+            valid=above=0
+            for sym in syms:
+                val=stocks.get(sym)
+                if val is None: continue
+                valid+=1
+                if val==1: above+=1
+            if valid<5: continue
+            groups[group]={"stocks":valid, label:round(above/valid*100,1)}
+        output.append({"date":dtc,"groups":groups})
+    return output
+
+# ══════════════════════════════════════════════════════════════
+# NEW — Multi-period/type version of the MA group history.
+# Instead of a single MA (e.g. just EMA50), this covers periods 10, 21, 50,
+# 200 for BOTH EMA and SMA (8 combinations total), merged into ONE group
+# entry per date so the frontend gets a single record per sector/industry
+# per date with all 8 percentages side by side:
+#   { "stocks":223, "pct_above_ema10":61.2, "pct_above_sma10":58.4,
+#     "pct_above_ema21":..., "pct_above_sma21":..., "pct_above_ema50":...,
+#     "pct_above_sma50":..., "pct_above_ema200":..., "pct_above_sma200":... }
+# Reuses _calculate_ma_above_history() + _build_ma_history_json() per
+# combination — no duplicate calculation logic, just called 8x.
+# ══════════════════════════════════════════════════════════════
+MA_GROUP_PERIODS=(10, 21, 50, 200)
+MA_GROUP_TYPES=("ema", "sma")
+
+def _build_ma_history_all_combos(all_data, periods=MA_GROUP_PERIODS, types=MA_GROUP_TYPES, history_days=180):
+    """Returns {"ema10": ma_history_json, "sma10": ma_history_json, ...} for every period x type combo."""
+    combos={}
+    for ma_type in types:
+        for period in periods:
+            label=f"{ma_type}{period}"
+            ma_data=_calculate_ma_above_history(all_data, period=period, ma_type=ma_type, history_days=history_days)
+            combos[label]=_build_ma_history_json(all_data, ma_data)
+    return combos
+
+def _build_group_ma_history_multi(classification, ma_history_by_label, field_name):
+    if not classification or not isinstance(classification, list): return []
+    group_map={}
+    for s in classification:
+        sym=s.get("symbol"); group=s.get(field_name)
+        if not sym or not group: continue
+        group_map.setdefault(group,[]).append(sym)
+    if not ma_history_by_label: return []
+
+    # Date columns: derive from whichever combo's fullest row has the most
+    # date keys (same defensive pattern as _build_group_rs_history — the
+    # first combo/row might belong to a short-history stock).
+    any_json=next((j for j in ma_history_by_label.values() if j), None)
+    if not any_json: return []
+    sample=max(any_json, key=lambda r: len(r))
+    date_cols=[k for k in sample.keys() if k!="Stock Name"]
+    if not date_cols:
+        log.warning(f"_build_group_ma_history_multi({field_name}): no date columns found — empty output")
+        return []
+
+    # Pre-index each combo as {date: {symbol: 0/1}} for fast lookups below.
+    combo_by_date={}
+    for label, hist_json in ma_history_by_label.items():
+        per_date={dtc:{} for dtc in date_cols}
+        for row in hist_json:
+            sym=row.get("Stock Name")
+            if not sym: continue
+            for dtc in date_cols:
+                val=row.get(dtc)
+                if val is not None: per_date[dtc][sym]=val
+        combo_by_date[label]=per_date
+
+    output=[]
+    for dtc in date_cols:
+        groups={}
+        for group,syms in group_map.items():
+            entry=None
+            for label, per_date in combo_by_date.items():
+                stocks=per_date[dtc]
+                valid=above=0
+                for sym in syms:
+                    val=stocks.get(sym)
+                    if val is None: continue
+                    valid+=1
+                    if val==1: above+=1
+                if valid<5: continue
+                if entry is None: entry={"stocks":valid}
+                entry[f"pct_above_{label}"]=round(above/valid*100,1)
+            if entry: groups[group]=entry
+        output.append({"date":dtc,"groups":groups})
+    return output
+
+
+PATTERN_BACKUP_FIELDS=["ib","dib","nr7","pullback","wib","w_dib","w_nr7","w_3tc","mcp","launchpad","bs","pp","atr_tightness","vol_footprint","new_52wh","new_52wl","hvq","hvm","hvy","lvq","lvm","lvy","hpbc","tl_hl_bo","ttm_squeeze","bb_squeeze","vol_shocker"]
+HLR_STATE_KEYS={"BO":"hlr_bo","Near HLR":"hlr_near","Consolidating near HLR":"hlr_consol"}
+GAP_STATE_KEYS={"Near Gap":"gap_near","Consolidating near Gap":"gap_consol","Gap Filled":"gap_just_filled"}
+
+def _build_pattern_day(feed):
+    day={}
+    for f in PATTERN_BACKUP_FIELDS:
+        syms=[r["symbol"] for r in feed if r.get(f)]
+        if syms: day[f]=syms
+    for state,key in HLR_STATE_KEYS.items():
+        syms=[r["symbol"] for r in feed if r.get("hlr_state")==state]
+        if syms: day[key]=syms
+    for state,key in GAP_STATE_KEYS.items():
+        syms=[r["symbol"] for r in feed if r.get("gap_fill")==state]
+        if syms: day[key]=syms
+    return day
+
+async def backup_pattern_history(client, feed, today, gap_new=None, gap_filled=None):
+    fname=f"pattern_history_{today[:4]}.json"; day=_build_pattern_day(feed)
+    if gap_new: day["gap_new"]=gap_new
+    if gap_filled: day["gap_filled"]=gap_filled
+    if not day: log.info(f"  🗄  pattern backup: no patterns on {today}, skip"); return
+    hist=await r2_download(client,fname)
+    if not isinstance(hist,dict): hist={}
+    hist[today]=day
+    await r2_upload(client,fname,json.dumps(hist,separators=(",",":")))
+    all_syms=set()
+    for k,v in day.items():
+        if k in ("gap_new","gap_filled"): all_syms.update(x.get("symbol") for x in v)
+        else: all_syms.update(v)
+    n_sym=len(all_syms)
+    log.info(f"  🗄  pattern_history: {today} → {fname}  ({len(day)} signals, {n_sym} stocks, {len(hist)} dates)")
+
+# ── DEP (Delayed EP) classification — sequential state machine ──
+# ep_type = Earnings EP / Normal EP (set from the Results catalyst in run_ep_scan);
+# state = dynamic current
+# behavior (Watch / Runner / Consolidation / Pullback / Dead). No buy trigger.
+def _detect_ep(all_data, min_gap_pct=2.0, volume_spike_x=2.0,
+               volume_lookback=20, max_ep_age_days=30,
+               non_gap_move_pct=5.0, non_gap_volume_spike_x=3.0,
+               non_gap_close_position_min=0.60):
+
+    signals = []
+
+    def _is_lower_high_lower_low(highs, lows, j):
+        """
+        Structure deterioration:
+        current bar makes both a lower high and lower low
+        versus previous bar.
+        """
+        if j <= 0:
+            return False
+
+        vals = (highs[j], highs[j - 1], lows[j], lows[j - 1])
+        if any(v is None for v in vals):
+            return False
+
+        return highs[j] < highs[j - 1] and lows[j] < lows[j - 1]
+
+    def _three_lower_closes(closes, j):
+        """
+        Three consecutive closing declines:
+        C[j] < C[j-1] < C[j-2] < C[j-3]
+
+        This intentionally requires repeated deterioration,
+        not one red candle.
+        """
+        if j < 3:
+            return False
+
+        vals = (closes[j], closes[j - 1], closes[j - 2], closes[j - 3])
+        if any(v is None for v in vals):
+            return False
+
+        return (
+            closes[j] < closes[j - 1]
+            and closes[j - 1] < closes[j - 2]
+            and closes[j - 2] < closes[j - 3]
+        )
+
+    def _pullback_stabilized(closes, j):
+        """
+        Pullback -> Consolidation:
+
+        Require:
+        1. enough candles after the decline,
+        2. no new closing low during the last 3 sessions,
+        3. recent closes overlap rather than continue migrating down.
+
+        This prevents one/two quiet candles from instantly
+        converting a Pullback into Consolidation.
+        """
+        if j < 4:
+            return False
+
+        vals = [closes[k] for k in range(j - 4, j + 1)]
+        if any(v is None for v in vals):
+            return False
+
+        # Lowest close of the older part of this 5-bar window.
+        prior_low = min(vals[0:2])
+
+        # Last 3 closes must not establish a new closing low.
+        last3 = vals[2:5]
+        no_new_low = min(last3) >= prior_low
+
+        # Recent closes should show overlap / loss of downward direction.
+        recent_down_moves = sum(
+            1 for a, b in zip(last3, last3[1:])
+            if b < a
+        )
+
+        return no_new_low and recent_down_moves <= 1
+
+    for sym, s in all_data.items():
+
+        dates = s["d"]
+        opens = s["o"]
+        highs = s["h"]
+        lows = s["l"]
+        closes = s["c"]
+        volumes = s["v"]
+
+        n = len(dates)
+
+        if n < volume_lookback + 2:
+            continue
+
+        if not _check_liquidity(volumes, closes, n):
+            continue
+
+        scan_from = max(volume_lookback, n - max_ep_age_days)
+
+        for i in range(scan_from, n):
+
+            # ==========================================================
+            # EP GATE
+            # ==========================================================
+
+            prev_high = highs[i - 1]
+            prev_close = closes[i - 1]
+            ep_open = opens[i]
+            ep_low = lows[i]
+            ep_high = highs[i]
+            ep_close = closes[i]
+
+            if any(v is None for v in (prev_high, prev_close, ep_low, ep_high, ep_close)):
+                continue
+
+            if prev_high <= 0 or prev_close <= 0 or ep_low <= 0:
+                continue
+
+            hist_vol = [
+                v for v in volumes[i - volume_lookback:i]
+                if v is not None
+            ]
+
+            if len(hist_vol) < volume_lookback:
+                continue
+
+            avg_vol = sum(hist_vol) / len(hist_vol)
+
+            if avg_vol <= 0 or volumes[i] is None:
+                continue
+
+            vol_x = volumes[i] / avg_vol
+
+            # Existing Gap EP path stays unchanged:
+            # true gap above previous high, >=2% gap, >=2x 20D volume.
+            true_gap_pct = (ep_low - prev_high) / prev_high * 100
+            is_gap_ep = (
+                ep_low > prev_high
+                and true_gap_pct >= min_gap_pct
+                and vol_x >= volume_spike_x
+            )
+
+            # New Non-Gap EP path:
+            # close-vs-previous-close >=5%, >=3x 20D volume,
+            # and close in the upper 40% of the day's range (position >=60%).
+            day_move_pct = (ep_close - prev_close) / prev_close * 100
+            day_range = ep_high - ep_low
+            close_position = ((ep_close - ep_low) / day_range) if day_range > 0 else 1.0
+            is_non_gap_ep = (
+                not is_gap_ep
+                and day_move_pct >= non_gap_move_pct
+                and vol_x >= non_gap_volume_spike_x
+                and close_position >= non_gap_close_position_min
+            )
+
+            if not (is_gap_ep or is_non_gap_ep):
+                continue
+
+            reaction_type = "Gap EP" if is_gap_ep else "Non-Gap EP"
+            # Keep gap_pct meaningful in the UI for both paths: Gap EP uses the
+            # original low-vs-prev-high definition; Non-Gap uses open-vs-prev-close.
+            if is_gap_ep:
+                gap_pct = true_gap_pct
+            elif ep_open is not None and ep_open > 0:
+                gap_pct = (ep_open - prev_close) / prev_close * 100
+            else:
+                gap_pct = 0.0
+
+            age = n - 1 - i
+
+            # ==========================================================
+            # HISTORICAL EP TYPE
+            #
+            # Runner EP:
+            # first 4 post-EP sessions contain a close >= EP High + 3%.
+            # Once true, historical EP Type remains Runner EP.
+            # ==========================================================
+
+            runner_ep = False
+            runner_end = min(i + 4, n - 1)
+
+            for j in range(i + 1, runner_end + 1):
+                c = closes[j]
+
+                if c is not None and c >= ep_high * 1.03:
+                    runner_ep = True
+                    break
+
+
+            # Dynamic highest high since EP.
+            valid_highs = [
+                h for h in highs[i:n]
+                if h is not None
+            ]
+
+            runner_peak = max(valid_highs) if valid_highs else ep_high
+
+            # ==========================================================
+            # CURRENT STATE — SEQUENTIAL STATE MACHINE
+            # ==========================================================
+
+            # Dead is terminal and checked first. Gap EP keeps the original
+            # previous-high failure level. For Non-Gap EP, previous close is
+            # the meaningful reaction base; using previous high can mark a
+            # valid non-gap reaction Dead immediately even while it holds the
+            # breakout move above the prior close.
+            dead_level = prev_high if is_gap_ep else prev_close
+            dead_early = any(
+                closes[j] is not None and closes[j] < dead_level
+                for j in range(i + 1, n)
+            )
+
+            if dead_early:
+                state = "Dead"
+
+            elif age < 2:
+                state = "Watch"
+
+            else:
+                # Runner EP starts as Runner.
+                # Normal EP starts as Consolidation.
+                state = "Runner" if runner_ep else "Consolidation"
+                # Start of the current consolidation base (reset after a
+                # Pullback stabilizes) -- its lowest low is the breakdown level.
+                cons_start = i + 1
+
+                for j in range(i + 1, n):
+
+                    c = closes[j]
+
+                    if c is None:
+                        continue
+
+                    # --------------------------------------------------
+                    # DEAD — terminal state
+                    # --------------------------------------------------
+                    if c < dead_level:
+                        state = "Dead"
+                        break
+
+                    # --------------------------------------------------
+                    # PULLBACK DETECTION (state-aware, see rules below)
+                    # --------------------------------------------------
+
+                    three_down = _three_lower_closes(closes, j)
+                    lh_ll = _is_lower_high_lower_low(highs, lows, j)
+
+                    close_weak = False
+
+                    if j > 0 and closes[j - 1] is not None:
+                        close_weak = closes[j] <= closes[j - 1]
+
+                    # Runner -> Pullback: 3 lower closes, or LH+LL on two
+                    # consecutive bars with a weaker close (one bar is noise).
+                    lh_ll_prev = (
+                        _is_lower_high_lower_low(highs, lows, j - 1)
+                        if j - 1 > i else False
+                    )
+
+                    if state == "Runner":
+                        if three_down or (lh_ll and lh_ll_prev and close_weak):
+                            state = "Pullback"
+                            continue
+
+                    # Consolidation -> Pullback: 3 lower closes, or a close
+                    # below the lowest low of the current base. A dip that
+                    # stays inside the base is still Consolidation.
+                    if state == "Consolidation":
+                        base_lows = [
+                            lows[k] for k in range(cons_start, j)
+                            if lows[k] is not None
+                        ]
+                        base_break = len(base_lows) >= 2 and c < min(base_lows)
+
+                        if three_down or base_break:
+                            state = "Pullback"
+                            continue
+
+                    # --------------------------------------------------
+                    # PULLBACK -> CONSOLIDATION
+                    #
+                    # Do not reset Pullback because of one green candle.
+                    # Require actual stabilization.
+                    # --------------------------------------------------
+
+                    if state == "Pullback":
+                        if _pullback_stabilized(closes, j):
+                            state = "Consolidation"
+                            cons_start = j
+                            continue
+
+                    # --------------------------------------------------
+                    # CONSOLIDATION -> RUNNER
+                    #
+                    # Only available to historical Runner EP.
+                    #
+                    # If price resumes/maintains upper progression by
+                    # closing at a fresh post-EP closing high, current
+                    # state can return to Runner.
+                    # --------------------------------------------------
+
+                    if state == "Consolidation" and runner_ep:
+
+                        prior_post_ep_closes = [
+                            closes[k]
+                            for k in range(i + 1, j)
+                            if closes[k] is not None
+                        ]
+
+                        if prior_post_ep_closes:
+                            prior_best_close = max(prior_post_ep_closes)
+
+                            if c > prior_best_close:
+                                state = "Runner"
+
+            # ==========================================================
+            # RETURNS
+            # ==========================================================
+
+            last_close = closes[-1]
+
+            ep_5d_idx = min(i + 5, n - 1)
+            ep_5d_return = ""
+
+            if (
+                ep_5d_idx > i
+                and closes[ep_5d_idx] is not None
+                and ep_close
+            ):
+                ep_5d_return = round(
+                    (closes[ep_5d_idx] - ep_close) / ep_close * 100,
+                    2
+                )
+
+            ep_return = 0.0
+
+            if last_close is not None and ep_close:
+                ep_return = round(
+                    (last_close - ep_close) / ep_close * 100,
+                    2
+                )
+
+            # ==========================================================
+            # OUTPUT
+            # ==========================================================
+
+            signals.append({
+                "symbol": sym,
+                "ep_date": dates[i],
+
+                "gap_lower": round(prev_high, 2),
+                "gap_pct": round(gap_pct, 2),
+
+                "vol_spike_x": round(vol_x, 2),
+                "reaction_type": reaction_type,
+                "day_move_pct": round(day_move_pct, 2),
+                "close_position_pct": round(close_position * 100, 1),
+
+                "ep_candle_high": round(ep_high, 2),
+                "ep_candle_low": round(ep_low, 2),
+                "ep_candle_close": round(ep_close, 2),
+
+                "runner_peak": round(runner_peak, 2),
+
+                # Final value (Earnings EP / Normal EP) is set in run_ep_scan
+                # from the Results catalyst; runner_ep only drives the state machine.
+                "ep_type": "Normal EP",
+                "state": state,
+
+                "age": age,
+
+                "ep_return": ep_return,
+                "ep_5d_return": ep_5d_return,
+
+                "last_close": (
+                    round(last_close, 2)
+                    if last_close is not None
+                    else None
+                ),
+
+                "last_date": dates[-1],
+
+                # Existing frontend compatibility.
+                "consolidation": age,
+            })
+
+    # Return every qualifying candidate. Catalyst gating happens later in
+    # run_ep_scan(); collapsing here can let a newer uncatalyzed Non-Gap EP
+    # hide an older valid Gap/Earnings/Event EP for the same symbol.
+    return signals
+
+def _detect_post_result_thrust(all_data,result_calendar,min_price_ch_pct=1.5,volume_spike_x=1.5,close_position_min=0.5,volume_lookback=20,max_result_age_days=30):
+    today_str=today_ist(); cutoff=(date.fromisoformat(today_str)-timedelta(days=max_result_age_days)).isoformat()
+    sym_to_result_date={}
+    for date_str,syms in result_calendar.items():
+        if date_str<cutoff: continue
+        for sym in syms:
+            if sym not in sym_to_result_date or date_str>sym_to_result_date[sym]: sym_to_result_date[sym]=date_str
+    signals=[]
+    for sym,result_date in sym_to_result_date.items():
+        if sym not in all_data: continue
+        s=all_data[sym]; dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
+        if n<volume_lookback+2 or result_date not in dates: continue
+        ri_list=[i for i,d in enumerate(dates) if d==result_date]
+        if not ri_list: continue
+        ri=ri_list[-1]; ti=ri+1
+        if ti>=n: continue
+        lookback=min(volume_lookback,ri)
+        if lookback==0: continue
+        avg_vol=sum(volumes[ri-lookback:ri])/lookback
+        if avg_vol==0: continue
+        result_day_ch=round((closes[ri]-closes[ri-1])/closes[ri-1]*100,2) if ri>0 and closes[ri-1] else 0.0
+        result_day_vol_x=round(volumes[ri]/avg_vol,1)
+        if lows[ti] is None or highs[ri] is None or lows[ti]>highs[ri]: continue
+        prev_close=closes[ri]
+        if prev_close==0: continue
+        price_ch_pct=(closes[ti]-prev_close)/prev_close*100
+        if price_ch_pct<min_price_ch_pct: continue
+        vol_x=volumes[ti]/avg_vol
+        if vol_x<volume_spike_x: continue
+        candle_range=highs[ti]-lows[ti]; close_pos=(closes[ti]-lows[ti])/candle_range if candle_range>0 else 1.0
+        if close_pos<close_position_min: continue
+        if abs(result_day_ch)<1.5 and result_day_vol_x<2.0: reaction_type="AH Result → T+1 Primary"
+        elif result_day_ch>=1.5: reaction_type="IH Result → T+1 Follow-through"
+        else: reaction_type="Mixed"
+        signals.append({"symbol":sym,"result_date":result_date,"result_day_ch":result_day_ch,"result_day_vol_x":result_day_vol_x,
+            "t1_date":dates[ti],"t1_open":round(opens[ti],2),"t1_high":round(highs[ti],2),"t1_low":round(lows[ti],2),
+            "t1_close":round(closes[ti],2),"price_ch_pct":round(price_ch_pct,2),"vol_pct":f"+{round((vol_x-1)*100)}%",
+            "close_position":round(close_pos*100,1),"reaction_type":reaction_type})
+    order={"AH Result → T+1 Primary":0,"IH Result → T+1 Follow-through":1,"Mixed":2}
+    signals.sort(key=lambda x:(order.get(x["reaction_type"],9),-x["price_ch_pct"]))
+    return signals
+
+
+# ══════════════════════════════════════════════════════════════
+# GAP TRACKER — persistent store, independent of rolling OHLC window
+# ══════════════════════════════════════════════════════════════
+#
+# OLD BUG: _detect_gap_signals() recomputed every gap from scratch out of
+# all_data (the 548-day rolling OHLC window) on every run. The day the
+# gap's *origin* candle ages past the rolling cutoff, its prev-day
+# high/low context disappears from all_data, so the gap could never be
+# detected — even if it was still open and later filled.
+#
+# NEW: open_gaps.json in R2 holds gap events independently of the OHLC
+# rolling window. Once a gap is recorded here it survives until it's
+# filled + KEEP_DAYS_AFTER_FILL days old, regardless of what happens to
+# the underlying OHLC history.
+#
+# Down-gaps only, by design:
+#   gap-down: today_high < prev_low   → filled when a later close >= prev_low
+#
+# Resumes from a per-symbol `last_checked` date every run (not a fixed
+# lookback window) — so an outage of ANY length still gets fully caught
+# up next run, as long as the missed date is still inside the rolling
+# OHLC window.
+# ══════════════════════════════════════════════════════════════
+
+GAP_KEEP_DAYS_AFTER_FILL = 30   # filled gaps pruned this many days after fill_date
+
+def _scan_new_gap_event(dates, highs, lows, i, min_gap_pct):
+    """Check candle i (vs i-1) for a fresh gap-down. Returns event dict or None."""
+    prev_low=lows[i-1]; today_high=highs[i]
+    if prev_low is not None and today_high is not None and today_high<prev_low:
+        gap_pct=(prev_low-today_high)/prev_low*100
+        if gap_pct>=min_gap_pct:
+            return {"gap_date":dates[i],"prev_date":dates[i-1],"direction":"down",
+                "gap_pct":round(gap_pct,2),"gap_top":round(prev_low,2),
+                "filled":False,"fill_date":None}
+    return None
+
+def _check_gap_fills(sym_gaps, dates, closes, from_idx):
+    """
+    Mark fill_date on open gap-downs whose gap_top gets crossed by a close.
+    Bounds each gap's check to start at max(from_idx, the gap's own index) —
+    a close before the gap was created can never "fill" it. Without this,
+    a batch scan (bootstrap or catch-up) that discovers multiple gaps in
+    one pass could wrongly stamp an earlier, pre-gap close as the fill
+    date for a gap created later in that same pass.
+    """
+    date_idx = {d: i for i, d in enumerate(dates)}
+    for g in sym_gaps:
+        if g["filled"]: continue
+        gap_idx = date_idx.get(g["gap_date"])
+        start = max(from_idx, gap_idx) if gap_idx is not None else from_idx
+        for j in range(start, len(dates)):
+            c=closes[j]
+            if c is None: continue
+            if c>=g["gap_top"]:
+                g["filled"]=True; g["fill_date"]=dates[j]; break
+
+async def update_gap_tracker(client, all_data, today, min_gap_pct=2.0, keep_days_after_fill=GAP_KEEP_DAYS_AFTER_FILL):
+    """
+    Persistent gap-down tracker.
+    Tracks a per-symbol `last_checked` date so every run resumes exactly
+    where it left off, scanning forward from last_checked+1 to today —
+    no fixed lookback window, so a missed/delayed pipeline run (of ANY
+    length) can never permanently lose a gap day, as long as that date
+    is still inside the rolling OHLC window (ROLLING_DAYS).
+    First time a symbol is seen (or its last_checked date has rolled out
+    of the OHLC window entirely) → safe full rescan of whatever history
+    is currently available; dedup via gap_date prevents double-entries.
+    Filled gaps get pruned keep_days_after_fill days after fill_date so
+    open_gaps.json doesn't grow unbounded.
+    Returns gaps_by_sym: {symbol: [event, ...]}
+    """
+    store=await r2_download(client,"open_gaps.json")
+    if not isinstance(store,dict) or "gaps" not in store: store={"gaps":{}}
+    gaps_by_sym=store["gaps"]
+    last_checked=store.get("last_checked") or {}
+    cutoff=(date.fromisoformat(today)-timedelta(days=keep_days_after_fill)).isoformat()
+    new_count=0; filled_today_count=0
+
+    for sym, s in all_data.items():
+        dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; n=len(dates)
+        if n<2: continue
+
+        sym_gaps=gaps_by_sym.get(sym,[])
+        existing_dates={g["gap_date"] for g in sym_gaps}
+        last_dt=last_checked.get(sym)
+
+        if last_dt and last_dt in dates:
+            start_idx=max(1,dates.index(last_dt)+1)   # resume right after last successful check
+        else:
+            start_idx=1   # never checked, or last_checked fell outside the rolling window — safe full rescan
+
+        for i in range(start_idx,n):
+            if dates[i] in existing_dates: continue
+            ev=_scan_new_gap_event(dates,highs,lows,i,min_gap_pct)
+            if ev:
+                sym_gaps.append(ev); existing_dates.add(dates[i]); new_count+=1
+        _check_gap_fills(sym_gaps,dates,closes,from_idx=start_idx)
+
+        filled_today_count+=sum(1 for g in sym_gaps if g["filled"] and g["fill_date"]==dates[-1])
+
+        # Prune filled gaps older than keep_days_after_fill (file size control)
+        sym_gaps=[g for g in sym_gaps if not (g["filled"] and g["fill_date"] and g["fill_date"]<cutoff)]
+
+        if sym_gaps: gaps_by_sym[sym]=sym_gaps
+        elif sym in gaps_by_sym: del gaps_by_sym[sym]
+        last_checked[sym]=dates[-1]
+
+    store["updated"]=today
+    store["last_checked"]=last_checked
+    await upload_str_with_manifest(client, r2_upload, "open_gaps.json",
+                                    json.dumps(store,separators=(",",":")),
+                                    schema_v=1, extra_meta={"stock_count": len(gaps_by_sym)})
+    log.info(f"  gap tracker: {sum(len(v) for v in gaps_by_sym.values())} open/recent gaps across {len(gaps_by_sym)} stocks  (+{new_count} new today, {filled_today_count} filled today)")
+    return gaps_by_sym
+
+# ══════════════════════════════════════════════════════════════
+# FOLLOW-THROUGH COUNTER
+# Condition: yesterday's daily % change >= min_pct AND today's daily
+# % change >= min_pct (back-to-back strong up days).
+# Persistent per-day count history stored in R2, independent of the
+# rolling OHLC window — mirrors the open_gaps.json pattern above.
+# ══════════════════════════════════════════════════════════════
+
+def _detect_follow_through(all_data, min_pct=3.0):
+    matches = []
+    for sym, s in all_data.items():
+        closes = s["c"]; dates = s["d"]; n = len(closes)
+        if n < 3: continue
+        c0, c1, c2 = closes[-1], closes[-2], closes[-3]   # today, yesterday, day-before
+        if c0 is None or c1 is None or c2 is None or c1 <= 0 or c2 <= 0: continue
+        today_chg = (c0 - c1) / c1 * 100
+        yday_chg  = (c1 - c2) / c2 * 100
+        if today_chg >= min_pct and yday_chg >= min_pct:
+            matches.append({
+                "symbol": sym,
+                "date": dates[-1],
+                "today_chg_pct": round(today_chg, 2),
+                "yday_chg_pct": round(yday_chg, 2),
+            })
+    return matches
+
+
+async def update_follow_through_history(client, all_data, today, min_pct=3.0, keep_days=730):
+    """
+    Persistent per-day follow-through count history.
+    Stores {date: count} independently of the rolling OHLC window, so
+    old counts survive even after those candles drop out of ohlc_*.json.
+    keep_days caps history length (default ~2 years).
+    """
+    store = await r2_download(client, "follow_through_history.json")
+    if not isinstance(store, dict) or "history" not in store:
+        store = {"history": {}}
+
+    matches = _detect_follow_through(all_data, min_pct=min_pct)
+    store["history"][today] = len(matches)
+
+    cutoff = (date.fromisoformat(today) - timedelta(days=keep_days)).isoformat()
+    store["history"] = {d: c for d, c in store["history"].items() if d >= cutoff}
+    store["updated"] = today
+
+    await upload_str_with_manifest(client, r2_upload, "follow_through_history.json",
+                                    json.dumps(store, separators=(",", ":")),
+                                    schema_v=1, extra_meta={"days": len(store["history"])})
+    log.info(f"  follow-through: {len(matches)} stocks today ({today}), history has {len(store['history'])} days")
+    return matches
+
+
+def _build_gap_state(all_data, gaps_by_sym, today, near_pct=5.0):
+    """Per-symbol CURRENT gap-down state for screener_feed."""
+    gap_state={}
+    for sym, sym_gaps in gaps_by_sym.items():
+        if sym not in all_data: continue
+        dates=all_data[sym]["d"]; highs=all_data[sym]["h"]; closes=all_data[sym]["c"]
+        ltp=next((v for v in reversed(closes) if v is not None), None)
+        if ltp is None: continue
+
+        down_gaps=[g for g in sym_gaps if g.get("direction")=="down"]
+        if not down_gaps: continue
+
+        just_filled=next((g for g in reversed(down_gaps) if g["filled"] and g["fill_date"]==today), None)
+        if just_filled:
+            gap_state[sym]={"state":"Gap Filled","direction":"down",
+                "gap_date":just_filled["gap_date"],"gap_pct":just_filled["gap_pct"],
+                "gap_top":just_filled["gap_top"],"fill_date":just_filled["fill_date"]}
+            continue
+
+        open_gap=next((g for g in reversed(down_gaps) if not g["filled"]), None)
+        if not open_gap: continue
+        level=open_gap["gap_top"]
+        if not level: continue
+
+        # Recover the gap's bottom edge (the gap-day's high) from OHLC history.
+        # gap_top alone is the FULL-FILL level (far edge) — measuring distance
+        # only to that misses stocks sitting below the whole gap zone but
+        # genuinely close to its near edge (e.g. price approaching from below).
+        gap_bottom=None
+        gd=open_gap.get("gap_date")
+        if gd in dates: gap_bottom=highs[dates.index(gd)]
+
+        def _dist_to_level(price):
+            if gap_bottom is not None and price<gap_bottom:
+                return (gap_bottom-price)/gap_bottom*100   # below the zone -> distance to near edge
+            return (level-price)/level*100                  # inside/near top -> distance to full fill
+
+        dist_pct=_dist_to_level(ltp)
+        if not (0<=dist_pct<=near_pct): continue
+
+        recent=[c for c in closes[-6:-1] if c is not None]
+        recent_near=bool(recent and len(recent)==5 and all(0<=_dist_to_level(c)<=near_pct for c in recent))
+
+        gap_state[sym]={"state":"Consolidating near Gap" if recent_near else "Near Gap",
+            "direction":"down","gap_date":open_gap["gap_date"],
+            "gap_pct":open_gap["gap_pct"],"gap_top":level,"dist_pct":round(dist_pct,2)}
+    return gap_state
+
+def _today_gap_events(gaps_by_sym, today):
+    """gap_new / gap_filled lists for backup_pattern_history — same shape as before, plus direction."""
+    gap_new=[]; gap_filled=[]
+    for sym, sym_gaps in gaps_by_sym.items():
+        for g in sym_gaps:
+            if g["gap_date"]==today:
+                gap_new.append({"symbol":sym,"direction":g["direction"],"gap_pct":g["gap_pct"],"gap_top":g["gap_top"]})
+            if g.get("fill_date")==today:
+                gap_filled.append({"symbol":sym,"direction":g["direction"],"gap_pct":g["gap_pct"],
+                    "gap_top":g["gap_top"],"gap_date":g["gap_date"]})
+    return gap_new, gap_filled
+
+
+# ══════════════════════════════════════════════════════════════
+# _build_screener_feed
+# ══════════════════════════════════════════════════════════════
+
+# Shakeout + Pause: only a LIVE pause counts (still running today). This is an
+# extra safety cap on how old the reclaim day may be, in trading sessions.
+SHAKEOUT_PAUSE_MAX_AGE = 20
+
+def _build_screener_feed(all_data, classification, rs_data, mswing_data,
+    result_calendar, sheet_data, today, hlr_map=None, pb_map=None, pat_map=None, gap_map=None, w_pb_map=None, w_hlr_map=None, m_pb_map=None, ema_shakeout_map=None, htf_map=None, vcp_map=None, ath_map=None, struct_map=None):
+    cls_map={}
+    for x in (classification or []):
+        sym=x.get("symbol") or x.get("nse_code")
+        if sym: cls_map[sym]=x
+    result_map={}
+    for date_str,syms in (result_calendar or {}).items():
+        for sym in syms:
+            if sym not in result_map or date_str>result_map[sym]: result_map[sym]=date_str
+    feed=[]
+    for sym, s in all_data.items():
+        dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]
+        closes=s["c"]; volumes=s["v"]; n=len(dates)
+        
+        if n < 2: continue   # 20 → 2, sirf pct_ch ke liye prev candle chahiye
+        
+        # Last valid close (None nahi) + uska actual date index
+        ltp_idx = next((i for i in range(n-1, -1, -1) if closes[i]), None)
+        ltp = closes[ltp_idx] if ltp_idx is not None else None
+        if not ltp: continue  # genuinely no price data ever
+        
+        prev_cls = next((closes[i] for i in range(n-2, -1, -1) if closes[i]), None)
+        today_close = closes[-1]  # None if stock didn't trade today
+        pct_ch = round((today_close - prev_cls) / prev_cls * 100, 2) if today_close and prev_cls else None
+        vol = volumes[-1] or 0
+        # 52-week high / low over the last 365 calendar days up to the latest candle (same as NSE /
+        # TradingView); 252 bars could reach further back than a year around holidays.
+        try:
+            w52_cut=(date.fromisoformat(str(dates[-1])[:10])-timedelta(days=365)).isoformat()
+            w52_start=next((i for i in range(n) if str(dates[i])[:10]>=w52_cut), max(0,n-252))
+        except (ValueError, TypeError):
+            w52_start=max(0,n-252)
+        w52_highs=[v for v in highs[w52_start:] if v is not None]; w52_lows=[v for v in lows[w52_start:] if v is not None]
+        high52=max(w52_highs) if w52_highs else None; low52=min(w52_lows) if w52_lows else None
+        whd52=round((ltp-high52)/high52*100,2) if high52 else None
+        wld52=round((ltp-low52)/low52*100,2) if low52 else None
+        new_52wh=bool(high52 and ltp>=high52); new_52wl=bool(low52 and ltp<=low52)
+        avg_vol20=sum(v for v in volumes[-21:-1] if v)/20 if n>=21 else None
+        avg_vol50=sum(v for v in volumes[-51:-1] if v)/50 if n>=51 else None
+        rvol=round(vol/avg_vol20,2) if avg_vol20 and vol else None
+        rvol50=round(vol/avg_vol50,2) if avg_vol50 and vol else None
+        trs=[]
+        for i in range(max(1,n-14),n):
+            h=highs[i]; l=lows[i]; pc=closes[i-1]
+            if None in (h,l,pc): continue
+            trs.append(max(h-l,abs(h-pc),abs(l-pc)))
+        atr14=sum(trs)/len(trs) if trs else None
+        pct_atr=round(atr14/ltp*100,2) if atr14 and ltp else None
+        cls20=[v for v in closes[-20:] if v is not None]
+        if len(cls20)>=20:
+            sma20=sum(cls20)/20; std20=(sum((x-sma20)**2 for x in cls20)/20)**0.5
+            upper=sma20+2*std20; lower=sma20-2*std20
+            pct_bbw=round((upper-lower)/sma20*100,2) if sma20 else None
+        else: pct_bbw=None
+        def ema(period):
+            if n<period: return None
+            k=2/(period+1); vals=[v for v in closes[:period] if v]
+            if not vals: return None
+            e=sum(vals)/len(vals)
+            for v in closes[period:]: e=v*k+e*(1-k) if v else e
+            return round(e,2)
+        ema10=ema(10); ema21=ema(21); ema50=ema(50); ema200=ema(200)
+        above_21=bool(ema21 and ltp>ema21); above_50=bool(ema50 and ltp>ema50); above_200=bool(ema200 and ltp>ema200)
+        gt_50_200=bool(ema50 and ema200 and ema50>ema200); gt_21_50=bool(ema21 and ema50 and ema21>ema50)
+        emad10=round((ltp-ema10)/ema10*100,2) if ema10 else None
+        emad21=round((ltp-ema21)/ema21*100,2) if ema21 else None
+        emad50=round((ltp-ema50)/ema50*100,2) if ema50 else None
+        def ret_cal(months):
+            close_then = _calendar_lookback_close(dates, closes, dates[ltp_idx], months)
+            if not close_then: return None
+            return round((ltp-close_then)/close_then*100,2)
+        mg1=ret_cal(1); mg3=ret_cal(3); mg6=ret_cal(6); mg9=ret_cal(9); mg12=ret_cal(12)
+        # 1-week return: close vs the last close on or before 7 calendar days back
+        _wk_pos=bisect.bisect_right(dates,(date.fromisoformat(dates[ltp_idx])-timedelta(days=7)).isoformat())-1
+        wg1=round((ltp-closes[_wk_pos])/closes[_wk_pos]*100,2) if _wk_pos>=0 and closes[_wk_pos] else None
+        def rng(n_days):
+            h=[v for v in highs[-n_days:] if v]; l=[v for v in lows[-n_days:] if v]
+            if not h or not l or not ltp: return None
+            return round((max(h)-min(l))/ltp*100,2)
+        range3d=rng(3); range5d=rng(5)
+        drsi=_calc_rsi([v for v in closes[-30:] if v is not None])
+        from datetime import date as dt
+        week_map={}
+        for i,(d,c) in enumerate(zip(dates,closes)):
+            if c is None: continue
+            try:
+                parts=d.split("-")
+                wk=dt.fromisoformat(f"{parts[0]}-{parts[1].zfill(2)}-{parts[2].zfill(2)}").isocalendar()[:2]
+                week_map[wk]=c
+            except: continue
+        weekly_closes=[week_map[k] for k in sorted(week_map.keys())]
+        wrsi=_calc_rsi(weekly_closes[-30:]) if len(weekly_closes)>=15 else None
+        month_map={}
+        for d,c in zip(dates,closes):
+            if c is None: continue
+            try:
+                parts=d.split("-"); mk=f"{parts[0]}-{parts[1].zfill(2)}"; month_map[mk]=c
+            except: continue
+        monthly_closes=[month_map[k] for k in sorted(month_map.keys())]
+        mrsi=_calc_rsi(monthly_closes) if len(monthly_closes)>=15 else None
+        sma_vol20=sum(v for v in volumes[-21:-1] if v)/20 if n>=21 else None
+        sma_vol50=sum(v for v in volumes[-51:-1] if v)/50 if n>=51 else None
+        turnover=None
+        if sma_vol50 and n>=51:
+            closes50=[c for c in closes[-51:-1] if c is not None]
+            if len(closes50)>=40: turnover=round((sum(closes50)/len(closes50)*sma_vol50)/10000000,2)
+        elif sma_vol20 and n>=21:
+            closes20=[c for c in closes[-21:-1] if c is not None]
+            if len(closes20)>=15: turnover=round((sum(closes20)/len(closes20)*sma_vol20)/10000000,2)
+        if turnover is None and ltp and vol: turnover=round((ltp*vol)/10000000,2)
+        sma_ref=sma_vol50 if sma_vol50 else sma_vol20
+        vd=bool(sma_ref and vol and vol<sma_ref*0.5)
+        vols_63=[v for v in volumes[-64:-1] if v]; vols_21=[v for v in volumes[-22:-1] if v]; vols_252=[v for v in volumes[-253:-1] if v]
+        hvq=bool(vols_63 and vol and vol>max(vols_63)); hvm=bool(vols_21 and vol and vol>max(vols_21))
+        hvy=bool(vols_252 and vol and vol>max(vols_252)); lvq=bool(vols_63 and vol and vol<min(vols_63))
+        lvm=bool(vols_21 and vol and vol<min(vols_21)); lvy=bool(vols_252 and vol and vol<min(vols_252))
+        unusual_vol_idx=None
+        if vols_252:
+            max_vol_252=max(volumes[-252:])
+            for i in range(n-1,max(n-22,0),-1):
+                if volumes[i] and volumes[i]>=max_vol_252*0.95: unusual_vol_idx=i; break
+        vol_footprint=bool((hvq or hvm or hvy or (rvol and rvol>=5.0)) and (unusual_vol_idx is not None and (n-1-unusual_vol_idx)<=21))
+        def ema_series(arr, period):
+            if len(arr)<period: return [None]*len(arr)
+            result=[None]*len(arr); k=2/(period+1)
+            vals=[v for v in arr[:period] if v]
+            if not vals: return result
+            result[period-1]=sum(vals)/len(vals)
+            for i in range(period,len(arr)):
+                v=arr[i]; result[i]=v*k+result[i-1]*(1-k) if v and result[i-1] else result[i-1]
+            return result
+        atr_tightness=bool(range3d is not None and pct_atr is not None and ema50 is not None and range3d<=pct_atr and ltp>ema50)
+        candle_range=highs[-1]-lows[-1] if highs[-1] and lows[-1] else 0
+        close_pos=(ltp-lows[-1])/candle_range if candle_range>0 else 0
+        bs=bool(rvol and rvol>=2.0 and closes[-2] and ltp>closes[-2] and close_pos>=0.65)
+        down_vols_20=[volumes[i] for i in range(max(0,n-21),n-1) if closes[i] is not None and opens[i] is not None and closes[i]<opens[i] and volumes[i]]
+        max_down_vol=max(down_vols_20) if down_vols_20 else 0
+        pp=bool(opens[-1] and ltp>opens[-1] and vol and vol>max_down_vol and close_pos>=0.5)
+        mcp_high=mcp_low=None; seen_mothers=set()
+        for m_idx in range(n-4,max(0,n-60),-1):
+            mh=highs[m_idx]; ml=lows[m_idx]
+            if mh is None or ml is None: continue
+            mk=round(mh*200)
+            if mk in seen_mothers: continue
+            baby_count=0; intact=True
+            for b in range(m_idx+1,n):
+                if highs[b] is None or lows[b] is None: continue
+                if highs[b]>mh or lows[b]<ml: intact=False; break
+                baby_count+=1
+            if baby_count>=3 and intact: seen_mothers.add(mk); mcp_high=mh; mcp_low=ml; break
+        mcp_flag=mcp_high is not None
+        launchpad=bool(mcp_flag and ema10 and ema21 and ema50 and mcp_low<=ema10<=mcp_high and mcp_low<=ema21<=mcp_high and mcp_low<=ema50<=mcp_high)
+        gap_info=(gap_map or {}).get(sym,{})
+        gap_fill_state=gap_info.get("state")
+        rs_info=rs_data.get(sym,{}); ms_info=mswing_data.get(sym,{})
+        cls_info=cls_map.get(sym,{}); sh_info=sheet_data.get(sym,{})
+        IDX_SHORT={"nifty50":"n50","nifty500":"n500","smallmid400":"sm400"}
+        rs_idx={}
+        for ikey,short in IDX_SHORT.items():
+            rs_idx[f"rs_val_{short}"]=rs_info.get(f"rs_val_{ikey}"); rs_idx[f"rs_nh21_{short}"]=rs_info.get(f"rs_nh_21_{ikey}")
+            rs_idx[f"rs_nl21_{short}"]=rs_info.get(f"rs_nl_21_{ikey}"); rs_idx[f"rs_div21_{short}"]=rs_info.get(f"rs_div_21_{ikey}")
+            rs_idx[f"rs_nh50_{short}"]=rs_info.get(f"rs_nh_50_{ikey}"); rs_idx[f"rs_nl50_{short}"]=rs_info.get(f"rs_nl_50_{ikey}")
+            rs_idx[f"rs_div50_{short}"]=rs_info.get(f"rs_div_50_{ikey}")
+        result_date=result_map.get(sym)
+        ath_info=(ath_map or {}).get(sym,{})
+        ath_val=ath_info.get("ath")
+        ath_off_pct=round((ltp-ath_val)/ath_val*100,2) if ath_val else None
+        # tv_code fallback: sheet_data.json (sh_info) is NSE-only legacy data,
+        # so it has no entry for BSE stocks — falling back to a hardcoded
+        # "NSE:{sym}," put an "NSE:" prefix on BSE numeric scrip codes
+        # (e.g. "NSE:500012,"), which isn't a real TradingView symbol and
+        # breaks the chart for every BSE stock. Build the fallback from
+        # classification.json's own exchange + trading_symbol instead — the
+        # real readable BSE trading symbol, correctly exchange-prefixed.
+        _cls_exch=cls_info.get("exchange") or "NSE"
+        _cls_tv_sym=cls_info.get("trading_symbol") or sym
+        row={"symbol":sym,"name":cls_info.get("name",""),
+            "tv_code":sh_info.get("tv_code") or f"{_cls_exch}:{_cls_tv_sym},",
+            "trading_symbol":cls_info.get("trading_symbol"),
+            # Explicit field for the frontend's All/NSE/BSE filter — safer
+            # than parsing the "NSE:"/"BSE:" prefix back out of tv_code.
+            "exchange":_cls_exch,
+            # Actual market-data date for this row. Never use the pipeline run
+            # date here: weekend/holiday runs must still identify the latest
+            # trading session represented by the OHLC values.
+            "date":dates[ltp_idx], "as_of_date":dates[ltp_idx],
+            "sector":cls_info.get("sector_group",""),"industry":cls_info.get("display_industry",""),
+            "mcap":cls_info.get("market_cap_cr"),"themes":cls_info.get("themes",[]),
+            "ltp":ltp,"pct_ch":pct_ch,"volume":vol,"rvol":rvol,"rvol50":rvol50,
+            "high":highs[-1],"low":lows[-1],
+            "avg_vol20":round(avg_vol20) if avg_vol20 else None,"avg_vol50":round(avg_vol50) if avg_vol50 else None,
+            "high52":high52,"low52":low52,"52whd":whd52,"52wld":wld52,"new_52wh":new_52wh,"new_52wl":new_52wl,
+            "ath":ath_val,"ath_date":ath_info.get("ath_date"),"ath_off_pct":ath_off_pct,
+            "pct_atr":pct_atr,"pct_bbw":pct_bbw,"ema10":ema10,"ema21":ema21,"ema50":ema50,"ema200":ema200,
+            "emad10":emad10,"emad21":emad21,"emad50":emad50,"above_21":above_21,"above_50":above_50,"above_200":above_200,
+            "gt_50_200":gt_50_200,"gt_21_50":gt_21_50,"1wg":wg1,"1mg":mg1,"3mg":mg3,"6mg":mg6,"9mg":mg9,"12mg":mg12,
+            "range3d":range3d,"range5d":range5d,"drsi":drsi,"wrsi":wrsi,"mrsi":mrsi,
+            "rs_rating":rs_info.get("rs"),"mswing":ms_info.get("mswing"),"mswing_avg9":ms_info.get("mswing_avg9"),
+            **rs_idx,"sales_ch":None,"eps_ch":None,"patterns":"","results":result_date,
+            "vd":vd,"hvq":hvq,"hvm":hvm,"hvy":hvy,"lvq":lvq,"lvm":lvm,"lvy":lvy,"to":turnover,
+            "vol_footprint":vol_footprint,"atr_tightness":atr_tightness,"bs":bs,"pp":pp,
+            "mcp":mcp_flag,"mcp_high":mcp_high,"mcp_low":mcp_low,"launchpad":launchpad,
+            "gap_fill":gap_fill_state,"gap_direction":gap_info.get("direction"),"gap_date":gap_info.get("gap_date"),
+            "gap_pct":gap_info.get("gap_pct"),"gap_top":gap_info.get("gap_top"),"gap_fill_date":gap_info.get("fill_date"),
+            "ib":"Inside Bar" in (pat_map or {}).get(sym,set()),"dib":"Double Inside Bar" in (pat_map or {}).get(sym,set()),
+            "nr7":"NR7" in (pat_map or {}).get(sym,set()),"wib":"Weekly IB" in (pat_map or {}).get(sym,set()),
+            "w_dib":"Weekly Double IB" in (pat_map or {}).get(sym,set()),"w_nr7":"Weekly NR7" in (pat_map or {}).get(sym,set()),
+            "w_3tc":"Weekly Tight Close" in (pat_map or {}).get(sym,set()),
+            "hlr_state":(hlr_map or {}).get(sym,{}).get("state"),"hlr_res":(hlr_map or {}).get(sym,{}).get("resistance"),
+            "hlr_dist":(hlr_map or {}).get(sym,{}).get("dist_pct"),"hlr_touches":(hlr_map or {}).get(sym,{}).get("touches"),
+            "pullback":sym in (pb_map or {}),"circuit":sh_info.get("circuit"),"hpbc":sh_info.get("hpbc"),"tl_hl_bo":sh_info.get("tl_hl_bo"),
+            "w_pullback":sym in (w_pb_map or {}),"w_pullback_date":(w_pb_map or {}).get(sym,{}).get("signal_date"),
+            "w_pullback_ema":(w_pb_map or {}).get(sym,{}).get("signal_ema"),
+            "w_hlr_state":(w_hlr_map or {}).get(sym,{}).get("state"),"w_hlr_res":(w_hlr_map or {}).get(sym,{}).get("resistance"),
+            "w_hlr_dist":(w_hlr_map or {}).get(sym,{}).get("dist_pct"),"w_hlr_touches":(w_hlr_map or {}).get(sym,{}).get("touches"),
+            "m_pullback":sym in (m_pb_map or {}),"m_pullback_date":(m_pb_map or {}).get(sym,{}).get("date"),
+            "m_pullback_ema":(m_pb_map or {}).get(sym,{}).get("ema_touch")}
+        # HH-HL / LL-LH and consolidation (structure_scan.py), daily + weekly
+        if struct_map and sym in struct_map: row.update(struct_map[sym])
+        _es_cats=(ema_shakeout_map or {}).get(sym)
+        if _es_cats:
+            _es_today=[cat for cat,rec in _es_cats.items() if rec.get("recovery_date")==today]
+            row["ema_shakeout"]=bool(_es_today)
+            row["ema_shakeout_cats"]=_es_today or list(_es_cats.keys())
+            # ─── NEW: shakeout PAUSE fields — shakeout_scanner.py now tags each
+            # signal with pause_days/pause_valid/pause_clean (whether the base
+            # right after the reclaim day stayed tight — see shakeout_scanner.py's
+            # _detect_pause). Surface that here so the frontend can build a
+            # "Shakeout + Pause" filter without re-fetching shakeout_signals.json
+            # itself. ───
+            # shakeout_signals.json keeps old signals, which made ~40% of stocks
+            # show a pause — only live pauses are kept (see _so_live).
+            def _so_age(rec):
+                rd=rec.get("recovery_date")
+                if not rd: return None
+                return sum(1 for d in dates if d and d>rd)   # sessions since the reclaim day (0 = today)
+            # LIVE pause only: the pause must still be running today, i.e. it
+            # covers every session since the reclaim day (age <= pause_days).
+            # A pause that already ended (breakout or breakdown since) has
+            # age > pause_days and is historical — not shown.
+            def _so_live(rec):
+                a=_so_age(rec); pd=rec.get("pause_days")
+                return a is not None and pd is not None and a<=SHAKEOUT_PAUSE_MAX_AGE and a<=pd
+            _fresh={cat:rec for cat,rec in _es_cats.items() if _so_live(rec)}
+            _ages=[_so_age(rec) for rec in _es_cats.values() if _so_age(rec) is not None]
+            row["shakeout_age"]=min(_ages) if _ages else None
+            _pause_cats=[cat for cat,rec in _fresh.items() if rec.get("pause_valid")]
+            _pause_clean_cats=[cat for cat,rec in _fresh.items() if rec.get("pause_clean")]
+            _pause_days_vals=[rec.get("pause_days") for cat,rec in _fresh.items() if cat in _pause_cats and rec.get("pause_days") is not None]
+            row["shakeout_pause"]=bool(_pause_cats)
+            row["shakeout_pause_clean"]=bool(_pause_clean_cats)
+            row["shakeout_pause_cats"]=_pause_cats
+            row["shakeout_pause_days"]=max(_pause_days_vals) if _pause_days_vals else None
+        else:
+            row["ema_shakeout"]=False; row["ema_shakeout_cats"]=[]; row["shakeout_age"]=None
+            row["shakeout_pause"]=False; row["shakeout_pause_clean"]=False
+            row["shakeout_pause_cats"]=[]; row["shakeout_pause_days"]=None
+        _htf_rec=(htf_map or {}).get(sym,{}).get("HTF")
+        _mhtf_rec=(htf_map or {}).get(sym,{}).get("MiniHTF")
+        row["htf_status"]=_htf_rec.get("status") if _htf_rec else None
+        row["htf_forming"]=bool(_htf_rec and _htf_rec.get("status")=="forming")
+        row["htf_pole_gain"]=_htf_rec.get("pole_gain_pct") if _htf_rec else None
+        row["mini_htf_status"]=_mhtf_rec.get("status") if _mhtf_rec else None
+        row["mini_htf_forming"]=bool(_mhtf_rec and _mhtf_rec.get("status")=="forming")
+        row["mini_htf_pole_gain"]=_mhtf_rec.get("pole_gain_pct") if _mhtf_rec else None
+        row["is_vcp"]=bool((vcp_map or {}).get(sym,{}).get("is_vcp"))
+        feed.append(row)
+    log.info(f"screener_feed: {len(feed)} stocks")
+    return feed
+
+
+# ══════════════════════════════════════════════════════════════
+# STOCK EVENTS — "what is new" per stock, for the screener's NEW tag,
+# its hover list and (later) preset alerts. Each row gets
+#   "ev": [[type, date, detail], ...]   (newest first, key left out when empty)
+# covering the last EVENT_WINDOW_SESSIONS sessions of that stock.
+#   stg  Weinstein stage change      (weinstein_transitions.json, date = Monday of the week)
+#   box  Box Finder breakout          (box_finder.json box_history[].breakout_date)
+#   h52  new 52-week high             (OHLC, 365 calendar days, latest such day)
+#   ath  new all-time high            (ath_date)
+#   rcl  close reclaimed EMA50        (OHLC; crossed above from at/below and still above today)
+#   ep   episodic pivot               (EP signals, not Dead)
+#   pb / wpb / mpb  pullback D / W / M (signal dates)
+#   so   EMA shakeout reclaim         (shakeout_signals recovery_date)
+#   mv   new Minervini Trend Template pass
+#   vcp / htf / mhtf  state entry: on today, off in the previous session's feed
+# Events of earlier days are carried over from the previous history feed, so
+# state-entry events (vcp / htf / mv) stay listed for the whole window.
+# Workflow order: minervini_scan, weinstein_scan and box_scan run before ep_scan.
+# ══════════════════════════════════════════════════════════════
+EVENT_WINDOW_SESSIONS = 10
+
+
+def _ev_ema_series(closes, period):
+    out = [None] * len(closes); k = 2 / (period + 1); e = None; seen = []
+    for i, v in enumerate(closes):
+        if v is None:
+            out[i] = e; continue
+        if e is None:
+            seen.append(v)
+            if len(seen) == period: e = sum(seen) / period
+        else:
+            e = v * k + e * (1 - k)
+        out[i] = e
+    return out
+
+
+def _ev_ohlc(s, win_start_idx):
+    """New 52W high and EMA50 reclaim from one stock's OHLC -> list of events."""
+    out = []
+    dates, highs, closes = s.get("d") or [], s.get("h") or [], s.get("c") or []
+    n = len(dates)
+    if n < 60: return out
+    # latest session in the window whose high is >= every high of the previous 365 days
+    for i in range(n - 1, win_start_idx - 1, -1):
+        h = highs[i]
+        if h is None: continue
+        try: cut = (date.fromisoformat(str(dates[i])[:10]) - timedelta(days=365)).isoformat()
+        except (ValueError, TypeError): continue
+        j = bisect.bisect_left(dates, cut, 0, i)
+        prev = [v for v in highs[j:i] if v is not None]
+        if len(prev) >= 120 and h >= max(prev):
+            out.append(["h52", dates[i], round(h, 2)]); break
+    # EMA50 reclaim: latest cross from at/below to above inside the window, still above today
+    m = _ev_ema_series(closes, 50)
+    if closes[-1] is not None and m[-1] is not None and closes[-1] > m[-1]:
+        for i in range(n - 1, max(win_start_idx, 1) - 1, -1):
+            c0, c1, m0, m1 = closes[i - 1], closes[i], m[i - 1], m[i]
+            if None in (c0, c1, m0, m1): break
+            if c0 <= m0 and c1 > m1:
+                out.append(["rcl", dates[i], "EMA50"]); break
+    return out
+
+
+def _attach_stock_events(feed, all_data, today, prev_feed=None, wtrans=None, box_raw=None,
+                         mv_raw=None, ep_signals=None, pb_map=None, w_pb_map=None, m_pb_map=None,
+                         ema_shakeout_map=None):
+    prev_rows = {r.get("symbol"): r for r in (prev_feed or []) if isinstance(r, dict)}
+    prev_date = next((r.get("as_of_date") for r in (prev_feed or []) if isinstance(r, dict) and r.get("as_of_date")), None)
+    # stage changes by symbol: [(monday, "1>2"), ...]
+    stg = {}
+    for wk, rows in (wtrans or {}).items():
+        for t in rows or []:
+            sym = t.get("symbol")
+            if sym and t.get("from_stage") is not None and t.get("to_stage") is not None:
+                stg.setdefault(sym, []).append((wk, f"{t['from_stage']}>{t['to_stage']}"))
+    box_hist = (box_raw or {}).get("box_history") or {}
+    mv_new = set((mv_raw or {}).get("new_today") or [])
+    mv_date = (mv_raw or {}).get("updated") or today
+    ep_by = {}
+    for sig in ep_signals or []:
+        if sig.get("state") == "Dead" or not sig.get("ep_date"): continue
+        ep_by.setdefault(sig["symbol"], []).append(sig["ep_date"])
+    n_ev = 0
+    for row in feed:
+        sym = row["symbol"]; s = all_data.get(sym) or {}
+        dates = s.get("d") or []
+        if not dates: continue
+        wi = max(0, len(dates) - EVENT_WINDOW_SESSIONS)
+        wstart = str(dates[wi])[:10]
+        ev = []
+        ev += _ev_ohlc(s, wi)
+        for wk, lab in stg.get(sym, []):
+            try: wk_end = (date.fromisoformat(wk) + timedelta(days=4)).isoformat()
+            except (ValueError, TypeError): continue
+            if wk_end >= wstart: ev.append(["stg", wk, lab])
+        for b in box_hist.get(sym) or []:
+            bd = b.get("breakout_date")
+            if bd and bd >= wstart: ev.append(["box", bd, b.get("base_length_candles")])
+        if row.get("ath_date") and str(row["ath_date"])[:10] >= wstart:
+            ev.append(["ath", str(row["ath_date"])[:10], row.get("ath")])
+        for d in ep_by.get(sym, []):
+            if d >= wstart: ev.append(["ep", d, None])
+        d = ((pb_map or {}).get(sym) or {}).get("date")
+        if d and d >= wstart: ev.append(["pb", d, None])
+        d = ((w_pb_map or {}).get(sym) or {}).get("signal_date")
+        if d and d >= wstart: ev.append(["wpb", d, None])
+        d = ((m_pb_map or {}).get(sym) or {}).get("date")
+        if d and d >= wstart: ev.append(["mpb", d, None])
+        for cat, rec in ((ema_shakeout_map or {}).get(sym) or {}).items():
+            d = rec.get("recovery_date")
+            if d and d >= wstart: ev.append(["so", d, cat])
+        if sym in mv_new: ev.append(["mv", mv_date, None])
+        # state entry vs the previous session's feed (skipped when that feed is missing)
+        pr = prev_rows.get(sym)
+        if pr is not None and prev_date and prev_date < today:
+            if row.get("is_vcp") and not pr.get("is_vcp"): ev.append(["vcp", today, None])
+            if row.get("htf_status") and row.get("htf_status") != pr.get("htf_status"): ev.append(["htf", today, row.get("htf_status")])
+            if row.get("mini_htf_status") and row.get("mini_htf_status") != pr.get("mini_htf_status"): ev.append(["mhtf", today, row.get("mini_htf_status")])
+        # carry over the previous feed's events that are still inside the window
+        if pr is not None:
+            for e in pr.get("ev") or []:
+                if isinstance(e, list) and len(e) >= 2 and str(e[1]) >= wstart: ev.append(list(e))
+        seen, uniq = set(), []
+        for e in sorted(ev, key=lambda x: str(x[1]), reverse=True):
+            k = (e[0], str(e[1]))
+            if k in seen: continue
+            seen.add(k); uniq.append(e)
+        if uniq:
+            row["ev"] = uniq; n_ev += 1
+        else:
+            row.pop("ev", None)
+    log.info(f"Stock events: {n_ev} stocks with an event in the last {EVENT_WINDOW_SESSIONS} sessions")
+
+
+async def _load_event_sources(client, market_data_date):
+    """weinstein_transitions, box_finder, minervini and the previous session's history feed."""
+    wtrans, box_raw, mv_raw, manifest = await asyncio.gather(
+        r2_download(client, "weinstein_transitions.json"), r2_download(client, "box_finder.json"),
+        r2_download(client, "minervini_trend_template.json"), r2_download(client, "history/manifest.json"),
+        return_exceptions=True)
+    clean = lambda x: x if isinstance(x, dict) else None
+    prev_feed = None
+    dates = (clean(manifest) or {}).get("dates") or []
+    prev = [d for d in dates if d < market_data_date]
+    if prev:
+        try:
+            pf = await r2_download(client, f"history/screener_feed_{prev[-1]}.json")
+            prev_feed = pf if isinstance(pf, list) else None
+        except Exception as e:
+            log.warning(f"Stock events: previous feed {prev[-1]} not loaded: {e}")
+    return clean(wtrans), clean(box_raw), clean(mv_raw), prev_feed
+
+
+
+# ══════════════════════════════════════════════════════════════
+# SCAN HISTORY — daily dated snapshot of screener_feed.json so the
+# frontend can let users browse past days' scan results ("yesterday
+# ka data"). Independent of the live screener_feed.json which always
+# holds only the latest snapshot.
+#
+# Stored as: history/screener_feed_YYYY-MM-DD.json
+# Index at:  history/manifest.json  → {"dates": [...], "updated": "..."}
+#
+# NOTE: this only trims the *manifest* (so old dates stop being listed/
+# offered in the frontend dropdown) — it does NOT delete the underlying
+# R2 objects, since r2_upload/r2_download here have no delete endpoint.
+# If you want old blobs physically removed too, either add a DELETE
+# route to the Cloudflare Worker, or set an R2 lifecycle rule on the
+# "history/" prefix in the Cloudflare dashboard.
+# ══════════════════════════════════════════════════════════════
+
+HISTORY_KEEP_DAYS = 90  # how many past days stay visible in the History dropdown
+
+async def archive_screener_feed_history(client, screener_feed, today, keep_days=HISTORY_KEEP_DAYS):
+    fname = f"history/screener_feed_{today}.json"
+    await r2_upload(client, fname, json.dumps(screener_feed))
+
+    manifest = await r2_download(client, "history/manifest.json")
+    dates = set(manifest.get("dates", [])) if isinstance(manifest, dict) else set()
+    dates.add(today)
+
+    cutoff = (date.fromisoformat(today) - timedelta(days=keep_days)).isoformat()
+    dates = {d for d in dates if d >= cutoff}
+
+    await r2_upload(client, "history/manifest.json", json.dumps({
+        "dates": sorted(dates), "updated": today,
+    }))
+    log.info(f"  🗄  history: saved {fname}  (manifest now has {len(dates)} dates)")
+
+
+# ══════════════════════════════════════════════════════════════
+# SIGNAL LEDGER — history/signals_<date>.json (Historical Screener plan, Phase 2)
+# One compact record per session of every scan hit per stock, including the scans
+# whose own files keep only "today" (Box status, VCP, HTF, shakeout, EP state, stage,
+# Minervini). With it a past date (History mode, +NEW, preset alerts) can answer
+# "was X a VCP / Box BO / Stage 2 on that day" instead of reading today's files.
+# Written by ep_scan after every other scan of the day has run (see the workflow order).
+# Keys per stock (only the ones that are set):
+#   box  [status, depth %, dist %, length, start]  status: BO | NBO (Near BO) | CNB (Consolidation near BO) | BF (Box forming)
+#   stg  Weinstein stage (1-4)          stw  weeks in that stage
+#   mv   1 = Minervini Trend Template pass       mvn  1 = new pass today
+#   ep   EP state (not Dead)            epd  its EP date      ept  EP type
+#   vcp  1
+#   htf / mhtf  [status, pole gain %, flag end date]   (HTF / Mini HTF, latest flag)
+#   so   {category: recovery date}       sop  [pause, clean, pause days]
+#   pb / wpb / mpb  1 = daily / weekly / monthly pullback
+#   hlr / whlr  HLR state (daily / weekly)
+#   pat  patterns of the day (same strings as the feed's "patterns")
+# ══════════════════════════════════════════════════════════════
+LEDGER_BOX_CODE = {"BO": "BO", "Near BO": "NBO", "Consolidation Near BO": "CNB", "Box Forming": "BF"}
+
+
+def _r1(v):
+    try: return round(float(v), 1)
+    except (TypeError, ValueError): return None
+
+
+def _ledger_box_entries(box_raw):
+    """box_finder.json payload -> {symbol: [status code, depth %, distance %, length, start]}."""
+    out = {}
+    hist = (box_raw or {}).get("box_history") or {}
+    for st in (box_raw or {}).get("stocks") or []:
+        sym, code = st.get("symbol"), LEDGER_BOX_CODE.get(st.get("status"))
+        if not sym or not code: continue
+        depth = None
+        for b in reversed(hist.get(sym) or []):
+            if b.get("start_date") == st.get("start_date") and abs((b.get("upper") or 0) - (st.get("upper") or 0)) < 1e-6:
+                depth = b.get("depth_pct"); break
+        if depth is None and (st.get("upper") or 0) > 0 and (st.get("lower") or 0) > 0:
+            depth = (st["upper"] - st["lower"]) / st["upper"] * 100
+        out[sym] = [code, _r1(depth), _r1(st.get("distance_pct")), st.get("base_length_candles"), st.get("start_date")]
+    return out
+
+
+def _ohlc_asof(all_data, day, keep=400, dkeys=None):
+    """Every stock's series cut at `day` (its last `keep` bars; box_finder looks back at most 320).
+    dkeys: {symbol: ['YYYY-MM-DD', ...]} built once by the caller when cutting at many dates."""
+    out = {}
+    for sym, s in all_data.items():
+        d = s.get("d") or []
+        if not d: continue
+        dk = dkeys.get(sym) if dkeys else None
+        i = bisect.bisect_right(dk if dk is not None else [str(x)[:10] for x in d], day)
+        if i <= 0: continue
+        lo = max(0, i - keep)
+        out[sym] = {k: (v[lo:i] if isinstance(v, list) and len(v) == len(d) else v) for k, v in s.items()}
+    return out
+
+
+def _build_signal_ledger(feed, day, box_raw=None, stages_raw=None, mv_raw=None, ep_signals=None,
+                         htf_map=None, ema_shakeout_map=None):
+    out = {}
+    def put(sym, k, v):
+        if v is None or v is False or v == "" or v == [] or v == {}: return
+        out.setdefault(sym, {})[k] = v
+    # Box Finder: current status of every stock with a live box (depth like base_scan.js)
+    for sym, entry in _ledger_box_entries(box_raw).items(): put(sym, "box", entry)
+    # Weinstein stage (weekly scan)
+    for x in (stages_raw or {}).get("signals") or []:
+        if x.get("symbol") and x.get("stage") in (1, 2, 3, 4):
+            put(x["symbol"], "stg", x["stage"]); put(x["symbol"], "stw", x.get("weeks_in_stage"))
+    # Minervini Trend Template
+    mv_new = set((mv_raw or {}).get("new_today") or [])
+    for x in (mv_raw or {}).get("signals") or []:
+        if x.get("symbol"):
+            put(x["symbol"], "mv", 1)
+            if x["symbol"] in mv_new: put(x["symbol"], "mvn", 1)
+    # EP: latest EP of the stock that is not Dead
+    for sig in sorted(ep_signals or [], key=lambda z: z.get("ep_date") or ""):
+        sym = sig.get("symbol")
+        if not sym or sig.get("state") == "Dead" or not sig.get("ep_date"): continue
+        put(sym, "ep", sig.get("state") or "Live"); put(sym, "epd", sig.get("ep_date")); put(sym, "ept", sig.get("ep_type"))
+    # HTF / Mini HTF (latest flag of each)
+    for sym, cats in (htf_map or {}).items():
+        for cat, key in (("HTF", "htf"), ("MiniHTF", "mhtf")):
+            r = (cats or {}).get(cat)
+            if r: put(sym, key, [r.get("status"), _r1(r.get("pole_gain_pct")), r.get("flag_end_date")])
+    # Shakeout: recovery date per category (the screener checks recovery_date == the day)
+    for sym, cats in (ema_shakeout_map or {}).items():
+        so = {cat: rec.get("recovery_date") for cat, rec in (cats or {}).items() if rec.get("recovery_date")}
+        put(sym, "so", so)
+    # Everything the feed row already knows for the day
+    for row in feed or []:
+        sym = row.get("symbol")
+        if not sym: continue
+        if row.get("is_vcp"): put(sym, "vcp", 1)
+        if row.get("shakeout_pause"): put(sym, "sop", [1, 1 if row.get("shakeout_pause_clean") else 0, row.get("shakeout_pause_days")])
+        if row.get("pullback"): put(sym, "pb", 1)
+        if row.get("w_pullback"): put(sym, "wpb", 1)
+        if row.get("m_pullback"): put(sym, "mpb", 1)
+        put(sym, "hlr", row.get("hlr_state")); put(sym, "whlr", row.get("w_hlr_state"))
+        pats = [p for p in str(row.get("patterns") or "").split("||") if p]
+        put(sym, "pat", pats)
+    return {"v": 1, "date": day, "updated": day, "count": len(out), "stocks": out}
+
+
+# ── Backfill for the days that already have a feed snapshot ──────────────
+#   python pipeline.py ledger_backfill [FROM] [TO] [--force]
+# Rebuilds history/signals_<D>.json for every date in history/manifest.json (or FROM..TO)
+# from files that already keep the past: the day's feed snapshot (VCP, pullback, HLR,
+# patterns, HTF status, shakeout pause), weinstein_stage_history.json (week on/before D),
+# minervini_history_<year>.json, shakeout_signals.json and ep_signals.json (dated signals).
+# No scan is re-run. What cannot be known for D is left out and listed in "partial":
+#   box       only when box_finder.py cannot be imported; otherwise Box Finder is re-run on the
+#             daily OHLC cut at D (build_box_finder, same rules as box_scan; ~5 s per date)
+#   ep_state  only the EP date / type; Runner / Watch / Dead is today's, not D's
+#   stg / mv  no stage week / Minervini entry on or before D
+# Dates that already have a ledger are skipped unless --force.
+def _backfill_ledger(feed, day, stage_hist=None, mv_hist=None, shakeout_raw=None, ep_raw=None, box_raw=None):
+    out = {}
+    partial = ["ep_state"] + ([] if box_raw else ["box"])
+    def put(sym, k, v):
+        if v is None or v is False or v == "" or v == [] or v == {}: return
+        out.setdefault(sym, {})[k] = v
+    # feed snapshot of the day
+    for row in feed or []:
+        sym = row.get("symbol")
+        if not sym: continue
+        if row.get("is_vcp"): put(sym, "vcp", 1)
+        if row.get("htf_status"): put(sym, "htf", [row.get("htf_status"), _r1(row.get("htf_pole_gain")), None])
+        if row.get("mini_htf_status"): put(sym, "mhtf", [row.get("mini_htf_status"), _r1(row.get("mini_htf_pole_gain")), None])
+        if row.get("shakeout_pause"): put(sym, "sop", [1, 1 if row.get("shakeout_pause_clean") else 0, row.get("shakeout_pause_days")])
+        if row.get("pullback"): put(sym, "pb", 1)
+        if row.get("w_pullback"): put(sym, "wpb", 1)
+        if row.get("m_pullback"): put(sym, "mpb", 1)
+        put(sym, "hlr", row.get("hlr_state")); put(sym, "whlr", row.get("w_hlr_state"))
+        put(sym, "pat", [p for p in str(row.get("patterns") or "").split("||") if p])
+    # Weinstein: the latest week on or before the day (keys are Mondays)
+    weeks = sorted(w for w in (stage_hist or {}) if w <= day)
+    if weeks:
+        for sym, r in (stage_hist[weeks[-1]] or {}).items():
+            if isinstance(r, dict): put(sym, "stg", r.get("stage")); put(sym, "stw", r.get("weeks_in_stage"))
+            elif isinstance(r, int): put(sym, "stg", r)
+    else: partial.append("stg")
+    # Minervini: the day's own entry (+ new vs the prior stored date)
+    if mv_hist and day in mv_hist:
+        today_syms = set(_mv_hist_symbols(mv_hist[day]))
+        prior = sorted(d for d in mv_hist if d < day)
+        prior_syms = set(_mv_hist_symbols(mv_hist[prior[-1]])) if prior else None
+        for sym in today_syms:
+            put(sym, "mv", 1)
+            if prior_syms is not None and sym not in prior_syms: put(sym, "mvn", 1)
+    else: partial.append("mv")
+    # Shakeout: per category the latest recovery on or before the day
+    so = {}
+    for sig in (shakeout_raw or {}).get("signals") or []:
+        sym, rd = sig.get("symbol"), sig.get("recovery_date")
+        if not sym or not rd or rd > day: continue
+        cat = "Combo" if sig.get("compound") else f"EMA{(sig.get('ema_periods') or [0])[0]}"
+        if rd > so.setdefault(sym, {}).get(cat, ""): so[sym][cat] = rd
+    for sym, cats in so.items(): put(sym, "so", cats)
+    # EP: latest EP dated on or before the day (state unknown for the past)
+    for sig in sorted((ep_raw or {}).get("signals") or [], key=lambda z: z.get("ep_date") or ""):
+        sym, ed = sig.get("symbol"), sig.get("ep_date")
+        if not sym or not ed or ed > day: continue
+        put(sym, "epd", ed); put(sym, "ept", sig.get("ep_type"))
+    # Box Finder re-run on the OHLC cut at the day (same rules as the daily box_scan)
+    for sym, entry in _ledger_box_entries(box_raw).items(): put(sym, "box", entry)
+    return {"v": 1, "date": day, "updated": today_ist(), "src": "backfill", "partial": partial, "count": len(out), "stocks": out}
+
+
+async def run_ledger_backfill(date_from=None, date_to=None, force=False) -> None:
+    log.info(f"━━━ Signal ledger backfill  {date_from or 'start'} → {date_to or 'end'}{'  (force)' if force else ''} ━━━")
+    async with httpx.AsyncClient() as client:
+        manifest = await r2_download(client, "history/manifest.json")
+        dates = sorted((manifest or {}).get("dates") or [])
+        dates = [d for d in dates if (not date_from or d >= date_from) and (not date_to or d <= date_to)]
+        if not dates:
+            log.info("No snapshot dates in range — nothing to do"); return
+        stage_hist, shakeout_raw, ep_raw = await asyncio.gather(
+            r2_download(client, "weinstein_stage_history.json"), r2_download(client, "shakeout_signals.json"),
+            r2_download(client, "ep_signals.json"))
+        mv_by_year = {}
+        for y in sorted({d[:4] for d in dates}):
+            h = await r2_download(client, f"minervini_history_{y}.json")
+            mv_by_year[y] = h if isinstance(h, dict) else {}
+        try:
+            from box_finder import build_box_finder
+        except Exception as e:
+            build_box_finder = None
+            log.warning(f"box_finder not available ({e}) — ledgers without Box status")
+        all_data = await download_all_chunks(client) if build_box_finder else {}
+        dkeys = {sym: [str(x)[:10] for x in (s.get("d") or [])] for sym, s in all_data.items()}
+        done = skipped = missing = 0
+        for d in dates:
+            try: old = await r2_download(client, f"history/signals_{d}.json")
+            except Exception: old = None
+            if old and (not force or old.get("src") != "backfill"):
+                skipped += 1; continue          # a ledger written by ep_scan that day is never replaced
+            feed = await r2_download(client, f"history/screener_feed_{d}.json")
+            if not isinstance(feed, list) or not feed:
+                log.warning(f"  {d}: no feed snapshot — skipped"); missing += 1; continue
+            box_raw = None
+            if build_box_finder:
+                try: box_raw = build_box_finder(_ohlc_asof(all_data, d, dkeys=dkeys), asof=d)
+                except Exception as e: log.warning(f"  {d}: box_finder failed: {e}")
+            ledger = _backfill_ledger(feed, d, stage_hist=stage_hist if isinstance(stage_hist, dict) else None,
+                                      mv_hist=mv_by_year.get(d[:4]), shakeout_raw=shakeout_raw if isinstance(shakeout_raw, dict) else None,
+                                      ep_raw=ep_raw if isinstance(ep_raw, dict) else None, box_raw=box_raw)
+            await archive_signal_ledger(client, ledger, d)
+            log.info(f"  {d}: {ledger['count']} stocks, partial={ledger['partial']}")
+            done += 1
+            del feed
+        log.info(f"━━━ Ledger backfill complete: {done} written, {skipped} already there, {missing} without a snapshot ━━━")
+
+
+async def archive_signal_ledger(client, ledger, day):
+    fname = f"history/signals_{day}.json"
+    try:   # never fail ep_scan over the ledger
+        body = json.dumps(ledger, separators=(",", ":"))
+        await r2_upload(client, fname, body)
+        log.info(f"  🗄  ledger: saved {fname}  ({ledger.get('count', 0)} stocks, {len(body) // 1024} KB)")
+    except Exception as e:
+        log.warning(f"  ledger upload failed ({fname}): {e}")
+
+
+# ══════════════════════════════════════════════════════════════
+# run_ep_scan
+# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# run_ep_scan  —  UPDATED to read fundamentals_summary.json
+# (old fundamentals.json is no longer maintained after the migration
+#  to pipeline_fundamentals_prod.py's per-symbol + summary architecture)
+# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# run_ep_scan  —  UPDATED to read fundamentals_summary.json
+# (old fundamentals.json is no longer maintained after the migration
+#  to pipeline_fundamentals_prod.py's per-symbol + summary architecture)
+# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# DASHBOARD SUMMARY — one small file (dash_summary.json) that feeds the
+# dashboard.html widgets, so the dashboard never needs the full screener data.
+# Built from screener_feed in run_ep_scan; no extra OHLC download.
+# ══════════════════════════════════════════════════════════════
+DASH_TOP_N = 60                 # rows kept per list (52W highs, volume shockers)
+DASH_RVOL_MIN = 3.0             # volume shocker: today's volume >= 3x the 20-day average
+DASH_MIN_TURNOVER = 1_00_00_000 # ₹1 crore average daily turnover, filters out illiquid names
+DASH_GROUP_MIN = 3              # sectors / industries need at least this many stocks
+DASH_RESULT_DAYS = 7            # results calendar window ahead of today
+DASH_STAGE_LIST_N = 25          # stocks listed per Weinstein stage
+DASH_SKIP_GROUPS = {"", "unclassified", "others", "na", "n/a"}  # group names hidden from sector / industry lists
+
+def _dash_num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+def _dash_median(vals):
+    v = sorted(x for x in vals if _dash_num(x) is not None)
+    if not v: return None
+    m = len(v) // 2
+    return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2
+
+def _dash_ad_line(all_data, sessions=20):
+    """Cumulative net advances (advances - declines) for the last `sessions` trading days."""
+    net = {}
+    for s in all_data.values():
+        d, c = s.get("d") or [], s.get("c") or []
+        for i in range(max(1, len(c) - sessions - 1), len(c)):
+            if c[i] is None or c[i - 1] is None or i >= len(d): continue
+            if c[i] > c[i - 1]: net[d[i]] = net.get(d[i], 0) + 1
+            elif c[i] < c[i - 1]: net[d[i]] = net.get(d[i], 0) - 1
+    out, run = [], 0
+    for day in sorted(net)[-sessions:]:
+        run += net[day]; out.append(run)
+    return out
+
+def _dash_ipos(ipo_raw):
+    """IPOs listing from today up to the next two trading days.
+    ep_scan runs after market close, so the extra day keeps tomorrow's listings
+    visible when the dashboard is opened the next morning; the widget labels
+    Today / Tomorrow from the viewer's own date."""
+    d = date.fromisoformat(today_ist())
+    window, cur = [d.isoformat()], d
+    while len(window) < 3:
+        cur += timedelta(days=1)
+        if is_trading_day(cur.isoformat()): window.append(cur.isoformat())
+    lo, hi = window[0], window[-1]
+    out = []
+    for x in (ipo_raw or {}).get("ipos") or []:
+        ld = x.get("listing_date") or ""
+        if not (lo <= ld <= hi): continue
+        out.append({"sym": x.get("symbol") or "", "name": x.get("name") or "", "type": x.get("issue_type"),
+                    "listing": ld, "ex": x.get("listing_exchange"), "band": x.get("price_band"),
+                    "price": x.get("cut_off_price") or x.get("max_price"), "subsX": x.get("subscription_x"),
+                    "sizeCr": x.get("issue_size_cr"), "listPrice": x.get("listing_price"),
+                    "gainPct": x.get("listing_gain_pct"), "id": x.get("id")})
+    out.sort(key=lambda r: (r["listing"], r["type"] != "regular", r["sym"]))
+    return out
+
+def _build_dash_summary(feed, all_data, result_calendar, as_of, prev_summary, stages_raw, cls_map=None,
+                        ipo_raw=None):
+    by_sym = {r["symbol"]: r for r in feed if r.get("symbol")}
+    cls_map = cls_map or {}
+
+    def tsym_of(sym, r=None):
+        # readable ticker: BSE-only stocks have numeric codes as `symbol`
+        r = r or by_sym.get(sym) or {}
+        c = cls_map.get(sym) or {}
+        return r.get("trading_symbol") or c.get("trading_symbol") or sym
+
+    def ex_of(sym, r=None):
+        r = r or by_sym.get(sym) or {}
+        return r.get("exchange") or (cls_map.get(sym) or {}).get("exchange") or ""
+
+    def name_of(sym, r=None):
+        r = r or by_sym.get(sym) or {}
+        return r.get("name") or (cls_map.get(sym) or {}).get("name") or tsym_of(sym, r)
+    # only stocks that traded in the latest session; stale rows would skew breadth
+    live = [r for r in feed if _dash_num(r.get("ltp")) is not None and _dash_num(r.get("pct_ch")) is not None and r.get("date") == as_of]
+
+    def lite(r, **extra):
+        sym = r["symbol"]
+        return {"sym": sym, "tsym": tsym_of(sym, r), "ex": ex_of(sym, r), "name": name_of(sym, r),
+                "ltp": r.get("ltp"), "chg": r.get("pct_ch"),
+                "rs": r.get("rs_rating"), "rvol": r.get("rvol"), **extra}
+
+    def liquid(r):
+        av, ltp = _dash_num(r.get("avg_vol20")), _dash_num(r.get("ltp"))
+        return av is not None and ltp is not None and av * ltp >= DASH_MIN_TURNOVER
+
+    # 52-week highs, strongest RS first (no liquidity filter)
+    highs = sorted((r for r in live if r.get("new_52wh")), key=lambda r: -(_dash_num(r.get("rs_rating")) or 0))
+
+    # volume shockers: liquid stocks trading far above their 20-day average volume
+    shockers = sorted((r for r in live if (_dash_num(r.get("rvol")) or 0) >= DASH_RVOL_MIN and liquid(r)),
+                      key=lambda r: -r["rvol"])
+
+    # results calendar: today + next DASH_RESULT_DAYS days
+    today_d = date.fromisoformat(today_ist())
+    end_d = (today_d + timedelta(days=DASH_RESULT_DAYS)).isoformat()
+    results = []
+    for d_str in sorted(result_calendar or {}):
+        if today_d.isoformat() <= d_str <= end_d:
+            for sym in result_calendar[d_str]:
+                results.append({"sym": sym, "tsym": tsym_of(sym), "ex": ex_of(sym), "name": name_of(sym),
+                                "date": d_str, "when": None})
+    results = results[:300]
+
+    # sectors and industries
+    def groups(field):
+        g = {}
+        for r in live:
+            k = (r.get(field) or "").strip()
+            if k.lower() not in DASH_SKIP_GROUPS: g.setdefault(k, []).append(r)
+        return {k: v for k, v in g.items() if len(v) >= DASH_GROUP_MIN}
+    # Group returns for the dashboard: ONE method for every widget (Performance, Sector Moves,
+    # Industry Ranks, drill-downs) = the MEDIAN of the group's live stocks.
+    # 1D = feed pct_ch, 1M / 6M / 1Y = feed 1mg / 6mg / 12mg (calendar months),
+    # 1W = feed 1wg (close vs the last close on or before 7 calendar days back).
+    # The dashboard's drill-down shows the same feed fields per stock.
+    def med(vals):
+        m = _dash_median(vals)
+        return round(m, 2) if m is not None else None
+    def perf_rows(field):
+        out = []
+        for k, v in groups(field).items():
+            out.append({"name": k, "count": len(v),
+                        "d1": med(r["pct_ch"] for r in v), "w1": med(r.get("1wg") for r in v),
+                        "m1": med(r.get("1mg") for r in v), "m6": med(r.get("6mg") for r in v), "y1": med(r.get("12mg") for r in v),
+                        "adv": sum(1 for r in v if r["pct_ch"] > 0), "dec": sum(1 for r in v if r["pct_ch"] < 0),
+                        "stocks": sorted(r["symbol"] for r in v)})
+        out.sort(key=lambda x: -(x["d1"] if x["d1"] is not None else -1e9))
+        return out
+    perf = {"sector": perf_rows("sector"), "industry": perf_rows("industry")}
+
+    # Sector Moves reads the same numbers as Performance > Sector > 1D
+    sectors = [{"name": x["name"], "chg": x["d1"], "adv": x["adv"], "dec": x["dec"]} for x in perf["sector"] if x["d1"] is not None]
+    sectors.sort(key=lambda x: -x["chg"])
+
+    industries = []
+    for k, v in groups("industry").items():
+        rs_vals = [_dash_num(r.get("rs_rating")) for r in v if _dash_num(r.get("rs_rating")) is not None]
+        if not rs_vals: continue
+        m1, m3 = _dash_median(r.get("1mg") for r in v), _dash_median(r.get("3mg") for r in v)
+        industries.append({"name": k, "rs": round(sum(rs_vals) / len(rs_vals)),
+                           "m1": round(m1, 2) if m1 is not None else None, "m3": round(m3, 2) if m3 is not None else None,
+                           "count": len(v)})
+    industries.sort(key=lambda x: (-x["rs"], -(x["m3"] or 0)))
+    # rank change vs about a week ago, from the rank history this file keeps for itself
+    hist = dict((prev_summary or {}).get("industryRankHistory") or {})
+    week_ago = (date.fromisoformat(as_of) - timedelta(days=7)).isoformat()
+    ref_dates = sorted(d for d in hist if d <= week_ago)
+    ref = hist.get(ref_dates[-1], {}) if ref_dates else {}
+    for i, x in enumerate(industries):
+        x["rank"] = i + 1
+        x["prevRank"] = ref.get(x["name"])
+    hist[as_of] = {x["name"]: x["rank"] for x in industries}
+    hist = {d: hist[d] for d in sorted(hist)[-15:]}
+
+    # breadth
+    adv = sum(1 for r in live if r["pct_ch"] > 0); dec = sum(1 for r in live if r["pct_ch"] < 0)
+    pct = lambda n: round(n / len(live) * 100) if live else 0
+    breadth = {"adv": adv, "dec": dec, "unch": len(live) - adv - dec,
+               "above50": pct(sum(1 for r in live if r.get("above_50"))),
+               "above200": pct(sum(1 for r in live if r.get("above_200"))),
+               "nh": sum(1 for r in live if r.get("new_52wh")), "nl": sum(1 for r in live if r.get("new_52wl")),
+               "adLine": _dash_ad_line(all_data)}
+
+    # Weinstein stages (weekly scan output, may be a few days old)
+    sigs = (stages_raw or {}).get("signals") or []
+    counts = {n: sum(1 for x in sigs if x.get("stage") == n) for n in (1, 2, 3, 4)}
+    stocks = {}
+    for n in (1, 2, 3, 4):
+        rows = []
+        for x in sigs:
+            if x.get("stage") != n or x.get("symbol") not in by_sym: continue
+            r = by_sym[x["symbol"]]
+            rows.append({"sym": x["symbol"], "tsym": tsym_of(x["symbol"], r), "name": name_of(x["symbol"], r), "chg": r.get("pct_ch"),
+                         "rs": r.get("rs_rating"), "weeks": x.get("weeks_in_stage")})
+        rows.sort(key=lambda y: -(_dash_num(y["rs"]) or 0))
+        stocks[n] = rows[:DASH_STAGE_LIST_N]
+
     return {
-        'updated': asof or max((v['d'][-1] for v in all_data.values() if v.get('d')), default=None),
-        'total': len(results), 'stocks': results, 'box_history': history,
+        "v": 1, "asOf": as_of,
+        "generated_at_ist": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
+        "highs52Count": len(highs), "highs52": [lite(r) for r in highs[:DASH_TOP_N]],
+        "volShockers": [lite(r, volLakh=round((_dash_num(r.get("volume")) or 0) / 1e5, 1)) for r in shockers[:DASH_TOP_N]],
+        "results": results,
+        "sectors": sectors,
+        "industries": industries,
+        "perf": perf,
+        "industryRankHistory": hist,
+        "breadth": breadth,
+        "stages": {"updated": (stages_raw or {}).get("updated"), "counts": counts, "stocks": stocks},
+        "ipos": _dash_ipos(ipo_raw),
     }
+
+
+async def run_ep_scan() -> None:
+    status = PipelineStatus("run_ep_scan")
+    try:
+        today=today_ist()
+        log.info(f"━━━ EP + Post-Result + RS Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP,BSE_ISIN_MAP,BSE_META
+            ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
+            by_date=await get_result_calendar_finedge(client)
+            if by_date: await save_result_calendar(client,by_date)
+            ohlc_tasks=[r2_download(client,f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
+            (ohlc_results,screener_raw,fund_raw,cal_raw,classification,
+             idx_hist_n50,idx_hist_n500,idx_hist_sm400,idx_daily,sheet_raw,
+             hlr_raw,pb_raw,pat_raw,w_pb_raw,w_hlr_raw,m_pb_raw,ema_shakeout_raw,htf_raw,vcp_raw,ath_raw,catalysts_raw,results_detailed_raw)=await asyncio.gather(
+                asyncio.gather(*ohlc_tasks,return_exceptions=True),
+                r2_download(client,"screener.json"),
+                r2_download(client,"fundamentals_summary.json"),   # ← CHANGED (was r2_download_fund(client))
+                r2_download(client,"result_calendar.json"),r2_download(client,"classification.json"),
+                r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty50']}.json"),
+                r2_download(client,f"index_history/{INDEX_SYMBOLS['nifty500']}.json"),
+                r2_download(client,f"index_history/{INDEX_SYMBOLS['smallmid400']}.json"),
+                r2_download(client,"index_daily.json"),r2_download(client,"sheet_data.json"),
+                r2_download(client,"hlr_signals.json"),r2_download(client,"pullback_signals.json"),
+                r2_download(client,"pattern_signals.json"),r2_download(client,"weekly_pullback_signals.json"),
+                r2_download(client,"weekly_hlr_signals.json"),r2_download(client,"monthly_pullback_signals.json"),
+                r2_download(client,"shakeout_signals.json"),   # ← NEW: shakeout_scanner.py's EMA-breakdown+recovery signals
+                r2_download(client,"htf_test_results.json"),   # ← NEW: htf_test_scan.py's HTF / Mini-HTF flag-pole signals
+                r2_download(client,"vcp_signals.json"),   # ← NEW: run_vcp_scan()'s VCP (Volatility Contraction Pattern) signals
+                r2_download(client,"ath_data.json"),   # ← NEW: All-Time-High per symbol, merged into screener_feed below
+                r2_download(client,"nse_catalysts.json"),  # material NSE events for Event EP attribution
+                r2_download(client,"nse_results_detailed.json"),  # authoritative Results BH/IH/AH session metadata
+            )
+            all_data={}
+            for i,res in enumerate(ohlc_results):
+                if isinstance(res,Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
+                elif res and "stocks" in res: all_data.update(res["stocks"])
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            # Authoritative market-data date for screener_feed/history.
+            # On weekends/holidays the pipeline may run today, while OHLC still
+            # ends on the previous trading session. Never label that snapshot
+            # with the calendar run date.
+            _market_dates = [
+                str(series.get("d", [])[-1])[:10]
+                for series in all_data.values()
+                if isinstance(series, dict) and series.get("d")
+            ]
+            market_data_date = max(_market_dates) if _market_dates else today
+            log.info(f"Market data as-of date: {market_data_date} (run date: {today})")
+
+            screener={}
+            if isinstance(screener_raw,list):
+                for row in screener_raw:
+                    sym=(row.get("Stocks","") or "").strip()
+                    if not sym: continue
+                    try: sc=float(row.get("SALES CH%",0))*100; sales_ch=f"+{sc:.1f}%" if sc>=0 else f"{sc:.1f}%"
+                    except: sales_ch=""
+                    try: ec=float(row.get("EPS CHANGE",0))*100; eps_ch=f"+{ec:.1f}%" if ec>=0 else f"{ec:.1f}%"
+                    except: eps_ch=""
+                    pat_cols=["NR7","WIB","DIB","MCP","W-MCP","HVQ","VD","PullBack","ATR Tightness","Volume footprint","Launchpad","HLR","BS","GAPUP","PP","HPBC","TL/HL BO","3WTC"]
+                    combined=set()
+                    for p in (row.get("Patterns","") or "").split("||"):
+                        p=p.strip()
+                        if p: combined.add(p)
+                    for col in pat_cols:
+                        v=row.get(col,"")
+                        if v and v not in ("",None,0,"No"): combined.add(v if isinstance(v,str) else col)
+                    screener[sym]={"sales_ch":sales_ch,"eps_ch":eps_ch,"patterns":"||".join(sorted(combined)),"sector":row.get("SECTOR",""),"rs":row.get("RS Rating",""),"ltp":row.get("LTP","")}
+
+            # ← CHANGED: fundamentals_summary.json shape is {"updated":..., "stocks": {SYM: {...}}}
+            fund_lookup={}
+            if isinstance(fund_raw,dict) and "stocks" in fund_raw:
+                fund_lookup=fund_raw["stocks"]
+            elif isinstance(fund_raw,dict):
+                fund_lookup=fund_raw
+            elif isinstance(fund_raw,list):
+                fund_lookup={d["symbol"]:d for d in fund_raw if d.get("symbol")}
+
+            result_calendar=cal_raw if isinstance(cal_raw,dict) else {}
+            classification=classification or []
+            sheet_data={}
+            if isinstance(sheet_raw,list):
+                for row in sheet_raw:
+                    sym=row.get("symbol") or row.get("Stocks","")
+                    if sym: sheet_data[sym]={"circuit":row.get("Circuit") or row.get("circuit"),"tv_code":row.get("TV CODE") or row.get("tv_code",""),"hpbc":row.get("HPBC") or row.get("hpbc",""),"tl_hl_bo":row.get("TL/HL BO") or row.get("tl_hl_bo","")}
+            elif isinstance(sheet_raw,dict): sheet_data=sheet_raw
+            ath_map=ath_raw.get("stocks",{}) if isinstance(ath_raw,dict) else {}
+            hlr_map={}
+            if isinstance(hlr_raw,dict):
+                for sig in (hlr_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym:
+                        if sym not in hlr_map or sig.get("touches",0)>hlr_map[sym].get("touches",0): hlr_map[sym]=sig
+            pb_map={}
+            if isinstance(pb_raw,dict):
+                for sig in (pb_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym: pb_map[sym]=sig
+            pat_map={}
+            if isinstance(pat_raw,dict):
+                for sig in (pat_raw.get("signals") or []):
+                    sym=sig.get("symbol"); pat=sig.get("pattern")
+                    if sym and pat: pat_map.setdefault(sym,set()).add(pat)
+
+            w_pb_map={}
+            if isinstance(w_pb_raw,dict):
+                for sig in (w_pb_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym and (sym not in w_pb_map or sig.get("signal_date","") > w_pb_map[sym].get("signal_date","")):
+                        w_pb_map[sym]=sig
+
+            # ─── FIX: weekly HLR + monthly pullback were computed in run_hlr_scan()
+            # and saved to R2 (weekly_hlr_signals.json / monthly_pullback_signals.json)
+            # but never read back into screener_feed — so the frontend's "W-HLR BO/
+            # Near/Consol" and "M-PullBack" filters always showed 0 stocks. ───
+            w_hlr_map={}
+            if isinstance(w_hlr_raw,dict):
+                for sig in (w_hlr_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym:
+                        if sym not in w_hlr_map or sig.get("touches",0)>w_hlr_map[sym].get("touches",0): w_hlr_map[sym]=sig
+            m_pb_map={}
+            if isinstance(m_pb_raw,dict):
+                for sig in (m_pb_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym: m_pb_map[sym]=sig
+
+            # ─── shakeout_scanner.py (EMA breakdown+recovery shakeout —
+            # the old wick/Supertrend-based _detect_shakeout has been removed;
+            # this is now the only shakeout detector) writes shakeout_signals.json
+            # to R2. Merge it into screener_feed here. ───
+            ema_shakeout_map={}
+            if isinstance(ema_shakeout_raw,dict):
+                for sig in (ema_shakeout_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if not sym: continue
+                    cat="Combo" if sig.get("compound") else f"EMA{(sig.get('ema_periods') or [0])[0]}"
+                    ema_shakeout_map.setdefault(sym,{})
+                    existing=ema_shakeout_map[sym].get(cat)
+                    if not existing or (sig.get("recovery_date") or "")>(existing.get("recovery_date") or ""):
+                        ema_shakeout_map[sym][cat]=sig
+
+            # ─── FIX: htf_test_scan.py (HTF / Mini-HTF flag-pole signals) also
+            # writes to R2 fine, but was never read back into screener_feed.json
+            # either — same gap as the shakeout scanner above. Merge it in too. ───
+            htf_map={}
+            if isinstance(htf_raw,dict):
+                for src_key,cat in (("HTF","HTF"),("Mini HTF","MiniHTF")):
+                    for sig in ((htf_raw.get(src_key) or {}).get("signals") or []):
+                        sym=sig.get("symbol")
+                        if not sym: continue
+                        htf_map.setdefault(sym,{})
+                        existing=htf_map[sym].get(cat)
+                        if not existing or (sig.get("flag_end_date") or "")>(existing.get("flag_end_date") or ""):
+                            htf_map[sym][cat]=sig
+
+            # ─── FIX: run_vcp_scan()'s VCP (Volatility Contraction Pattern)
+            # signals also write to R2 fine (vcp_signals.json), but were
+            # never read back into screener_feed.json either. Merge in too. ───
+            vcp_map={}
+            if isinstance(vcp_raw,dict):
+                for sig in (vcp_raw.get("signals") or []):
+                    sym=sig.get("symbol")
+                    if sym: vcp_map[sym]=sig
+
+            # ─── FIX: fresh enrichment helpers ───
+            cls_map_ep={}
+            for x in (classification or []):
+                sym0=x.get("symbol") or x.get("nse_code")
+                if sym0: cls_map_ep[sym0]=x
+
+            def _fund_chg(fund):
+                """fundamentals_summary.json se q_name + YoY sales/eps change strings.
+                CHANGED: 'pl_quarterly' -> 'quarters' (new summary schema),
+                field names inside each quarter row (header/sales/eps) unchanged.
+                FIX: divide by abs(prev) not prev -- a negative prior-year base
+                (loss quarter) was flipping the sign of the % change, so a
+                loss->profit turnaround showed as a large NEGATIVE eps_ch instead
+                of positive. abs() keeps the sign meaning "improved/worsened"
+                correct regardless of which side of zero the base sits on."""
+                q=fund.get("quarters",[])
+                q_name=q[0].get("header","") if q else ""
+                sales_ch=eps_ch=""
+                if q and len(q)>=5:
+                    s0=q[0].get("sales"); s4=q[4].get("sales")
+                    if s0 is not None and s4:
+                        v=round((s0-s4)/abs(s4)*100,1); sales_ch=f"+{v}%" if v>=0 else f"{v}%"
+                    e0=q[0].get("eps"); e4=q[4].get("eps")
+                    if e0 is not None and e4:
+                        v=round((e0-e4)/abs(e4)*100,1); eps_ch=f"+{v}%" if v>=0 else f"{v}%"
+                return q_name,sales_ch,eps_ch
+
+            signals=_detect_ep(all_data)
+
+            # ── EP catalyst attribution ──
+            # Priority: Earnings EP > Event EP > Normal EP.
+            # Non-Gap EP is catalyst-gated: it is retained only when a Results
+            # filing or material Market Event maps to that reaction session.
+            # Gap EP remains eligible without a catalyst (Normal EP).
+            catalyst_rows=[]
+            if isinstance(catalysts_raw,list):
+                catalyst_rows=catalysts_raw
+            elif isinstance(catalysts_raw,dict):
+                # nse_catalysts.json production shape is normally:
+                # {"updated": ..., "source": ..., "data": {"SYMBOL": [events...]}}
+                # Older/alternate builds may expose a flat list under
+                # events/items/catalysts/data. Support both shapes.
+                for key in ("events","items","catalysts","data"):
+                    block=catalysts_raw.get(key)
+                    if isinstance(block,list):
+                        catalyst_rows=block
+                        break
+                    if isinstance(block,dict):
+                        for block_sym, block_events in block.items():
+                            if not isinstance(block_events,list):
+                                continue
+                            for ev in block_events:
+                                if not isinstance(ev,dict):
+                                    continue
+                                e=dict(ev)
+                                # Symbol is the dictionary key in the production file.
+                                e.setdefault("symbol",block_sym)
+                                catalyst_rows.append(e)
+                        if catalyst_rows:
+                            break
+                log.info(f"EP catalyst input: {len(catalyst_rows)} event row(s)")
+
+            def _next_trading_day(d):
+                dt=date.fromisoformat(d)+timedelta(days=1)
+                for _ in range(14):
+                    if is_trading_day(dt.isoformat()): return dt.isoformat()
+                    dt+=timedelta(days=1)
+                return d
+
+            def _event_reaction_date(row):
+                # Prefer the catalyst backend's already-normalized reaction date
+                # and session. This is holiday-aware and avoids recalculating an
+                # AH filing from the raw announcement timestamp.
+                react=str(row.get("react_date") or row.get("reaction_date") or "").strip()[:10]
+                timing=str(row.get("session") or row.get("catalyst_timing") or "").strip().upper()
+                if react:
+                    try:
+                        date.fromisoformat(react)
+                        return react, timing
+                    except Exception:
+                        pass
+
+                raw=str(row.get("dt") or row.get("datetime") or row.get("timestamp") or row.get("date") or "").strip()
+                if not raw: return "", timing
+                d=raw[:10]
+                try: date.fromisoformat(d)
+                except Exception: return "", timing
+                if not timing:
+                    m=re.search(r"[T\s](\d{1,2}):(\d{2})",raw)
+                    if m:
+                        hm=(int(m.group(1)),int(m.group(2)))
+                        timing="AH" if hm >= (15,30) else "IH"
+                rd=_next_trading_day(d) if timing == "AH" else (d if is_trading_day(d) else _next_trading_day(d))
+                return rd,timing
+
+            events_by_reaction={}
+            for ev in catalyst_rows:
+                if not isinstance(ev,dict): continue
+                sym=str(ev.get("symbol") or ev.get("ticker") or "").strip().upper()
+                rd,timing=_event_reaction_date(ev)
+                if not sym or not rd: continue
+                e=dict(ev); e["_catalyst_timing"]=timing
+                events_by_reaction.setdefault((sym,rd),[]).append(e)
+
+            # Results source used by the Earnings Screener. market_session is
+            # already classified as BH / IH / AH; next_trading_date is preferred
+            # over calculating a weekday so exchange holidays are respected.
+            results_by_reaction={}
+            result_items=[]
+            if isinstance(results_detailed_raw,dict):
+                result_items=results_detailed_raw.get("items") or []
+            elif isinstance(results_detailed_raw,list):
+                result_items=results_detailed_raw
+            for it in result_items:
+                if not isinstance(it,dict): continue
+                meta=it.get("meta") or {}; pr=it.get("price_reaction") or {}
+                sym=str(meta.get("symbol") or "").strip().upper()
+                rd=str(meta.get("board_meeting_date") or "")[:10]
+                sess=str(meta.get("market_session") or "").upper()
+                next_td=str(pr.get("next_trading_date") or "")[:10]
+                if not sym or not rd: continue
+                reaction_dates=[]
+                if sess == "BH": reaction_dates=[rd]
+                elif sess == "AH": reaction_dates=[next_td or _next_trading_day(rd)]
+                elif sess == "IH": reaction_dates=[rd, next_td or _next_trading_day(rd)]
+                else: reaction_dates=[rd, next_td or _next_trading_day(rd)]
+                for react_d in dict.fromkeys(x for x in reaction_dates if x):
+                    results_by_reaction.setdefault((sym,react_d),[]).append({
+                        "result_date":rd,"session":sess,"quarter":meta.get("quarter_label") or "",
+                        "next_trading_date":next_td
+                    })
+
+            log.info(f"EP catalyst indexes: events={len(events_by_reaction)} reaction key(s), "
+                     f"results={len(results_by_reaction)} reaction key(s), candidates={len(signals)}")
+
+            kept_signals=[]
+            for sig in signals:
+                sig["catalyst"]=""; sig["result_date"]=""; sig["catalyst_timing"]=""
+                sig["catalyst_category"]=""; sig["catalyst_id"]=""; sig["catalyst_summary"]=""
+                key=(sig["symbol"].upper(),sig["ep_date"])
+
+                result_matches=results_by_reaction.get(key,[])
+                if result_matches:
+                    # If IH qualifies both same day and next day, each detected EP
+                    # is attributed to the actual reaction date being evaluated.
+                    rr=max(result_matches,key=lambda x:x.get("result_date") or "")
+                    sig["catalyst"]="Results"
+                    sig["ep_type"]="Earnings EP"
+                    sig["result_date"]=rr.get("result_date","")
+                    sig["catalyst_timing"]=rr.get("session","")
+                    kept_signals.append(sig)
+                    continue
+
+                matches=events_by_reaction.get(key,[])
+                if matches:
+                    ev=max(matches,key=lambda x:str(x.get("dt") or x.get("datetime") or x.get("timestamp") or x.get("date") or ""))
+                    cat=str(ev.get("category") or ev.get("event_type") or "Event").strip()
+                    sig["ep_type"]="Event EP"; sig["catalyst"]=cat
+                    sig["catalyst_timing"]=ev.get("_catalyst_timing","")
+                    sig["catalyst_category"]=cat
+                    sig["catalyst_id"]=str(ev.get("id") or ev.get("announcement_id") or "")
+                    sig["catalyst_summary"]=str(ev.get("event_summary") or ev.get("summary") or ev.get("subject") or "").strip()
+                    kept_signals.append(sig)
+                    continue
+
+                # No catalyst: preserve existing Gap EP / Normal EP behaviour,
+                # but do not admit the new Non-Gap EP path on price/volume alone.
+                if sig.get("reaction_type") == "Gap EP":
+                    kept_signals.append(sig)
+
+            # Catalyst gating is complete. Only now choose the latest VALID
+            # EP per symbol, so an uncatalyzed Non-Gap candidate cannot erase
+            # an older valid signal.
+            latest_valid={}
+            for sig in kept_signals:
+                sym=sig.get("symbol")
+                if sym and (sym not in latest_valid or sig.get("ep_date","") > latest_valid[sym].get("ep_date","")):
+                    latest_valid[sym]=sig
+            signals=list(latest_valid.values())
+            from collections import Counter as _Counter
+            log.info(f"DEP states: {dict(_Counter(s.get('state') for s in signals))}  "
+                     f"types: {dict(_Counter(s.get('ep_type') for s in signals))}")
+            signals.sort(key=lambda x:(x["ep_date"],x["gap_pct"]),reverse=True)
+            for sig in signals:
+                sym=sig["symbol"]; sc=screener.get(sym,{}); ci=cls_map_ep.get(sym,{}); fund=fund_lookup.get(sym,{})
+                q_name,sales_ch,eps_ch=_fund_chg(fund)
+                sig.update({
+                    "sales_ch":sales_ch or sc.get("sales_ch",""),
+                    "eps_ch":eps_ch or sc.get("eps_ch",""),
+                    "patterns":sc.get("patterns",""),
+                    "sector":ci.get("sector_group") or sc.get("sector",""),
+                    "ltp":sig["last_close"],
+                    "q_name":q_name,
+                })
+                vol_x=sig.pop("vol_spike_x",1); sig["vol_pct"]=f"+{round((vol_x-1)*100)}%"
+            pr_signals=[]
+            if result_calendar:
+                pr_signals=_detect_post_result_thrust(all_data,result_calendar)
+                for sig in pr_signals:
+                    sym=sig["symbol"]; sc=screener.get(sym,{}); ci=cls_map_ep.get(sym,{}); fund=fund_lookup.get(sym,{})
+                    q_name,sales_ch,eps_ch=_fund_chg(fund)
+                    fresh_ltp=None
+                    if sym in all_data:
+                        fresh_ltp=next((v for v in reversed(all_data[sym]["c"]) if v is not None),None)
+                    sig.update({
+                        "sales_ch":sales_ch or sc.get("sales_ch",""),
+                        "eps_ch":eps_ch or sc.get("eps_ch",""),
+                        "patterns":sc.get("patterns",""),
+                        "sector":ci.get("sector_group") or sc.get("sector",""),
+                        "ltp":round(fresh_ltp,2) if fresh_ltp is not None else sc.get("ltp",""),
+                        "q_name":q_name,
+                    })
+            rs_data=_calculate_rs(all_data,history_days=180)
+            rs_history_list=_build_rs_history_json(all_data,rs_data)
+            for sig in signals:
+                rc=rs_data.get(sig["symbol"],{}).get("rs")
+                sig["rs_calc"]=rc
+                sig["rs"]=rc if rc is not None else sig.get("rs","")
+            for sig in pr_signals:
+                rc=rs_data.get(sig["symbol"],{}).get("rs")
+                sig["rs_calc"]=rc
+                sig["rs"]=rc if rc is not None else sig.get("rs","")
+            idx_daily=idx_daily or {}
+            index_maps={
+                "nifty50":_build_index_close_map(idx_hist_n50,idx_daily.get(INDEX_SYMBOLS["nifty50"],{}).get("close"),today),
+                "nifty500":_build_index_close_map(idx_hist_n500,idx_daily.get(INDEX_SYMBOLS["nifty500"],{}).get("close"),today),
+                "smallmid400":_build_index_close_map(idx_hist_sm400,idx_daily.get(INDEX_SYMBOLS["smallmid400"],{}).get("close"),today),
+            }
+            mansfield=_calculate_mansfield_rs(all_data,index_maps)
+            for sym in rs_data:
+                m=mansfield.get(sym,{})
+                for idx_key,metrics in m.items():
+                    for k,v in metrics.items(): rs_data[sym][f"{k}_{idx_key}"]=v
+            sector_group_rs_history=_build_group_rs_history(classification,rs_history_list,"sector_group")
+            industry_rs_history=_build_group_rs_history(classification,rs_history_list,"display_industry")
+            mswing_data=_calculate_mswing(all_data,history_days=ROLLING_DAYS-50)
+            mswing_list=_build_mswing_json(all_data,mswing_data)
+            sector_group_mswing_history=_build_group_mswing_history(classification,mswing_list,"sector_group")
+            industry_mswing_history=_build_group_mswing_history(classification,mswing_list,"display_industry")
+            # MA group history — Daily EMA10/21/50/200 AND SMA10/21/50/200
+            # "close above/below" per stock, rolled up to % of stocks above
+            # each MA per sector/industry per date (8 percentages per group).
+            ma_history_combos=_build_ma_history_all_combos(all_data,history_days=180)
+            sector_group_ma_history=_build_group_ma_history_multi(classification,ma_history_combos,"sector_group")
+            industry_ma_history=_build_group_ma_history_multi(classification,ma_history_combos,"display_industry")
+            # Index breadth (Nifty 50/500/Midcap 150/Smallcap 250/MidSmall 400,
+            # % above EMA/SMA 10/21/50/200) and sector/industry returns
+            # (1M/3M/6M/1Y; median, equal, mcap-weighted), 1 year each —
+            # see breadth_returns.py. Never allowed to break the scan.
+            index_ma_history=sector_returns_history=industry_returns_history=None
+            index_master_br={}
+            try:
+                index_master_br=await r2_download(client,"index_master.json") or {}
+                index_ma_history=build_index_ma_history(all_data,index_master_br)
+                log.info("Index breadth: "+", ".join(f"{v['name']} {v['matched']}/{v['constituents']}" for v in index_ma_history["indices"].values()))
+            except Exception as e:
+                log.warning(f"Index breadth skipped: {e}")
+            # Market Structure widget: HH-HL / LL-LH counts per index (Nifty 50,
+            # MidSmall 400, Nifty 500), daily + weekly swings, 1 year — see
+            # structure_history.py. Never allowed to break the scan.
+            index_structure_history=None
+            try:
+                index_structure_history=build_index_structure_history(all_data,index_master_br,_check_liquidity)
+                log.info("Index structure: "+", ".join(f"{v['name']} HH-HL {v['d']['hh'][-1]} / LL-LH {v['d']['ll'][-1]} of {v['d']['n'][-1]}" for v in index_structure_history["indices"].values()))
+            except Exception as e:
+                log.warning(f"Index structure skipped: {e}")
+            try:
+                sector_returns_history=build_group_returns_history(all_data,classification,"sector_group")
+                industry_returns_history=build_group_returns_history(all_data,classification,"display_industry")
+                log.info(f"Group returns: {len(sector_returns_history['groups'])} sectors, {len(industry_returns_history['groups'])} industries")
+            except Exception as e:
+                log.warning(f"Group returns skipped: {e}")
+            # Per-exchange copies of the group files, for the RS Dashboard's
+            # All / NSE / BSE switch. Same builders, run on the NSE-only and
+            # BSE-only part of classification; the "All" files above are
+            # unchanged. Never allowed to break the scan.
+            exch_group_files={}
+            for _ex in ("NSE","BSE"):
+                try:
+                    _cls_ex=[c for c in (classification or []) if (c.get("exchange") or "NSE").upper()==_ex]
+                    _sfx=_ex.lower()
+                    exch_group_files[f"sector_group_rs_history_{_sfx}.json"]=_build_group_rs_history(_cls_ex,rs_history_list,"sector_group")
+                    exch_group_files[f"industry_rs_history_{_sfx}.json"]=_build_group_rs_history(_cls_ex,rs_history_list,"display_industry")
+                    exch_group_files[f"sector_group_ma_history_{_sfx}.json"]=_build_group_ma_history_multi(_cls_ex,ma_history_combos,"sector_group")
+                    exch_group_files[f"industry_ma_history_{_sfx}.json"]=_build_group_ma_history_multi(_cls_ex,ma_history_combos,"display_industry")
+                    exch_group_files[f"sector_returns_history_{_sfx}.json"]=build_group_returns_history(all_data,_cls_ex,"sector_group")
+                    exch_group_files[f"industry_returns_history_{_sfx}.json"]=build_group_returns_history(all_data,_cls_ex,"display_industry")
+                    _last=(exch_group_files[f"sector_group_rs_history_{_sfx}.json"] or [{}])[-1]
+                    log.info(f"Exchange {_ex}: {len(_cls_ex)} stocks, {len(_last.get('groups',{}))} sectors")
+                except Exception as e:
+                    log.warning(f"Exchange {_ex} group files skipped: {e}")
+            for sig in signals:
+                sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
+            for sig in pr_signals:
+                sym=sig["symbol"]; sig["mswing"]=mswing_data.get(sym,{}).get("mswing"); sig["mswing_avg9"]=mswing_data.get(sym,{}).get("mswing_avg9")
+            gaps_by_sym=await update_gap_tracker(client,all_data,today)
+            gap_state=_build_gap_state(all_data,gaps_by_sym,today)
+            gap_new,gap_filled=_today_gap_events(gaps_by_sym,today)
+            # Price structure (HH-HL / LL-LH, consolidation) — never allowed to break the scan
+            struct_map={}
+            try:
+                struct_map=build_structure_map(all_data,_check_liquidity)
+                log.info(f"Structure: {sum(1 for r in struct_map.values() if r.get('hhhl')=='HH-HL')} HH-HL, "
+                         f"{sum(1 for r in struct_map.values() if r.get('hhhl')=='LL-LH')} LL-LH, "
+                         f"{sum(1 for r in struct_map.values() if r.get('cons'))} consolidating (daily); "
+                         f"{sum(1 for r in struct_map.values() if r.get('w_cons'))} consolidating (weekly)")
+            except Exception as e:
+                log.warning(f"Structure scan skipped: {e}")
+            screener_feed=_build_screener_feed(all_data,classification,rs_data,mswing_data,result_calendar,sheet_data,market_data_date,hlr_map=hlr_map,pb_map=pb_map,pat_map=pat_map,gap_map=gap_state,w_pb_map=w_pb_map,w_hlr_map=w_hlr_map,m_pb_map=m_pb_map,ema_shakeout_map=ema_shakeout_map,htf_map=htf_map,vcp_map=vcp_map,ath_map=ath_map,struct_map=struct_map)
+            mtf_ma_map=_calc_multi_tf_ma(all_data)
+            log.info(f"Multi-TF EMA/SMA: {len(mtf_ma_map)} stocks")
+            for row in screener_feed:
+                row.update(mtf_ma_map.get(row["symbol"],{}))
+            sq_map=_calc_squeeze_vol_flags(all_data)
+            for row in screener_feed:
+                row.update(sq_map.get(row["symbol"],{}))
+            tx_map=_calc_tech_extras(all_data)
+            for row in screener_feed:
+                row.update(tx_map.get(row["symbol"],{}))
+            log.info(f"Tech extras: {len(tx_map)} stocks  "
+                     f"ST buy {sum(1 for v in tx_map.values() if v.get('st_dir')==1)}  "
+                     f"BB expansion {sum(1 for v in tx_map.values() if v.get('bb_exp_days') is not None)}")
+            log.info(f"Squeeze/VolShock: TTM {sum(1 for v in sq_map.values() if v['ttm_squeeze'])}  "
+                     f"BB {sum(1 for v in sq_map.values() if v['bb_squeeze'])}  "
+                     f"VolShocker {sum(1 for v in sq_map.values() if v['vol_shocker'])}")
+            ep_pat_map={}
+            for sig in signals:
+                # Dead EPs (closed below gap_lower) used to be excluded by the old
+                # detector; keep them out of the screener "EP" tag to preserve that.
+                if sig.get("state")=="Dead": continue
+                ep_pat_map.setdefault(sig["symbol"],set()).add("EP")
+            for row in screener_feed:
+                sym=row["symbol"]; sc=screener.get(sym,{}); fund=fund_lookup.get(sym,{})
+                pl=fund.get("quarters",[]); row["q_name"]=pl[0].get("header","") if pl else ""   # CHANGED (was pl_quarterly)
+                if pl and len(pl)>=5:
+                    s0=pl[0].get("sales"); s4=pl[4].get("sales")
+                    # FIX: abs(s4)/abs(e4) in denominator -- same sign-flip bug as
+                    # _fund_chg() above, see comment there.
+                    row["sales_ch"]=round((s0-s4)/abs(s4)*100,1) if s0 is not None and s4 else None
+                    e0=pl[0].get("eps"); e4=pl[4].get("eps")
+                    row["eps_ch"]=round((e0-e4)/abs(e4)*100,1) if e0 is not None and e4 else None
+                else: row["sales_ch"]=None; row["eps_ch"]=None
+                pats=set()
+                for flag,label in [("vd","VD"),("hvq","HVQ"),("hvm","HVM"),("hvy","HVY"),("lvq","LVQ"),("lvm","LVM"),("lvy","LVY"),("vol_footprint","Volume Footprint"),("atr_tightness","ATR Tightness"),("bs","BS"),("pp","PP"),("mcp","MCP"),("launchpad","Launchpad"),("ib","IB"),("dib","DIB"),("nr7","NR7"),("wib","WIB"),("w_dib","W-DIB"),("w_nr7","W-NR7"),("w_3tc","3WTC"),("pullback","PullBack"),("tl_hl_bo","TL/HL BO"),("hpbc","HPBC"),("w_pullback","W-Pullback"),("m_pullback","M-PullBack")]:
+                    if row.get(flag): pats.add(label)
+                if row.get("gap_fill"): pats.add(row["gap_fill"])
+                if row.get("hlr_state"): pats.add(row["hlr_state"])
+                # FIX: weekly HLR was computed (weekly_hlr_signals.json) but never
+                # merged into screener_feed — frontend's "W-HLR BO/Near/Consol"
+                # filters always showed 0. Map to the exact labels the frontend
+                # chips expect (see fdrTogSig's _exHlr / data-sig in screener.html).
+                _w_hlr_labels={"BO":"W-HLR BO","Consolidating near HLR":"W-HLR Consol","Near HLR":"W-HLR Near"}
+                if row.get("w_hlr_state") in _w_hlr_labels: pats.add(_w_hlr_labels[row["w_hlr_state"]])
+                if row.get("ema_shakeout"): pats.add("EMA Shakeout")
+                if row.get("htf_forming"): pats.add("HTF")
+                if row.get("mini_htf_forming"): pats.add("Mini HTF")
+                if row.get("is_vcp"): pats.add("VCP")
+                if row.get("ttm_squeeze"): pats.add("TTM Squeeze")
+                if row.get("bb_squeeze"): pats.add("BB Squeeze")
+                if row.get("vol_shocker"): pats.add("Vol Shocker")
+                if sym in ep_pat_map: pats|=ep_pat_map[sym]
+                row["patterns"]="||".join(sorted(pats))
+            feed_pat={row["symbol"]:row["patterns"] for row in screener_feed}
+            for sig in signals:
+                if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
+            for sig in pr_signals:
+                if sig["symbol"] in feed_pat: sig["patterns"]=feed_pat[sig["symbol"]]
+
+            # ── per-stock events for the NEW tag (see _attach_stock_events) ──
+            _bx = _mv = None   # also used by the signal ledger below
+            try:
+                _wt, _bx, _mv, _pf = await _load_event_sources(client, market_data_date)
+                _attach_stock_events(screener_feed, all_data, market_data_date, prev_feed=_pf, wtrans=_wt,
+                                     box_raw=_bx, mv_raw=_mv, ep_signals=signals, pb_map=pb_map,
+                                     w_pb_map=w_pb_map, m_pb_map=m_pb_map, ema_shakeout_map=ema_shakeout_map)
+            except Exception as e:
+                log.warning(f"Stock events skipped: {e}")
+
+            # ── Date confirmation for frontend. as_of_date is the latest
+            # actual OHLC trading session, NOT the calendar day the job ran.
+            # This prevents Saturday/Sunday/holiday runs from showing a fake
+            # non-trading date in the screener frontend.
+            screener_meta = {
+                "as_of_date": market_data_date,
+                "generated_at_ist": datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
+                "stock_count": len(screener_feed),
+            }
+
+            # dash_summary.json for dashboard.html (previous file keeps the industry rank history)
+            dash_prev, dash_stages, dash_ipo = await asyncio.gather(
+                r2_download(client, "dash_summary.json"),
+                r2_download(client, "weinstein_stage_analysis.json"),
+                r2_download(client, "ipo_data.json"),
+                return_exceptions=True)
+            dash_summary = _build_dash_summary(
+                screener_feed, all_data, result_calendar, market_data_date,
+                dash_prev if isinstance(dash_prev, dict) else {},
+                dash_stages if isinstance(dash_stages, dict) else {},
+                cls_map_ep,
+                dash_ipo if isinstance(dash_ipo, dict) else {})
+            # ── signal ledger of the day (Phase 2 of the Historical Screener plan) ──
+            signal_ledger = None
+            try:
+                signal_ledger = _build_signal_ledger(
+                    screener_feed, market_data_date, box_raw=_bx,
+                    stages_raw=dash_stages if isinstance(dash_stages, dict) else None,
+                    mv_raw=_mv, ep_signals=signals, htf_map=htf_map, ema_shakeout_map=ema_shakeout_map)
+            except Exception as e:
+                log.warning(f"Signal ledger skipped: {e}")
+            log.info(f"dash_summary: {dash_summary['highs52Count']} 52W highs, {len(dash_summary['volShockers'])} vol shockers, "
+                     f"{len(dash_summary['sectors'])} sectors, {len(dash_summary['industries'])} industries, "
+                     f"{len(dash_summary['ipos'])} IPO listings")
+
+            await asyncio.gather(
+                upload_str_with_manifest(client, r2_upload, "dash_summary.json", json.dumps(dash_summary),
+                                          schema_v=1, extra_meta={"as_of": market_data_date}),
+                upload_str_with_manifest(client, r2_upload, "ep_signals.json",
+                                          json.dumps({"updated":today,"count":len(signals),"signals":signals}),
+                                          schema_v=1, extra_meta={"count": len(signals)}),
+                upload_str_with_manifest(client, r2_upload, "rs_ratings.json",
+                                          json.dumps({"updated":today,"count":len(rs_data),"stocks":rs_data}),
+                                          schema_v=1, extra_meta={"count": len(rs_data)}),
+                upload_str_with_manifest(client, r2_upload, "rs_history.json",
+                                          json.dumps(rs_history_list),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "mswing.json",
+                                          json.dumps(mswing_list),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "post_result_signals.json",
+                                          json.dumps({"updated":today,"count":len(pr_signals),"ah_count":sum(1 for s in pr_signals if "AH" in s["reaction_type"]),"ih_count":sum(1 for s in pr_signals if "IH" in s["reaction_type"]),"signals":pr_signals}),
+                                          schema_v=1, extra_meta={"count": len(pr_signals)}),
+                upload_str_with_manifest(client, r2_upload, "sector_group_rs_history.json",
+                                          json.dumps(sector_group_rs_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "industry_rs_history.json",
+                                          json.dumps(industry_rs_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "sector_group_mswing_history.json",
+                                          json.dumps(sector_group_mswing_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "industry_mswing_history.json",
+                                          json.dumps(industry_mswing_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "sector_group_ma_history.json",
+                                          json.dumps(sector_group_ma_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "industry_ma_history.json",
+                                          json.dumps(industry_ma_history),
+                                          schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "screener_feed.json", json.dumps(screener_feed),
+                                          schema_v=1, extra_meta={"stock_count": len(screener_feed)}),
+                upload_str_with_manifest(client, r2_upload, "screener_meta.json", json.dumps(screener_meta),
+                                          schema_v=1, extra_meta={}),
+                backup_pattern_history(client,screener_feed,market_data_date,gap_new=gap_new,gap_filled=gap_filled),
+                archive_screener_feed_history(client, screener_feed, market_data_date),
+                *([archive_signal_ledger(client, signal_ledger, market_data_date)] if signal_ledger else []),
+            )
+            extra_uploads=[]
+            for fname,obj in (("index_ma_history.json",index_ma_history),
+                              ("index_structure_history.json",index_structure_history),
+                              ("sector_returns_history.json",sector_returns_history),
+                              ("industry_returns_history.json",industry_returns_history),
+                              *exch_group_files.items()):
+                if obj:
+                    extra_uploads.append(upload_str_with_manifest(client,r2_upload,fname,
+                                         json.dumps(obj,separators=(",",":")),schema_v=1))
+            if extra_uploads:
+                try:
+                    await asyncio.gather(*extra_uploads)
+                except Exception as e:
+                    log.warning(f"Breadth/returns upload failed: {e}")
+            log.info(f"✅ EP:{len(signals)}  PostResult:{len(pr_signals)}  RS:{len(rs_data)}")
+        status.success()
+        log.info("━━━ EP + Post-Result + RS Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+# ══════════════════════════════════════════════════════════════
+# HLR + PULLBACK SCAN
+# ══════════════════════════════════════════════════════════════
+
+def _detect_pullback(all_data,length_pull=4,min_swing_range_pct=10.0,min_pullback_pct=5.0,ema_proximity_pct=1.0,max_range_atr=1.5,
+                     max_retrace_pct=61.8,min_pb_bars=2,max_pb_bars=12,max_bars_from_pb_low=2,
+                     new_high_lookback=50,min_ema_gap_pct=1.5,ema50_slope_bars=20,min_ema50_slope_pct=2.0):
+    """Daily pullback, same rules as the TwT Pullback script v3.4.
+
+    Swing high = highest high since the last confirmed swing low (known on the day it is made).
+    Signal on the latest bar when: swing >= 10%, pullback 5%+ deep, <= 61.8% retrace, 2-12 bars
+    old, its lowest low made in the last 2 bars, low/close within 1% of EMA10/21 (or a reversal
+    through it), EMA10/21 > EMA50 and close > EMA21, EMA50 rising 5 bars, flat-base guard
+    (swing high is a 50-bar high, EMA21 1.5%+ over EMA50, EMA50 up 2%+ in 20 bars),
+    candle range < 1.5 x ATR%(14), 3-day volume under the 20-day average, MACD line > 0.
+    Any candle colour and close position.
+    """
+    signals=[]
+    L=length_pull
+    for sym,s in all_data.items():
+        dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
+        if n<80 or not _check_liquidity(volumes,closes,n): continue
+        i=n-1
+        if any(x[i] is None for x in (highs,lows,closes)): continue
+        H=[h if h is not None else c for h,c in zip(highs,closes)]
+        Lo=[l if l is not None else c for l,c in zip(lows,closes)]
+        if any(c is None for c in closes[-120:]): continue
+        ema10=_calc_ema(closes,10); ema21=_calc_ema(closes,21); ema50=_calc_ema(closes,50)
+        ema12=_calc_ema(closes,12); ema26=_calc_ema(closes,26)
+        if any(v is None for v in (ema10[i],ema21[i],ema50[i],ema12[i],ema26[i])): continue
+        if ema50[i-ema50_slope_bars] is None or any(ema50[i-k] is None for k in range(6)): continue
+        macd_line=[(ema12[k]-ema26[k]) if ema12[k] is not None and ema26[k] is not None else None for k in range(n)]
+        macd_signal=_calc_ema([v if v is not None else 0.0 for v in macd_line],9)
+
+        # ---- walk the bars: swing low, swing high since it, pullback low ----
+        swing_low=0.0; leg_high=0.0; leg_high_idx=0; pb_low=None; pb_low_idx=0
+        for t in range(n):
+            j=t-L
+            pl=(j-L>=0 and all(Lo[j]<Lo[k] for k in range(j-L,j)) and all(Lo[j]<=Lo[k] for k in range(j+1,t+1)))
+            if pl:
+                swing_low=Lo[j]
+                win=H[t-L:t+1]; leg_high=max(win)
+                leg_high_idx=t-L+max(k for k,v in enumerate(win) if v==leg_high)
+            elif H[t]>=leg_high:
+                leg_high=H[t]; leg_high_idx=t
+            if pl or leg_high_idx==t or pb_low is None:
+                pb_low=Lo[t]; pb_low_idx=t
+            elif Lo[t]<=pb_low:
+                pb_low=Lo[t]; pb_low_idx=t
+        if swing_low<=0 or leg_high<=0 or pb_low is None: continue
+
+        # ---- conditions on the latest bar ----
+        swing_range_pct=(leg_high-swing_low)/swing_low*100
+        if swing_range_pct<min_swing_range_pct: continue
+        pb_bars=i-leg_high_idx
+        pullback_pct=(leg_high-pb_low)/leg_high*100
+        retrace_pct=(leg_high-pb_low)/(leg_high-swing_low)*100 if leg_high>swing_low else 100
+        if not (i-pb_low_idx<=max_bars_from_pb_low and pullback_pct>=min_pullback_pct
+                and retrace_pct<=max_retrace_pct and pb_low>swing_low
+                and min_pb_bars<=pb_bars<=max_pb_bars): continue
+        e10=ema10[i]; e21=ema21[i]; e50=ema50[i]
+        near_ema10=abs(Lo[i]-e10)/e10*100<=ema_proximity_pct or abs(closes[i]-e10)/e10*100<=ema_proximity_pct
+        near_ema21=abs(Lo[i]-e21)/e21*100<=ema_proximity_pct or abs(closes[i]-e21)/e21*100<=ema_proximity_pct
+        reversal_ema10=Lo[i]<e10 and closes[i]>e10; reversal_ema21=Lo[i]<e21 and closes[i]>e21
+        if not(near_ema10 or near_ema21 or reversal_ema10 or reversal_ema21): continue
+        if not(e21>e50 and e10>e50 and closes[i]>e21): continue
+        if not all(ema50[i-k]>ema50[i-k-1] for k in range(5)): continue
+        # flat-base guard
+        if leg_high<max(H[i-new_high_lookback+1:i+1]): continue
+        if (e21-e50)/e50*100<min_ema_gap_pct: continue
+        e50_old=ema50[i-ema50_slope_bars]
+        if e50_old<=0 or (e50-e50_old)/e50_old*100<min_ema50_slope_pct: continue
+        # candle size vs the stock's own ATR% (Wilder ATR 14)
+        atr=None
+        for t in range(1,n):
+            tr=max(H[t]-Lo[t],abs(H[t]-closes[t-1]),abs(Lo[t]-closes[t-1]))
+            atr=tr if atr is None else (atr*13+tr)/14
+        if not atr or closes[i]<=0 or Lo[i]<=0: continue
+        candle_range_pct=(H[i]-Lo[i])/Lo[i]*100
+        if candle_range_pct>=max_range_atr*atr/closes[i]*100: continue
+        # volume dry-up and momentum
+        v3=[v for v in volumes[i-2:i+1] if v is not None]; v20=[v for v in volumes[i-19:i+1] if v is not None]
+        if len(v3)<3 or len(v20)<20 or sum(v3)/3>=sum(v20)/20: continue
+        if macd_line[i] is None or macd_line[i]<=0: continue
+        ema_touch="Reversal" if (reversal_ema10 or reversal_ema21) else "Near EMA10" if near_ema10 else "Near EMA21"
+        signals.append({"symbol":sym,"date":dates[i],"close":round(closes[i],2),
+            "swing_high":round(leg_high,2),"swing_low":round(swing_low,2),
+            "swing_range_pct":round(swing_range_pct,2),"pullback_pct":round(pullback_pct,2),
+            "retrace_pct":round(retrace_pct,2),"pb_bars":pb_bars,
+            "ema10":round(e10,2),"ema21":round(e21,2),"ema50":round(e50,2),
+            "ema_touch":ema_touch,"candle_range_pct":round(candle_range_pct,2),
+            "macd":round(macd_line[i],4),"macd_signal":round(macd_signal[i],4) if macd_signal[i] is not None else None})
+    return signals
+
+
+def _detect_pullback_tf(all_data, tf="W", ema_periods=(10, 30), length_pull=2,
+                         min_swing_range_pct=10.0, min_pullback_pct=5.0,
+                         ema_proximity_pct=1.5, max_candle_range_pct=10.0):
+    """
+    Same pullback logic as _detect_pullback (swing high -> pullback -> EMA
+    proximity/reversal -> MACD confirmation), run on weekly ('W') or monthly
+    ('M') resampled candles instead of daily.
+
+    ema_periods: the EMA(s) checked for proximity/reversal — e.g. weekly=(10,30),
+    monthly=(21,). Trend confirmation requires price above the LONGEST supplied
+    EMA, with that EMA rising over its last few bars (adapted from the daily
+    version's "EMA21>EMA50, EMA10>EMA50, EMA50 rising" stack — daily has 3 EMAs
+    to chain together, weekly/monthly only have what's supplied here).
+    """
+    signals = []
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        if len(dates) < 60 or not _check_liquidity(volumes, closes, len(dates)): continue
+        td, th, tl, tc, _ = _build_tf_series(dates, highs, lows, closes, volumes, tf)
+        n = len(td)
+        min_bars = max(ema_periods) + 10
+        if n < min_bars: continue
+
+        emas = {p: _calc_ema(tc, p) for p in ema_periods}
+        if any(emas[p][-1] is None for p in ema_periods): continue
+
+        ema12 = _calc_ema(tc, 12); ema26 = _calc_ema(tc, 26)
+        macd_line = [(ema12[i] - ema26[i]) if ema12[i] is not None and ema26[i] is not None else None for i in range(n)]
+        if len([v for v in macd_line if v is not None]) < 9: continue
+        macd_arr = [v if v is not None else 0.0 for v in macd_line]
+        macd_signal = _calc_ema(macd_arr, 9)
+
+        last_swing_high_price = last_swing_high_bar = last_swing_low_price = last_swing_low_bar = None
+        for i in range(length_pull, n - length_pull):
+            if all(th[i] >= th[i - k] for k in range(1, length_pull + 1)) and all(th[i] >= th[i + k] for k in range(1, length_pull + 1)):
+                last_swing_high_price = th[i]; last_swing_high_bar = i
+            if all(tl[i] <= tl[i - k] for k in range(1, length_pull + 1)) and all(tl[i] <= tl[i + k] for k in range(1, length_pull + 1)):
+                last_swing_low_price = tl[i]; last_swing_low_bar = i
+        if last_swing_high_price is None or last_swing_low_price is None: continue
+        i = n - 1
+        if last_swing_high_bar is None or last_swing_low_bar is None: continue
+        if last_swing_high_bar <= last_swing_low_bar: continue
+        if tc[i] is None or th[i] is None or tl[i] is None: continue
+
+        if last_swing_low_price <= 0 or last_swing_high_price <= 0: continue  # bad/zero price data
+        swing_range_pct = (last_swing_high_price - last_swing_low_price) / last_swing_low_price * 100
+        if swing_range_pct < min_swing_range_pct: continue
+        pullback_pct = (last_swing_high_price - tl[i]) / last_swing_high_price * 100
+        if pullback_pct < min_pullback_pct: continue
+
+        near_any = False; reversal_any = False; touched_label = None
+        for p in sorted(ema_periods):
+            e = emas[p][i]
+            near = abs(tl[i] - e) / e * 100 <= ema_proximity_pct or abs(tc[i] - e) / e * 100 <= ema_proximity_pct
+            reversal = tl[i] < e and tc[i] > e
+            if near or reversal:
+                near_any = near_any or near; reversal_any = reversal_any or reversal
+                touched_label = f"EMA{p}"
+        if not (near_any or reversal_any): continue
+
+        longest = max(ema_periods); e_long = emas[longest][i]
+        if not (tc[i] > e_long): continue
+        lb = min(5, i)
+        if any(emas[longest][i - k] is None for k in range(lb + 1)): continue
+        if not all(emas[longest][i - k] >= emas[longest][i - k - 1] for k in range(lb)): continue
+
+        candle_range_pct = (th[i] - tl[i]) / tl[i] * 100 if tl[i] > 0 else 0
+        if candle_range_pct >= max_candle_range_pct: continue
+        if macd_line[i] is None or macd_signal[i] is None: continue
+        if macd_line[i] < macd_signal[i]: continue
+
+        ema_touch = "Reversal" if reversal_any else f"Near {touched_label}"
+        signals.append({"symbol": sym, "tf": tf, "date": td[i], "close": round(tc[i], 2),
+            "swing_high": round(last_swing_high_price, 2), "swing_low": round(last_swing_low_price, 2),
+            "swing_range_pct": round(swing_range_pct, 2), "pullback_pct": round(pullback_pct, 2),
+            **{f"ema{p}": round(emas[p][i], 2) for p in ema_periods},
+            "ema_touch": ema_touch, "candle_range_pct": round(candle_range_pct, 2),
+            "macd": round(macd_line[i], 4), "macd_signal": round(macd_signal[i], 4)})
+    return signals
+
+
+# ══════════════════════════════════════════════════════════════
+# WEEKLY PULLBACK v2 — chain-based pole detection (HTF-style), replaces
+# ONLY the weekly leg of the old _detect_pullback_tf() call in
+# run_hlr_scan(). _detect_pullback_tf() itself is untouched and still
+# powers the MONTHLY pullback scan (tf="M") — see run_hlr_scan() below.
+# _build_tf_series / _calc_ema / _check_liquidity are reused as-is.
+#
+# No entry/SL fields — just the signal itself (pole + pullback + which
+# EMA it touched), for feeding into screener_feed.json as a boolean flag.
+# ══════════════════════════════════════════════════════════════
+
+def _isoweek_to_date(week_str):
+    """Converts _build_tf_series' weekly date-key string (e.g. '(2025, 26)')
+    into the Monday of that ISO week, e.g. '2025-06-23'."""
+    m = re.match(r"\((\d+),\s*(\d+)\)", str(week_str))
+    if not m:
+        return week_str
+    year, week = int(m.group(1)), int(m.group(2))
+    return date.fromisocalendar(year, week, 1).isoformat()
+
+
+def _weekly_pullback_swing_low_candidates(lows, end_idx, lookback, floor=0):
+    """Returns ALL candidate base ('lo') indices within [floor, end_idx],
+    sorted so lower lows (bigger potential gain%) are tried first."""
+    start = max(0, end_idx - lookback, floor)
+    seg_idx = [i for i in range(start, end_idx + 1) if lows[i] is not None]
+    if not seg_idx:
+        return []
+    return sorted(seg_idx, key=lambda i: lows[i])
+
+
+def _try_build_weekly_pullback_v2(lo, hi, wd, wh, wl, wc, emas, n,
+                                   pole_min_weeks, pole_max_weeks, min_gain_pct,
+                                   min_pullback_pct, ema_proximity_pct, max_pullback_weeks,
+                                   pole_ema_tolerance_pct, peak_check_min_pullback_pct,
+                                   max_signal_age_weeks=2):
+    if lo is None or lo >= hi:
+        return None
+
+    pole_high = wh[hi]
+    pole_low = wl[lo]
+    pole_weeks = hi - lo
+    if pole_weeks < pole_min_weeks or pole_weeks > pole_max_weeks:
+        return None
+    if not pole_low or pole_low <= 0:
+        return None
+
+    gain_pct = (pole_high - pole_low) / pole_low * 100.0
+    if gain_pct < min_gain_pct:
+        return None
+
+    if any(wh[k] is not None and wh[k] > pole_high for k in range(lo, hi)):
+        return None
+
+    # Pullback-aware forward check: a later close meaningfully above
+    # pole_high only invalidates this candidate if the rally never genuinely
+    # paused first. If a real pullback already happened before that later
+    # higher close, this candidate IS a legitimate, separate pole-top — the
+    # later high belongs to a NEW leg, picked up by the chain logic below.
+    peak_check_end = min(n, hi + 5)
+    min_low_seen = pole_high
+    for k in range(hi + 1, peak_check_end):
+        if wl[k] is not None:
+            min_low_seen = min(min_low_seen, wl[k])
+        if wc[k] is not None and wc[k] > pole_high * 1.03:
+            pullback_so_far = (pole_high - min_low_seen) / pole_high * 100.0
+            if pullback_so_far < peak_check_min_pullback_pct:
+                return None
+            break
+
+    # Pole-cleanliness: the rally itself (lo -> hi) must stay above its own
+    # EMA10 the whole way (small tolerance for minor undershoots).
+    fast_ema = min(emas.keys())
+    for k in range(lo, hi + 1):
+        e = emas[fast_ema][k]
+        if e is not None and wc[k] is not None and wc[k] < e * (1 - pole_ema_tolerance_pct / 100.0):
+            return None
+
+    walk_end = min(n - 1, hi + max_pullback_weeks)
+    cum_low = pole_high
+    cum_low_idx = hi
+    signal_idx = None
+    signal_ema = None
+    signal_kind = None
+
+    for j in range(hi + 1, walk_end + 1):
+        l, c = wl[j], wc[j]
+
+        # If this week's HIGH already breaks above pole_high, the stock isn't
+        # pulling back anymore — it's making a fresh new high. Such a candle
+        # can't be a valid "pullback signal" week even if its low/close also
+        # happens to sit near an EMA; a wide-range week that dips to the EMA
+        # AND rallies to a new high in the same week is a breakout candle,
+        # not a pullback candle. Stop looking for a signal on this pole.
+        if wh[j] is not None and wh[j] > pole_high * 1.03:
+            break
+
+        if l is not None and l < cum_low:
+            cum_low = l
+            cum_low_idx = j
+
+        # ---- FIX: keep walking and OVERWRITE with the LATEST touch, don't
+        # stop at the FIRST one. A stock can sit near its EMA for many
+        # consecutive weeks (or touch it, drift off, then touch again) —
+        # stopping at the earliest touch meant the staleness check below
+        # could reject a pullback that's genuinely still live today just
+        # because it ALSO happened to touch the EMA weeks earlier. What
+        # matters for "is this a live pullback signal" is the MOST RECENT
+        # touch before any breakout, not the first one on this pole.
+        for p in sorted(emas.keys()):
+            e = emas[p][j]
+            if e is None:
+                continue
+            near = (l is not None and abs(l - e) / e * 100 <= ema_proximity_pct) or \
+                   (c is not None and abs(c - e) / e * 100 <= ema_proximity_pct)
+            reversal = l is not None and c is not None and l < e and c > e
+            if near or reversal:
+                signal_idx = j
+                signal_ema = p
+                signal_kind = "Reversal" if reversal else f"Near EMA{p}"
+                break
+
+    if signal_idx is None:
+        return None
+
+    # ---- FIX: a signal is only a valid "pullback" if it's still CURRENT —
+    # not just something that happened somewhere in the last max_pullback_weeks.
+    # Without this, a stock that touched its EMA once (weeks ago) and has
+    # since broken down further into an outright downtrend still shows up
+    # as "W-Pullback" today, because w_pb_map keeps whichever match has the
+    # latest signal_date with no check that the signal is still live. Real
+    # confirmed example: AAVAS — pole was Feb->Jul (genuine +48% rally),
+    # EMA touch happened early Aug, but by mid-Sep the stock has kept
+    # falling well below both EMAs (RS 28, Mswing -0.83) — a breakdown, not
+    # a live pullback-to-EMA setup. Require the touch to be within the last
+    # max_signal_age_weeks of the most recent bar.
+    if (n - 1 - signal_idx) > max_signal_age_weeks:
+        return None
+
+    # ---- Trend-health gate: as of the LATEST bar (today), the fast EMA
+    # must still be above the slow EMA (e.g. weekly EMA10 > EMA30). A stock
+    # can pass the staleness check above yet still have flipped into a
+    # genuine downtrend structure (fast EMA crossed below slow EMA) — this
+    # catches that independently of how recent the EMA "touch" itself was.
+    slow_ema = max(emas.keys())
+    fast_last, slow_last = emas[fast_ema][n - 1], emas[slow_ema][n - 1]
+    if fast_last is None or slow_last is None or fast_last <= slow_last:
+        return None
+
+    pullback_pct = (pole_high - wl[signal_idx]) / pole_high * 100.0
+    if pullback_pct < min_pullback_pct:
+        return None
+
+    return {
+        "pole_low_date": _isoweek_to_date(wd[lo]), "pole_low": round(pole_low, 2),
+        "pole_high_date": _isoweek_to_date(wd[hi]), "pole_high": round(pole_high, 2),
+        "pole_gain_pct": round(gain_pct, 1), "pole_weeks": pole_weeks,
+        "signal_date": _isoweek_to_date(wd[signal_idx]), "signal_ema": f"EMA{signal_ema}",
+        "signal_kind": signal_kind,
+        "pullback_pct": round(pullback_pct, 1),
+        "as_of_date": _isoweek_to_date(wd[-1]), "as_of_close": round(wc[-1], 2) if wc[-1] is not None else None,
+        "_cum_low_idx": cum_low_idx, "_signal_idx": signal_idx,
+    }
+
+
+def _detect_weekly_pullback_v2(all_data, min_gain_pct=30.0, pole_min_weeks=3, pole_max_weeks=26,
+                                ema_periods=(10, 30), ema_proximity_pct=5.0,
+                                max_pullback_weeks=12, min_pullback_pct=5.0,
+                                pole_ema_tolerance_pct=0.0, peak_check_min_pullback_pct=10.0,
+                                lookback_weeks=104, max_signal_age_weeks=2):
+    """
+    Chain-based weekly rally + pullback-to-EMA signal detector (HTF-style):
+    pole must be a strictly clean rally (no real EMA10 close-violations
+    during formation), peak-check is pullback-aware, and each pole's own
+    pullback-low chains directly into the next pole's base. No entry/SL —
+    just the signal, for boolean-flagging in screener_feed.json.
+
+    The EMA-touch signal must be RECENT (within max_signal_age_weeks of the
+    latest bar) — not just anywhere within max_pullback_weeks of the pole's
+    own high. Without this, a stock that touched its EMA once weeks ago and
+    has since broken down further into an outright downtrend (e.g. AAVAS:
+    genuine Feb->Jul pole, EMA touch early Aug, but still falling through
+    mid-Sep with RS 28 and negative Mswing) kept showing as "W-Pullback"
+    long after the setup stopped being live.
+    """
+    all_signals = []
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        if len(dates) < 60 or not _check_liquidity(volumes, closes, len(dates)):
+            continue
+
+        wd, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, "W")
+        n = len(wd)
+        min_bars = max(ema_periods) + pole_min_weeks + 5
+        if n < min_bars:
+            continue
+
+        emas = {p: _calc_ema(wc, p) for p in ema_periods}
+
+        matches = []
+        scan_start = max(0, n - lookback_weeks)
+        chain_lo = None
+        fallback_floor = -1
+
+        for hi in range(scan_start + pole_min_weeks, n):
+            if wh[hi] is None:
+                continue
+
+            candidates = []
+            if chain_lo is not None and hi - chain_lo <= pole_max_weeks:
+                candidates.append(chain_lo)
+            for search_lo in _weekly_pullback_swing_low_candidates(wl, hi, pole_max_weeks, floor=fallback_floor):
+                if search_lo not in candidates:
+                    candidates.append(search_lo)
+
+            match = None
+            for lo in candidates:
+                match = _try_build_weekly_pullback_v2(
+                    lo, hi, wd, wh, wl, wc, emas, n,
+                    pole_min_weeks, pole_max_weeks, min_gain_pct,
+                    min_pullback_pct, ema_proximity_pct, max_pullback_weeks,
+                    pole_ema_tolerance_pct, peak_check_min_pullback_pct,
+                    max_signal_age_weeks)
+                if match is not None:
+                    break
+
+            if match is None:
+                continue
+
+            cum_low_idx = match.pop("_cum_low_idx")
+            signal_idx = match.pop("_signal_idx")
+            matches.append(match)
+            chain_lo = cum_low_idx if cum_low_idx > hi else None
+            fallback_floor = signal_idx + 2
+
+        matches.sort(key=lambda m: m["pole_high_date"], reverse=True)
+        for m in matches:
+            all_signals.append({"symbol": sym, **m})
+
+    return all_signals
+
+
+def _hlr_consolidation(highs, lows, close, atr_value, short_days=3, long_days=5):
+    """Tight 3-bar range (<1 ATR) OR sustained 5-bar range (<1.5 ATR)."""
+    if atr_value is None or atr_value <= 0 or close is None or close <= 0:
+        return False, None, None
+    def range_for(days):
+        if len(highs) < days or len(lows) < days:
+            return None
+        hs, ls = highs[-days:], lows[-days:]
+        if any(v is None for v in hs) or any(v is None for v in ls):
+            return None
+        return max(hs) - min(ls)
+    r3, r5 = range_for(short_days), range_for(long_days)
+    is_consol = (r3 is not None and r3 < atr_value) or (r5 is not None and r5 < 1.5 * atr_value)
+    return is_consol, (round(r3 / close * 100, 2) if r3 is not None else None), (round(r5 / close * 100, 2) if r5 is not None else None)
+
+def _detect_hlr(all_data,swing_n=9,cluster_pct=2.0,consol_days=3):
+    signals=[]
+    for sym,s in all_data.items():
+        dates=s["d"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
+        if n<swing_n*2+consol_days+2 or not _check_liquidity(volumes,closes,n): continue
+        vol_lookback=min(50,n-1)
+        avg_vol_50=sum(volumes[-vol_lookback-1:-1])/vol_lookback if vol_lookback>0 else 0
+        vol_spike=volumes[-1]/avg_vol_50 if avg_vol_50>0 and vol_lookback>=20 else None
+        swing_highs=[]
+        for i in range(swing_n,n-swing_n):
+            if all(highs[i]>=highs[i-k] for k in range(1,swing_n+1)) and all(highs[i]>=highs[i+k] for k in range(1,swing_n+1)):
+                sh_price=highs[i]
+                if any(closes[j]>sh_price * 1.002 for j in range(i+1,n-1) if closes[j] is not None): continue
+                broke_today=closes[-1] is not None and closes[-1]>sh_price * 1.002
+                swing_highs.append((sh_price,dates[i],"BO" if broke_today else "valid"))
+        if not swing_highs: continue
+        swing_highs.sort(key=lambda x:x[0],reverse=True); used=[False]*len(swing_highs); levels=[]
+        for i,(h,d,tag) in enumerate(swing_highs):
+            if used[i] or not h or h<=0: continue
+            cluster=[(h,d,tag)]
+            for j in range(i+1,len(swing_highs)):
+                if not used[j] and abs(swing_highs[j][0]-h)/h*100<=cluster_pct: cluster.append(swing_highs[j]); used[j]=True
+            used[i]=True
+            level=max(c[0] for c in cluster); zone_low=min(c[0] for c in cluster)
+            cluster_tag="BO" if any(c[2]=="BO" for c in cluster) else "valid"
+            touch_pts=sorted([{"date":c[1],"price":round(c[0],2)} for c in cluster],key=lambda x:x["date"])
+            levels.append((level,zone_low,len(cluster),len(cluster)>=2,touch_pts,cluster_tag, [c[0] for c in cluster]))
+        curr_close=closes[-1]
+        if curr_close is None or curr_close<=0: continue   # bad candle (c=0) guard
+        atr_value = _calc_atr_series(highs, lows, closes, 14)[-1]
+        near_pct = min(4.0, atr_value / curr_close * 100 * 1.5) if atr_value is not None else None
+        curr_date=dates[-1]
+        is_consol, range_pct, range_5_pct = _hlr_consolidation(highs, lows, curr_close, atr_value, consol_days, 5)
+        for (level,zone_low,touches,is_zone,touch_pts,cluster_tag,member_highs) in levels:
+            if not level or level<=0: continue
+            dist_pct=(level-curr_close)/level*100
+            if cluster_tag=="BO":
+                state="BO"
+            elif near_pct is not None and any(abs(curr_close - sh) / sh * 100 <= near_pct and curr_close <= sh * 1.002 for sh in member_highs): state="Consolidating near HLR" if is_consol else "Near HLR"
+            else: continue
+            signals.append({"symbol":sym,"state":state,"resistance":round(level,2),"zone_low":round(zone_low,2),
+                "is_zone":is_zone,"touches":touches,"touch_points":touch_pts,"dist_pct":round(dist_pct,2),
+                "last_close":round(curr_close,2),"last_date":curr_date,"consol_range":range_pct,"consol_range_5":range_5_pct,
+                "vol_spike":round(vol_spike,1) if vol_spike is not None else None})
+    return signals
+
+def _detect_hlr_tf(all_data, tf="W", swing_n=3, cluster_pct=2.5, consol_days=3):
+    """
+    Same swing-cluster resistance-zone logic as _detect_hlr, run on weekly
+    candles. Both timeframes use either 3 candles below 1 ATR or 5 candles below
+    1.5 ATR, using their own Wilder ATR(14). Volume-spike isn't tracked here (weekly aggregated
+    volume is a less meaningful "spike" signal than daily's).
+    """
+    signals = []
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        if len(dates) < 260 or not _check_liquidity(volumes, closes, len(dates)): continue
+        wd, wh, wl, wc, _ = _build_tf_series(dates, highs, lows, closes, volumes, tf)
+        n = len(wd)
+        if n < swing_n * 2 + consol_days + 2: continue
+
+        swing_highs = []
+        for i in range(swing_n, n - swing_n):
+            if all(wh[i] >= wh[i - k] for k in range(1, swing_n + 1)) and all(wh[i] >= wh[i + k] for k in range(1, swing_n + 1)):
+                sh_price = wh[i]
+                if any(wc[j] > sh_price for j in range(i + 1, n - 1) if wc[j] is not None): continue
+                broke_today = wc[-1] is not None and wc[-1] > sh_price
+                swing_highs.append((sh_price, wd[i], "BO" if broke_today else "valid"))
+        if not swing_highs: continue
+        swing_highs.sort(key=lambda x: x[0], reverse=True); used = [False] * len(swing_highs); levels = []
+        for i, (h, d, tag) in enumerate(swing_highs):
+            if used[i] or not h or h <= 0: continue
+            cluster = [(h, d, tag)]
+            for j in range(i + 1, len(swing_highs)):
+                if not used[j] and abs(swing_highs[j][0] - h) / h * 100 <= cluster_pct:
+                    cluster.append(swing_highs[j]); used[j] = True
+            used[i] = True
+            level = max(c[0] for c in cluster); zone_low = min(c[0] for c in cluster)
+            cluster_tag = "BO" if any(c[2] == "BO" for c in cluster) else "valid"
+            touch_pts = sorted([{"date": c[1], "price": round(c[0], 2)} for c in cluster], key=lambda x: x["date"])
+            levels.append((level, zone_low, len(cluster), len(cluster) >= 2, touch_pts, cluster_tag))
+
+        curr_close = wc[-1]
+        if curr_close is None or curr_close <= 0: continue   # bad candle (c=0) → ZeroDivisionError guard
+        # Weekly proximity uses ATR of weekly candles, not daily ATR.
+        atr_value = _calc_atr_series(wh, wl, wc, 14)[-1]
+        near_pct = min(4.0, atr_value / curr_close * 100 * 1.5) if atr_value is not None else None
+        curr_date = wd[-1]
+        is_consol, range_pct, range_5_pct = _hlr_consolidation(wh, wl, curr_close, atr_value, consol_days, 5)
+
+        for (level, zone_low, touches, is_zone, touch_pts, cluster_tag) in levels:
+            if not level or level <= 0: continue
+            dist_pct = (level - curr_close) / level * 100
+            if cluster_tag == "BO": state = "BO"
+            elif near_pct is not None and 0 <= dist_pct <= near_pct: state = "Consolidating near HLR" if is_consol else "Near HLR"
+            else: continue
+            signals.append({"symbol": sym, "tf": tf, "state": state, "resistance": round(level, 2), "zone_low": round(zone_low, 2),
+                "is_zone": is_zone, "touches": touches, "touch_points": touch_pts, "dist_pct": round(dist_pct, 2),
+                "last_close": round(curr_close, 2), "last_date": curr_date, "consol_range": range_pct, "consol_range_5": range_5_pct})
+    return signals
+
+async def run_hlr_scan() -> None:
+    status = PipelineStatus("run_hlr_scan")
+    try:
+        today=today_ist()
+        log.info(f"━━━ HLR + Pullback Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP,BSE_ISIN_MAP,BSE_META
+            ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
+            all_data=await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+            _zero=[(sym,s_["d"][i]) for sym,s_ in all_data.items() for i,c in enumerate(s_.get("c") or []) if c is not None and c<=0]
+            if _zero:
+                log.warning(f"⚠ Zero/negative closes: {len(_zero)} → {_zero[:20]}")
+                _bad={sym for sym,_ in _zero}
+                all_data={k:v for k,v in all_data.items() if k not in _bad}
+                log.warning(f"⚠ Excluded {len(_bad)} symbol(s) with bad prices from HLR/Pullback scan: {sorted(_bad)}")
+            hlr_signals=_detect_hlr(all_data)
+            order={"BO":0,"Consolidating near HLR":1,"Near HLR":2}
+            hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
+            bo=sum(1 for s in hlr_signals if s["state"]=="BO")
+            consol=sum(1 for s in hlr_signals if s["state"]=="Consolidating near HLR")
+            near=sum(1 for s in hlr_signals if s["state"]=="Near HLR")
+            log.info(f"HLR — BO:{bo} Consolidating:{consol} Near:{near} Total:{len(hlr_signals)}")
+            pb_signals=_detect_pullback(all_data)
+            pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+            w_hlr_signals=_detect_hlr_tf(all_data,tf="W")
+            w_hlr_signals.sort(key=lambda x:(order.get(x["state"],9),-x["touches"]))
+            log.info(f"Weekly HLR: {len(w_hlr_signals)} signals")
+            w_pb_signals=_detect_weekly_pullback_v2(all_data)
+            w_pb_signals.sort(key=lambda x:x["pole_high_date"],reverse=True)
+            m_pb_signals=_detect_pullback_tf(all_data,tf="M",ema_periods=(21,))
+            m_pb_signals.sort(key=lambda x:x["pullback_pct"],reverse=True)
+            log.info(f"Weekly Pullback: {len(w_pb_signals)}  Monthly Pullback: {len(m_pb_signals)}")
+            # CPR
+            cpr_data = _build_cpr_data(all_data, today)
+            narrow_cpr = sum(
+                1 for v in cpr_data.values()
+                if v.get("daily", {}).get("next", {}).get("category") in ("Very Narrow", "Narrow")
+            )
+            log.info(f"CPR: {len(cpr_data)} stocks  Narrow next-day: {narrow_cpr}")
+            log.info(f"Pullback signals: {len(pb_signals)}")
+            await asyncio.gather(
+                upload_str_with_manifest(client, r2_upload, "hlr_signals.json", json.dumps({
+                    "updated": today, "count": len(hlr_signals),
+                    "bo": bo, "consolidating": consol, "near": near,
+                    "signals": hlr_signals,
+                }), schema_v=1, extra_meta={"count": len(hlr_signals)}),
+                upload_str_with_manifest(client, r2_upload, "pullback_signals.json", json.dumps({
+                    "updated": today, "count": len(pb_signals),
+                    "signals": pb_signals,
+                }), schema_v=1, extra_meta={"count": len(pb_signals)}),
+                upload_str_with_manifest(client, r2_upload, "weekly_hlr_signals.json", json.dumps({
+                    "updated": today, "count": len(w_hlr_signals),
+                    "signals": w_hlr_signals,
+                }), schema_v=1, extra_meta={"count": len(w_hlr_signals)}),
+                upload_str_with_manifest(client, r2_upload, "weekly_pullback_signals.json", json.dumps({
+                    "updated": today, "count": len(w_pb_signals),
+                    "signals": w_pb_signals,
+                }), schema_v=1, extra_meta={"count": len(w_pb_signals)}),
+                upload_str_with_manifest(client, r2_upload, "monthly_pullback_signals.json", json.dumps({
+                    "updated": today, "count": len(m_pb_signals),
+                    "signals": m_pb_signals,
+                }), schema_v=1, extra_meta={"count": len(m_pb_signals)}),
+                upload_str_with_manifest(client, r2_upload, "cpr.json", json.dumps({
+                    "updated": today,
+                    "count": len(cpr_data),
+                    "stocks": cpr_data,
+                }), schema_v=1, extra_meta={"stock_count": len(cpr_data)}),
+            )
+        status.success()
+        log.info("━━━ HLR + Pullback Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# PATTERN SCAN
+# ══════════════════════════════════════════════════════════════
+
+def _build_weekly(dates,opens,highs,lows,closes,volumes):
+    from datetime import date as dt
+    weekly={}
+    for d,o,h,l,c,v in zip(dates,opens,highs,lows,closes,volumes):
+        if h is None or l is None or c is None: continue
+        key=dt.fromisoformat(d).isocalendar()[:2]
+        if key not in weekly: weekly[key]={"o":o,"h":h,"l":l,"c":c,"v":v or 0,"d":d}
+        else: weekly[key]["h"]=max(weekly[key]["h"],h); weekly[key]["l"]=min(weekly[key]["l"],l); weekly[key]["c"]=c; weekly[key]["v"]+=v or 0
+    return weekly
+
+def _detect_patterns(all_data,min_volume=2500,coil_min_babies=3,tight_close_weeks=3,tight_close_pct=2.0):
+    from datetime import date as dt
+    signals=[]
+    for sym,s in all_data.items():
+        dates=s["d"]; opens=s["o"]; highs=s["h"]; lows=s["l"]; closes=s["c"]; volumes=s["v"]; n=len(dates)
+        if n<10 or not _check_liquidity(volumes,closes,n): continue
+        if any(v is None for v in [highs[-1],highs[-2],lows[-1],lows[-2],closes[-1]]): continue
+        if volumes[-1] is None or volumes[-1]<min_volume: continue
+        today_d=dates[-1]
+        if highs[-1]<=highs[-2] and lows[-1]>=lows[-2]:
+            signals.append({"symbol":sym,"pattern":"Inside Bar","date":today_d,"high":round(highs[-1],2),"low":round(lows[-1],2),"prev_high":round(highs[-2],2),"prev_low":round(lows[-2],2)})
+        if n>=3 and highs[-3] is not None and lows[-3] is not None:
+            if highs[-1]<=highs[-2] and lows[-1]>=lows[-2] and highs[-2]<=highs[-3] and lows[-2]>=lows[-3]:
+                signals.append({"symbol":sym,"pattern":"Double Inside Bar","date":today_d,"high":round(highs[-1],2),"low":round(lows[-1],2),"mother_high":round(highs[-3],2),"mother_low":round(lows[-3],2)})
+        if n>=7:
+            last7_h=[highs[-i] for i in range(1,8)]; last7_l=[lows[-i] for i in range(1,8)]
+            if all(v is not None for v in last7_h+last7_l):
+                today_range=last7_h[0]-last7_l[0]
+                if today_range<=min(last7_h[i]-last7_l[i] for i in range(1,7)):
+                    signals.append({"symbol":sym,"pattern":"NR7","date":today_d,"range":round(today_range,2),"high":round(highs[-1],2),"low":round(lows[-1],2)})
+        seen_mothers=set()
+        for m_idx in range(n-coil_min_babies-1,max(0,n-60),-1):
+            m_high=highs[m_idx]; m_low=lows[m_idx]
+            if m_high is None or m_low is None: continue
+            m_key=round(m_high*200)
+            if m_key in seen_mothers: continue
+            baby_count=0; coil_state="Coiling"
+            for b in range(m_idx+1,n):
+                if highs[b] is None or lows[b] is None: continue
+                if highs[b]>m_high: coil_state="Upper BO"; break
+                elif lows[b]<m_low: coil_state="Lower BD"; break
+                else: baby_count+=1
+            if baby_count>=coil_min_babies and coil_state=="Coiling":
+                seen_mothers.add(m_key)
+                signals.append({"symbol":sym,"pattern":f"{baby_count} Bar MCP" if baby_count<=6 else "Mini Coil","date":today_d,"mcp_high":round(m_high,2),"mcp_low":round(m_low,2),"baby_count":baby_count,"coil_state":coil_state,"mother_date":dates[m_idx]})
+        weekly=_build_weekly(dates,opens,highs,lows,closes,volumes)
+        if not weekly: continue
+        current_week = dt.fromisoformat(today_d).isocalendar()[:2]
+        if _is_week_complete(today_d):
+            past_weeks = sorted(k for k in weekly if k <= current_week)
+        else:
+            past_weeks = sorted(k for k in weekly if k < current_week)
+        if len(past_weeks)<2: continue
+        lw=weekly[past_weeks[-1]]; lw2=weekly[past_weeks[-2]]
+        if lw["h"]<=lw2["h"] and lw["l"]>=lw2["l"]:
+            signals.append({"symbol":sym,"pattern":"Weekly IB","date":today_d,"w_high":round(lw["h"],2),"w_low":round(lw["l"],2),"w_close":round(lw["c"],2),"prev_w_high":round(lw2["h"],2),"prev_w_low":round(lw2["l"],2)})
+            if len(past_weeks)>=3:
+                lw3=weekly[past_weeks[-3]]
+                if lw2["h"]<=lw3["h"] and lw2["l"]>=lw3["l"]:
+                    signals.append({"symbol":sym,"pattern":"Weekly Double IB","date":today_d,"w_high":round(lw["h"],2),"w_low":round(lw["l"],2),"mother_w_high":round(lw3["h"],2),"mother_w_low":round(lw3["l"],2)})
+        if len(past_weeks)>=7:
+            lw_range=lw["h"]-lw["l"]
+            if lw_range<=min(weekly[past_weeks[-i]]["h"]-weekly[past_weeks[-i]]["l"] for i in range(2,8)):
+                signals.append({"symbol":sym,"pattern":"Weekly NR7","date":today_d,"w_range":round(lw_range,2),"w_high":round(lw["h"],2),"w_low":round(lw["l"],2)})
+        if len(past_weeks)>=tight_close_weeks:
+            last_n=[weekly[past_weeks[-i]]["c"] for i in range(1,tight_close_weeks+1)]
+            if all(c is not None for c in last_n) and min(last_n)>0:
+                tc_range=(max(last_n)-min(last_n))/min(last_n)*100
+                if tc_range<=tight_close_pct:
+                    signals.append({"symbol":sym,"pattern":"Weekly Tight Close","date":today_d,"closes":[round(c,2) for c in last_n],"range_pct":round(tc_range,2)})
+    return signals
+
+async def run_pattern_scan(force: bool = False) -> None:
+    status = PipelineStatus("run_pattern_scan")
+    try:
+        today=today_ist()
+        if not force and not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        if force: log.info(f"⚠️  FORCE MODE — bypassing trading-day check for {today}")
+        log.info(f"━━━ Pattern Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP,BSE_ISIN_MAP,BSE_META
+            ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
+            all_data=await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+            signals=_detect_patterns(all_data)
+            from collections import Counter; counts=Counter(s["pattern"] for s in signals)
+            for pat,cnt in sorted(counts.items()): log.info(f"  {pat}: {cnt}")
+            log.info(f"Total: {len(signals)} signals")
+
+            await update_follow_through_history(client, all_data, today)
+
+            await upload_str_with_manifest(client, r2_upload, "pattern_signals.json",
+                                            json.dumps({"updated":today,"count":len(signals),"summary":dict(counts),"signals":signals}),
+                                            schema_v=1, extra_meta={"count": len(signals)})
+        status.success()
+        log.info("━━━ Pattern Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+# ══════════════════════════════════════════════════════════════
+# CANDLESTICK PATTERN SCAN  (candle_scan)
+#   Outputs:
+#     candle_patterns.json      — signals from the last CANDLE_SIGNAL_SESSIONS sessions
+#     candle_pattern_stats.json — per-pattern backtest over the full OHLC history
+#                                 (forward returns after 5 / 10 / 20 sessions)
+#     candle_patterns_weekly.json      — same scan on COMPLETED weekly candles (last 10 weeks)
+#     candle_pattern_stats_weekly.json — weekly backtest (forward returns after 5 / 10 / 20 weeks)
+#   Does not touch pattern_scan (Inside Bar / NR7 / MCP stay there).
+# ══════════════════════════════════════════════════════════════
+
+CANDLE_SIGNAL_SESSIONS = 10          # sessions of signals kept in candle_patterns.json
+CANDLE_FWD_BARS        = (5, 10, 20) # forward-return horizons for the backtest
+CANDLE_AVG_LOOKBACK    = 10          # bars used for "average body / range" references
+CANDLE_TREND_LOOKBACK  = 5           # bars used to judge the trend before a pattern
+CANDLE_TREND_MIN_PCT   = 3.0         # minimum close-to-close move over that window to count as a trend
+CANDLE_TREND_EMA       = 10          # close must be above (uptrend) / below (downtrend) this EMA
+CANDLE_EXTREME_LOOKBACK = 10         # reversal patterns must print the highest high / lowest low of this many prior bars
+CANDLE_WEEKLY_MIN_BARS = 20          # weekly scan: minimum completed weekly candles per stock
+TWT_REV_MIN_DOWN       = 3          # TWT Reversal: minimum straight down days (lower close, lower high, lower low) before the reversal bar
+
+# pattern name -> bias ("bullish" / "bearish" / "neutral"), in display order
+CANDLE_PATTERNS = {
+    "TWT Reversal": "bullish",
+    "Bullish Engulfing": "bullish", "Bearish Engulfing": "bearish",
+    "Hammer": "bullish", "Shooting Star": "bearish",
+    "Morning Star": "bullish", "Evening Star": "bearish",
+    "Piercing Line": "bullish", "Dark Cloud Cover": "bearish",
+    "Bullish Harami": "bullish", "Bearish Harami": "bearish",
+    "Tweezer Bottom": "bullish", "Tweezer Top": "bearish",
+    "Bullish Marubozu": "bullish", "Bearish Marubozu": "bearish",
+    "Three White Soldiers": "bullish", "Three Black Crows": "bearish",
+    "Doji": "neutral", "Dragonfly Doji": "bullish", "Gravestone Doji": "bearish",
+}
+
+
+def _candle_prep(s):
+    """Per-stock arrays used by the detector. Bars with a missing O/H/L/C are marked invalid."""
+    o, h, l, c = s["o"], s["h"], s["l"], s["c"]
+    n = len(c)
+    ok = [all(x is not None and x > 0 for x in (o[i], h[i], l[i], c[i])) and h[i] >= l[i] for i in range(n)]
+    body = [abs(c[i] - o[i]) if ok[i] else None for i in range(n)]
+    rng = [h[i] - l[i] if ok[i] else None for i in range(n)]
+    # Average body / range of the CANDLE_AVG_LOOKBACK bars BEFORE bar i (never includes bar i)
+    avg_body = [None] * n
+    avg_rng = [None] * n
+    lb = CANDLE_AVG_LOOKBACK
+    for i in range(lb, n):
+        bs = [body[j] for j in range(i - lb, i) if body[j] is not None]
+        rs = [rng[j] for j in range(i - lb, i) if rng[j] is not None]
+        if len(bs) >= lb // 2: avg_body[i] = sum(bs) / len(bs)
+        if len(rs) >= lb // 2: avg_rng[i] = sum(rs) / len(rs)
+    ema = _calc_ema(c, CANDLE_TREND_EMA)  # value at bar i uses closes up to i only
+    return {"o": o, "h": h, "l": l, "c": c, "ok": ok, "body": body, "rng": rng,
+            "avg_body": avg_body, "avg_rng": avg_rng, "ema": ema, "n": n}
+
+
+def _candle_trend(p, start):
+    """Trend over the CANDLE_TREND_LOOKBACK bars before the pattern's first bar `start`.
+    'up'   = close rose >= CANDLE_TREND_MIN_PCT over the window AND closes above EMA(CANDLE_TREND_EMA);
+    'down' = close fell >= CANDLE_TREND_MIN_PCT over the window AND closes below that EMA."""
+    k = CANDLE_TREND_LOOKBACK
+    a, b = start - 1 - k, start - 1
+    if a < 0: return None
+    c, ema = p["c"], p["ema"]
+    if not (p["ok"][a] and p["ok"][b]) or ema[b] is None: return None
+    chg = (c[b] / c[a] - 1) * 100
+    if chg >= CANDLE_TREND_MIN_PCT and c[b] > ema[b]: return "up"
+    if chg <= -CANDLE_TREND_MIN_PCT and c[b] < ema[b]: return "down"
+    return None
+
+
+def _candle_at_extreme(p, start, end, side):
+    """True if the pattern (bars start..end) makes the lowest low ('low') or highest high ('high')
+    versus the CANDLE_EXTREME_LOOKBACK bars before it — i.e. it sits at the end of the move."""
+    lb = CANDLE_EXTREME_LOOKBACK
+    a = start - lb
+    if a < 0: return False
+    prior = [j for j in range(a, start) if p["ok"][j]]
+    if len(prior) < lb // 2: return False
+    if side == "low":
+        return min(p["l"][x] for x in range(start, end + 1)) <= min(p["l"][j] for j in prior)
+    return max(p["h"][x] for x in range(start, end + 1)) >= max(p["h"][j] for j in prior)
+
+
+def _candle_patterns_at(p, i):
+    """Candlestick patterns that complete on bar i. Returns [(name, candles_in_pattern), ...]."""
+    out = []
+    if i < 3 or not p["ok"][i]: return out
+    o, h, l, c, body, rng = p["o"], p["h"], p["l"], p["c"], p["body"], p["rng"]
+    ab, ar = p["avg_body"][i], p["avg_rng"][i]
+    if not ab or not ar or rng[i] <= 0: return out
+
+    O, H, L, C, B, R = o[i], h[i], l[i], c[i], body[i], rng[i]
+    UW = H - max(O, C)          # upper wick
+    LW = min(O, C) - L          # lower wick
+    bull, bear = C > O, C < O
+    t1 = _candle_trend(p, i)    # trend before a 1-bar pattern
+    # Reversal patterns must also sit at the end of the move (10-bar low after a fall / high after a rise)
+    low1 = t1 == "down" and _candle_at_extreme(p, i, i, "low")
+    high1 = t1 == "up" and _candle_at_extreme(p, i, i, "high")
+
+    # ── Single-candle ──
+    # Doji: tiny body on a normal-sized range, only at the end of a trend
+    if B <= 0.1 * R and R >= 0.5 * ar and (low1 or high1):
+        if UW <= 0.1 * R and LW >= 0.6 * R: out.append(("Dragonfly Doji", 1))
+        elif LW <= 0.1 * R and UW >= 0.6 * R: out.append(("Gravestone Doji", 1))
+        else: out.append(("Doji", 1))
+    # Hammer: at a 10-bar low after a decline, long lower wick (>= 2x body), tiny upper wick, body in the top part
+    if low1 and B > 0.1 * R and LW >= 2 * B and UW <= 0.10 * R and min(O, C) >= L + 0.6 * R:
+        out.append(("Hammer", 1))
+    # Shooting Star: at a 10-bar high after a rise, long upper wick (>= 2x body), tiny lower wick, body in the bottom part
+    if high1 and B > 0.1 * R and UW >= 2 * B and LW <= 0.10 * R and max(O, C) <= L + 0.4 * R:
+        out.append(("Shooting Star", 1))
+    # Marubozu: long body (>= 1.5x average) with almost no wicks
+    if B >= 1.5 * ab and B >= 0.9 * R:
+        out.append(("Bullish Marubozu" if bull else "Bearish Marubozu", 1))
+
+    # ── Two-candle ──
+    j = i - 1
+    if p["ok"][j] and rng[j] > 0:
+        O1, H1, L1, C1, B1 = o[j], h[j], l[j], c[j], body[j]
+        bull1, bear1 = C1 > O1, C1 < O1
+        t2 = _candle_trend(p, j)  # trend before a 2-bar pattern
+        dn2 = t2 == "down" and _candle_at_extreme(p, j, i, "low")
+        up2 = t2 == "up" and _candle_at_extreme(p, j, i, "high")
+        # Engulfing: today's body fully covers yesterday's opposite-colour body
+        if dn2 and bear1 and bull and O <= C1 and C >= O1 and B > B1:
+            out.append(("Bullish Engulfing", 2))
+        if up2 and bull1 and bear and O >= C1 and C <= O1 and B > B1:
+            out.append(("Bearish Engulfing", 2))
+        # Piercing Line: long red, then green opens at/below its close and closes above its midpoint
+        if dn2 and bear1 and B1 >= ab and bull and O <= C1 and (O1 + C1) / 2 < C < O1:
+            out.append(("Piercing Line", 2))
+        # Dark Cloud Cover: long green, then red opens at/above its close and closes below its midpoint
+        if up2 and bull1 and B1 >= ab and bear and O >= C1 and O1 < C < (O1 + C1) / 2:
+            out.append(("Dark Cloud Cover", 2))
+        # Harami: long body, then a small (<= half) opposite body inside it
+        if dn2 and bear1 and B1 >= ab and bull and B <= 0.5 * B1 and O >= C1 and C <= O1:
+            out.append(("Bullish Harami", 2))
+        if up2 and bull1 and B1 >= ab and bear and B <= 0.5 * B1 and O <= C1 and C >= O1:
+            out.append(("Bearish Harami", 2))
+        # Tweezers: matching lows (highs) within 10% of the average range, colours flip
+        tol = 0.1 * ar
+        if dn2 and bear1 and bull and abs(L - L1) <= tol:
+            out.append(("Tweezer Bottom", 2))
+        if up2 and bull1 and bear and abs(H - H1) <= tol:
+            out.append(("Tweezer Top", 2))
+
+    # ── Three-candle ──
+    k = i - 2
+    if p["ok"][k] and p["ok"][j]:
+        O2, C2, B2 = o[k], c[k], body[k]
+        O1, C1, B1 = o[j], c[j], body[j]
+        t3 = _candle_trend(p, k)  # trend before a 3-bar pattern
+        dn3 = t3 == "down" and _candle_at_extreme(p, k, i, "low")
+        up3 = t3 == "up" and _candle_at_extreme(p, k, i, "high")
+        mid2 = (O2 + C2) / 2
+        # Morning Star: long red, small body at/below its close, then green closing above its midpoint
+        if (dn3 and C2 < O2 and B2 >= ab and B1 <= 0.3 * B2 and max(O1, C1) <= C2 + 0.1 * B2
+                and bull and B >= 0.5 * ab and C > mid2):
+            out.append(("Morning Star", 3))
+        # Evening Star: long green, small body at/above its close, then red closing below its midpoint
+        if (up3 and C2 > O2 and B2 >= ab and B1 <= 0.3 * B2 and min(O1, C1) >= C2 - 0.1 * B2
+                and bear and B >= 0.5 * ab and C < mid2):
+            out.append(("Evening Star", 3))
+        # Three White Soldiers: 3 solid green bars, higher closes, each opening inside the previous body
+        bars = [(O2, C2, B2, h[k]), (O1, C1, B1, h[j]), (O, C, B, H)]
+        if (all(cc > oo and bb >= 0.6 * ab and (hh - cc) <= 0.3 * bb for oo, cc, bb, hh in bars)
+                and C1 > C2 and C > C1 and O2 <= O1 <= C2 and O1 <= O <= C1):
+            out.append(("Three White Soldiers", 3))
+        # Three Black Crows: 3 solid red bars, lower closes, each opening inside the previous body
+        lows3 = [(O2, C2, B2, l[k]), (O1, C1, B1, l[j]), (O, C, B, L)]
+        if (all(cc < oo and bb >= 0.6 * ab and (cc - ll) <= 0.3 * bb for oo, cc, bb, ll in lows3)
+                and C1 < C2 and C < C1 and C2 <= O1 <= O2 and C1 <= O <= O1):
+            out.append(("Three Black Crows", 3))
+
+    # ── TWT Reversal (bullish, custom) ──
+    # At least TWT_REV_MIN_DOWN straight down days before today — each day a lower close,
+    # lower high AND lower low than the day before — then today: higher high, higher low,
+    # opens above yesterday's close, closes above yesterday's open and above its own open.
+    j = i - 1
+    if p["ok"][j] and H > h[j] and L > l[j] and O > c[j] and C > o[j] and C > O:
+        run, k = 0, j
+        while (k >= 1 and p["ok"][k] and p["ok"][k - 1]
+               and c[k] < c[k - 1] and h[k] < h[k - 1] and l[k] < l[k - 1]):
+            run += 1
+            k -= 1
+        if run >= TWT_REV_MIN_DOWN:
+            out.append(("TWT Reversal", run + 1))  # down days + the reversal bar
+    return out
+
+
+def _candle_liquid_flags(s):
+    """Per-bar liquidity (same rule as _check_liquidity, but using only data up to that bar)."""
+    v, c = s["v"], s["c"]
+    n = len(c)
+    flags = [False] * n
+    for i in range(n):
+        lb = min(50, i + 1)
+        if lb < 20: continue
+        vols = [x for x in v[i + 1 - lb:i + 1] if x is not None]
+        prices = [x for x in c[i + 1 - lb:i + 1] if x is not None and x > 0]
+        if len(vols) < 20 or len(prices) < 20: continue
+        flags[i] = (sum(vols) / len(vols) * sum(prices) / len(prices)) >= 3_00_00_000
+    return flags
+
+
+_WEEK_DONE_CACHE = {}
+
+
+def _candle_weekly_series(s, liquid_daily):
+    """Daily -> weekly (ISO week) OHLCV for the candle scan.
+    Each weekly bar is dated by its LAST trading day; its liquidity flag is the daily flag on that day.
+    The running week is dropped unless it is already complete (same rule as the other weekly scans)."""
+    d, o, h, l, c, v = s["d"], s["o"], s["h"], s["l"], s["c"], s["v"]
+    keys, wk = [], {}
+    for i in range(len(d)):
+        if o[i] is None or h[i] is None or l[i] is None or c[i] is None: continue
+        k = date.fromisoformat(d[i]).isocalendar()[:2]
+        w = wk.get(k)
+        if w is None:
+            wk[k] = {"d": d[i], "o": o[i], "h": h[i], "l": l[i], "c": c[i], "v": v[i] or 0, "liq": liquid_daily[i]}
+            keys.append(k)
+        else:
+            w["d"] = d[i]; w["h"] = max(w["h"], h[i]); w["l"] = min(w["l"], l[i])
+            w["c"] = c[i]; w["v"] += v[i] or 0; w["liq"] = liquid_daily[i]
+    if keys:
+        last_d = wk[keys[-1]]["d"]
+        if last_d not in _WEEK_DONE_CACHE: _WEEK_DONE_CACHE[last_d] = _is_week_complete(last_d)
+        if not _WEEK_DONE_CACHE[last_d]: keys.pop()
+    ws = {f: [wk[k][f] for k in keys] for f in ("d", "o", "h", "l", "c", "v")}
+    return ws, [wk[k]["liq"] for k in keys]
+
+
+def _detect_candle_patterns(all_data, sessions=CANDLE_SIGNAL_SESSIONS, tf="D"):
+    """Returns (recent_signals, stats). Signals: last `sessions` bars of each liquid stock.
+    Stats: every historical occurrence (liquid at that bar) with forward returns.
+    tf="W" runs the same detector on completed weekly candles (bars / horizons are then weeks)."""
+    signals = []
+    agg = {name: {"n": 0, **{f"sum_{f}": 0.0 for f in CANDLE_FWD_BARS},
+                  **{f"cnt_{f}": 0 for f in CANDLE_FWD_BARS}, **{f"win_{f}": 0 for f in CANDLE_FWD_BARS}}
+           for name in CANDLE_PATTERNS}
+    first_date, last_date = None, None
+
+    for sym, s in all_data.items():
+        n = len(s.get("c") or [])
+        if n < 30: continue
+        liquid = _candle_liquid_flags(s)
+        if tf == "W":
+            s, liquid = _candle_weekly_series(s, liquid)
+            n = len(s["c"])
+            if n < CANDLE_WEEKLY_MIN_BARS: continue
+        p = _candle_prep(s)
+        dates, c = s["d"], s["c"]
+        for i in range(3, n):
+            if not liquid[i]: continue
+            found = _candle_patterns_at(p, i)
+            if not found: continue
+            recent = i >= n - sessions
+            for name, ncandles in found:
+                bias = CANDLE_PATTERNS[name]
+                # ---- backtest: forward returns from this bar's close ----
+                a = agg[name]; a["n"] += 1
+                for f in CANDLE_FWD_BARS:
+                    if i + f < n and c[i + f] is not None and c[i + f] > 0:
+                        ret = (c[i + f] / c[i] - 1) * 100
+                        a[f"sum_{f}"] += ret; a[f"cnt_{f}"] += 1
+                        # "win" = price moved the way the pattern suggests (neutral: counted as up-moves)
+                        if (bias == "bearish" and ret < 0) or (bias != "bearish" and ret > 0):
+                            a[f"win_{f}"] += 1
+                d = dates[i]
+                if first_date is None or d < first_date: first_date = d
+                if last_date is None or d > last_date: last_date = d
+                # ---- recent signals ----
+                if recent:
+                    st = i - ncandles + 1
+                    signals.append({
+                        "symbol": sym, "pattern": name, "bias": bias, "date": d,
+                        "candles": ncandles,
+                        "high": round(max(s["h"][x] for x in range(st, i + 1)), 2),
+                        "low": round(min(s["l"][x] for x in range(st, i + 1)), 2),
+                        "close": round(c[i], 2),
+                    })
+
+    stats = []
+    for name, bias in CANDLE_PATTERNS.items():
+        a = agg[name]
+        row = {"pattern": name, "bias": bias, "occurrences": a["n"]}
+        for f in CANDLE_FWD_BARS:
+            cnt = a[f"cnt_{f}"]
+            row[f"avg_ret_{f}d"] = round(a[f"sum_{f}"] / cnt, 2) if cnt else None
+            row[f"win_rate_{f}d"] = round(a[f"win_{f}"] / cnt * 100, 1) if cnt else None
+            row[f"samples_{f}d"] = cnt
+        stats.append(row)
+    signals.sort(key=lambda x: (x["date"], x["symbol"]), reverse=True)
+    return signals, {"from": first_date, "to": last_date, "patterns": stats}
+
+
+async def run_candle_scan(force: bool = False) -> None:
+    status = PipelineStatus("run_candle_scan")
+    try:
+        today = today_ist()
+        if not force and not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
+        if force: log.info(f"⚠️  FORCE MODE — bypassing trading-day check for {today}")
+        log.info(f"━━━ Candlestick Pattern Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            signals, stats = _detect_candle_patterns(all_data)
+            from collections import Counter
+            latest = max((s["date"] for s in signals), default=None)
+            today_counts = Counter(s["pattern"] for s in signals if s["date"] == latest)
+            sessions = sorted({s["date"] for s in signals}, reverse=True)
+            for pat in CANDLE_PATTERNS:
+                if today_counts.get(pat): log.info(f"  {pat}: {today_counts[pat]}")
+            log.info(f"Signals: {len(signals)} over {len(sessions)} sessions (latest {latest}: {sum(today_counts.values())})")
+            for r in stats["patterns"]:
+                log.info(f"  [stats] {r['pattern']:<22} n={r['occurrences']:<6} win10={r['win_rate_10d']}%  avg10={r['avg_ret_10d']}%")
+
+            # ── Weekly: same detector on completed weekly candles (horizons = weeks) ──
+            w_signals, w_stats = _detect_candle_patterns(all_data, tf="W")
+            w_latest = max((s["date"] for s in w_signals), default=None)
+            w_counts = Counter(s["pattern"] for s in w_signals if s["date"] == w_latest)
+            w_sessions = sorted({s["date"] for s in w_signals}, reverse=True)
+            for pat in CANDLE_PATTERNS:
+                if w_counts.get(pat): log.info(f"  [W] {pat}: {w_counts[pat]}")
+            log.info(f"Weekly signals: {len(w_signals)} over {len(w_sessions)} weeks (latest week ending {w_latest}: {sum(w_counts.values())})")
+
+            await asyncio.gather(
+                upload_str_with_manifest(client, r2_upload, "candle_patterns_weekly.json", json.dumps({
+                    "updated": today, "tf": "W", "latest": w_latest, "sessions": w_sessions,
+                    "count": len(w_signals), "summary_latest": dict(w_counts),
+                    "signals": w_signals,
+                }), schema_v=1, extra_meta={"count": len(w_signals)}),
+                upload_str_with_manifest(client, r2_upload, "candle_pattern_stats_weekly.json", json.dumps({
+                    "updated": today, "tf": "W", "horizons_unit": "weeks", "horizons": list(CANDLE_FWD_BARS), **w_stats,
+                }), schema_v=1),
+                upload_str_with_manifest(client, r2_upload, "candle_patterns.json", json.dumps({
+                    "updated": today, "latest": latest, "sessions": sessions,
+                    "count": len(signals), "summary_latest": dict(today_counts),
+                    "signals": signals,
+                }), schema_v=1, extra_meta={"count": len(signals)}),
+                upload_str_with_manifest(client, r2_upload, "candle_pattern_stats.json", json.dumps({
+                    "updated": today, "horizons": list(CANDLE_FWD_BARS), **stats,
+                }), schema_v=1),
+            )
+        status.success()
+        log.info("━━━ Candlestick Pattern Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+# ══════════════════════════════════════════════════════════════
+# HOME PAGE TICKER  (home_ticker)
+#   Reads today's scan outputs from R2 and writes a tiny public file,
+#   home_ticker.json, for the scrolling ticker on the home page.
+#   Run it AFTER all scans (it only reads their outputs + OHLC for breadth).
+# ══════════════════════════════════════════════════════════════
+
+TICKER_PER_TYPE = 3   # stocks per signal type (highest RS first)
+
+
+def _ticker_pick(symbols, rs_map, n=TICKER_PER_TYPE):
+    """Top-n symbols by RS rating; skips BSE numeric codes (not readable on a ticker) and duplicates."""
+    seen, clean = set(), []
+    for s in symbols:
+        if not s or s in seen or str(s).isdigit(): continue
+        seen.add(s); clean.append(s)
+    clean.sort(key=lambda s: -(rs_map.get(s) or 0))
+    return clean[:n]
+
+
+def _ticker_latest(signals):
+    """Only the signals from the most recent date in a list (lists can carry older days)."""
+    dates = [s.get("date") for s in signals if s.get("date")]
+    if not dates: return signals
+    last = max(dates)
+    return [s for s in signals if s.get("date") == last]
+
+
+def _ticker_breadth_50sma(all_data):
+    """% of stocks (with >= 50 closes) whose last close is above their 50-day SMA."""
+    above = total = 0
+    for s in all_data.values():
+        closes = [c for c in (s.get("c") or []) if c is not None and c > 0]
+        if len(closes) < 50: continue
+        total += 1
+        if closes[-1] > sum(closes[-50:]) / 50: above += 1
+    return round(above / total * 100) if total else None
+
+
+async def run_home_ticker() -> None:
+    status = PipelineStatus("run_home_ticker")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Home Ticker  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            names = ["rs_ratings.json", "pattern_signals.json", "hlr_signals.json", "pullback_signals.json",
+                     "candle_patterns.json", "minervini_trend_template.json"]
+            res = await asyncio.gather(*[r2_download(client, n) for n in names], return_exceptions=True)
+            data = {}
+            for n, r in zip(names, res):
+                if isinstance(r, Exception) or not r:
+                    log.warning(f"  {n} unavailable — skipped"); data[n] = {}
+                else:
+                    data[n] = r
+            rs_map = {sym: (v or {}).get("rs") for sym, v in (data["rs_ratings.json"].get("stocks") or {}).items()}
+
+            items = []
+            def add(label, syms, tone):
+                for s in _ticker_pick(syms, rs_map):
+                    items.append({"label": label, "symbol": s, "tone": tone})
+
+            # HLR breakouts
+            hlr = data["hlr_signals.json"].get("signals") or []
+            add("HLR BREAKOUT", [s["symbol"] for s in hlr if s.get("state") == "BO"], "green")
+            # Pullbacks (latest session only)
+            pb = _ticker_latest(data["pullback_signals.json"].get("signals") or [])
+            add("PULLBACK", [s["symbol"] for s in pb], "green")
+            # MCP / coil still coiling
+            pat = data["pattern_signals.json"].get("signals") or []
+            add("MCP COILING", [s["symbol"] for s in pat
+                                if ("MCP" in str(s.get("pattern")) or s.get("pattern") == "Mini Coil")
+                                and s.get("coil_state", "Coiling") == "Coiling"], "cyan")
+            # Stage 2 leaders — prefer stocks that entered the Trend Template today
+            mv = data["minervini_trend_template.json"]
+            new_today = [s for s in (mv.get("new_today") or [])]
+            stage2 = new_today if new_today else [s["symbol"] for s in (mv.get("signals") or [])]
+            add("NEW STAGE 2" if new_today else "STAGE 2 LEADER", stage2, "green")
+            # Candlestick patterns (latest session): 2 bullish + 1 bearish
+            cs = [s for s in (data["candle_patterns.json"].get("signals") or [])
+                  if s.get("date") == data["candle_patterns.json"].get("latest")]
+            for bias, tone, n in (("bullish", "green", 2), ("bearish", "red", 1)):
+                picked = _ticker_pick([s["symbol"] for s in cs if s.get("bias") == bias], rs_map, n)
+                for sym in picked:
+                    pat_name = next(s["pattern"] for s in cs if s["symbol"] == sym and s.get("bias") == bias)
+                    items.append({"label": pat_name.upper(), "symbol": sym, "tone": tone})
+
+            # Market breadth line
+            all_data = await download_all_chunks(client)
+            pct50 = _ticker_breadth_50sma(all_data)
+            breadth = None
+            if pct50 is not None:
+                breadth = {"label": "% ABOVE 50 SMA", "value": f"{pct50}%", "tone": "green" if pct50 >= 50 else "red"}
+
+            # Interleave types so the ticker doesn't show 3 of the same in a row
+            by_label = {}
+            for it in items: by_label.setdefault(it["label"], []).append(it)
+            mixed, queues = [], list(by_label.values())
+            while any(queues):
+                for q in queues:
+                    if q: mixed.append(q.pop(0))
+            if breadth: mixed.insert(0, breadth)
+
+            last_session = max([d for d in [data["candle_patterns.json"].get("latest"),
+                                            data["hlr_signals.json"].get("updated")] if d] or [today])
+            log.info(f"Ticker items: {len(mixed)} (session {last_session})")
+            for it in mixed: log.info(f"  {it['label']} · {it.get('symbol', it.get('value'))}")
+
+            await upload_str_with_manifest(client, r2_upload, "home_ticker.json", json.dumps({
+                "updated": today, "date": last_session, "items": mixed,
+            }), schema_v=1, extra_meta={"count": len(mixed)})
+        status.success()
+        log.info("━━━ Home Ticker complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+#-----------------
+def _calc_sma(closes, period):
+    n = len(closes)
+    sma = [None] * n
+    for i in range(period - 1, n):
+        window = closes[i - period + 1:i + 1]
+        if any(v is None for v in window):
+            continue
+        sma[i] = sum(window) / period
+    return sma
+
+
+# ══════════════════════════════════════════════════════════════
+# MULTI-TIMEFRAME EMA / SMA  —  Daily SMA + Weekly + Monthly EMA/SMA
+# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+# SQUEEZE + VOLUME SHOCKER  —  runs inside run_ep_scan, merged into
+# screener_feed.json (no separate R2 file)
+#   ttm_squeeze  : BB(20,2) fully inside Keltner(20, 1.5×ATR); ttm_squeeze_days = streak
+#   bb_squeeze   : BB(20,2) width as % of SMA20 <= BB_SQUEEZE_MAX_BBW_PCT; bb_squeeze_days = streak
+#   vol_shocker  : today's volume >= VOL_SHOCKER_X × avg of previous 20 sessions
+#                  (vol_shock_dir = up / down / flat vs previous close)
+# ══════════════════════════════════════════════════════════════
+SQUEEZE_LEN            = 20
+TTM_BB_MULT            = 2.0
+TTM_KC_MULT            = 1.5
+BB_SQUEEZE_MAX_BBW_PCT = 8.0    # BB(20,2) width (upper-lower)/SMA20 in %; tune freely
+VOL_SHOCKER_X          = 3.0
+VOL_SHOCKER_LOOKBACK   = 20
+
+SQUEEZE_MAX_STREAK     = 60     # cap for the consecutive-days count (performance)
+
+def _squeeze_at(highs, lows, closes, i):
+    """(ttm_on, bbw_pct) for bar i using the 20 bars ending at i; (None, None) if data missing."""
+    L = SQUEEZE_LEN
+    if i - L < 0:
+        return None, None
+    win_c = closes[i - L + 1:i + 1]
+    if any(v is None for v in win_c):
+        return None, None
+    sma = sum(win_c) / L
+    if sma <= 0:
+        return None, None
+    sd = (sum((x - sma) ** 2 for x in win_c) / L) ** 0.5   # population stdev (TradingView ta.stdev)
+    bb_up, bb_lo = sma + TTM_BB_MULT * sd, sma - TTM_BB_MULT * sd
+    bbw = (bb_up - bb_lo) / sma * 100
+    trs = []
+    for k in range(i - L + 1, i + 1):
+        h, l, pc = highs[k], lows[k], closes[k - 1]
+        if None in (h, l, pc): continue
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < L:
+        return None, bbw
+    atr = sum(trs) / L                                         # SMA of TR (LazyBear TTM)
+    kc_up, kc_lo = sma + TTM_KC_MULT * atr, sma - TTM_KC_MULT * atr
+    return (bb_up < kc_up and bb_lo > kc_lo), bbw
+
+def _calc_squeeze_vol_flags(all_data):
+    """Returns {symbol: {ttm_squeeze, ttm_squeeze_days, bb_squeeze, bb_squeeze_days,
+    bb_width_pct, vol_shocker, vol_shock_x, vol_shock_dir}} for the latest bar.
+    *_squeeze_days = consecutive trading days the squeeze has been ON up to today
+    (0 = off). The frontend lets the user pick the day range to filter on."""
+    out = {}
+    for sym, s in all_data.items():
+        highs, lows, closes, volumes = s["h"], s["l"], s["c"], s["v"]
+        n = len(closes)
+        if n < SQUEEZE_LEN + 1 or closes[-1] is None:
+            continue
+        row = {"ttm_squeeze": False, "ttm_squeeze_days": 0,
+               "bb_squeeze": False, "bb_squeeze_days": 0, "bb_width_pct": None,
+               "vol_shocker": False, "vol_shock_x": None, "vol_shock_dir": None}
+
+        # ── Squeeze streaks, walking back from today ──
+        ttm_run = bb_run = True
+        for back in range(SQUEEZE_MAX_STREAK):
+            i = n - 1 - back
+            ttm_on, bbw = _squeeze_at(highs, lows, closes, i)
+            if back == 0 and bbw is not None:
+                row["bb_width_pct"] = round(bbw, 2)
+            if ttm_run and ttm_on: row["ttm_squeeze_days"] += 1
+            else: ttm_run = False
+            if bb_run and bbw is not None and bbw <= BB_SQUEEZE_MAX_BBW_PCT: row["bb_squeeze_days"] += 1
+            else: bb_run = False
+            if not ttm_run and not bb_run:
+                break
+        row["ttm_squeeze"] = row["ttm_squeeze_days"] > 0
+        row["bb_squeeze"] = row["bb_squeeze_days"] > 0
+
+        # ── Volume shocker ──
+        vol = volumes[-1]
+        prev_vols = [v for v in volumes[-VOL_SHOCKER_LOOKBACK - 1:-1] if v is not None]
+        if vol and len(prev_vols) == VOL_SHOCKER_LOOKBACK:
+            avg = sum(prev_vols) / len(prev_vols)
+            if avg > 0:
+                x = vol / avg
+                row["vol_shock_x"] = round(x, 2)
+                if x >= VOL_SHOCKER_X:
+                    row["vol_shocker"] = True
+                    pc = closes[-2]
+                    if pc:
+                        row["vol_shock_dir"] = "up" if closes[-1] > pc else ("down" if closes[-1] < pc else "flat")
+        out[sym] = row
+    return out
+
+
+# ══════════════════════════════════════════════════════════════
+# TECHNICAL EXTRAS (daily) — merged into screener_feed.json rows
+#   st_dir / st_flip_days : Supertrend(10, 3) direction (1 buy, -1 sell) and
+#                           bars since it last flipped (0 = flipped today)
+#   macd_bull / macd_x_days : MACD(12,26,9) line above signal; bars since the
+#                           last bullish crossover (only while still above)
+#   adx / pdi / mdi       : ADX(14) with +DI / -DI (Wilder)
+#   drsi_prev             : yesterday's daily RSI(14), same method as drsi
+#   bb_pos                : close vs Bollinger(20,2): "above" | "inside" | "below"
+#   bb_exp_days           : bars since a Bollinger expansion started (0 = today):
+#                           first day the BB width rose above BB_SQUEEZE_MAX_BBW_PCT
+#                           after at least BB_EXP_MIN_SQUEEZE squeeze days; None if
+#                           the width went back into a squeeze since
+#   w_*                   : the same on weekly candles (weekly squeeze width
+#                           BB_SQUEEZE_MAX_BBW_PCT_W), plus wrsi_prev
+# ══════════════════════════════════════════════════════════════
+BB_EXP_MIN_SQUEEZE = 3      # squeeze days needed right before the expansion
+BB_EXP_LOOKBACK    = 10     # how far back an expansion start is looked for
+BB_SQUEEZE_MAX_BBW_PCT_W = 15.0   # weekly squeeze: BB(20,2) width at or below this % (weekly bands are wider)
+
+
+def _ema_valid(vals, period):
+    """EMA over a series that may start with None (seeded on the first `period` valid values)."""
+    out = [None] * len(vals); k = 2 / (period + 1); seed = []; prev = None
+    for i, v in enumerate(vals):
+        if v is None:
+            out[i] = prev; continue
+        if prev is None:
+            seed.append(v)
+            if len(seed) == period:
+                prev = sum(seed) / period; out[i] = prev
+            continue
+        prev = v * k + prev * (1 - k); out[i] = prev
+    return out
+
+
+def _calc_adx(highs, lows, closes, period=14):
+    """(adx, +di, -di) for the last bar, Wilder smoothing; (None, None, None) if too short."""
+    n = len(closes)
+    if n < period * 2 + 2:
+        return None, None, None
+    tr_s = pdm_s = mdm_s = None; dxs = []; adx = None; pdi = mdi = None
+    trs, pdms, mdms = [], [], []
+    for i in range(1, n):
+        h, l, pc, ph, pl = highs[i], lows[i], closes[i - 1], highs[i - 1], lows[i - 1]
+        if None in (h, l, pc, ph, pl):
+            continue
+        up, dn = h - ph, pl - l
+        pdm = up if (up > dn and up > 0) else 0.0
+        mdm = dn if (dn > up and dn > 0) else 0.0
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        if tr_s is None:
+            trs.append(tr); pdms.append(pdm); mdms.append(mdm)
+            if len(trs) == period:
+                tr_s, pdm_s, mdm_s = sum(trs), sum(pdms), sum(mdms)
+            else:
+                continue
+        else:
+            tr_s = tr_s - tr_s / period + tr
+            pdm_s = pdm_s - pdm_s / period + pdm
+            mdm_s = mdm_s - mdm_s / period + mdm
+        if not tr_s:
+            continue
+        pdi, mdi = 100 * pdm_s / tr_s, 100 * mdm_s / tr_s
+        dx = 100 * abs(pdi - mdi) / (pdi + mdi) if (pdi + mdi) else 0.0
+        if adx is None:
+            dxs.append(dx)
+            if len(dxs) == period:
+                adx = sum(dxs) / period
+        else:
+            adx = (adx * (period - 1) + dx) / period
+    if adx is None:
+        return None, None, None
+    return round(adx, 2), round(pdi, 2), round(mdi, 2)
+
+
+def _tech_core(highs, lows, closes, sq_max, prefix=""):
+    """Supertrend / MACD / ADX / Bollinger fields for one OHLC series (see the table above)."""
+    n = len(closes); row = {}; c = closes[-1]
+    st = _calc_supertrend(highs, lows, closes, 10, 3)
+    dirs = [None if (st[i] is None or closes[i] is None) else (1 if closes[i] > st[i] else -1) for i in range(n)]
+    if dirs[-1] is not None:
+        k = 0
+        for i in range(n - 2, -1, -1):
+            if dirs[i] is None or dirs[i] != dirs[-1]:
+                break
+            k += 1
+        row["st_dir"] = dirs[-1]; row["st_flip_days"] = k
+    e12, e26 = _ema_valid(closes, 12), _ema_valid(closes, 26)
+    macd = [(x - y) if (x is not None and y is not None) else None for x, y in zip(e12, e26)]
+    sig = _ema_valid(macd, 9)
+    if macd[-1] is not None and sig[-1] is not None:
+        bull = macd[-1] > sig[-1]
+        row["macd_bull"] = bull
+        xd = None
+        if bull:
+            xd = 0
+            for i in range(n - 2, -1, -1):
+                if macd[i] is None or sig[i] is None or macd[i] <= sig[i]:
+                    break
+                xd += 1
+        row["macd_x_days"] = xd
+    adx, pdi, mdi = _calc_adx(highs, lows, closes, 14)
+    if adx is not None:
+        row.update({"adx": adx, "pdi": pdi, "mdi": mdi})
+    L = SQUEEZE_LEN
+    win = [v for v in closes[-L:] if v is not None]
+    if len(win) == L and c is not None:
+        sma = sum(win) / L
+        sd = (sum((x - sma) ** 2 for x in win) / L) ** 0.5
+        up, lo = sma + TTM_BB_MULT * sd, sma - TTM_BB_MULT * sd
+        row["bb_pos"] = "above" if c > up else "below" if c < lo else "inside"
+    widths = {}
+    for back in range(BB_EXP_LOOKBACK + BB_EXP_MIN_SQUEEZE + 1):
+        i = n - 1 - back
+        _, bbw = _squeeze_at(highs, lows, closes, i)
+        widths[i] = bbw
+    exp = None
+    for back in range(BB_EXP_LOOKBACK):
+        i = n - 1 - back
+        w = widths.get(i)
+        if w is None or w <= sq_max:
+            continue
+        if any(widths.get(j) is None or widths[j] <= sq_max for j in range(i + 1, n)):
+            break    # went back into a squeeze after this bar
+        pre = [widths.get(i - 1 - t) for t in range(BB_EXP_MIN_SQUEEZE)]
+        if all(v is not None and v <= sq_max for v in pre):
+            exp = back
+            break
+    row["bb_exp_days"] = exp
+    return {prefix + k: v for k, v in row.items()}
+
+
+def _weekly_ohlc(dates, highs, lows, closes):
+    """ISO-week bars, the current unfinished week included (same as wrsi)."""
+    wk, order = {}, []
+    for d, h, l, c in zip(dates, highs, lows, closes):
+        if None in (h, l, c) or not d:
+            continue
+        try:
+            k = date.fromisoformat(d[:10]).isocalendar()[:2]
+        except Exception:
+            continue
+        if k not in wk:
+            wk[k] = [h, l, c]; order.append(k)
+        else:
+            w = wk[k]; w[0] = max(w[0], h); w[1] = min(w[1], l); w[2] = c
+    rows = [wk[k] for k in order]
+    return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+
+
+def _calc_tech_extras(all_data):
+    out = {}
+    for sym, s in all_data.items():
+        try:
+            highs, lows, closes = s["h"], s["l"], s["c"]
+            n = len(closes)
+            if n < 60 or closes[-1] is None:
+                continue
+            row = _tech_core(highs, lows, closes, BB_SQUEEZE_MAX_BBW_PCT)
+            # yesterday's RSI, same window as drsi in _build_screener_feed
+            row["drsi_prev"] = _calc_rsi([v for v in closes[-31:-1] if v is not None])
+            # weekly: same indicators on ISO-week candles (fields prefixed w_)
+            wh, wl, wc = _weekly_ohlc(s.get("d") or [], highs, lows, closes)
+            if len(wc) >= 40:
+                row.update(_tech_core(wh, wl, wc, BB_SQUEEZE_MAX_BBW_PCT_W, "w_"))
+                row["wrsi_prev"] = _calc_rsi(wc[-31:-1])
+            out[sym] = row
+        except Exception:
+            continue
+    return out
+
+def _calc_multi_tf_ma(all_data, daily_sma_periods=(10, 21, 50, 200),
+                       weekly_periods=(10, 30, 40, 50), monthly_periods=(10, 21)):
+    """
+    Returns {symbol: {field: value, ...}} with:
+      - Daily SMA(daily_sma_periods)  — daily EMA already exists elsewhere in screener_feed
+      - Weekly EMA + SMA(weekly_periods), built off completed weekly candles
+      - Monthly EMA + SMA(monthly_periods), built off completed monthly candles
+    Each period gets 3 fields: <prefix>{ema|sma}{period}, <prefix>above_{ema|sma}{period},
+    <prefix>dist_{ema|sma}{period} (% distance of LTP from that level).
+    None-safe throughout — short-history stocks simply get None for periods they can't support.
+    """
+    result = {}
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = s["d"], s["h"], s["l"], s["c"], s["v"]
+        n = len(dates)
+        if n < 30: continue
+        ltp = next((v for v in reversed(closes) if v is not None), None)
+        if ltp is None: continue
+        row = {}
+
+        for p in daily_sma_periods:
+            sma = _calc_sma(closes, p); v = sma[-1] if sma else None
+            row[f"sma{p}"] = round(v, 2) if v is not None else None
+            row[f"above_sma{p}"] = bool(v and ltp > v)
+            row[f"dist_sma{p}"] = round((ltp - v) / v * 100, 2) if v else None
+
+        _, wh, wl, wc, _ = _build_tf_series(dates, highs, lows, closes, volumes, "W")
+        for p in weekly_periods:
+            ema_s = _calc_ema(wc, p); sma_s = _calc_sma(wc, p)
+            ev = ema_s[-1] if ema_s else None; sv = sma_s[-1] if sma_s else None
+            row[f"w_ema{p}"] = round(ev, 2) if ev is not None else None
+            row[f"w_above_ema{p}"] = bool(ev and ltp > ev)
+            row[f"w_dist_ema{p}"] = round((ltp - ev) / ev * 100, 2) if ev else None
+            row[f"w_sma{p}"] = round(sv, 2) if sv is not None else None
+            row[f"w_above_sma{p}"] = bool(sv and ltp > sv)
+            row[f"w_dist_sma{p}"] = round((ltp - sv) / sv * 100, 2) if sv else None
+
+        _, mh, ml, mc, _ = _build_tf_series(dates, highs, lows, closes, volumes, "M")
+        for p in monthly_periods:
+            ema_s = _calc_ema(mc, p); sma_s = _calc_sma(mc, p)
+            ev = ema_s[-1] if ema_s else None; sv = sma_s[-1] if sma_s else None
+            row[f"m_ema{p}"] = round(ev, 2) if ev is not None else None
+            row[f"m_above_ema{p}"] = bool(ev and ltp > ev)
+            row[f"m_dist_ema{p}"] = round((ltp - ev) / ev * 100, 2) if ev else None
+            row[f"m_sma{p}"] = round(sv, 2) if sv is not None else None
+            row[f"m_above_sma{p}"] = bool(sv and ltp > sv)
+            row[f"m_dist_sma{p}"] = round((ltp - sv) / sv * 100, 2) if sv else None
+
+        result[sym] = row
+    return result
+
+
+def _detect_stage2(all_data, sma_fast=50, sma_mid=150, sma_long=200,
+                    slope_lookback=25, pct_above_low_min=30.0, pct_below_high_max=25.0,
+                    rs_data=None, min_rs_rating=None):
+    """
+    Stage 2 (Advancing) — Minervini-style trend template.
+    Rules (all must pass):
+      1. close > sma50 > sma150 > sma200   (stacked order)
+      2. sma200 today > sma200 N bars ago  (long-term trend up)
+      3. close >= pct_above_low_min% above 52w low
+      4. close within pct_below_high_max% of 52w high
+      5. (optional, when rs_data given) RS Rating >= min_rs_rating  — full 8-point template
+
+    Pass rs_data=None (default) for the original 4-rule Stage-2 scan (run_stage2_scan).
+    Pass rs_data=_calculate_rs(all_data) + min_rs_rating=70 for the full 8-point
+    Minervini Trend Template (run_minervini_scan) — criterion 8 (RS Rating).
+
+    Returns:
+      current_signals  -> list of stocks in Stage 2 as of latest bar
+      breadth_history  -> [{date, count}] date-wise total Stage 2 stocks (full history)
+    """
+    current_signals = []
+    breadth = {}
+
+    for sym, s in all_data.items():
+        dates, closes, highs, lows, volumes = s["d"], s["c"], s["h"], s["l"], s["v"]
+        n = len(dates)
+        if n < sma_long + slope_lookback + 5:
+            continue
+        if not _check_liquidity(volumes, closes, n):
+            continue
+
+        sma50  = _calc_sma(closes, sma_fast)
+        sma150 = _calc_sma(closes, sma_mid)
+        sma200 = _calc_sma(closes, sma_long)
+
+        start = sma_long + slope_lookback
+        last_flag = None
+        last_detail = None
+
+        for i in range(start, n):
+            c, s50, s150, s200 = closes[i], sma50[i], sma150[i], sma200[i]
+            if None in (c, s50, s150, s200):
+                continue
+            s200_prev = sma200[i - slope_lookback]
+            if s200_prev is None:
+                continue
+
+            lo_start = max(0, i - 251)
+            wl = [v for v in lows[lo_start:i + 1] if v is not None]
+            wh = [v for v in highs[lo_start:i + 1] if v is not None]
+            if not wl or not wh:
+                continue
+            low52, high52 = min(wl), max(wh)
+            if low52 <= 0 or high52 <= 0:
+                continue
+
+            pct_off_low  = (c - low52) / low52 * 100
+            pct_off_high = (high52 - c) / high52 * 100
+
+            rs_val = rs_data.get(sym, {}).get("rs") if rs_data is not None else None
+            rs_ok = True if rs_data is None else (rs_val is not None and rs_val >= min_rs_rating)
+
+            is_s2 = (c > s50 > s150 > s200) and (s200 > s200_prev) \
+                    and (pct_off_low >= pct_above_low_min) \
+                    and (pct_off_high <= pct_below_high_max) \
+                    and rs_ok
+
+            if is_s2:
+                d = dates[i]
+                breadth[d] = breadth.get(d, 0) + 1
+
+            if i == n - 1:
+                last_flag = is_s2
+                last_detail = {
+                    "symbol": sym, "date": dates[i], "close": round(c, 2),
+                    "sma50": round(s50, 2), "sma150": round(s150, 2), "sma200": round(s200, 2),
+                    "pct_off_low": round(pct_off_low, 2), "pct_off_high": round(pct_off_high, 2),
+                }
+                if rs_data is not None:
+                    last_detail["rs_rating"] = rs_val
+
+        if last_flag:
+            current_signals.append(last_detail)
+
+    breadth_history = [{"date": d, "count": cnt} for d, cnt in sorted(breadth.items())]
+    return current_signals, breadth_history
+async def run_stage2_scan() -> None:
+    status = PipelineStatus("run_stage2_scan")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Stage 2 Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            signals, breadth_history = _detect_stage2(all_data)
+            signals.sort(key=lambda x: x["pct_off_high"])  # closest to 52w high first
+
+            log.info(f"Stage 2 stocks today: {len(signals)}")
+            if breadth_history:
+                log.info(f"Breadth history: {len(breadth_history)} dates, latest count {breadth_history[-1]['count']}")
+
+            await asyncio.gather(
+                upload_str_with_manifest(client, r2_upload, "stage2_signals.json", json.dumps({
+                    "updated": today, "count": len(signals), "signals": signals,
+                }), schema_v=1, extra_meta={"count": len(signals)}),
+                upload_str_with_manifest(client, r2_upload, "stage2_breadth.json", json.dumps({
+                    "updated": today, "history": breadth_history,
+                }), schema_v=1),
+            )
+        status.success()
+        log.info("━━━ Stage 2 Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+def _mv_hist_symbols(entry):
+    """A stored minervini_history_{year}.json date entry can be OLD-format
+    (list of plain symbol strings, from before this function stored full
+    detail) or NEW-format (list of full signal dicts) — handle both so old
+    dates already in R2 keep working."""
+    if not entry:
+        return []
+    if isinstance(entry[0], dict):
+        return [e.get("symbol") for e in entry if e.get("symbol")]
+    return list(entry)
+
+
+async def backup_minervini_history(client, signals, today):
+    """
+    Date-wise accumulating history, same convention as backup_pattern_history()
+    → pattern_history_{year}.json. Downloads existing minervini_history_{year}.json
+    from R2, appends today's FULL signal list (symbol, close, sma50/150/200,
+    pct_off_low/high, rs_rating, is_new), re-uploads. Builds real history
+    run-by-run (no retroactive RS issue — each day's entry is that day's actual
+    scan). Storing full detail (not just symbol names) lets History mode show
+    the same rich fields for a past date as the live view does.
+
+    Also diffs today's symbol list against the most recent PRIOR date already
+    in history (before today's own entry is added) to return:
+      new_syms     -> passed today, did NOT pass on the prior scan date
+      dropped_syms -> passed on the prior scan date, did NOT pass today
+    Returns (new_syms, dropped_syms) — empty lists if no prior date exists yet.
+    """
+    fname = f"minervini_history_{today[:4]}.json"
+    today_syms = [s["symbol"] for s in signals]
+
+    hist = await r2_download(client, fname)
+    if not isinstance(hist, dict): hist = {}
+
+    prior_dates = sorted(d for d in hist if d < today)
+    prior_syms = set(_mv_hist_symbols(hist[prior_dates[-1]])) if prior_dates else None
+    today_set = set(today_syms)
+    if prior_syms is None:
+        new_syms, dropped_syms = [], []
+    else:
+        new_syms = sorted(today_set - prior_syms)
+        dropped_syms = sorted(prior_syms - today_set)
+
+    if not signals:
+        log.info(f"  🗄  minervini backup: no signals on {today}, skip")
+        return new_syms, dropped_syms
+
+    hist[today] = signals
+    await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
+    log.info(f"  🗄  minervini_history: {today} → {fname}  ({len(today_syms)} stocks, {len(hist)} dates, "
+              f"+{len(new_syms)} new, -{len(dropped_syms)} dropped)")
+    return new_syms, dropped_syms
+
+
+async def run_minervini_scan(min_rs_rating=70) -> None:
+    """
+    Full 8-point Minervini Trend Template = _detect_stage2 (criteria 1-7)
+    + RS Rating >= min_rs_rating (criterion 8), RS via existing _calculate_rs().
+
+    Today's signals go to minervini_trend_template.json — including top-level
+    "new_today" / "dropped_today" symbol lists (diffed against the last prior
+    scan date) and a per-signal "is_new" flag, so the frontend can filter
+    directly for new additions. Date-wise history accumulates separately via
+    backup_minervini_history() → same convention as pattern_history_{year}.json:
+    each pipeline run appends that day's actual symbol list, so history is
+    always exact (no retroactive RS issue).
+    """
+    status = PipelineStatus("run_minervini_scan")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Minervini Trend Template Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            rs_data = _calculate_rs(all_data)
+            signals, breadth_history = _detect_stage2(
+                all_data, rs_data=rs_data, min_rs_rating=min_rs_rating
+            )
+            signals.sort(key=lambda x: x["pct_off_high"])  # closest to 52w high first
+
+            log.info(f"Minervini Trend Template stocks today: {len(signals)}")
+            if breadth_history:
+                log.info(f"Breadth history: {len(breadth_history)} dates, latest count {breadth_history[-1]['count']}")
+
+            # Backup history first — diffs against the last prior scan date to get new/dropped
+            new_syms, dropped_syms = await backup_minervini_history(client, signals, today)
+            new_set = set(new_syms)
+            for sig in signals:
+                sig["is_new"] = sig["symbol"] in new_set
+
+            await upload_str_with_manifest(client, r2_upload, "minervini_trend_template.json", json.dumps({
+                "updated": today, "count": len(signals), "min_rs_rating": min_rs_rating,
+                "new_today": new_syms, "dropped_today": dropped_syms,
+                "signals": signals,
+            }), schema_v=1, extra_meta={"count": len(signals)})
+        status.success()
+        log.info("━━━ Minervini Trend Template Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# WEINSTEIN STAGE ANALYSIS — original 4-stage method
+# (weekly chart, 30-week SMA — separate from Minervini's daily Trend Template)
+# ══════════════════════════════════════════════════════════════
+
+STAGE_NAMES = {1: "Basing", 2: "Advancing", 3: "Topping", 4: "Declining"}
+
+
+TRANSITION_LABELS = {
+    # Only 8 of the theoretical 12 (stage, stage) pairs are reachable — the
+    # carry-forward rule (stage = 3 if last_trend==2 else 1) means a "flat"
+    # week ALWAYS resolves to whichever of {1,3} matches the current
+    # last_trend, so (2→1), (4→3), (1→3), (3→1) can never actually happen —
+    # a run coming from 2 or 3 can only flat-resolve to 3, and a run coming
+    # from 4 or 1 can only flat-resolve to 1. Deliberately no entries for
+    # those 4 — .get() just returns None for them (won't happen, but safe).
+    (1, 2): "Base Breakout — Basing to Advancing",
+    (2, 3): "Topping Started — Advancing to Topping",
+    (2, 1): "Failed Breakout — Return to Base",
+    (3, 1): "Return to Base — Original Breakout Failed",
+    (3, 4): "Breakdown Confirmed — Topping to Declining",
+    (4, 1): "Bottoming — Declining to Basing",
+    (3, 2): "Failed Top — resumed Advancing without breaking down",
+    (1, 4): "Failed Base — resumed Declining without breaking out",
+    (2, 4): "Sharp Reversal — Advancing straight to Declining",
+    (4, 2): "Sharp Reversal — Declining straight to Advancing",
+    # Reachable since the flat-phase rule looks at where the range sits
+    # (near the 2-year high = topping, far below it = basing).
+    (1, 3): "Range near highs — Basing to Topping",
+    (4, 3): "Flat near highs — Declining to Topping",
+}
+
+# Stage 1 / 3 -> 4 needs a weekly close below the range low (lowest low of
+# the previous BASE_LOOKBACK_WEEKS); a falling 30-week EMA alone is not enough.
+BASE_LOOKBACK_WEEKS = 30
+NEAR_BASE_LOW_PCT = 10.0      # close within this % above the range low -> near_base_low warning
+# A flat phase is Topping (3) when the range high is within this % of the
+# highest high of the last HIGH_LOOKBACK_WEEKS, otherwise Basing (1).
+TOPPING_NEAR_HIGH_PCT = 15.0
+HIGH_LOOKBACK_WEEKS = 104
+
+
+def _weinstein_weekly_records(wh, wl, wc, wv, ema_period=30,
+                              slope_lookback=4, flat_threshold_pct=0.5,
+                              ema_short_period=10, swing_lookback=10):
+    """ARCStage-inspired weekly phase classification (EMA variant).
+
+    Directional stages use 30-week EMA slope and closing-price position.
+    Flat phases use the most recent confirmed directional stage to
+    distinguish basing (after decline) from topping (after advance).
+    No breakout, pivot lookahead, or future candles required.
+    """
+    n = len(wc)
+    ema30 = _calc_ema(wc, ema_period)
+    ema10 = _calc_ema(wc, ema_short_period)
+    records = []
+    stage = stage_start = last_direction = None
+    breakout_level = None
+    highest_high_since_bo = None
+    below_base_streak = 0
+    return_to_base = False
+    pending_bo = None
+    pending_start = None
+    pending_below = 0
+    for i in range(n):
+        price, e30, e10 = wc[i], ema30[i], ema10[i]
+        ep = ema30[i-slope_lookback] if i >= slope_lookback else None
+        slope = ((e30 / ep - 1) * 100
+                 if e30 is not None and ep not in (None, 0) else None)
+        prev = stage
+        high_ref = (max(wh[i-swing_lookback:i]) if i >= swing_lookback
+                    and all(x is not None for x in wh[i-swing_lookback:i]) else None)
+        low_ref = (min(wl[i-swing_lookback:i]) if i >= swing_lookback
+                   and all(x is not None for x in wl[i-swing_lookback:i]) else None)
+        # Range of the last BASE_LOOKBACK_WEEKS (this week excluded) and the
+        # highest high of the last HIGH_LOOKBACK_WEEKS.
+        base_win_l = [x for x in wl[max(0, i-BASE_LOOKBACK_WEEKS):i] if x is not None]
+        base_win_h = [x for x in wh[max(0, i-BASE_LOOKBACK_WEEKS):i] if x is not None]
+        long_win_h = [x for x in wh[max(0, i-HIGH_LOOKBACK_WEEKS):i] if x is not None]
+        base_low = min(base_win_l) if i >= swing_lookback and base_win_l else None
+        range_high = max(base_win_h) if i >= swing_lookback and base_win_h else None
+        high_long = max(long_win_h) if i >= swing_lookback and long_win_h else None
+        near_highs = bool(range_high is not None and high_long is not None
+                          and range_high >= high_long * (1 - TOPPING_NEAR_HIGH_PCT / 100))
+        raw_bo = (price is not None and high_ref is not None and price > high_ref)
+        aligned = (e10 is not None and e30 is not None and e10 > e30
+                   and slope is not None and slope > flat_threshold_pct
+                   and price is not None and price > e30)
+        # Remember a breakout even when EMA alignment arrives later.
+        # Two consecutive closes below its level invalidate it.
+        if raw_bo and (pending_bo is None or price > pending_bo):
+            if pending_bo is None:
+                pending_bo = high_ref
+                pending_start = i
+        if pending_bo is not None:
+            if price is not None and price < pending_bo:
+                pending_below = pending_below + 1
+            else:
+                pending_below = 0
+            if pending_below >= 2:
+                pending_bo = None
+                pending_start = None
+                pending_below = 0
+        # Delayed alignment only qualifies if price is actually advancing:
+        # last three weekly highs AND lows must be rising, not sideways.
+        advancing = (i >= 2 and all(x is not None for x in wh[i-2:i+1])
+                     and all(x is not None for x in wl[i-2:i+1])
+                     and wh[i] > wh[i-1] > wh[i-2]
+                     and wl[i] > wl[i-1] > wl[i-2])
+        delayed_bo = (pending_bo is not None and pending_start is not None
+                      and i > pending_start and price > pending_bo
+                      and advancing and aligned)
+        fresh_bo = bool(raw_bo and aligned)
+        enter_stage2 = bool(fresh_bo or delayed_bo)
+        if enter_stage2 and (breakout_level is None or return_to_base):
+            breakout_level = pending_bo if delayed_bo else high_ref
+            highest_high_since_bo = wh[i]
+            below_base_streak = 0
+            return_to_base = False
+        # After return-to-base, new BO must be a NEW event, not old EMA slope.
+        if price is not None and e30 is not None and slope is not None:
+            distance = (price / e30 - 1) * 100
+            if slope > flat_threshold_pct and price > e30:
+                if stage == 2 or enter_stage2 or (stage == 3 and breakout_level is not None
+                                                    and not return_to_base and price > breakout_level):
+                    stage = 2
+                    last_direction = 2
+            elif slope < -flat_threshold_pct and price < e30:
+                # From Basing / Topping, Stage 4 needs the range low to break
+                # (checked below); a falling EMA alone keeps the current phase.
+                if stage not in (1, 3):
+                    stage = 4
+                    last_direction = 4
+            elif abs(slope) <= flat_threshold_pct and abs(distance) <= 12:
+                # Flat phase: a range near the 2-year high is Topping, a range
+                # far below it is Basing (not only the last trend direction,
+                # which misses advances that never qualified as Stage 2).
+                if range_high is not None and high_long is not None:
+                    if near_highs:
+                        stage = 3
+                        last_direction = 2
+                    else:
+                        stage = 1
+                        last_direction = 4
+                elif last_direction == 4:
+                    stage = 1
+                elif last_direction == 2:
+                    stage = 3
+                # With no known preceding trend, leave stage unknown.
+            # Other transitional weeks retain the last confirmed phase.
+        # Failed Stage 2 breakout: two consecutive weekly closes back
+        # below the ORIGINAL 10-week BO level, with no new post-entry high
+        # on either week. Applies even if EMA flattening labelled Stage 3.
+        if breakout_level is not None and not return_to_base:
+            new_high = (highest_high_since_bo is not None and wh[i] is not None
+                        and wh[i] > highest_high_since_bo)
+            if new_high:
+                highest_high_since_bo = wh[i]
+                below_base_streak = 0
+            elif price is not None and price < breakout_level:
+                below_base_streak += 1
+            else:
+                below_base_streak = 0
+            if below_base_streak >= 2:
+                # Back inside the range: Topping when the range sits near the
+                # 2-year high, otherwise Basing.
+                stage = 3 if near_highs else 1
+                last_direction = 2 if near_highs else 4
+                return_to_base = True
+        if return_to_base and not enter_stage2 and stage in (2, 3):
+            stage = 3 if near_highs else 1
+        # Basing / Topping -> Declining: a weekly close below the range low.
+        if (stage in (1, 3) and base_low is not None and price is not None
+                and price < base_low):
+            stage = 4
+            last_direction = 4
+        near_base_low = bool(stage in (1, 3) and base_low is not None
+                             and price is not None
+                             and price <= base_low * (1 + NEAR_BASE_LOW_PCT / 100))
+        if stage != prev:
+            stage_start = i if stage is not None else None
+        candidate = bool(stage != 2 and slope is not None
+                         and slope > flat_threshold_pct and price is not None
+                         and e30 is not None and price > e30
+                         and high_ref is not None
+                         and high_ref * .95 <= price <= high_ref)
+        prior_volumes = wv[max(0, i-10):i]
+        volume_confirmed = (wv[i] >= 1.5 * sum(prior_volumes)/10
+                            if len(prior_volumes) == 10 and wv[i] is not None
+                            and all(v is not None for v in prior_volumes)
+                            and sum(prior_volumes) > 0 else None)
+        records.append({
+            'stage': stage, 'prev_stage': prev,
+            'stage_change': prev is not None and stage != prev,
+            'weeks_in_stage': i-stage_start+1 if stage_start is not None else 0,
+            'close': price, 'ema30': e30, 'ema10': e10, 'slope_pct': slope,
+            'stage2_candidate': candidate, 'volume_confirmed': volume_confirmed,
+            'high_ref': high_ref, 'low_ref': low_ref,
+            'base_low': base_low, 'near_base_low': near_base_low,
+        })
+    return records
+
+
+def _detect_weinstein_stages(all_data, ema_period=30, slope_lookback=4,
+                              flat_threshold_pct=0.5, min_weeks=40,
+                              early_breakout_lookback=26, ema_short_period=10,
+                              min_weeks_in_prior_stage=3, confirm_weeks=2,
+                              swing_lookback=10, early_stage2_weeks=8):
+    """Simplified Weinstein detector. Legacy arguments kept for callers."""
+    signals, breadth = [], {}
+    for sym, s in all_data.items():
+        dates, highs, lows, closes, volumes = (s[k] for k in ('d','h','l','c','v'))
+        if len(dates) < 200 or not _check_liquidity(volumes, closes, len(dates)):
+            continue
+        labels, wh, wl, wc, wv = _build_tf_series(dates, highs, lows, closes, volumes, 'W')
+        if not wc:
+            continue
+        rows = _weinstein_weekly_records(wh, wl, wc, wv, ema_period, slope_lookback,
+                                        flat_threshold_pct, ema_short_period, swing_lookback)
+        for label, row in zip(labels, rows):
+            if row['stage'] is not None:
+                breadth.setdefault(label, {1:0, 2:0, 3:0, 4:0})[row['stage']] += 1
+        r = rows[-1]
+        prior_duration = 0
+        if r['stage_change']:
+            for old in reversed(rows[:-1]):
+                if old['stage'] == r['prev_stage']:
+                    prior_duration += 1
+                else:
+                    break
+        transition = TRANSITION_LABELS.get((r['prev_stage'],r['stage'])) if r['stage_change'] else None
+        signals.append({
+            'symbol': sym, 'week': labels[-1], 'stage': r['stage'], 'prev_stage': r['prev_stage'],
+            'stage_change': r['stage_change'], 'transition_type': transition,
+            'weeks_in_stage': r['weeks_in_stage'], 'weeks_in_prev_stage': prior_duration,
+            'close': round(r['close'],2) if r['close'] is not None else None,
+            'ema30': round(r['ema30'],2) if r['ema30'] is not None else None,
+            'ema10': round(r['ema10'],2) if r['ema10'] is not None else None,
+            'early_transition': r['stage2_candidate'],
+            'early_transition_label': 'Stage 2 Candidate' if r['stage2_candidate'] else None,
+            'range_ref': round(r['high_ref'],2) if r['high_ref'] is not None else None,
+            'early_stage2': r['stage'] == 2 and r['weeks_in_stage'] <= early_stage2_weeks,
+            'stage2_candidate': r['stage2_candidate'],
+            'volume_confirmed': r['volume_confirmed'],
+            'ema30_slope_pct': round(r['slope_pct'],3) if r['slope_pct'] is not None else None,
+            'base_low': round(r['base_low'],2) if r['base_low'] is not None else None,
+            'near_base_low': r['near_base_low'],
+        })
+    breadth_history = [{'week': w, **{f'stage{k}': c[k] for k in (1,2,3,4)}}
+                       for w,c in sorted(breadth.items())]
+    return signals, breadth_history
+
+
+async def backup_weinstein_history(client, signals):
+    """
+    Accumulating history keyed by the completed WEEK (not the run date) —
+    re-running mid-week overwrites that week's entry instead of duplicating
+    it. Stores each symbol's FULL signal detail (not just the bare stage
+    number) — stage, weeks_in_stage, stage_change, transition_type,
+    early_transition (+label), range_ref, close, ema30, ema10 — so History
+    mode can show the exact same rich fields for a past week as the live
+    view does, not just a bare stage number.
+    {week_date: {symbol: {stage, weeks_in_stage, stage_change,
+    transition_type, early_transition, early_transition_label, range_ref,
+    close, ema30, ema10}, ...}, ...} in weinstein_stage_history.json.
+
+    Older weeks already saved before this change are plain {symbol: stage_int}
+    — the frontend's historical loader handles both formats.
+    """
+    fname = "weinstein_stage_history.json"
+    if not signals:
+        log.info("  🗄  weinstein backup: no signals, skip")
+        return
+    week_key = _isoweek_to_date(signals[0]["week"])
+
+    hist = await r2_download(client, fname)
+    if not isinstance(hist, dict): hist = {}
+    hist[week_key] = {
+        s["symbol"]: {
+            "stage": s["stage"],
+            "weeks_in_stage": s["weeks_in_stage"],
+            "stage_change": s["stage_change"],
+            "transition_type": s["transition_type"],
+            "early_transition": s["early_transition"],
+            "early_transition_label": s["early_transition_label"],
+            "range_ref": s["range_ref"],
+            "close": s["close"],
+            "ema30": s["ema30"],
+            "ema10": s["ema10"],
+            "early_stage2": s["early_stage2"],
+            "base_low": s.get("base_low"),
+            "near_base_low": s.get("near_base_low", False),
+        }
+        for s in signals
+    }
+    await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
+    log.info(f"  🗄  weinstein_stage_history: {week_key} → {fname}  ({len(signals)} stocks, {len(hist)} weeks)")
+
+
+async def backup_weinstein_transitions(client, signals):
+    """
+    Separate, LEAN log of ONLY the stage-transition events (stage_change=True)
+    — not a full weekly snapshot like weinstein_stage_history.json. Keyed by
+    the completed WEEK (idempotent, re-running mid-week overwrites that
+    week's entries). Lets you answer "when did SYMBOL last change stage" or
+    "show me every Failed Top ever" without scanning full snapshots.
+    {week_date: [{symbol, from_stage, from_stage_name, to_stage,
+                  to_stage_name, transition_type}, ...], ...}
+    in weinstein_transitions.json.
+    """
+    fname = "weinstein_transitions.json"
+    if not signals:
+        log.info("  🗄  weinstein transitions backup: no signals, skip")
+        return
+    week_key = _isoweek_to_date(signals[0]["week"])
+    transitions = [
+        {
+            "symbol": s["symbol"],
+            "from_stage": s["prev_stage"],
+            "from_stage_name": STAGE_NAMES.get(s["prev_stage"]),
+            "to_stage": s["stage"],
+            "to_stage_name": STAGE_NAMES.get(s["stage"]),
+            "transition_type": s["transition_type"],
+        }
+        for s in signals if s["stage_change"]
+    ]
+
+    hist = await r2_download(client, fname)
+    if not isinstance(hist, dict): hist = {}
+    hist[week_key] = transitions
+    await r2_upload(client, fname, json.dumps(hist, separators=(",", ":")))
+    log.info(f"  🗄  weinstein_transitions: {week_key} → {fname}  "
+              f"({len(transitions)} transitions this week, {len(hist)} weeks tracked)")
+
+
+async def debug_weinstein_symbol(symbol, weeks_shown=20, **kwargs) -> None:
+    """Debug with the same shared stage engine used by the production scan."""
+    async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+        all_data = await download_all_chunks(client)
+    sym = symbol.upper().strip()
+    if sym not in all_data:
+        print(f"{sym} not found")
+        return
+    s = all_data[sym]
+    labels, wh, wl, wc, wv = _build_tf_series(s['d'],s['h'],s['l'],s['c'],s['v'],'W')
+    rows = _weinstein_weekly_records(wh,wl,wc,wv)
+    print(f"{sym}: {len(rows)} completed weekly bars")
+    print(f"{'Week':<13}{'Close':>11}{'EMA30':>11}{'Slope%':>11}{'Stage':>12}{'Candidate':>12}")
+    for label,r in list(zip(labels,rows))[-weeks_shown:]:
+        fmt = lambda x: f'{x:.2f}' if x is not None else '—'
+        print(f"{_isoweek_to_date(label):<13}{fmt(r['close']):>11}{fmt(r['ema30']):>11}"
+              f"{fmt(r['slope_pct']):>11}{str(r['stage'] or 'Unknown'):>12}"
+              f"{str(r['stage2_candidate']):>12}")
+
+
+async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
+    """
+    dry_run=True: skip all R2 uploads (weinstein_stage_analysis.json +
+    weinstein_stage_history.json + weinstein_transitions.json) and instead
+    PRINT the top print_top_n signals per stage (symbol name, weeks_in_stage,
+    close, ema30) to the log — for manually cross-checking real stock names
+    against a chart before trusting the detector on live data.
+    """
+    status = PipelineStatus("run_weinstein_scan")
+    try:
+        today = today_ist()
+        log.info(f"━━━ Weinstein Stage Analysis Scan  {today}{'  [DRY RUN]' if dry_run else ''} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+
+            signals, breadth_history = _detect_weinstein_stages(all_data)
+
+            if not dry_run:
+                # backups keyed on raw week label BEFORE we reformat "week" to a date string below
+                await backup_weinstein_history(client, signals)
+                await backup_weinstein_transitions(client, signals)
+
+            for sig in signals:
+                sig["stage_name"] = STAGE_NAMES.get(sig["stage"], "Unknown")
+                sig["week"] = _isoweek_to_date(sig["week"])
+            signals.sort(key=lambda x: (x["stage"] is None, x["stage"] or 0, -x["weeks_in_stage"]))
+
+            stage_counts = {STAGE_NAMES[n]: sum(1 for s in signals if s["stage"] == n) for n in (1, 2, 3, 4)}
+            log.info(f"Weinstein stages today: {stage_counts}")
+            if breadth_history:
+                log.info(f"Breadth history: {len(breadth_history)} weeks")
+
+            if dry_run:
+                # Full, sortable audit export; no R2 writes.
+                import csv
+                from pathlib import Path
+                out = Path("weinstein_test_results.csv")
+                columns = ["symbol", "week", "stage", "stage_name", "prev_stage",
+                           "weeks_in_stage", "close", "ema10", "ema30",
+                           "ema30_slope_pct", "stage_change", "transition_type",
+                           "stage2_candidate", "volume_confirmed",
+                           "base_low", "near_base_low"]
+                with out.open("w", newline="", encoding="utf-8") as fh:
+                    writer = csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(sorted(signals, key=lambda x: x["symbol"]))
+                log.info(f"Full Weinstein audit CSV: {out} ({len(signals)} stocks)")
+                for n in (1, 2, 3, 4):
+                    stage_syms = [s for s in signals if s["stage"] == n]
+                    log.info(f"\n── Stage {n} ({STAGE_NAMES[n]}) — {len(stage_syms)} stocks, "
+                              f"showing top {min(print_top_n, len(stage_syms))} by weeks_in_stage ──")
+                    for s in stage_syms[:print_top_n]:
+                        tag = f"  ⚡ {s['early_transition_label']} (range_ref={s['range_ref']})" if s["early_transition"] else ""
+                        chg = f"  🔄 {s['transition_type']}" if s["stage_change"] else ""
+                        es2 = "  🌱 Early Stage 2" if s["early_stage2"] else ""
+                        log.info(f"  {s['symbol']:<15} weeks_in_stage={s['weeks_in_stage']:<5} "
+                                  f"close={s['close']:<10} ema30={s['ema30']:<10} "
+                                  f"stage_change={s['stage_change']}{tag}{chg}{es2}")
+                early_watch = [s for s in signals if s["early_transition"]]
+                if early_watch:
+                    log.info(f"\n⚡ {len(early_watch)} stocks with early_transition=True "
+                              f"(base breakout / range breakdown ahead of SMA30 confirmation): "
+                              f"{[s['symbol'] for s in early_watch]}")
+                early_stage2_watch = [s for s in signals if s["early_stage2"]]
+                if early_stage2_watch:
+                    log.info(f"\n🌱 {len(early_stage2_watch)} stocks in early_stage2=True "
+                              f"(confirmed Stage 2, still within its first few weeks): "
+                              f"{[s['symbol'] for s in early_stage2_watch]}")
+                transitioned = [s for s in signals if s["stage_change"]]
+                if transitioned:
+                    log.info(f"\n🔄 {len(transitioned)} stage transitions this week (would be logged "
+                              f"to weinstein_transitions.json in a real run):")
+                    for s in transitioned:
+                        log.info(f"  {s['symbol']:<15} {s['transition_type']}")
+                log.info("\n[DRY RUN] No R2 files written — copy symbol names above into "
+                          "TradingView/your chart tool to cross-check.")
+            else:
+                await upload_str_with_manifest(client, r2_upload, "weinstein_stage_analysis.json", json.dumps({
+                    "updated": today, "count": len(signals), "stage_counts": stage_counts, "signals": signals,
+                }), schema_v=1, extra_meta={"count": len(signals)})
+        status.success()
+        log.info("━━━ Weinstein Stage Analysis Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+# ══════════════════════════════════════════════════════════════
+# VCP SCAN
+# ══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# VCP DETECTOR
+# ══════════════════════════════════════════════════════════════
+
+from statistics import mean as _mean
+
+def _vcp_atr(highs, lows, closes, period=14):
+    """Average True Range over the trailing `period` bars."""
+    n = len(highs)
+    if n < period + 1: return 0.0
+    trs = []
+    for i in range(1, n):
+        h, l, c_prev = highs[i], lows[i], closes[i - 1]
+        if h is None or l is None or c_prev is None: continue
+        trs.append(max(h - l, abs(h - c_prev), abs(l - c_prev)))
+    if len(trs) < period: return 0.0
+    return sum(trs[-period:]) / period
+
+
+def _vcp_sma(arr, period, end=None):
+    end = len(arr) if end is None else end
+    if end < period: return None
+    seg = arr[end - period:end]
+    if not seg or any(v is None for v in seg): return None
+    return sum(seg) / period
+
+
+def _vcp_zigzag_abs(highs, lows, atr_threshold):
+    """
+    ATR-based ZigZag — a pivot (H or L) is only confirmed once price has
+    reversed by at least atr_threshold (an absolute price amount, derived
+    from ATR so it auto-scales to each stock's own volatility) from the
+    running extreme. Replaces the older fixed-percentage ZigZag, which used
+    the same % threshold for a ₹50 penny stock and a ₹5,000 large-cap.
+    """
+    n = len(highs)
+    if n < 2: return []
+    piv = []
+    ext_high = highs[0]; ext_high_idx = 0
+    ext_low  = lows[0];  ext_low_idx  = 0
+    direction = None
+    for i in range(1, n):
+        h, l = highs[i], lows[i]
+        if h is None or l is None: continue
+        if ext_high is None or h > ext_high: ext_high, ext_high_idx = h, i
+        if ext_low  is None or l < ext_low:  ext_low,  ext_low_idx  = l, i
+        if direction is None:
+            if ext_high is not None and l <= ext_high - atr_threshold:
+                piv.append((ext_high_idx, ext_high, "H", i))
+                direction = "down"; ext_low, ext_low_idx = l, i
+            elif ext_low is not None and h >= ext_low + atr_threshold:
+                piv.append((ext_low_idx, ext_low, "L", i))
+                direction = "up"; ext_high, ext_high_idx = h, i
+        elif direction == "up":
+            if l <= ext_high - atr_threshold:
+                piv.append((ext_high_idx, ext_high, "H", i))
+                direction = "down"; ext_low, ext_low_idx = l, i
+        else:
+            if h >= ext_low + atr_threshold:
+                piv.append((ext_low_idx, ext_low, "L", i))
+                direction = "up"; ext_high, ext_high_idx = h, i
+    return piv
+
+
+def _vcp_zigzag_close_atr(highs, lows, closes, atr_threshold):
+    """
+    Same idea as _vcp_zigzag_abs, but uses CLOSING prices to decide WHEN a
+    reversal is confirmed (noise-resistant against intraday wick spikes),
+    then looks back to find the TRUE high/low within that confirmed span.
+    """
+    n = len(closes)
+    if n < 2: return []
+    close_piv = _vcp_zigzag_abs(closes, closes, atr_threshold)
+    if not close_piv: return []
+    piv = []
+    span_start = 0
+    for idx, _price, kind, confirm_idx in close_piv:
+        scan_end = confirm_idx
+        seg = highs[span_start:scan_end+1] if kind == "H" else lows[span_start:scan_end+1]
+        vals = [(span_start + off, v) for off, v in enumerate(seg) if v is not None]
+        if vals:
+            true_idx, true_price = (max(vals, key=lambda x: x[1]) if kind == "H"
+                                     else min(vals, key=lambda x: x[1]))
+            piv.append((true_idx, true_price, kind))
+            span_start = true_idx + 1
+        else:
+            span_start = idx + 1
+    return piv
+
+
+def _vcp_filter_nested(piv, max_nested_ratio=0.65):
+    if len(piv) < 5: return piv
+    out = list(piv)
+    i = 1
+    while i < len(out) - 2:
+        pa, pb = out[i], out[i + 1]
+        prev_p, next_p = out[i - 1], out[i + 2]
+        nested = False
+        if pa[2] == "H" and pb[2] == "L":
+            if pa[1] <= next_p[1] and pb[1] >= prev_p[1]: nested = True
+        elif pa[2] == "L" and pb[2] == "H":
+            if pa[1] >= next_p[1] and pb[1] <= prev_p[1]: nested = True
+        if nested:
+            inner = abs(pa[1] - pb[1])
+            left = abs(prev_p[1] - pa[1])
+            right = abs(pb[1] - next_p[1])
+            neighbor = min(left, right) if left and right else max(left, right)
+            if neighbor and inner <= neighbor * max_nested_ratio:
+                del out[i:i + 2]
+                continue
+        i += 1
+    return out
+
+
+def _detect_vcp(hist, lookback=150, atr_multiplier=1.5, atr_period=14,
+                min_contractions=3, max_contractions=6,
+                max_base_depth=0.45, max_final_depth=0.12, tighten_tol=0.03,
+                max_ceiling_jump=0.025, max_dist_from_pivot=0.08, min_prior_move=0.20,
+                max_52wh_dist=0.20, max_post_breakout_run=0.03,
+                live_min_bars=5, live_min_depth=0.02, min_first_leg_bars=15,
+                ceiling_band_tol=0.04, min_leg_span_bars=5, max_depth_ratio=0.75,
+                min_pattern_days=15, max_pattern_days=325, debug=False):
+    """
+    VCP (Volatility Contraction Pattern) detector — resistance/pivot-chain
+    based, ATR-scaled ZigZag on closes (auto-adjusts to each stock's own
+    volatility, unlike a fixed-percentage threshold), with nested-swing
+    filtering and an asymmetric ceiling check for flat/descending
+    resistance bases.
+
+    Chains consecutive swing-high -> swing-low legs into the longest run
+    of progressively tightening contractions ending at the most recent
+    leg, and scores each candidate base via TWO independent methods,
+    keeping whichever is valid (Method B preferred when both are):
+
+      METHOD A (zigzag_chain) — walks the raw pivot chain backward,
+      stopping the run the moment a leg's depth stops tightening OR its
+      high jumps up more than max_ceiling_jump versus its own immediate
+      neighbor. Handles descending-resistance (converging/symmetrical-
+      triangle) bases where each successive high is itself lower than the
+      one before.
+
+      METHOD B (ceiling_cluster) — only the highs that actually touch the
+      base's own ceiling (within ceiling_band_tol) count as contraction
+      boundaries; smaller internal highs that never approach the ceiling
+      are noise inside the base, not separate contractions. Same
+      immediate-neighbor jump rule as Method A applies to ceiling-touching
+      nodes. Handles flat-top, multi-touch cup-with-handle shapes.
+
+    Both methods require the FIRST contraction to be meaningfully deeper
+    than the base leg (max_depth_ratio), and every later leg to be no
+    deeper than the one before it by more than tighten_tol (additive).
+    A live/still-forming final leg (not yet confirmed by a ZigZag reversal)
+    is included if it already meets live_min_bars/live_min_depth, so a
+    base can be caught mid-formation, not just after it closes.
+    """
+    highs  = hist.get("h") or []
+    lows   = hist.get("l") or []
+    closes = hist.get("c") or []
+    vols   = hist.get("v") or []
+    dates  = hist.get("d") or []
+    n = len(closes)
+
+    if n < 60: return None
+    if any(x is None for x in (closes[-1], highs[-1], lows[-1])): return None
+    last_close = closes[-1]
+
+    sma50 = _vcp_sma(closes, 50)
+    sma150 = _vcp_sma(closes, 150) if n >= 150 else _vcp_sma(closes, min(n, 100))
+    if sma50 is None or sma150 is None: return None
+    if not (last_close > sma50 > sma150): return None
+
+    lb = min(lookback, n)
+    start = n - lb
+    h_w = highs[start:]; l_w = lows[start:]; c_w = closes[start:]
+
+    atr_val = _vcp_atr(h_w, l_w, c_w, atr_period)
+    if atr_val <= 0: return None
+    atr_threshold = atr_val * atr_multiplier
+
+    piv = _vcp_zigzag_close_atr(h_w, l_w, c_w, atr_threshold)
+    piv = [(i + start, p, k) for (i, p, k) in piv]
+    piv = _vcp_filter_nested(piv)
+    if len(piv) < 3: return None
+
+    h_pivots = [p for p in piv if p[2] == "H"]
+    if not h_pivots: return None
+
+    def _try_base(base_high, dbg=False):
+        seq = [p for p in piv if p[0] >= base_high[0]]
+        if not seq or seq[0][2] != "H": return None
+
+        search_start = max(0, base_high[0] - 252)
+        prior_lows = [lows[i] for i in range(search_start, base_high[0]) if lows[i] is not None]
+        if not prior_lows: return None
+        prior_low = min(prior_lows)
+        prior_move = (base_high[1] - prior_low) / prior_low
+        if prior_move < min_prior_move: return None
+
+        contractions = []
+        i = 0
+        while i < len(seq) - 1:
+            if seq[i][2] == "H" and seq[i+1][2] == "L":
+                hi, hp = seq[i][0], seq[i][1]
+                span_end = seq[i+2][0] if i+2 < len(seq) else n - 1
+                span = [(idx, lows[idx]) for idx in range(hi+1, span_end+1) if lows[idx] is not None]
+                if span:
+                    li, lp = min(span, key=lambda x: x[1])
+                else:
+                    li, lp = seq[i+1][0], seq[i+1][1]
+                n_bars = li - hi
+                if hp > 0 and n_bars >= min_leg_span_bars:
+                    contractions.append((hi, hp, li, lp, (hp - lp) / hp))
+                i += 2
+            else:
+                i += 1
+
+        last_piv = seq[-1]
+        live_leg = None
+        if last_piv[2] == "H":
+            hi, hp = last_piv[0], last_piv[1]
+            span = [(idx, lows[idx]) for idx in range(hi + 1, n) if lows[idx] is not None]
+            if span:
+                li, lp = min(span, key=lambda x: x[1])
+                depth = (hp - lp) / hp if hp > 0 else 0
+                if hp > 0 and (n - 1 - hi) >= live_min_bars and depth >= live_min_depth:
+                    live_leg = (hi, hp, li, lp, depth)
+        else:
+            after = [(idx, highs[idx]) for idx in range(last_piv[0] + 1, n) if highs[idx] is not None]
+            if after:
+                hi, hp = max(after, key=lambda x: x[1])
+                span = [(idx, lows[idx]) for idx in range(hi + 1, n) if lows[idx] is not None]
+                if span:
+                    li, lp = min(span, key=lambda x: x[1])
+                    depth = (hp - lp) / hp if hp > 0 else 0
+                    if hp > 0 and (n - 1 - hi) >= live_min_bars and depth >= live_min_depth:
+                        live_leg = (hi, hp, li, lp, depth)
+
+        if live_leg is not None:
+            if contractions and contractions[-1][0] == live_leg[0]:
+                if live_leg[3] < contractions[-1][3]:
+                    contractions[-1] = live_leg
+            elif not contractions or live_leg[0] > contractions[-1][0]:
+                contractions.append(live_leg)
+
+        if len(contractions) < min_contractions: return None
+
+        # ---- METHOD A: two-pass zigzag-chain walk. Ceiling check is
+        # IMMEDIATE-NEIGHBOR only -- no high may jump up more than
+        # max_ceiling_jump versus the leg right before it, anywhere in the
+        # chain (not just the final/pivot leg). Legitimate revisits of an
+        # OLDER, higher ceiling (like ABB's case) are handled separately by
+        # METHOD B (ceiling-cluster) below, so Method A no longer needs to
+        # reach back through unconfirmed earlier legs to excuse a jump --
+        # that was what let CRISIL's chain through with a 9.7% jump on its
+        # final leg versus its immediate neighbor, which is exactly the
+        # pattern that shouldn't be excused.
+        depths = [c[4] for c in contractions]
+        run_end = len(depths) - 1
+        j = run_end - 1
+        while j >= 0:
+            if depths[j] < depths[j+1] - tighten_tol:
+                break
+            hi_a, hi_b = contractions[j][1], contractions[j+1][1]
+            if hi_b > hi_a * (1 + max_ceiling_jump):
+                break
+            j -= 1
+        run_a = contractions[j+1:]
+
+        # ---- METHOD B: ceiling-cluster (handles flat-top, multi-touch
+        # cup-with-handle shapes -- only the H's that actually touch the
+        # base's own ceiling count as contraction boundaries; smaller
+        # internal highs that never approach the ceiling are treated as
+        # noise inside the base, not separate contractions) ----
+        ceiling = max(c[1] for c in contractions)
+        node_idxs = [idx for idx, c in enumerate(contractions) if c[1] >= ceiling * (1 - ceiling_band_tol)]
+        # Same immediate-neighbor rule as Method A: no ceiling-touching
+        # node's high may jump up more than max_ceiling_jump versus the
+        # node right before it -- being within the overall ceiling band is
+        # not enough on its own (that let a leg jump ~4% versus its own
+        # immediate predecessor slip through, e.g. MAHSCOOTER's 26-May ->
+        # 04-Aug node pair, even though both happened to sit within 4% of
+        # the much-older Feb high). Walk backward and keep only the
+        # longest trailing run of nodes satisfying this.
+        if len(node_idxs) >= 2:
+            k = len(node_idxs) - 1
+            while k >= 1:
+                hi_prev = contractions[node_idxs[k-1]][1]
+                hi_cur  = contractions[node_idxs[k]][1]
+                if hi_cur > hi_prev * (1 + max_ceiling_jump):
+                    break
+                k -= 1
+            node_idxs = node_idxs[k:]
+        run_b = None
+        if len(node_idxs) >= 2:
+            run_b = []
+            for a_i, b_i in zip(node_idxs, node_idxs[1:]):
+                hi, hp = contractions[a_i][0], contractions[a_i][1]
+                span_end = contractions[b_i][0]
+                span = [(idx, lows[idx]) for idx in range(hi+1, span_end+1) if lows[idx] is not None]
+                if not span: continue
+                li, lp = min(span, key=lambda x: x[1])
+                run_b.append((hi, hp, li, lp, (hp-lp)/hp if hp>0 else 0))
+            last_idx = node_idxs[-1]
+            last_c = contractions[last_idx]
+            if last_c[0] == contractions[-1][0]:
+                run_b.append(contractions[-1])
+
+        def _validate_and_score(run):
+            if run is None: return None
+            run_depths = [c[4] for c in run]
+            if not (min_contractions <= len(run) <= max_contractions): return None
+            for k in range(1, len(run)):
+                if run[k][3] < run[k-1][3]: return None
+            if len(run) >= 2 and (run[1][0] - run[0][0]) < min_first_leg_bars: return None
+            for k in range(len(run)):
+                low_k = run[k][3]; check_from = run[k][2]
+                for idx in range(check_from + 1, n):
+                    if lows[idx] is not None and lows[idx] < low_k: return None
+            for k in range(1, len(run_depths)):
+                if run_depths[k] >= run_depths[k-1] + tighten_tol: return None
+            # ---- The FIRST contraction must be meaningfully tighter than
+            # the base leg -- at most max_depth_ratio (75%) of its size --
+            # since the base leg's initial pullback should be dramatically
+            # deeper than the next one for a base to be credibly starting
+            # to tighten. Later legs only need the milder additive
+            # tighten_tol check above; requiring every single later pair
+            # to also clear 75% was rejecting valid patterns where the
+            # tail-end legs are already both quite tight (e.g. 6.3% ->
+            # 5.9%), which is a fine, still-valid final approach to the
+            # pivot -- not a sign the base isn't tightening.
+            if len(run_depths) >= 2 and run_depths[1] >= run_depths[0] * max_depth_ratio:
+                return None
+            base_depth  = run_depths[0]
+            final_depth = run_depths[-1]
+            if base_depth > max_base_depth: return None
+            if final_depth > max_final_depth: return None
+            pivot_price = run[-1][1]
+            if pivot_price <= 0: return None
+            dist = (pivot_price - last_close) / pivot_price
+            if dist > max_dist_from_pivot or dist < -0.02: return None
+            post_base_start = run[-1][2] + 1
+            if post_base_start < n:
+                highs_since = [highs[idx] for idx in range(post_base_start, n) if highs[idx] is not None]
+                if highs_since and max(highs_since) > pivot_price * (1 + max_post_breakout_run):
+                    return None
+            def _leg_vol(c):
+                a, b = c[0], c[2]
+                seg = [v for v in vols[a:b+1] if v]
+                return sum(seg) / len(seg) if seg else 0
+            first_vol = _leg_vol(run[0])
+            last_vol  = _leg_vol(run[-1])
+            vol_dryup = last_vol < first_vol * 0.75 if first_vol else False
+            base_start = run[0][0]; base_end = run[-1][2]
+            base_len = base_end - base_start
+            if base_len < min_pattern_days: return None
+            if base_len > max_pattern_days: return None
+            score = 0
+            score += min(len(run), 4) * 10
+            score += max(0, (max_final_depth - final_depth) / max_final_depth) * 25
+            score += max(0, (0.25 - (last_vol / first_vol if first_vol else 1)) / 0.25) * 20
+            score += max(0, (max_dist_from_pivot - abs(dist)) / max_dist_from_pivot) * 15
+            score += min(prior_move / 1.0, 1.0) * 10
+            score = round(min(score, 100), 1)
+            return {
+                "is_vcp": True, "contractions": len(run),
+                "depths_pct": [round(d * 100, 1) for d in run_depths],
+                "base_depth_pct": round(base_depth * 100, 1),
+                "final_depth_pct": round(final_depth * 100, 1),
+                "pivot": round(pivot_price, 2),
+                "pivot_date": dates[run[-1][0]] if dates else None,
+                "base_start_date": dates[run[0][0]] if dates else None,
+                "base_end_date": dates[run[-1][2]] if dates else None,
+                "resistance_shape": "descending" if run[0][1] > run[-1][1] * 1.01 else "flat",
+                "contraction_dates": [
+                    {"h_date": dates[c[0]], "h_price": round(c[1], 2),
+                     "l_date": dates[c[2]], "l_price": round(c[3], 2)}
+                    for c in run if dates
+                ],
+                "dist_from_pivot_pct": round(dist * 100, 2),
+                "vol_dryup": vol_dryup,
+                "prior_move_pct": round(prior_move * 100, 1),
+                "base_len": base_len,
+                "score": score,
+                "method": "zigzag_chain",
+            }
+
+        res_a = _validate_and_score(run_a)
+        res_b = _validate_and_score(run_b)
+        if res_b is not None:
+            res_b["method"] = "ceiling_cluster"
+        candidates = [r for r in (res_a, res_b) if r is not None]
+        if not candidates: return None
+        # Ceiling-cluster preferred whenever valid -- it represents the
+        # cleaner, textbook "flat-top, multiple ceiling touches" shape.
+        # zigzag_chain (which can carry extra internal-noise legs) is only
+        # used as a fallback when ceiling_cluster itself isn't valid, e.g.
+        # genuine descending-resistance bases where highs never cluster.
+        return res_b if res_b is not None else res_a
+
+    best = None
+    for base_high in sorted(h_pivots, key=lambda x: -x[0]):
+        result = _try_base(base_high, dbg=debug)
+        if result and (best is None or result["score"] > best["score"]):
+            best = result
+    return best
+
+
+async def run_vcp_scan() -> None:
+    status = PipelineStatus("run_vcp_scan")
+    try:
+    
+        today = today_ist()
+        log.info(f"━━━ VCP Scan  {today} ━━━")
+        async with httpx.AsyncClient() as client:
+            global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+            ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+            all_data = await download_all_chunks(client)
+            log.info(f"Loaded {len(all_data)} stocks")
+            signals = []
+            for sym, s in all_data.items():
+                if not _check_liquidity(s["v"], s["c"], len(s["c"])):
+                    continue
+                r = _detect_vcp(s)
+                if r:
+                    signals.append({"symbol": sym, **r})
+            signals.sort(key=lambda x: x["score"], reverse=True)
+            log.info(f"VCP signals: {len(signals)}")
+            await upload_str_with_manifest(client, r2_upload, "vcp_signals.json", json.dumps({
+                "updated": today,
+                "count": len(signals),
+                "signals": signals,
+            }), schema_v=1, extra_meta={"count": len(signals)})
+        status.success()
+        log.info("━━━ VCP Scan complete ━━━")
+    except Exception as e:
+        status.failure(e)
+
+
+
+# ══════════════════════════════════════════════════════════════
+# CPR (Central Pivot Range) — Daily / Weekly / Monthly
+# ══════════════════════════════════════════════════════════════
+
+def _calculate_cpr(high, low, close, atr=None):
+    pivot = (high + low + close) / 3
+    bc    = (high + low) / 2
+    tc    = (2 * pivot) - bc
+    width = abs(tc - bc)
+    width_pct  = round((width / pivot) * 100, 3) if pivot else 0
+    atr_ratio  = round(width / atr, 3) if atr and atr > 0 else None
+
+    if atr_ratio is not None:
+        if atr_ratio < 0.15:   category = "Very Narrow"
+        elif atr_ratio < 0.30: category = "Narrow"
+        elif atr_ratio < 0.55: category = "Moderate"
+        else:                  category = "Wide"
+    else:
+        if width_pct < 0.25:   category = "Very Narrow"
+        elif width_pct < 0.5:  category = "Narrow"
+        elif width_pct < 1.0:  category = "Moderate"
+        else:                  category = "Wide"
+
+    result = {"p": round(pivot, 2), "bc": round(bc, 2), "tc": round(tc, 2),
+              "width_pct": width_pct, "category": category}
+    if atr_ratio is not None:
+        result["atr_ratio"] = atr_ratio
+    return result
+
+
+def _calc_atr14(highs, lows, closes, period=14):
+    n = len(closes); trs = []
+    for i in range(max(1, n - period), n):
+        h = highs[i]; l = lows[i]; pc = closes[i - 1]
+        if None in (h, l, pc): continue
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs) / len(trs) if trs else None
+
+
+def _resample_weekly(dates, highs, lows, closes):
+    weekly = {}
+    for d, h, l, c in zip(dates, highs, lows, closes):
+        if None in (h, l, c): continue
+        key = date.fromisoformat(d).isocalendar()[:2]
+        if key not in weekly:
+            weekly[key] = {"h": h, "l": l, "c": c}
+        else:
+            weekly[key]["h"] = max(weekly[key]["h"], h)
+            weekly[key]["l"] = min(weekly[key]["l"], l)
+            weekly[key]["c"] = c
+    return weekly
+
+
+def _resample_monthly(dates, highs, lows, closes):
+    monthly = {}
+    for d, h, l, c in zip(dates, highs, lows, closes):
+        if None in (h, l, c): continue
+        key = d[:7]
+        if key not in monthly:
+            monthly[key] = {"h": h, "l": l, "c": c}
+        else:
+            monthly[key]["h"] = max(monthly[key]["h"], h)
+            monthly[key]["l"] = min(monthly[key]["l"], l)
+            monthly[key]["c"] = c
+    return monthly
+
+
+def _build_cpr_data(all_data, today):
+    today_dt          = date.fromisoformat(today)
+    current_week_key  = today_dt.isocalendar()[:2]
+    current_month_key = today[:7]
+    result = {}
+
+    for sym, s in all_data.items():
+        dates  = s["d"]; highs = s["h"]; lows = s["l"]; closes = s["c"]
+        n = len(dates)
+        if n < 2: continue
+
+        # Daily ATR14
+        atr14 = _calc_atr14(highs, lows, closes)
+
+        def _candle(idx):
+            h, l, c = highs[idx], lows[idx], closes[idx]
+            return (h, l, c) if None not in (h, l, c) else None
+
+        # ── Daily CPR ──────────────────────────────────────────
+        daily_cpr = {}
+        prev = _candle(-2)
+        curr = _candle(-1)
+        if prev: daily_cpr["today"] = _calculate_cpr(*prev, atr=atr14)
+        if curr: daily_cpr["next"]  = _calculate_cpr(*curr, atr=atr14)
+
+        # ── Weekly CPR ─────────────────────────────────────────
+        # ── Weekly CPR ─────────────────────────────────────────
+        wk_map     = _resample_weekly(dates, highs, lows, closes)
+        past_weeks = sorted(k for k in wk_map if k < current_week_key)
+        weekly_cpr = None
+        if past_weeks:
+            lw = wk_map[past_weeks[-1]]
+            wk_sorted = [wk_map[k] for k in sorted(wk_map.keys())]
+            w_trs = []
+            for i in range(max(1, len(wk_sorted) - 14), len(wk_sorted)):
+                wh = wk_sorted[i]["h"]; wl = wk_sorted[i]["l"]; wpc = wk_sorted[i-1]["c"]
+                w_trs.append(max(wh - wl, abs(wh - wpc), abs(wl - wpc)))
+            weekly_atr = sum(w_trs) / len(w_trs) if w_trs else None
+            weekly_cpr = _calculate_cpr(lw["h"], lw["l"], lw["c"], atr=weekly_atr)
+
+        # Weekly developing — current incomplete week
+        weekly_dev_cpr = None
+        if current_week_key in wk_map:
+            cw = wk_map[current_week_key]
+            weekly_dev_cpr = _calculate_cpr(cw["h"], cw["l"], cw["c"], atr=weekly_atr)
+
+        # ── Monthly CPR ────────────────────────────────────────
+        mo_map      = _resample_monthly(dates, highs, lows, closes)
+        past_months = sorted(k for k in mo_map if k < current_month_key)
+        monthly_cpr = None
+        if past_months:
+            lm = mo_map[past_months[-1]]
+            mo_sorted = [mo_map[k] for k in sorted(mo_map.keys())]
+            m_trs = []
+            for i in range(max(1, len(mo_sorted) - 14), len(mo_sorted)):
+                mh = mo_sorted[i]["h"]; ml = mo_sorted[i]["l"]; mpc = mo_sorted[i-1]["c"]
+                m_trs.append(max(mh - ml, abs(mh - mpc), abs(ml - mpc)))
+            monthly_atr = sum(m_trs) / len(m_trs) if m_trs else None
+            monthly_cpr = _calculate_cpr(lm["h"], lm["l"], lm["c"], atr=monthly_atr)
+
+        # Monthly developing — current incomplete month
+        monthly_dev_cpr = None
+        if current_month_key in mo_map:
+            cm = mo_map[current_month_key]
+            monthly_dev_cpr = _calculate_cpr(cm["h"], cm["l"], cm["c"], atr=monthly_atr)
+
+        result[sym] = {
+            "daily":             daily_cpr,
+            "weekly":            weekly_cpr,
+            "weekly_developing": weekly_dev_cpr,
+            "monthly":           monthly_cpr,
+            "monthly_developing": monthly_dev_cpr,
+        }
+
+    return result
+# ══════════════════════════════════════════════════════════════
+# SHAKEOUT DETECTOR  — Supertrend(10,3) / EMA21 / SMA50 wick-recovery
+# ══════════════════════════════════════════════════════════════
+
+def _calc_atr_series(highs, lows, closes, period):
+    """Wilder-smoothed ATR series — None-safe, carries forward like _calc_ema."""
+    n = len(closes)
+    trs = [None] * n
+    for i in range(1, n):
+        h, l, pc = highs[i], lows[i], closes[i - 1]
+        if None in (h, l, pc): continue
+        trs[i] = max(h - l, abs(h - pc), abs(l - pc))
+    atr = [None] * n
+    seed = [v for v in trs[1:period + 1] if v is not None]
+    if len(seed) < period: return atr
+    atr[period] = sum(seed) / period
+    for i in range(period + 1, n):
+        tr = trs[i]
+        if tr is None or atr[i - 1] is None:
+            atr[i] = atr[i - 1]
+        else:
+            atr[i] = (atr[i - 1] * (period - 1) + tr) / period
+    return atr
+
+
+def _calc_supertrend(highs, lows, closes, period=10, mult=3):
+    """
+    Standard Supertrend(period, mult) — returns the active band series
+    (flips between upper/lower band on trend change). None-safe: carries
+    forward the previous band/trend when a candle is missing OHLC.
+    """
+    n = len(closes)
+    atr = _calc_atr_series(highs, lows, closes, period)
+    upper = [None] * n; lower = [None] * n
+    trend = [None] * n; st = [None] * n
+    for i in range(n):
+        h, l, c, a = highs[i], lows[i], closes[i], atr[i]
+        if h is None or l is None or a is None:
+            upper[i] = upper[i - 1] if i > 0 else None
+            lower[i] = lower[i - 1] if i > 0 else None
+            trend[i] = trend[i - 1] if i > 0 else None
+            st[i] = st[i - 1] if i > 0 else None
+            continue
+        mid = (h + l) / 2
+        basic_upper = mid + mult * a
+        basic_lower = mid - mult * a
+        prev_close = closes[i - 1] if i > 0 else None
+        prev_upper = upper[i - 1] if i > 0 else None
+        prev_lower = lower[i - 1] if i > 0 else None
+        if prev_upper is not None and prev_close is not None and prev_close <= prev_upper:
+            upper[i] = min(basic_upper, prev_upper)
+        else:
+            upper[i] = basic_upper
+        if prev_lower is not None and prev_close is not None and prev_close >= prev_lower:
+            lower[i] = max(basic_lower, prev_lower)
+        else:
+            lower[i] = basic_lower
+        prev_trend = trend[i - 1] if i > 0 else None
+        if c is None:
+            trend[i] = prev_trend if prev_trend is not None else 1
+        elif prev_trend == -1:
+            trend[i] = 1 if c > upper[i] else -1
+        elif prev_trend == 1:
+            trend[i] = -1 if c < lower[i] else 1
+        else:
+            trend[i] = 1   # first valid bar — default uptrend seed
+        st[i] = lower[i] if trend[i] == 1 else upper[i]
+    return st
+async def run_box_scan(dry_run=False) -> None:
+    """Scan existing R2 OHLC and publish Box Finder results."""
+    from box_finder import build_box_finder
+    today = today_ist()
+    async with httpx.AsyncClient() as client:
+        all_data = await download_all_chunks(client)
+        payload = build_box_finder(all_data, asof=today)
+        from collections import Counter
+        counts = Counter(row['status'] for row in payload['stocks'])
+        log.info(f"Box Finder: {payload['total']} rows; statuses={dict(counts)}")
+        if dry_run:
+            for row in payload['stocks'][:25]:
+                log.info(f"  {row['symbol']:15s} {row['status']:23s} upper={row['upper']}")
+            log.info("Box Finder dry run: no R2 writes")
+            return
+        await upload_str_with_manifest(
+            client, r2_upload, 'box_finder.json', json.dumps(payload),
+            schema_v=1, extra_meta={'stock_count': payload['total'], 'asof': today}
+        )
+        log.info('Box Finder uploaded: box_finder.json')
+
+
+# ══════════════════════════════════════════════════════════════
+# PUBLIC ALERTS — end-of-day summaries to the public Telegram group
+# (@twt_alerts, Topics on). One message per topic, built from screener_feed.json
+# (its per-stock "ev" events). Run after ep_scan:  python pipeline.py public_alerts
+#   Market Summary  internals.json (Market Internals page): MA breadth, M-Swing, net A/D, 52W H/L, Stage 2
+#   Box Breakouts   ev "box" dated today
+#   52W High & ATH  ev "ath" / "h52" dated today
+#   Stage 2 Entries ev "stg" into stage 2 (weekly; each symbol posted once per week)
+#   EP & Gaps       ev "ep" today + gap-ups of at least PUBLIC_ALERT_GAP_MIN_PCT today
+#   Setups          ev "rcl" / "so" / "vcp" / "htf" / "mhtf" / "pb" dated today
+# Already-posted items are kept in R2 public_alerts_state.json so a re-run (or a
+# holiday run on the same data) does not post them again.
+# Liquidity filter keeps out illiquid names: 50-day average turnover >= PUBLIC_ALERT_MIN_TURNOVER_CR.
+# ══════════════════════════════════════════════════════════════
+PUBLIC_ALERT_MIN_TURNOVER_CR = 1.0     # "to" in screener_feed, crore per day
+PUBLIC_ALERT_MAX_ROWS = 10             # stocks listed per message; the rest as "+N more"
+PUBLIC_ALERT_GAP_MIN_PCT = 3.0
+PUBLIC_ALERT_STATE_DAYS = 20
+PUBLIC_ALERT_SITE = "https://tradewithtech.in"
+
+
+def _pa_esc(t):
+    return str(t if t is not None else "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _pa_line(row, extra=""):
+    sym = _pa_esc(row.get("trading_symbol") or row.get("symbol"))
+    pc = row.get("pct_ch")
+    pc_txt = f"{pc:+.1f}%" if isinstance(pc, (int, float)) else ""
+    rs = row.get("rs_rating")
+    rs_txt = f" · RS {int(rs)}" if isinstance(rs, (int, float)) else ""
+    return f"• <b>{sym}</b> {pc_txt}{rs_txt}" + (f" · {_pa_esc(extra)}" if extra else "")
+
+
+def _pa_block(title, items, date_txt, note=""):
+    """items: [(row, extra)] already sorted; returns message text or None."""
+    if not items:
+        return None
+    shown = items[:PUBLIC_ALERT_MAX_ROWS]
+    lines = [f"<b>{title}</b> — {date_txt}", ""]
+    lines += [_pa_line(r, x) for r, x in shown]
+    if len(items) > len(shown):
+        lines.append(f"… +{len(items) - len(shown)} more")
+    if note:
+        lines += ["", f"<i>{_pa_esc(note)}</i>"]
+    lines += ["", f'<a href="{PUBLIC_ALERT_SITE}">Full list on TradeWithTech</a> · not investment advice']
+    return "\n".join(lines)
+
+
+def _pa_rank(row):
+    rs = row.get("rs_rating")
+    return -(rs if isinstance(rs, (int, float)) else 0)
+
+
+# Market Summary from internals.json (the rows behind the Market Internals page:
+# MA Breadth, M-Swing, Net A/D, 52W H/L, Stage 2). Column names are matched the
+# same way the page does (exact or contains, case-insensitive).
+def _pa_col(headers, names):
+    up = [h.strip().upper() for h in headers]
+    for exact in (True, False):          # exact name first, then "contains"
+        for n in names:
+            n = n.upper()
+            for i, h in enumerate(up):
+                if (h == n) if exact else (n in h and not h.startswith("BELOW")):
+                    return headers[i]
+    return None
+
+
+def _pa_num(v):
+    if v is None: return None
+    if isinstance(v, (int, float)): return float(v)
+    t = re.sub(r"[^0-9.\-]", "", str(v))
+    try: return float(t) if t not in ("", "-", ".") else None
+    except ValueError: return None
+
+
+def _pa_row_date(v):
+    s = str(v or "").strip()
+    try: return date.fromisoformat(s[:10])
+    except ValueError: pass
+    for fmt in ("%d/%m/%y", "%d-%m-%y", "%d-%m-%Y", "%d/%m/%Y", "%d %b %Y", "%d-%b-%Y", "%d %B %Y", "%b %d, %Y", "%d-%b-%y", "%d %b %y"):
+        try: return datetime.strptime(s, fmt).date()
+        except ValueError: pass
+    return None
+
+
+PUBLIC_ALERT_TREND_DAYS = 10
+_PA_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def _pa_spark(vals, lo=None, hi=None, min_range=8.0):
+    """One block character per value, scaled to the series' own min / max (at least min_range wide)."""
+    v = [x for x in vals if x is not None]
+    if not v: return ""
+    lo = min(v) if lo is None else lo; hi = max(v) if hi is None else hi
+    if hi - lo < min_range:   # small moves stay small instead of filling the whole height
+        mid = (hi + lo) / 2; lo, hi = mid - min_range / 2, mid + min_range / 2
+    if hi - lo < 1e-9: return _PA_SPARK[3] * len(vals)
+    out = ""
+    for x in vals:
+        if x is None: out += " "; continue
+        k = int(round((min(hi, max(lo, x)) - lo) / (hi - lo) * (len(_PA_SPARK) - 1)))
+        out += _PA_SPARK[k]
+    return out
+
+
+def _pa_bar(p, width=10):
+    p = max(0.0, min(100.0, p or 0.0)); n = int(round(p / 100 * width))
+    return "▓" * n + "░" * (width - n)
+
+
+def _pa_market_from_internals(rows):
+    """Returns (date_iso, text) or (None, None)."""
+    rows = [r for r in (rows or []) if isinstance(r, dict)]
+    if not rows: return None, None
+    headers = list(rows[0].keys())
+    c_date = _pa_col(headers, ["Date", "DATE"])
+    if not c_date: return None, None
+    dated = [(_pa_row_date(r.get(c_date)), i, r) for i, r in enumerate(rows)]
+    dated = [x for x in dated if x[0]]
+    if not dated: return None, None
+    dated.sort(key=lambda x: (x[0], x[1]))
+    d_last, _, last = dated[-1]
+    prev = dated[-2][2] if len(dated) > 1 else {}
+    lines = [f"<b>🌡 Market Internals</b> · {d_last.strftime('%a %d %b %Y')}", ""]
+
+    # trend table: last PUBLIC_ALERT_TREND_DAYS sessions, oldest -> today, one block per day
+    win = [r for _, _, r in dated[-PUBLIC_ALERT_TREND_DAYS:]]
+    def series(c): return [_pa_num(r.get(c)) for r in win]
+    trows = []
+    # rows are kept to about 29 characters so the block does not wrap on a phone
+    def trow(label, ser, val_txt):
+        chg = f"{ser[-1] - ser[-2]:+.1f}" if len(ser) > 1 and ser[-2] is not None else ""
+        return f"{label:<7}{_pa_spark(ser)} {val_txt:>6}{chg:>5}"
+    for label, names in (("10EMA", ["Above 10EMA", "10EMA"]), ("20EMA", ["Above 20EMA", "20EMA"]),
+                         ("50EMA", ["Above 50EMA", "50EMA"]), ("200EMA", ["Above 200EMA", "200EMA"])):
+        c = _pa_col(headers, names)
+        if not c: continue
+        ser = series(c)
+        if ser[-1] is None: continue
+        trows.append(trow(label, ser, f"{ser[-1]:.1f}%"))
+    c_ms = _pa_col(headers, ["Mswing", "MSwing", "MSWING", "M-Swing"])
+    ms_line = None
+    if c_ms:
+        ser = series(c_ms)
+        if ser[-1] is not None:
+            trows.append(trow("MSwing", ser, f"{ser[-1]:.1f}"))
+            full = [x for x in (_pa_num(r.get(c_ms)) for _, _, r in dated) if x is not None]
+            v = full[-1]; sma9 = sum(full[-9:]) / len(full[-9:])
+            zone = "🟢 strong" if v >= 50 and v >= sma9 else "🟡 mixed" if v >= 50 or v >= sma9 else "🔴 weak"
+            ms_line = f"<b>⚡ M-Swing</b> {v:.2f} · 9 SMA {sma9:.2f} ({'above' if v >= sma9 else 'below'}) · {zone}"
+    c_h, c_l = _pa_col(headers, ["52WH"]), _pa_col(headers, ["52WL"])
+    if c_h and c_l:
+        hs, ls = series(c_h), series(c_l)
+        net = [(a - b) if a is not None and b is not None else None for a, b in zip(hs, ls)]
+        if net[-1] is not None:
+            trows.append(trow("NetH-L", net, f"{net[-1]:+.1f}%"))
+    if trows:
+        n = len(win)
+        head = f"{'':<7}{(str(n) + 'd trend'):<{n}} {'now':>6}{'1d':>5}"
+        lines += [f"<b>📈 Breadth</b> · % of stocks · last {n} days",
+                  "<pre>" + "\n".join([head] + trows) + "</pre>"]
+    if ms_line:
+        lines.append(ms_line)
+
+    extra = []
+    # internals.json: Advances / Declines are stock counts; 52WH / 52WL / Stage 2 are % of stocks
+    c_a, c_d = _pa_col(headers, ["Advances"]), _pa_col(headers, ["Declines"])
+    if c_a and c_d and _pa_num(last.get(c_a)) is not None and _pa_num(last.get(c_d)) is not None:
+        extra.append(f"Advances / declines <b>{_pa_num(last.get(c_a)):.0f} / {_pa_num(last.get(c_d)):.0f}</b>")
+    c_h, c_l = _pa_col(headers, ["52WH"]), _pa_col(headers, ["52WL"])
+    if c_h and c_l and _pa_num(last.get(c_h)) is not None and _pa_num(last.get(c_l)) is not None:
+        _nh, _nl = _pa_num(last.get(c_h)), _pa_num(last.get(c_l))
+        extra.append(f"At 52W high / low <b>{_nh:.1f}% / {_nl:.1f}%</b>")
+    c_s2 = _pa_col(headers, ["Stage 2", "STAGE 2", "STAGE2"])
+    if c_s2 and _pa_num(last.get(c_s2)) is not None:
+        extra.append(f"In Stage 2 <b>{_pa_num(last.get(c_s2)):.1f}%</b>")
+    if extra:
+        lines += [""] + ["• " + x for x in extra]
+
+    if len(lines) <= 2:
+        return None, None
+    lines += ["", f'<a href="{PUBLIC_ALERT_SITE}">Market Internals on TradeWithTech</a>']
+    return d_last.isoformat(), "\n".join(lines)
+
+
+def _build_public_alerts(feed, market_date, sent, internals=None):
+    """Returns ([(topic_key, text)], new_sent_keys). sent = set of keys already posted."""
+    try:
+        date_txt = date.fromisoformat(market_date).strftime("%d %b %Y")
+    except ValueError:
+        date_txt = market_date
+    liquid = [r for r in feed if isinstance(r.get("to"), (int, float)) and r["to"] >= PUBLIC_ALERT_MIN_TURNOVER_CR]
+    new_keys, out = set(), []
+
+    def fresh(key):
+        return key not in sent and key not in new_keys
+
+    # ── market summary (once per date): Market Internals rows; screener_feed only as a fallback ──
+    m_date, m_text = _pa_market_from_internals(internals) if internals else (None, None)
+    if m_text and m_date != market_date:
+        # internals.json has not reached today's session yet: send nothing rather than an old day
+        log.warning(f"Public alerts: internals.json latest date {m_date} != market date {market_date} — Market Summary skipped")
+        m_text, internals_stale = None, True
+    else:
+        internals_stale = False
+    if m_text:
+        key = f"mi|{m_date}"
+        if fresh(key):
+            out.append(("market", m_text)); new_keys.add(key)
+    key = f"market|{market_date}"
+    if not m_text and not internals_stale and fresh(key):
+        rows = [r for r in feed if r.get("date") == market_date and isinstance(r.get("pct_ch"), (int, float))]
+        if rows:
+            adv = sum(1 for r in rows if r["pct_ch"] > 0); dec = sum(1 for r in rows if r["pct_ch"] < 0)
+            nh = sum(1 for r in rows if r.get("new_52wh")); nl = sum(1 for r in rows if r.get("new_52wl"))
+            a50 = 100 * sum(1 for r in rows if r.get("above_50")) / len(rows)
+            a200 = 100 * sum(1 for r in rows if r.get("above_200")) / len(rows)
+            sec = {}
+            for r in rows:
+                if r.get("sector"): sec.setdefault(r["sector"], []).append(r["pct_ch"])
+            sec_avg = sorted(((s, sum(v) / len(v)) for s, v in sec.items() if len(v) >= 10), key=lambda x: -x[1])
+            lines = [f"<b>🌡 Market Summary</b> — {date_txt}", "",
+                     f"Advances / declines: <b>{adv}</b> / <b>{dec}</b>",
+                     f"New 52W highs / lows: <b>{nh}</b> / <b>{nl}</b>",
+                     f"Above EMA50: <b>{a50:.0f}%</b> · above EMA200: <b>{a200:.0f}%</b>"]
+            if sec_avg:
+                lines += ["", "Strongest sectors: " + ", ".join(f"{_pa_esc(s)} {v:+.1f}%" for s, v in sec_avg[:3]),
+                          "Weakest sectors: " + ", ".join(f"{_pa_esc(s)} {v:+.1f}%" for s, v in sec_avg[-3:][::-1])]
+            lines += ["", f'<a href="{PUBLIC_ALERT_SITE}">Open the screener</a>']
+            out.append(("market", "\n".join(lines))); new_keys.add(key)
+
+    def evs(row, types):
+        return [e for e in (row.get("ev") or []) if isinstance(e, list) and len(e) >= 2 and e[0] in types]
+
+    # ── box breakouts ──
+    items = []
+    for r in liquid:
+        for e in evs(r, ("box",)):
+            k = f"box|{r['symbol']}|{e[1]}"
+            if e[1] == market_date and fresh(k):
+                items.append((r, f"{e[2]}-candle base" if e[2] else "")); new_keys.add(k); break
+    out.append(("box", _pa_block("📦 Box Breakouts", sorted(items, key=lambda x: _pa_rank(x[0])), date_txt)))
+
+    # ── 52W high and ATH (ATH first) ──
+    # One stock is posted once per day in this topic (as ATH or as 52W high, never both / twice).
+    # Stocks without an RS rating (listed for less than about a year) are left out: their
+    # "52W high / ATH" is only the high since listing. An ATH must also be a new 52W high today,
+    # which drops rows whose stored ATH date is wrong (ath_data.json seeding / adjustments).
+    ath, h52 = [], []
+    for r in liquid:
+        sym = r["symbol"]
+        keys = (f"hi|{sym}|{market_date}", f"ath|{sym}|{market_date}", f"h52|{sym}|{market_date}")
+        if not all(fresh(k) for k in keys) or not isinstance(r.get("rs_rating"), (int, float)):
+            continue
+        is_ath = any(e[1] == market_date for e in evs(r, ("ath",))) and r.get("new_52wh")
+        is_h52 = any(e[1] == market_date for e in evs(r, ("h52",)))
+        if is_ath:
+            ath.append((r, "ATH")); new_keys.add(keys[0])
+        elif is_h52:
+            h52.append((r, "52W high")); new_keys.add(keys[0])
+    items = sorted(ath, key=lambda x: _pa_rank(x[0])) + sorted(h52, key=lambda x: _pa_rank(x[0]))
+    out.append(("highs", _pa_block("🚀 New 52W High & ATH", items, date_txt,
+                                   f"{len(ath)} at an all-time high, {len(h52)} at a 52-week high" if items else "")))
+
+    # ── stage 2 entries (weekly; posted once per symbol and week) ──
+    items = []
+    for r in liquid:
+        for e in evs(r, ("stg",)):
+            lab = str(e[2] if len(e) > 2 else "")
+            k = f"stg|{r['symbol']}|{e[1]}"
+            if lab.endswith(">2") and fresh(k):
+                items.append((r, "Stage " + lab.replace(">", " → "))); new_keys.add(k); break
+    out.append(("stage2", _pa_block("🪜 Stage 2 Entries", sorted(items, key=lambda x: _pa_rank(x[0])), date_txt,
+                                    "Weinstein weekly stage")))
+
+    # ── EP and gap-ups ──
+    items = []
+    for r in liquid:
+        k = f"ep|{r['symbol']}|{market_date}"
+        if not fresh(k):
+            continue
+        is_ep = any(e[1] == market_date for e in evs(r, ("ep",)))
+        gp = r.get("gap_pct")
+        is_gap = (r.get("gap_date") == market_date and r.get("gap_direction") == "up"
+                  and isinstance(gp, (int, float)) and gp >= PUBLIC_ALERT_GAP_MIN_PCT)
+        if is_ep or is_gap:
+            extra = "EP" if is_ep else ""
+            if isinstance(gp, (int, float)) and r.get("gap_date") == market_date:
+                extra = (extra + " · " if extra else "") + f"gap {gp:+.1f}%"
+            items.append((r, extra)); new_keys.add(k)
+    items.sort(key=lambda x: (0 if x[1].startswith("EP") else 1, _pa_rank(x[0])))
+    out.append(("ep", _pa_block("⚡ EP & Gap-ups", items, date_txt)))
+
+    # ── setups ──
+    names = {"rcl": "EMA50 reclaim", "so": "Shakeout reclaim", "vcp": "VCP", "htf": "HTF", "mhtf": "Mini HTF", "pb": "Pullback"}
+    items = []
+    for r in liquid:
+        tags = []
+        for e in evs(r, tuple(names)):
+            k = f"{e[0]}|{r['symbol']}|{e[1]}"
+            if e[1] == market_date and fresh(k):
+                t = names[e[0]] + (f" ({e[2]})" if e[0] == "so" and len(e) > 2 and e[2] else "")
+                if t not in tags: tags.append(t)
+                new_keys.add(k)
+        if tags:
+            items.append((r, ", ".join(tags)))
+    out.append(("setups", _pa_block("🎯 Setups", sorted(items, key=lambda x: _pa_rank(x[0])), date_txt)))
+
+    return [(t, m) for t, m in out if m], new_keys
+
+
+def run_public_alerts_ping() -> None:
+    """Sends one short test message to every topic of the public group (checks chat id and topic ids)."""
+    from telegram_notify import send_public, PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID
+    if not TELEGRAM_PUBLIC_CHAT_ID:
+        log.warning("Public alerts ping: TELEGRAM_PUBLIC_CHAT_ID not set")
+        return
+    for t, tid in PUBLIC_TOPICS.items():
+        ok = send_public(f"🔧 Test message for topic <b>{t}</b> — please ignore.", thread_id=tid, silent=True)
+        log.info(f"  ping {t} (topic {tid}): {'sent' if ok else 'FAILED'}")
+
+
+async def run_public_alerts(dry_run=False) -> None:
+    from telegram_notify import send_public, PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID
+    async with httpx.AsyncClient() as client:
+        feed, state, internals = await asyncio.gather(r2_download(client, "screener_feed.json"),
+                                                      r2_download(client, "public_alerts_state.json"),
+                                                      r2_download(client, "internals.json"))
+        if not isinstance(feed, list) or not feed:
+            log.warning("Public alerts: screener_feed.json missing or empty — nothing sent")
+            return
+        market_date = max(str(r.get("as_of_date") or r.get("date") or "")[:10] for r in feed)
+        state = state if isinstance(state, dict) else {}
+        sent_map = state.get("sent") if isinstance(state.get("sent"), dict) else {}
+        if not isinstance(internals, list) or not internals:
+            log.warning("Public alerts: internals.json missing — Market Summary falls back to screener_feed")
+            internals = None
+        msgs, new_keys = _build_public_alerts(feed, market_date, set(sent_map), internals=internals)
+        log.info(f"Public alerts for {market_date}: {len(msgs)} message(s), {len(new_keys)} new item(s)")
+        if dry_run:
+            for t, m in msgs:
+                log.info(f"--- topic {t} ---\n{m}")
+            return
+        if not TELEGRAM_PUBLIC_CHAT_ID:
+            log.warning("Public alerts: TELEGRAM_PUBLIC_CHAT_ID not set — nothing sent")
+            return
+        ok_topics = []
+        for t, m in msgs:
+            ok = False
+            for attempt in range(3):
+                if send_public(m, thread_id=PUBLIC_TOPICS.get(t)):
+                    ok = True; break
+                await asyncio.sleep(5 * (attempt + 1))
+            log.info(f"  topic {t}: {'sent' if ok else 'FAILED'}")
+            if ok: ok_topics.append(t)
+            await asyncio.sleep(2)
+        # remember only what reached Telegram; a failed topic is tried again next run
+        prefix = {"market": ("market", "mi"), "box": ("box",), "highs": ("hi", "ath", "h52"), "stage2": ("stg",),
+                  "ep": ("ep",), "setups": ("rcl", "so", "vcp", "htf", "mhtf", "pb")}
+        keep_types = {p for t in ok_topics for p in prefix.get(t, ())}
+        for k in new_keys:
+            if k.split("|", 1)[0] in keep_types:
+                sent_map[k] = market_date
+        cutoff = (date.fromisoformat(market_date) - timedelta(days=PUBLIC_ALERT_STATE_DAYS)).isoformat()
+        sent_map = {k: d for k, d in sent_map.items() if d >= cutoff}
+        await r2_upload(client, "public_alerts_state.json", json.dumps({"updated": market_date, "sent": sent_map}))
+
+
+# ══════════════════════════════════════════════════════════════
+# USER ALERTS — personal price / line alerts on Telegram (run after ep_scan)
+#   python pipeline.py user_alerts          check and send
+#   python pipeline.py user_alerts_dryrun   log only
+# The Worker keeps the alerts users set on the chart (D1, synced by the browser) and the
+# Telegram chat of users who connected Telegram. Rule (same as the chart): an "above" alert
+# fires when the day's close is >= its level, "below" when <= it; once fired it stays off.
+# A line alert's level today = the straight line through its two dated points, extended
+# bar by bar to the latest session. Alerts are only checked on sessions on/after the day
+# they were created. Only alerts whose message reached Telegram are marked fired.
+# v2 (chart 5.8.43+): cond "cross" fires when the close gets to the other side of the level
+# from `side` (the side it was on); trig "daily" sends at most one message per session and
+# stays active (the Worker keeps it, last_day = last message); exp = last session checked;
+# msg = the user's note, added to the message.
+# ══════════════════════════════════════════════════════════════
+
+def _ua_level(alert, dates, last_i):
+    if alert.get("kind") == "level":
+        v = alert.get("level")
+        return float(v) if isinstance(v, (int, float)) and v > 0 else None
+    if alert.get("kind") == "line":
+        try:
+            i0 = bisect.bisect_left(dates, str(alert["p0d"])); i1 = bisect.bisect_left(dates, str(alert["p1d"]))
+            p0, p1 = float(alert["p0p"]), float(alert["p1p"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if i0 >= len(dates) or i1 >= len(dates) or i0 == i1:
+            return None
+        return p0 + (p1 - p0) / (i1 - i0) * (last_i - i0)
+    return None
+
+
+def _ua_hit(a, close, level):
+    """(fires, side after this close). side is only tracked for crossing alerts."""
+    cond = a.get("cond") or a.get("dir")
+    if cond == "cross":
+        ref = a.get("side") if a.get("side") in ("above", "below") else ("below" if a.get("dir") == "above" else "above")
+        hit = close >= level if ref == "below" else close <= level
+        return hit, (("above" if ref == "below" else "below") if hit else ref)
+    if cond == "above":
+        return close >= level, None
+    return close <= level, None
+
+
+def _ua_check(alerts, all_data):
+    """Returns [(alert, day, close, level, side)] for alerts that fire on the latest session."""
+    hits = []
+    for a in alerts:
+        s = all_data.get(a.get("sym")) or {}
+        dates, closes = s.get("d") or [], s.get("c") or []
+        last_i = next((i for i in range(len(closes) - 1, -1, -1) if closes[i] is not None), None)
+        if last_i is None:
+            continue
+        day = str(dates[last_i])[:10]
+        if day < str(a.get("created") or "")[:10]:
+            continue
+        if a.get("exp") and day > str(a["exp"])[:10]:
+            continue                                     # expired: the page drops it on its next sync
+        if a.get("last_day") and day <= str(a["last_day"])[:10]:
+            continue                                     # already sent for this session (daily)
+        level = _ua_level(a, [str(d)[:10] for d in dates], last_i)
+        if level is None or level <= 0:
+            continue
+        close = float(closes[last_i])
+        hit, side = _ua_hit(a, close, level)
+        if hit:
+            hits.append((a, day, close, level, side))
+    return hits
+
+
+def _ua_esc(t):
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ua_message(a, day, close, level, side=None):
+    try: d_txt = date.fromisoformat(day).strftime("%d %b %Y")
+    except ValueError: d_txt = day
+    sym = _ua_esc(a.get("sym", ""))
+    cond = a.get("cond") or a.get("dir")
+    if cond == "cross":
+        word = "crossed above" if side == "above" else "crossed below"
+    else:
+        word = "closed above" if cond == "above" else "closed below"
+    src = "trendline" if a.get("kind") == "line" else "level"
+    tag = a.get("tag") if a.get("tag") in ("Target", "Stop Loss") else None
+    title = "Stop loss" if tag == "Stop Loss" else (tag or "Price alert")
+    lines = [f"🔔 <b>{title} · {sym}</b>",
+             f"{word[0].upper() + word[1:]} the {src} <b>₹{level:,.2f}</b>",
+             f"Close ₹{close:,.2f} · {d_txt}"]
+    if a.get("name") and a.get("name") != a.get("tag"):
+        lines.append(f"<i>{_ua_esc(a['name'])}</i>")
+    if a.get("trig") == "daily":
+        until = ""
+        if a.get("exp"):
+            try: until = " until " + date.fromisoformat(str(a["exp"])[:10]).strftime("%d %b")
+            except ValueError: until = ""
+        lines.append(f"Every day{until}")
+    if a.get("msg"):
+        lines += ["", f"📝 {_ua_esc(a['msg'])}"]
+    lines += ["", '<a href="https://tradewithtech.in">Open the chart on TradeWithTech</a>']
+    return "\n".join(lines)
+
+
+async def run_user_alerts(dry_run=False) -> None:
+    from telegram_notify import send_message
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{WORKER_URL}/alerts/active", headers=WORKER_HEADERS, timeout=60)
+        if r.status_code != 200:
+            log.warning(f"User alerts: /alerts/active answered HTTP {r.status_code} — nothing checked")
+            return
+        alerts = (r.json() or {}).get("alerts") or []
+        log.info(f"User alerts: {len(alerts)} active alert(s) of linked users")
+        if not alerts:
+            return
+        all_data = await download_all_chunks(client)
+        hits = _ua_check(alerts, all_data)
+        log.info(f"User alerts: {len(hits)} fired")
+        fired = []
+        for a, day, close, level, side in hits:
+            msg = _ua_message(a, day, close, level, side)
+            if dry_run:
+                log.info(f"--- {a.get('uid')} {a.get('sym')} ---\n{msg}")
+                continue
+            ok = send_message(msg, chat_id=str(a.get("chat_id")))
+            if ok:
+                fired.append({"uid": a["uid"], "id": a["id"], "day": day, "price": round(close, 2), "level": round(level, 2), "side": side})
+            else:
+                log.warning(f"  alert {a.get('id')} ({a.get('sym')}): Telegram send failed — will retry next run")
+            await asyncio.sleep(0.05)
+        if fired:
+            r2 = await client.post(f"{WORKER_URL}/alerts/fired", headers={**WORKER_HEADERS, "Content-Type": "application/json"},
+                                   content=json.dumps({"fired": fired}), timeout=60)
+            log.info(f"User alerts: marked {len(fired)} fired (HTTP {r2.status_code})")
+
+
+# ══════════════════════════════════════════════════════════════
+# PRESET ALERTS — a user's saved screener preset on Telegram (run after ep_scan / user_alerts)
+#   python pipeline.py preset_alerts          check and send
+#   python pipeline.py preset_alerts_dryrun   log only
+# The screener's filters run only in the browser, so this opens the real screener in a headless
+# browser (Playwright), signs in with a bot account (secrets TWT_BOT_EMAIL / TWT_BOT_PASSWORD; a Pro
+# account with a verified email), and for every preset alert applies the saved snapshot:
+#   today:     the live screener (applyFilterSnapshot + getFiltered)
+#   yesterday: the previous session in History mode (loadHistoryDate; history_asof.js cuts the OHLC and
+#              reads that day's signal ledger)
+# "new" mode sends the stocks that entered the list today; "full" sends the whole list every day with the
+# entered / left ones marked. Lists longer than PR_SHOW_MAX also come as a CSV file.
+# One evaluation per distinct snapshot, however many users share the preset.
+# ══════════════════════════════════════════════════════════════
+PR_SHOW_MAX = 30
+PR_SITE_URL = os.environ.get("TWT_SITE_URL", "https://tradewithtech.in").rstrip("/")
+PR_SCREENER_PATH = os.environ.get("TWT_SCREENER_PATH", "/screener")
+
+# readiness: data, OHLC chunks and the filter entry points of the screener page
+_PR_READY_JS = """() => {
+  try {
+    if (typeof getFiltered !== 'function' || typeof applyFilterSnapshot !== 'function') return false;
+    if (typeof allStocks === 'undefined' || !allStocks || allStocks.length < 100) return false;
+    var ok = window._ohlcChunkLoaded; if (ok && ok.length && !ok.every(Boolean)) return false;
+    return !!window._dataAsOfDate;
+  } catch (e) { return false; }
+}"""
+# slower side data (box finder, HTF, shakeout): waited for, but not required
+_PR_EXTRAS_JS = """() => {
+  try {
+    var box = typeof window.bscanReady !== 'function' || window.bscanReady();
+    var htf = typeof _htfLoaded === 'undefined' || _htfLoaded;
+    var so = typeof _shakeoutLoaded === 'undefined' || _shakeoutLoaded;
+    return box && htf && so;
+  } catch (e) { return true; }
+}"""
+_PR_EVAL_JS = """async (snaps) => {
+  var out = {};
+  for (var key in snaps) {
+    try {
+      applyFilterSnapshot(JSON.parse(JSON.stringify(snaps[key])));
+      await new Promise(function (r) { setTimeout(r, 40); });
+      var rows = getFiltered() || [];
+      out[key] = { ok: true, rows: rows.map(function (s) {
+        var tv = (s.exchange || 'NSE') + ':' + String(s.trading_symbol || s.stock).replace(/,/g, '');
+        return [s.stock, s.ltp == null ? null : +s.ltp, s.ch == null ? null : +s.ch, s.rs == null ? null : +s.rs, s.sector || '', s.industry || '', tv];
+      }) };
+    } catch (e) { out[key] = { ok: false, err: String((e && e.message) || e) }; }
+  }
+  return out;
+}"""
+
+
+async def _pr_wait(page, js, timeout_s, label, required=True):
+    try:
+        await page.wait_for_function(js, timeout=timeout_s * 1000, polling=1000)
+        return True
+    except Exception as e:
+        if required: raise RuntimeError(f"screener not ready ({label}): {e}")
+        log.warning(f"Preset alerts: {label} not ready after {timeout_s}s — continuing")
+        return False
+
+
+async def _pr_run_screener(snaps):
+    """snaps: {key: snapshot}. Returns (today_day, prev_day, today{key: res}, prev{key: res})."""
+    from playwright.async_api import async_playwright
+    email, password = os.environ.get("TWT_BOT_EMAIL"), os.environ.get("TWT_BOT_PASSWORD")
+    if not email or not password:
+        raise RuntimeError("TWT_BOT_EMAIL / TWT_BOT_PASSWORD secrets are not set")
+    async with async_playwright() as p:
+        # GitHub's Ubuntu runners already have Google Chrome and its libraries: use it (no download).
+        # Elsewhere fall back to Playwright's own Chromium (python -m playwright install chromium).
+        try:
+            browser = await p.chromium.launch(channel="chrome")
+            log.info("Preset alerts: using the installed Google Chrome")
+        except Exception as e:
+            log.info(f"Preset alerts: Google Chrome not available ({str(e)[:80]}), using Playwright Chromium")
+            browser = await p.chromium.launch()
+        ctx = await browser.new_context(viewport={"width": 1500, "height": 900}, locale="en-IN", timezone_id="Asia/Kolkata")
+        page = await ctx.new_page()
+        page.on("dialog", lambda d: asyncio.ensure_future(d.dismiss()))
+        page.on("pageerror", lambda e: log.warning(f"  page error: {str(e)[:200]}"))
+        # 1. sign in (Firebase on the login page), then open the screener
+        await page.goto(f"{PR_SITE_URL}/login", wait_until="domcontentloaded", timeout=90000)
+        await _pr_wait(page, "() => !!(window.firebase && firebase.auth)", 60, "firebase on /login")
+        info = await page.evaluate("""async ([e, p]) => {
+            var c = await firebase.auth().signInWithEmailAndPassword(e, p);
+            return { verified: !!(c.user && c.user.emailVerified) };
+        }""", [email, password])
+        if not info.get("verified"):
+            raise RuntimeError("the bot account's email is not verified — the screener would redirect to /verify-email")
+        await page.goto(f"{PR_SITE_URL}{PR_SCREENER_PATH}", wait_until="domcontentloaded", timeout=90000)
+        if "/login" in page.url or "verify-email" in page.url:
+            raise RuntimeError(f"not signed in on the screener (landed on {page.url})")
+        await _pr_wait(page, _PR_READY_JS, 300, "screener data")
+        await _pr_wait(page, _PR_EXTRAS_JS, 90, "box / HTF / shakeout", required=False)
+        await page.wait_for_timeout(3000)
+        today_day = str(await page.evaluate("() => window._dataAsOfDate"))[:10]
+        today = await page.evaluate(_PR_EVAL_JS, snaps)
+        # 2. the previous session in History mode
+        prev_day = await page.evaluate("""async (d) => {
+            var ds = await _historyFetchManifest(true);
+            return (ds || []).filter(function (x) { return x < d; }).sort().pop() || null;
+        }""", today_day)
+        prev = {}
+        if prev_day:
+            await page.evaluate("async (d) => { await loadHistoryDate(d); }", prev_day)
+            await _pr_wait(page, f"() => typeof _historyMode !== 'undefined' && _historyMode && String(_historyDate).slice(0, 10) === '{prev_day}'", 120, "history date")
+            await page.wait_for_timeout(2000)
+            prev = await page.evaluate(_PR_EVAL_JS, snaps)
+        await browser.close()
+        return today_day, prev_day, today, prev
+
+
+def _pr_esc(t):
+    return str(t).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _pr_csv(rows, new_set, out_set):
+    import csv, io
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["Symbol", "TradingView", "Status", "LTP", "Change %", "RS", "Sector", "Industry"])
+    for r in rows:
+        w.writerow([r[0], _pr_tv(r), "new" if r[0] in new_set else "", r[1], r[2], r[3], r[4], r[5]])
+    for sym in sorted(out_set):
+        w.writerow([sym, "", "left", "", "", "", "", ""])
+    return buf.getvalue().encode("utf-8")
+
+
+def _pr_tv(r):
+    """TradingView symbol, e.g. NSE:SBC / BSE:SSPRL (rows from older runs have no 7th field)."""
+    return r[6] if len(r) > 6 and r[6] else f"NSE:{r[0]}"
+
+
+def _pr_message(a, day, rows, new_rows, out_syms, out_tv=None):
+    """Names go in <code> blocks as NSE:SYM,BSE:SYM,... : one tap copies them in Telegram, and TradingView's
+    watchlist import takes the comma list as is. Long lists are cut to fit Telegram's 4096 characters
+    (the CSV file has everything)."""
+    try: d_txt = date.fromisoformat(day).strftime("%d %b")
+    except ValueError: d_txt = day
+    name = _pr_esc(a.get("pname") or a.get("name") or "Preset")
+    by_rs = lambda lst: sorted(lst, key=lambda r: -(r[3] or 0))
+    full = a.get("pmode") == "full"
+    new_ids = {x[0] for x in new_rows}
+    groups = []   # (label, [tv symbols])
+    if full:
+        if new_rows: groups.append(("✨ New", [_pr_tv(r) for r in by_rs(new_rows)]))
+        rest = [r for r in by_rs(rows) if r[0] not in new_ids]
+        if rest: groups.append(("In the list" if new_rows else None, [_pr_tv(r) for r in rest]))
+        if out_syms: groups.append(("Left", sorted((out_tv or {}).get(s0, f"NSE:{s0}") for s0 in out_syms)))
+        head = [f"🔔 <b>Preset · {name}</b> · {d_txt}",
+                f"{len(rows)} stock{'s' if len(rows) != 1 else ''}" + (f" (✨ {len(new_rows)} new, {len(out_syms)} left)" if (new_rows or out_syms) else "")]
+    else:
+        groups.append((None, [_pr_tv(r) for r in by_rs(new_rows)]))
+        head = [f"🔔 <b>Preset · {name}</b> · {d_txt}",
+                f"{len(new_rows)} new stock{'s' if len(new_rows) != 1 else ''} today (total {len(rows)})"]
+    tail = []
+    if a.get("exp"):
+        try: tail.append(f"Until {date.fromisoformat(str(a['exp'])[:10]).strftime('%d %b')}")
+        except ValueError: pass
+    if a.get("msg"): tail += ["", f"📝 {_pr_esc(a['msg'])}"]
+    tail += ["", f'<a href="{PR_SITE_URL}{PR_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
+
+    def build(cap):
+        out = list(head)
+        for label, syms in groups:
+            shown = syms[:cap]
+            more = len(syms) - len(shown)
+            out.append("")
+            if label: out.append(f"{label}" + (f" ({len(syms)})" if full else ""))
+            out.append("<code>" + _pr_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else ""))
+        return "\n".join(out + tail)
+    cap = 200
+    text = build(cap)
+    while len(text) > 3900 and cap > 5:   # stay inside Telegram's limit without cutting a tag
+        cap = cap * 2 // 3
+        text = build(cap)
+    return text
+
+
+async def _pr_send_document(client, chat_id, filename, data, caption=None):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if not token: return False
+    try:
+        r = await client.post(f"https://api.telegram.org/bot{token}/sendDocument",
+                              data={"chat_id": str(chat_id), **({"caption": caption[:1000]} if caption else {})},
+                              files={"document": (filename, data, "text/csv")}, timeout=60)
+        return r.status_code == 200
+    except Exception as e:
+        log.warning(f"  sendDocument failed: {e}"); return False
+
+
+async def run_preset_alerts(dry_run=False, force=False) -> None:
+    """force: ignore "already sent for this session" (testing; PR_FORCE=1 or --force)."""
+    from telegram_notify import send_message
+    force = force or os.environ.get("PR_FORCE") == "1" or "--force" in sys.argv
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{WORKER_URL}/alerts/active", headers=WORKER_HEADERS, timeout=60)
+        if r.status_code != 200:
+            log.warning(f"Preset alerts: /alerts/active answered HTTP {r.status_code} — nothing checked"); return
+        alerts = [a for a in ((r.json() or {}).get("alerts") or []) if a.get("kind") == "preset" and a.get("snap")]
+        log.info(f"Preset alerts: {len(alerts)} active preset alert(s) of linked users")
+        if not alerts: return
+        snaps, key_of = {}, {}
+        for a in alerts:
+            try: snap = json.loads(a["snap"]) if isinstance(a["snap"], str) else a["snap"]
+            except (TypeError, ValueError): log.warning(f"  {a.get('id')}: bad snapshot"); continue
+            k = json.dumps(snap, sort_keys=True)
+            key_of[a["id"]] = k; snaps[k] = snap
+        log.info(f"Preset alerts: {len(snaps)} distinct preset(s) to evaluate")
+        today_day, prev_day, today, prev = await _pr_run_screener(snaps)
+        log.info(f"Preset alerts: today {today_day}, previous session {prev_day}")
+        fired = []
+        for a in alerts:
+            k = key_of.get(a["id"])
+            t, y = today.get(k) or {}, prev.get(k) or {}
+            tag = f"  {a['id']} ({a.get('pname')}, {a.get('pmode') or 'new'}):"
+            if not t.get("ok"):
+                log.warning(f"{tag} {t.get('err') or 'not evaluated'}"); continue
+            if a.get("exp") and today_day > str(a["exp"])[:10]:
+                log.info(f"{tag} expired on {a['exp']} — skipped"); continue
+            if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
+                log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
+            rows = t["rows"]; syms = {x[0] for x in rows}
+            yset = {x[0] for x in (y.get("rows") or [])} if y.get("ok") else None
+            if yset is None and a.get("pmode") != "full":
+                log.warning(f"{tag} previous session not available — skipped"); continue
+            new_rows = [x for x in rows if yset is not None and x[0] not in yset]
+            out_syms = (yset - syms) if yset is not None else set()
+            out_tv = {x[0]: _pr_tv(x) for x in (y.get("rows") or [])} if y.get("ok") else {}
+            log.info(f"{tag} {len(rows)} today, {len(new_rows)} new, {len(out_syms)} left")
+            if a.get("pmode") != "full" and not new_rows:
+                log.info(f"{tag} no new stocks — nothing to send"); continue
+            msg = _pr_message(a, today_day, rows, new_rows, out_syms, out_tv)
+            big = "more (CSV)" in msg or len(rows if a.get("pmode") == "full" else new_rows) > 100
+            if dry_run:
+                log.info(f"--- {a.get('uid')} {a.get('pname')} ({len(rows)} rows, {len(new_rows)} new, {len(out_syms)} left){' + CSV' if big else ''} ---\n{msg}")
+                continue
+            ok = send_message(msg, chat_id=str(a.get("chat_id")))
+            if ok and big:
+                fname = re.sub(r"[^A-Za-z0-9_-]+", "_", str(a.get("pname") or "preset"))[:40] + f"_{today_day}.csv"
+                csv_rows = rows if a.get("pmode") == "full" else new_rows
+                await _pr_send_document(client, a.get("chat_id"), fname, _pr_csv(csv_rows, {x[0] for x in new_rows}, out_syms if a.get("pmode") == "full" else set()))
+            if ok:
+                fired.append({"uid": a["uid"], "id": a["id"], "day": today_day, "price": len(rows), "level": len(new_rows)})
+            else:
+                log.warning(f"  preset alert {a['id']}: Telegram send failed — will retry next run")
+            await asyncio.sleep(0.05)
+        if fired:
+            r2 = await client.post(f"{WORKER_URL}/alerts/fired", headers={**WORKER_HEADERS, "Content-Type": "application/json"},
+                                   content=json.dumps({"fired": fired}), timeout=60)
+            log.info(f"Preset alerts: sent {len(fired)} (HTTP {r2.status_code})")
+
+
+# ══════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    match mode:
+        case "daily":         asyncio.run(run_daily())
+        case "today":         asyncio.run(run_today())
+        case "full":          asyncio.run(run_full())
+        case "backfill_missing":
+            asyncio.run(run_backfill_missing(sys.argv[2] if len(sys.argv) > 2 else None))
+        case "status":        asyncio.run(run_status())
+        case "fund_daily":    asyncio.run(run_fund_daily())
+        case "fund_full":     asyncio.run(run_fund_full(0))
+        case "fund_full_1":   asyncio.run(run_fund_full(1))
+        case "fund_full_2":   asyncio.run(run_fund_full(2))
+        case "fund_full_3":   asyncio.run(run_fund_full(3))
+        case "fund_full_4":   asyncio.run(run_fund_full(4))
+        case "fund_full_5":   asyncio.run(run_fund_full(5))
+        case "fund_full_6":   asyncio.run(run_fund_full(6))
+        case "fund_full_7":   asyncio.run(run_fund_full(7))
+        case "fund_full_8":   asyncio.run(run_fund_full(8))
+        case "fund_full_9":   asyncio.run(run_fund_full(9))
+        case "fund_full_10":  asyncio.run(run_fund_full(10))
+        case "finedge_daily": asyncio.run(run_finedge_daily())
+        case "update_holidays": asyncio.run(run_update_holidays())
+        case "ep_scan":       asyncio.run(run_ep_scan())
+        case "hlr_scan":      asyncio.run(run_hlr_scan())
+        case "pattern_scan":  asyncio.run(run_pattern_scan())
+        case "pattern_scan_force": asyncio.run(run_pattern_scan(force=True))
+        case "candle_scan":   asyncio.run(run_candle_scan())
+        case "candle_scan_force": asyncio.run(run_candle_scan(force=True))
+        case "home_ticker":   asyncio.run(run_home_ticker())
+        case "stage2_scan":   asyncio.run(run_stage2_scan())
+        case "minervini_scan": asyncio.run(run_minervini_scan())
+        case "box_scan": asyncio.run(run_box_scan())
+        case "public_alerts": asyncio.run(run_public_alerts())
+        case "public_alerts_dryrun": asyncio.run(run_public_alerts(dry_run=True))
+        case "public_alerts_ping": run_public_alerts_ping()
+        case "ledger_backfill":
+            _a = [x for x in sys.argv[2:] if not x.startswith("--")]
+            asyncio.run(run_ledger_backfill(_a[0] if len(_a) > 0 else None, _a[1] if len(_a) > 1 else None,
+                                            force="--force" in sys.argv))
+        case "preset_alerts": asyncio.run(run_preset_alerts())   # --force: resend today (testing)
+        case "preset_alerts_dryrun": asyncio.run(run_preset_alerts(dry_run=True))
+        case "user_alerts": asyncio.run(run_user_alerts())
+        case "user_alerts_dryrun": asyncio.run(run_user_alerts(dry_run=True))
+        case "box_scan_dryrun": asyncio.run(run_box_scan(dry_run=True))
+        case "weinstein_scan": asyncio.run(run_weinstein_scan())
+        case "weinstein_scan_dryrun": asyncio.run(run_weinstein_scan(dry_run=True))
+        case "weinstein_debug":
+            if len(sys.argv) < 3:
+                print("Usage: python pipeline.py weinstein_debug SYMBOL")
+                sys.exit(1)
+            asyncio.run(debug_weinstein_symbol(sys.argv[2]))
+        case "vcp_scan":      asyncio.run(run_vcp_scan())
+        case "ath_backfill":  asyncio.run(run_ath_backfill())
+        case "ath_reset":     asyncio.run(run_ath_reset())
+        case _:
+            print(__doc__)
+            sys.exit(1)
