@@ -40,7 +40,11 @@ def _font(bold, size):
             if os.path.exists(p):
                 f = ImageFont.truetype(p, size); break
         if f: break
-    _FC[k] = f or ImageFont.load_default()
+    if f is None:                                       # no DejaVu / Inter on the machine
+        try: f = ImageFont.load_default(size=size)      # Pillow 10.1+: scalable built-in font
+        except TypeError: f = ImageFont.load_default()
+        print("result_card: DejaVu font not found — using Pillow's built-in font")
+    _FC[k] = f
     return _FC[k]
 
 
