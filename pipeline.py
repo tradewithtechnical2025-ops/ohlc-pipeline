@@ -3154,7 +3154,7 @@ async def _load_event_sources(client, market_data_date):
 # "history/" prefix in the Cloudflare dashboard.
 # ══════════════════════════════════════════════════════════════
 
-HISTORY_KEEP_DAYS = 90  # how many past days stay visible in the History dropdown
+HISTORY_KEEP_DAYS = 3650  # how many past days stay listed in History (was 90; the files were never deleted, only hidden)
 
 async def archive_screener_feed_history(client, screener_feed, today, keep_days=HISTORY_KEEP_DAYS):
     fname = f"history/screener_feed_{today}.json"
