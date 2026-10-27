@@ -29,7 +29,8 @@ jobs:
           python-version: '3.11'
           cache: pip
       - name: Install dependencies
-        run: pip install httpx feedparser requests pypdf pdfplumber fonttools
+        # pillow: result_card.py draws the results table as an image for Telegram
+        run: pip install httpx feedparser requests pypdf pdfplumber fonttools pillow
       - name: Run Insider Trading Pipeline
         run: python pipeline_insider.py
         env:
