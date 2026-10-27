@@ -2457,7 +2457,7 @@ def _fmt_table_pp(val, decimals=1):
         return "-"
 
 
-def _telegram_fin_table(parsed: dict) -> list:
+def _fin_table_data(parsed: dict):
     """Builds a compact multi-column comparison table — Metric rows
     (Sales/PAT/EPS/OPM%) x QoQ/YoY/Current/QoQ-prior/YoY-prior columns —
     as a Telegram <pre> monospace block. Mirrors the row-x-column layout
@@ -2527,7 +2527,7 @@ def _telegram_fin_table(parsed: dict) -> list:
         yoy_header = _shorten_quarter_header(yf.get("prior_header"))
 
     if not qf and not yf and not yoy_native:
-        return []  # nothing to compare against — a table would be all dashes
+        return None  # nothing to compare against — a table would be all dashes
 
     # Sales/PAT are raw rupees on the `quarter`/fundamentals dicts — scale
     # to ₹Cr (÷1e7) for the table, same convention _fmt_cr uses everywhere
@@ -2558,11 +2558,10 @@ def _telegram_fin_table(parsed: dict) -> list:
             rows.append((label, _cr(q.get(field)), _cr(qf.get(f"{field}_prior")), qf.get(f"{field}_qoq_pct"),
                          _cr(yf.get(f"{field}_prior")), yf.get(f"{field}_yoy_pct"), 1, "pct"))
         rows.append(("EPS", cur_eps, qoq_eps, None, yoy_eps, None, 2, "pct"))
-    hdr_cur = cur_header or "Cur"
-    hdr_qoq = qoq_header or "-"
-    hdr_yoy = yoy_header or "-"
-    header = f"{'Metric':<7}{'QoQ':>8}{'YoY':>8}{hdr_cur:>9}{hdr_qoq:>9}{hdr_yoy:>9}"
-    lines = [f"<pre>{header}"]
+    note = ("Income/Premium/UW P&L/PAT in ₹Cr · Premium = net premium earned" if q.get("financial_sector") == "insurance"
+            else "Total Income/NII/PPOP/PAT in ₹Cr · PPOP = profit before provisions" if _is_bank_period(q)
+            else "Sales/OP/PAT in ₹Cr · OP = EBITDA excl. other income")
+    out = []
     for label, cur, qprior, qdelta, yprior, ydelta, dec, delta_kind in rows:
         # Sales/PAT/OPM already have a precomputed delta; EPS doesn't carry
         # one upstream, so derive a plain % change here from the prior value.
@@ -2571,15 +2570,26 @@ def _telegram_fin_table(parsed: dict) -> list:
                 qdelta = (cur - qprior) / abs(qprior) * 100
             if ydelta is None and cur is not None and yprior is not None and yprior != 0:
                 ydelta = (cur - yprior) / abs(yprior) * 100
-            fmt_delta = _fmt_table_pct
-        else:
-            fmt_delta = _fmt_table_pp
-        row = (f"{label:<7}{fmt_delta(qdelta):>8}{fmt_delta(ydelta):>8}"
-               f"{_fmt_table_num(cur, dec):>9}{_fmt_table_num(qprior, dec):>9}{_fmt_table_num(yprior, dec):>9}")
-        lines.append(row)
+        out.append({"name": label, "cur": cur, "prev": qprior, "qoq": qdelta, "yago": yprior, "yoy": ydelta,
+                    "dec": dec, "kind": delta_kind})
+    return {"rows": out, "cols": [cur_header or "Cur", qoq_header or "-", yoy_header or "-"], "note": note}
+
+
+def _telegram_fin_table(parsed: dict) -> list:
+    """Text version of the comparison table (a Telegram <pre> block). Used when the result card
+    image can't be made or sent. Returns [] when there is no prior-period data at all."""
+    t = _fin_table_data(parsed)
+    if not t:
+        return []
+    hdr_cur, hdr_qoq, hdr_yoy = t["cols"]
+    header = f"{'Metric':<7}{'QoQ':>8}{'YoY':>8}{hdr_cur:>9}{hdr_qoq:>9}{hdr_yoy:>9}"
+    lines = [f"<pre>{header}"]
+    for r in t["rows"]:
+        fmt_delta = _fmt_table_pct if r["kind"] == "pct" else _fmt_table_pp
+        lines.append(f"{r['name']:<7}{fmt_delta(r['qoq']):>8}{fmt_delta(r['yoy']):>8}"
+                     f"{_fmt_table_num(r['cur'], r['dec']):>9}{_fmt_table_num(r['prev'], r['dec']):>9}{_fmt_table_num(r['yago'], r['dec']):>9}")
     lines.append("</pre>")
-    lines.append("<i>Income/Premium/UW P&amp;L/PAT in ₹Cr · Premium = net premium earned</i>" if q.get("financial_sector") == "insurance" else "<i>Total Income/NII/PPOP/PAT in ₹Cr · PPOP = profit before provisions</i>"
-                 if _is_bank_period(q) else "<i>Sales/OP/PAT in ₹Cr · OP = EBITDA excl. other income</i>")
+    lines.append("<i>" + t["note"].replace("&", "&amp;") + "</i>")
     return lines
 
 
@@ -2637,7 +2647,7 @@ def _telegram_basis_block(parsed: dict) -> list:
         lines.append("")
         lines.append("<b>✨ Key Highlights</b>")
         for h in highlights:
-            lines.append(f"• {h}")
+            lines.append(f"• {_amounts_in_cr(h)}")
 
     commentary = parsed.get("management_commentary")
     if commentary:
@@ -2697,6 +2707,139 @@ def _telegram_result_message(group) -> str:
     if len(msg) > TELEGRAM_MAX_CHARS:
         msg = msg[:TELEGRAM_MAX_CHARS].rsplit("\n", 1)[0] + "\n\n…(truncated, see full data on the site)"
     return msg
+
+
+# ── Result card (image) ─────────────────────────────────────────────
+# The comparison table goes out as a PNG (result_card.py) so it never wraps on a phone; the caption
+# carries the company, quarter and Key Highlights. Anything that does not fit Telegram's 1024-character
+# caption (segment revenue, management commentary, other board decisions, extra highlights) follows
+# as one text message. If the image can't be made or sent, the old text message goes instead.
+_AMT_RE = re.compile(r"(₹|Rs\.?|INR)\s?([\d,]+(?:\.\d+)?)\s?(million|mn|billion|bn|lakhs?|lacs?)\b", re.I)
+
+
+def _amounts_in_cr(text: str) -> str:
+    """'₹7,678.38 million' -> '₹767.84 Cr' (the table is in ₹ Cr; the AI copies the filing's unit)."""
+    def conv(m):
+        try:
+            v = float(m.group(2).replace(",", ""))
+        except ValueError:
+            return m.group(0)
+        u = m.group(3).lower()
+        cr = v / 10 if u in ("million", "mn") else v * 100 if u in ("billion", "bn") else v / 100
+        return f"₹{cr:,.2f} Cr" if cr < 100 else f"₹{cr:,.1f} Cr"
+    return _AMT_RE.sub(conv, str(text or ""))
+
+
+def _result_card_png(group):
+    """PNG bytes of the comparison card for a grouped result, or None (no table data / no Pillow)."""
+    try:
+        from result_card import render_result_card
+    except Exception as e:
+        print(f"  (result card off: {e})")
+        return None
+    items = group if isinstance(group, list) else [group]
+    items = sorted(items, key=lambda p: 0 if (p.get("meta", {}).get("standalone_consolidated") == "Consolidated") else 1)
+    sections = []
+    for parsed in items:
+        t = _fin_table_data(parsed)
+        if not t:
+            return None                                    # a basis without a table: send the text message
+        sections.append({"title": parsed.get("meta", {}).get("standalone_consolidated") or "",
+                         "cols": t["cols"], "rows": t["rows"], "note": t["note"]})
+    if not sections:
+        return None
+    m = items[0].get("meta", {})
+    try:
+        return render_result_card({"name": m.get("company_name") or items[0].get("title") or "",
+                                   "symbol": m.get("symbol") or "", "quarter": m.get("quarter_label") or "",
+                                   "audit": m.get("audited") or "", "date": m.get("board_meeting_date") or "",
+                                   "sections": sections})
+    except Exception as e:
+        print(f"  ⚠ result card for {m.get('symbol')}: {e}")
+        return None
+
+
+def _telegram_result_caption(group):
+    """(caption ≤ 1024 chars, extra text or '') for the result card."""
+    items = group if isinstance(group, list) else [group]
+    items = sorted(items, key=lambda p: 0 if (p.get("meta", {}).get("standalone_consolidated") == "Consolidated") else 1)
+    m = items[0].get("meta", {})
+    company = m.get("company_name") or items[0].get("title") or "Unknown"
+    head = [f"📊 <b>{company}</b>"]
+    tag_bits = [b for b in (m.get("quarter_label"), m.get("audited")) if b]
+    if tag_bits:
+        head.append(" · ".join(tag_bits))
+    if m.get("board_meeting_date"):
+        head.append(f"Result Date: {m.get('board_meeting_date')}")
+    if any((p.get("quarter") or {}).get("yoy_caution") for p in items):
+        head += ["", "⚠️ Company notes: results may not be YoY comparable"]
+    hl, seen = [], set()
+    for p in items:
+        for h in p.get("key_highlights") or []:
+            h = _amounts_in_cr(h)
+            if h not in seen:
+                seen.add(h); hl.append(h)
+    # blocks in order; as many whole lines as fit go in the caption, the rest in one follow-up message
+    blocks = []
+    if hl:
+        blocks.append(["<b>✨ Key Highlights</b>"] + [f"• {h}" for h in hl])
+    for p in items:
+        nature = p.get("meta", {}).get("standalone_consolidated") or ""
+        tag = f" ({nature})" if nature and len(items) > 1 else ""
+        segs = [s for s in (p.get("segment_breakup") or []) if s.get("segment") and s.get("revenue") is not None]
+        if segs:
+            blocks.append([f"<b>📦 Segment Revenue{tag}</b>"] + [f"{s['segment']}: {_fmt_cr(s['revenue'])}" for s in segs])
+        if p.get("management_commentary"):
+            blocks.append([f"<b>🗣️ Management Commentary{tag}</b>", p["management_commentary"]])
+        if p.get("board_meeting_outcome"):
+            blocks.append([f"<b>🏛️ Other Board Decisions{tag}</b>", p["board_meeting_outcome"]])
+    cap, extra, full = list(head), [], False
+    for b in blocks:
+        if full:
+            extra += [""] + b; continue
+        take = []
+        for k, line in enumerate(b):
+            if len("\n".join(cap + [""] + take + [line])) > 1000:
+                break
+            take.append(line)
+        if len(take) > 1 or (take and len(b) == 1):
+            cap += [""] + take
+            rest = b[len(take):]
+            if rest:
+                extra += ["", b[0].replace("</b>", " (contd.)</b>")] + rest; full = True
+        else:
+            extra += [""] + b; full = True
+    caption = "\n".join(cap)[:1024]
+    text = ""
+    if extra:
+        text = f"📊 <b>{company}</b> · more\n" + "\n".join(extra).strip("\n")
+        if len(text) > 4000:
+            text = text[:4000].rsplit("\n", 1)[0] + "\n\n…(truncated, see full data on the site)"
+    return caption, text
+
+
+def _send_photo(chat_id, png: bytes, caption: str, thread_id=None) -> bool:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = chat_id or os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return False
+    data = {"chat_id": str(chat_id), "caption": caption, "parse_mode": "HTML"}
+    if thread_id:
+        data["message_thread_id"] = str(thread_id)
+    try:
+        r = httpx.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data,
+                       files={"photo": ("result.png", png, "image/png")}, timeout=60)
+        if r.status_code == 200 and r.json().get("ok"):
+            return True
+        print(f"    sendPhoto HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code == 400 and "parse" in r.text.lower():   # bad HTML in the caption: send it plain
+            data.pop("parse_mode", None); data["caption"] = re.sub(r"<[^>]+>", "", caption)
+            r = httpx.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data,
+                           files={"photo": ("result.png", png, "image/png")}, timeout=60)
+            return r.status_code == 200 and r.json().get("ok")
+    except Exception as e:
+        print(f"    sendPhoto error: {e}")
+    return False
 
 
 def _merge_xbrl_into_pdf_record(existing: dict, xbrl_parsed: dict) -> dict:
@@ -3718,11 +3861,14 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         # Targets: the "Results" topic of the public alerts group (TELEGRAM_PUBLIC_CHAT_ID) and,
         # if TELEGRAM_RESULTS_CHAT_ID is still set, the old private results group as well.
         # Remove the TELEGRAM_RESULTS_CHAT_ID secret to stop the private copy.
+        # (name, text sender, photo sender)
         targets = []
         if TELEGRAM_PUBLIC_CHAT_ID:
-            targets.append(("public", lambda m: send_public(m, thread_id=PUBLIC_TOPICS.get("results"))))
+            targets.append(("public", lambda m: send_public(m, thread_id=PUBLIC_TOPICS.get("results")),
+                            lambda png, cap: _send_photo(TELEGRAM_PUBLIC_CHAT_ID, png, cap, PUBLIC_TOPICS.get("results"))))
         if TELEGRAM_RESULTS_CHAT_ID or not targets:
-            targets.append(("private", lambda m: send_message(m, chat_id=TELEGRAM_RESULTS_CHAT_ID)))
+            targets.append(("private", lambda m: send_message(m, chat_id=TELEGRAM_RESULTS_CHAT_ID),
+                            lambda png, cap: _send_photo(TELEGRAM_RESULTS_CHAT_ID, png, cap)))
         if not TELEGRAM_RESULTS_CHAT_ID and not TELEGRAM_PUBLIC_CHAT_ID:
             print("  ⚠ TELEGRAM_RESULTS_CHAT_ID not set — results going to the main "
                   "TELEGRAM_CHAT_ID channel (will mix with pipeline status alerts). "
@@ -3740,12 +3886,22 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         for group in groups:
             sym = group[0].get("meta", {}).get("symbol") if group else "?"
             msg = _telegram_result_message(group)
+            png = _result_card_png(group)            # None: no table data / no Pillow -> text message
+            caption, extra = _telegram_result_caption(group) if png else ("", "")
             # send_message / send_public return False instead of raising (429 flood limit
             # included), so a False result is retried with a growing wait.
-            for tname, send in targets:
+            for tname, send, send_png in targets:
+                photo_sent = False
                 for attempt in range(SEND_RETRIES):
                     try:
-                        ok = send(msg)
+                        if png and not photo_sent and attempt < SEND_RETRIES - 1:
+                            # the card; the last attempt falls back to the plain text message
+                            ok = photo_sent = bool(send_png(png, caption))
+                            if ok and extra:
+                                await asyncio.sleep(1)
+                                send(extra)
+                        else:
+                            ok = send(msg)
                         err = "" if ok else "send returned False"
                     except Exception as e:
                         ok, err = False, str(e)
