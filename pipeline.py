@@ -7822,7 +7822,7 @@ async def run_user_alerts(dry_run=False) -> None:
 #   yesterday: the previous session in History mode (loadHistoryDate; history_asof.js cuts the OHLC and
 #              reads that day's signal ledger)
 # "new" mode sends the stocks that entered the list today; "full" sends the whole list every day with the
-# entered / left ones marked. Lists longer than PR_SHOW_MAX also come as a CSV file.
+# entered / left ones marked. A list too long for one Telegram message (~250+ stocks) also comes as a CSV file.
 # One evaluation per distinct snapshot, however many users share the preset.
 # ══════════════════════════════════════════════════════════════
 PR_SHOW_MAX = 30
@@ -7985,10 +7985,10 @@ def _pr_message(a, day, rows, new_rows, out_syms, out_tv=None):
             if label: out.append(f"{label}" + (f" ({len(syms)})" if full else ""))
             out.append("<code>" + _pr_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else ""))
         return "\n".join(out + tail)
-    cap = 200
+    cap = 2000
     text = build(cap)
     while len(text) > 3900 and cap > 5:   # stay inside Telegram's limit without cutting a tag
-        cap = cap * 2 // 3
+        cap = min(cap, max(len(g[1]) for g in groups)) * 9 // 10 if groups else 5
         text = build(cap)
     return text
 
@@ -8047,7 +8047,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
             if a.get("pmode") != "full" and not new_rows:
                 log.info(f"{tag} no new stocks — nothing to send"); continue
             msg = _pr_message(a, today_day, rows, new_rows, out_syms, out_tv)
-            big = "more (CSV)" in msg or len(rows if a.get("pmode") == "full" else new_rows) > 100
+            big = "more (CSV)" in msg          # CSV only when the codes did not all fit in the message
             if dry_run:
                 log.info(f"--- {a.get('uid')} {a.get('pname')} ({len(rows)} rows, {len(new_rows)} new, {len(out_syms)} left){' + CSV' if big else ''} ---\n{msg}")
                 continue
