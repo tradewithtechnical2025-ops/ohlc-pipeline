@@ -414,7 +414,12 @@ _NAME_STOPWORDS = re.compile(r"\b(limited|ltd|private|pvt|the|india|co|company|c
 
 
 def _compact_name(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", _NAME_STOPWORDS.sub(" ", (name or "").lower()))
+    # RSS uses "and" where classification/PDF headers may use "&".
+    # Normalize the conjunction before stripping punctuation so both names
+    # resolve to the same canonical trading symbol (e.g. ABDINDIA -> ABDL).
+    import html
+    normalized = html.unescape(name or "").lower().replace("&", " and ")
+    return re.sub(r"[^a-z0-9]", "", _NAME_STOPWORDS.sub(" ", normalized))
 
 
 def _register_symbols(symbols=(), names: dict | None = None):
