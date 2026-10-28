@@ -1,4 +1,5 @@
 name: Market Data Pipeline
+
 on:
   workflow_dispatch:
     inputs:
@@ -16,10 +17,20 @@ on:
         description: 'Manual results ka Telegram bhi bhejo'
         type: boolean
         default: false
+
+# Every workflow writing these result/history files must use this same group.
+# Let the active writer finish; never cancel it when another run is requested.
+concurrency:
+  group: twt-market-data-r2
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   run-pipelines:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,38 +40,46 @@ jobs:
           python-version: '3.11'
           cache: pip
       - name: Install dependencies
-        # pillow: result_card.py draws the results table as an image for Telegram
         run: pip install httpx feedparser requests pypdf pdfplumber fonttools pillow
       - name: Run Insider Trading Pipeline
-        run: python pipeline_insider.py
+        run: python -u pipeline_insider.py
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
       - name: Run News Pipeline
-        run: python pipeline_news.py
+        shell: bash
+        run: python -u pipeline_news.py 2>&1 | tee pipeline_news.log
         env:
           WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_RESULTS_CHAT_ID: ${{ secrets.TELEGRAM_RESULTS_CHAT_ID }}
-          # Results also go to the "Results" topic of the public alerts group (@twt_alerts)
           TELEGRAM_PUBLIC_CHAT_ID: ${{ secrets.TELEGRAM_PUBLIC_CHAT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           REPROCESS_STALE_RESULTS: ${{ inputs.reprocess_stale && '1' || '0' }}
           MANUAL_RESULT_PDFS: ${{ inputs.manual_pdfs }}
           MANUAL_SEND_TELEGRAM: ${{ inputs.manual_telegram && '1' || '0' }}
+          RESULT_TRACE_SYMBOLS: VEDL,PVRINOX,ABDL
+      - name: Preserve News Pipeline Log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: news-pipeline-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: pipeline_news.log
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Run IPO scan
         if: ${{ github.event.inputs.mode == 'full' }}
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
-          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
-        run: python pipeline_ipo.py
+        run: python -u pipeline_ipo.py
       - name: Run Catalyst scan
         env:
           UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
-          WORKER_URL:   ${{ secrets.WORKER_URL }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
           WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python nse_catalysts.py
+        run: python -u nse_catalysts.py
