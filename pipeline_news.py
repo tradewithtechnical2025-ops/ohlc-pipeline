@@ -1344,6 +1344,40 @@ def _dedup_bse_by_link(items: list[dict]) -> list[dict]:
 # (a) accept them, and (b) give up on them sooner than on strict results.
 BSE_PDF_FEED_CAP = 3000          # bse_results_pdf_feed.json (was 500)
 SOFT_GIVE_UP_ATTEMPTS = 4        # retry cap for calendar/loose fallback items
+
+# Old-filing guards (both overridable via env; manual PDFs bypass both).
+#   RESULT_MAX_AGE_HOURS: filings published longer ago than this are never
+#     downloaded or sent to AI (0 = off). Raise to 24 if Gemini was down long.
+#   STALE_PERIOD_GATE: "1" rejects statements for a quarter older than the
+#     latest completed quarter at filing time (e.g. a June-quarter result filed
+#     on 28 Oct) — terminal, never stored/sent/retried. "0" = off.
+RESULT_MAX_AGE_HOURS = float(os.environ.get("RESULT_MAX_AGE_HOURS", "12"))
+STALE_PERIOD_GATE = os.environ.get("STALE_PERIOD_GATE", "1").strip().lower() in ("1", "true", "yes")
+
+
+def _is_too_old(it: dict) -> bool:
+    """Filing published more than RESULT_MAX_AGE_HOURS ago -> no download, no AI."""
+    if it.get("_manual") or RESULT_MAX_AGE_HOURS <= 0:
+        return False
+    ts = _effective_ts(it)
+    return bool(ts) and (time.time() - ts) > RESULT_MAX_AGE_HOURS * 3600
+
+
+def _latest_quarter_end(d: date) -> date:
+    """Most recent completed quarter-end on/before d (28 Oct 2026 -> 30 Sep 2026)."""
+    m = ((d.month - 1) // 3) * 3
+    if m == 0:
+        return date(d.year - 1, 12, 31)
+    return date(d.year, m, calendar.monthrange(d.year, m)[1])
+
+
+def _is_stale_period(period_end_iso, filing_date: date) -> bool:
+    if not STALE_PERIOD_GATE or not period_end_iso:
+        return False
+    try:
+        return date.fromisoformat(str(period_end_iso)) < _latest_quarter_end(filing_date)
+    except ValueError:
+        return False
 _GENERIC_OUTCOME_RE = re.compile(r"outcome\s+of\s+(the\s+)?board\s+meeting", re.IGNORECASE)
 
 
@@ -2232,22 +2266,37 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
         print(f"    · [{fname_dbg}] AI says this isn't a results table — skipping")
         return None
 
+    # ── Older-quarter statement (e.g. a June-quarter result filed in late Oct) ──
+    # Terminal rejection: never stored, never sent to Telegram, never retried.
+    # Returned BEFORE _build_result_from_ai so the AI checkpoint is kept.
+    if not force_ai and STALE_PERIOD_GATE:
+        fts = _filing_ts(link)
+        try:
+            fdate = (datetime.strptime(fts, "%d%m%Y%H%M%S").date() if fts
+                     else date.fromisoformat(fallback_board_meeting_date) if fallback_board_meeting_date
+                     else datetime.now(_IST).date())
+        except ValueError:
+            fdate = datetime.now(_IST).date()
+        if _is_stale_period(ai.get("period_end"), fdate):
+            print(f"    · [{fname_dbg}] statement is for {ai.get('period_end')} (older than latest quarter "
+                  f"{_latest_quarter_end(fdate).isoformat()}) — not stored/sent")
+            if rejection_sink is not None:
+                rejection_sink[link] = {
+                    "terminal_not_result": True,
+                    "document_type": "stale_period",
+                    "rejected_at": datetime.now(timezone.utc).isoformat(),
+                }
+            return None
+
     result = _build_result_from_ai(ai, text, link, fname_dbg, rss_title,
                                     scrip_code=scrip_code, fallback_board_meeting_date=fallback_board_meeting_date,
                                     symbol_override=symbol_override, exchange=exchange)
     if not result:
+        # The AI checkpoint is deliberately KEPT. Deleting it here used to send
+        # the same PDF to Gemini again on every run (up to the give-up limit).
+        # Retries now hit the cache for free; force a fresh extraction with
+        # MANUAL_RESULT_PDFS or REPROCESS_STALE_RESULTS=1 (both bypass cache).
         print(f"    · [{fname_dbg}] AI result failed validation (missing revenue/PAT, bad date, or filename mismatch) — skipping")
-        # Invalid numeric extraction must be allowed a fresh provider attempt.
-        if _AI_CACHE_LOCK is not None:
-            async with _AI_CACHE_LOCK:
-                bad_keys = [key for key, entry in (_AI_RESPONSE_CACHE or {}).items()
-                            if entry.get("filename") == fname_dbg]
-                for key in bad_keys:
-                    del _AI_RESPONSE_CACHE[key]
-                if bad_keys:
-                    await r2_put(client, "results_ai_checkpoint.json", {
-                        "updated_at": datetime.now(timezone.utc).isoformat(),
-                        "responses": _AI_RESPONSE_CACHE})
     return result
 
 
@@ -3298,6 +3347,20 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print(f"  ⏭ Skipping {skipped_successful} PDF(s) already successfully processed "
               "(persistent URL history; no Gemini call)")
 
+    # Age gate: filings published long ago stay in the rolling candidate feeds
+    # (nse/bse_results_pdf_feed.json) until processed or given up, and the
+    # calendar ±1-day window admits yesterday's filings too — so without this
+    # they were downloaded and sent to Gemini a day or more later.
+    too_old = [it for it in new_pdf
+               if _is_too_old(it) and it["link"] not in incomplete_pdf_links]
+    if too_old:
+        old_links = {it["link"] for it in too_old}
+        for it in too_old:
+            _trace_result(it, "skipped", f"filed more than {RESULT_MAX_AGE_HOURS:g}h ago")
+        new_pdf = [it for it in new_pdf if it["link"] not in old_links]
+        print(f"  ⏭ Skipping {len(too_old)} PDF(s) filed more than {RESULT_MAX_AGE_HOURS:g}h ago "
+              f"— no download, no Gemini call")
+
     # Give-up tracking: NSE's WAF blocks some specific filing URLs
     # persistently for GitHub Actions' IP/pattern (confirmed: the same file
     # is fetchable from elsewhere, so this isn't a transient/cache issue —
@@ -3640,6 +3703,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                     pass
             if not dt:
                 return it
+            fdate = datetime.fromtimestamp(_effective_ts(it) or time.time(), tz=_IST).date()
+            if not it.get("_manual") and _is_stale_period(dt.date().isoformat(), fdate):
+                it["_pre_stale_period"] = True
+                ai_rejections[it["link"]] = {
+                    "terminal_not_result": True, "document_type": "stale_period",
+                    "rejected_at": datetime.now(timezone.utc).isoformat()}
+                return it
             sym = _pdf_probable_symbol(it, bse_symbol_map)
             if sym:
                 it["_pre_result_key"] = (sym, dt.date().isoformat(), next(iter(natures)))
@@ -3683,6 +3753,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             _trace_result(it, "excluded", "administrative PDF; no formal statement evidence")
             failed_links.append(it["link"])
         singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_admin")]
+        stale_items = [it for it in singleton_pdf if it.get("_pre_stale_period")]
+        if stale_items:
+            for it in stale_items:
+                _trace_result(it, "excluded", "statement is for an older quarter")
+                failed_links.append(it["link"])   # terminal (see ai_rejections) → never retried
+            singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_stale_period")]
+            print(f"  ⏭ {len(stale_items)} PDF(s) are statements for an older quarter — skipped BEFORE Gemini")
         # Skip invalid NSE metadata BEFORE Gemini; do not charge for a
         # result the downstream validator cannot store.
         bad_filename = [it for it in singleton_pdf if it.get("_pre_bad_filename")]
@@ -3772,6 +3849,11 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 failed_links.append(it["link"])
                 _trace_result(it, "excluded", "administrative PDF; no formal statement evidence")
         checked_items = [it for it in checked_items if not it.get("_pre_admin")]
+        for it in checked_items:
+            if it.get("_pre_stale_period"):
+                failed_links.append(it["link"])   # terminal (see ai_rejections) → never retried
+                _trace_result(it, "excluded", "statement is for an older quarter")
+        checked_items = [it for it in checked_items if not it.get("_pre_stale_period")]
         non_stmt = [it for it in checked_items if it.get("_pre_non_statement")]
         if non_stmt:
             narrative_candidates.extend(non_stmt)
