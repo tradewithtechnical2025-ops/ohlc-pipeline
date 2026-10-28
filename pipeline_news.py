@@ -1382,6 +1382,46 @@ _GENERIC_OUTCOME_RE = re.compile(r"outcome\s+of\s+(the\s+)?board\s+meeting", re.
 
 
 # Administrative filings are not admitted just because results are due today.
+# ── Filename-only pre-download filter (NSE filenames; BSE GUIDs never match) ──
+# Companies on today's result_calendar.json file many other PDFs the same day
+# (newspaper ads, security-cover certificates, earnings-call notices, investor
+# PPTs). These used to be downloaded and some reached Gemini. Decided from the
+# filename alone, so nothing is downloaded.
+#   "skip"      -> never a results statement: dropped before download.
+#   "narrative" -> press release / presentation: kept out of numbers extraction
+#                  (still used only for highlights/commentary, as before).
+# A filename that also says Outcome/UFR is never touched (combined filings such
+# as "..._BM_Outcome_UFR_PressRelease.pdf" carry the real statement).
+_FN_NEVER_RESULT_RE = re.compile(
+    r"newspaper|advertis|publication|security[ _-]*cover|record[ _-]*date|"
+    r"statement[ _-]*of[ _-]*deviation|deviation[ _-]*(?:and|&)?[ _-]*variation|devvar|"
+    r"monitor\w*[ _-]*agency|(?:^|_)MA[ _-]*report|audio[ _-]*rec|transcript|"
+    r"prior[ _-]*intimation|trading[ _-]*window|interest[ _-]*payment",
+    re.IGNORECASE)
+_FN_SOFT_NON_RESULT_RE = re.compile(
+    r"earnings?[ _-]*call|conference[ _-]*call|con[ _-]*call|utili[sz]ation|acquisition|"
+    r"profile|kpi|completion",
+    re.IGNORECASE)
+_FN_NARRATIVE_RE = re.compile(
+    r"press[ _-]*rel|media[ _-]*rel|presentation|ppt|shareholders?[ _-]*letter",
+    re.IGNORECASE)
+_FN_OUTCOME_RE = re.compile(r"outcome|ufr", re.IGNORECASE)
+_FN_RESULT_RE = re.compile(r"outcome|ufr|result|financ|quarterly", re.IGNORECASE)
+
+
+def _filename_non_result_kind(link: str):
+    fname = (link or "").split("?", 1)[0].rsplit("/", 1)[-1]
+    if _FN_OUTCOME_RE.search(fname):
+        return None
+    if _FN_NEVER_RESULT_RE.search(fname):
+        return "skip"
+    if _FN_NARRATIVE_RE.search(fname):
+        return "narrative"
+    if _FN_SOFT_NON_RESULT_RE.search(fname) and not _FN_RESULT_RE.search(fname):
+        return "skip"
+    return None
+
+
 _ADMIN_FILING_RE = re.compile(
     r"audio[ _-]*record|(?:schedule|intimation)[^\n]{0,60}(?:earnings|conference)[ _-]*call|"
     r"prior[ _-]*intimation|intimation[ _-]*of[ _-]*(?:the[ _-]*)?board[ _-]*meeting|"
@@ -3360,6 +3400,30 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         new_pdf = [it for it in new_pdf if it["link"] not in old_links]
         print(f"  ⏭ Skipping {len(too_old)} PDF(s) filed more than {RESULT_MAX_AGE_HOURS:g}h ago "
               f"— no download, no Gemini call")
+
+    # Filename-only filter (see _filename_non_result_kind): drop obvious
+    # non-results before download; route press releases / presentations to
+    # the narrative-only path so they never reach numbers extraction.
+    fn_skipped, fn_narrative = [], 0
+    for it in new_pdf:
+        if it["link"] in incomplete_pdf_links:
+            continue
+        kind = _filename_non_result_kind(it["link"])
+        if kind == "skip":
+            fn_skipped.append(it)
+        elif kind == "narrative":
+            it["_narrative"] = True
+            fn_narrative += 1
+    if fn_skipped:
+        skip_links = {it["link"] for it in fn_skipped}
+        for it in fn_skipped:
+            _trace_result(it, "skipped", "filename marks a non-results filing")
+        new_pdf = [it for it in new_pdf if it["link"] not in skip_links]
+        print(f"  ⏭ Skipping {len(fn_skipped)} PDF(s) whose filename marks a non-results filing "
+              f"(newspaper ad, security cover, earnings-call notice…) — no download, no Gemini call")
+    if fn_narrative:
+        print(f"  📝 {fn_narrative} press release / presentation PDF(s) by filename — narrative-only, "
+              f"no numbers extraction")
 
     # Give-up tracking: NSE's WAF blocks some specific filing URLs
     # persistently for GitHub Actions' IP/pattern (confirmed: the same file
