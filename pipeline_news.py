@@ -3528,6 +3528,41 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # left untouched.  This prevents burning Gemini calls on corrected/re-filed
     # copies while preserving legitimate Standalone + Consolidated filings.
     preflight_sem = asyncio.Semaphore(4)
+    hash_payload = await r2_get(client, "results_pdf_hash_history.json")
+    hash_history = (hash_payload or {}).get("hashes", {})
+    if not isinstance(hash_history, dict):
+        hash_history = {}
+    hash_by_link = {}
+    pdf_read_cache = {}
+    pdf_read_locks = {}
+
+    async def _read_unique_pdf(it, content):
+        # Check byte identity BEFORE opening pdfplumber. Never infer identity
+        # from filename, file size, company, date, or reporting period.
+        import hashlib
+        digest = hashlib.sha256(content).hexdigest()
+        it["_pre_sha256"] = digest
+        hash_by_link[it["link"]] = digest
+        stored = hash_history.get(digest, {})
+        if not it.get("_manual") and not os.environ.get("REPROCESS_STALE_RESULTS") == "1":
+            if (stored.get("status") == "processed"
+                    and stored.get("link") in processed_links
+                    and stored.get("link") not in incomplete_pdf_links):
+                it["_pre_hash_done"] = True
+                _trace_result(it, "skipped", "identical bytes match a successfully stored PDF")
+                return content, None
+            if stored.get("status") == "not_result":
+                it["_pre_hash_done"] = True
+                _trace_result(it, "skipped", "identical bytes match a confirmed non-result PDF")
+                return content, None
+        lock = pdf_read_locks.setdefault(digest, asyncio.Lock())
+        async with lock:
+            if digest in pdf_read_cache:
+                print(f"  ⏭ {it['link'].rsplit('/', 1)[-1]}: identical PDF bytes — reused text; no second PDF read")
+                return pdf_read_cache[digest]
+            loaded, text = await _load_result_pdf(client, it["link"], content)
+            pdf_read_cache[digest] = (loaded, text)
+            return loaded, text
 
     async def _preflight_pdf(it):
         async with preflight_sem:
@@ -3540,12 +3575,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             content = await fetch_pdf_bytes(client, it["link"])
             if not content:
                 return it
-            content, text = await _load_result_pdf(client, it["link"], content)
+            content, text = await _read_unique_pdf(it, content)
+            if it.get("_pre_hash_done"):
+                return it
             it["_pre_content"] = content
             it["_pre_text"] = text
-            # Local-only identity: identical PDF bytes never need two AI calls.
-            import hashlib
-            it["_pre_sha256"] = hashlib.sha256(content).hexdigest()
+            # _read_unique_pdf already hashed the downloaded bytes before reading.
             filename = it["link"].split("?", 1)[0].rsplit("/", 1)[-1]
             # Validate the NSE filename metadata before an expensive request.
             # BSE GUID filenames are handled through their published-date fallback.
@@ -3638,6 +3673,11 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     if singleton_pdf:
         singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
+        hash_done = [it for it in singleton_pdf if it.get("_pre_hash_done")]
+        if hash_done:
+            new_dupe_links.extend(it["link"] for it in hash_done)
+            print(f"  ⏭ {len(hash_done)} PDF(s) matched persistent byte-hash history BEFORE text extraction")
+        singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_hash_done")]
         admin_items = [it for it in singleton_pdf if it.get("_pre_admin")]
         for it in admin_items:
             _trace_result(it, "excluded", "administrative PDF; no formal statement evidence")
@@ -3725,6 +3765,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         # groups.  Preflight is local (pdfplumber only) and its cached bytes/
         # text are reused by process_pdf if AI is genuinely needed.
         checked_items = list(await asyncio.gather(*(_preflight_pdf(it) for it in group_items)))
+        new_dupe_links.extend(it["link"] for it in checked_items if it.get("_pre_hash_done"))
+        checked_items = [it for it in checked_items if not it.get("_pre_hash_done")]
         for it in checked_items:
             if it.get("_pre_admin"):
                 failed_links.append(it["link"])
@@ -3860,6 +3902,26 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             print(f"  ⚠ {len(newly_given_up)} filing(s) just crossed {GIVE_UP_ATTEMPTS} failed "
                   f"attempts — giving up on them going forward (nse_xbrl_failures.json)")
         await r2_put(client, "nse_xbrl_failures.json", {"updated_at": now_iso, "links": failures})
+
+    hash_changed = False
+    for rec in parsed_all:
+        link = rec.get("link")
+        digest = hash_by_link.get(link)
+        if digest:
+            hash_history[digest] = {"status": "processed", "link": link,
+                                    "saved_at": datetime.now(timezone.utc).isoformat()}
+            hash_changed = True
+    for link, rejection in ai_rejections.items():
+        digest = hash_by_link.get(link)
+        if digest and rejection.get("terminal_not_result"):
+            hash_history[digest] = {"status": "not_result", "link": link,
+                                    "saved_at": datetime.now(timezone.utc).isoformat()}
+            hash_changed = True
+    if hash_changed:
+        # Stable retention: keep recent decisions, never arbitrary set order.
+        recent = sorted(hash_history.items(), key=lambda pair: pair[1].get("saved_at", ""), reverse=True)[:10000]
+        await r2_put(client, "results_pdf_hash_history.json", {
+            "updated_at": datetime.now(timezone.utc).isoformat(), "hashes": dict(recent)})
 
     # Intra-batch dedup: NSE sometimes files the same symbol+quarter+nature
     # twice within minutes (correction/resubmission) — both can land as
