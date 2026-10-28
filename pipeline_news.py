@@ -532,6 +532,9 @@ def _result_candidate_in_universe(it: dict, universe: set[str], bse_symbol_map: 
     resolver so legitimate filename/live-symbol mismatches (e.g. old internal
     filing codes) are not unnecessarily lost. BSE uses classification's scrip map.
     """
+    if (it.get("_cal_fallback") or it.get("_loose")) and not _fallback_result_candidate(it):
+        _trace_result(it, "excluded", "calendar-only administrative/narrative filing")
+        return False
     if not universe:
         return True
     sym = _pdf_probable_symbol(it, bse_symbol_map).strip().upper()
@@ -542,6 +545,7 @@ def _result_candidate_in_universe(it: dict, universe: set[str], bse_symbol_map: 
         resolved, _ = _resolve_symbol(sym, title, explicit=False)
         if resolved in universe:
             return True
+    _trace_result(it, "excluded", "outside classification universe")
     return False
 
 
@@ -1036,7 +1040,7 @@ _PDF_BOILERPLATE_PRECEDE_RE = re.compile(r"(accompanying|reviewed)[\s\S]{0,15}$"
 # Allow NSE internal uploader segments between the ticker and 14-digit filing time.
 # Group numbering stays unchanged for downstream symbol/date extraction.
 _PDF_FILENAME_TS_RE = re.compile(
-    r"^([A-Z0-9&\-]+)_(?:[A-Z][A-Z0-9&\-]*_){0,3}(\d{2})(\d{2})(\d{4})\d{6}_",
+    r"^([A-Z0-9&\-]+)_(?:[A-Z0-9&\-]+_){0,8}(\d{2})(\d{2})(\d{4})\d{6}_",
     re.IGNORECASE,
 )
 
@@ -1343,6 +1347,41 @@ SOFT_GIVE_UP_ATTEMPTS = 4        # retry cap for calendar/loose fallback items
 _GENERIC_OUTCOME_RE = re.compile(r"outcome\s+of\s+(the\s+)?board\s+meeting", re.IGNORECASE)
 
 
+# Administrative filings are not admitted just because results are due today.
+_ADMIN_FILING_RE = re.compile(
+    r"audio[ _-]*record|(?:schedule|intimation)[^\n]{0,60}(?:earnings|conference)[ _-]*call|"
+    r"prior[ _-]*intimation|intimation[ _-]*of[ _-]*(?:the[ _-]*)?board[ _-]*meeting|"
+    r"monitoring[ _-]*agency|statement[ _-]*(?:of[ _-]*)?(?:deviation|variation)|"
+    r"security[ _-]*cover|interest[ _-]*payment|record[ _-]*date|"
+    r"newspaper|advertisement|publication|certificate|transcript", re.I)
+_BOARD_HINT_RE = re.compile(r"outcome|\bBM\b|BM[ _-]*outcome|outcomeofbm", re.I)
+_RESULT_TRACE = []
+
+
+def _trace_result(it, stage, reason=""):
+    symbol = _pdf_probable_symbol(it, globals().get("_TRACE_BSE_MAP"))
+    row = {"symbol": symbol, "title": it.get("title", ""),
+           "link": it.get("link", ""), "stage": stage, "reason": reason}
+    _RESULT_TRACE.append(row)
+    watch = {x.strip().upper() for x in os.environ.get(
+        "RESULT_TRACE_SYMBOLS", "VEDL,PVRINOX,ABDL").split(",") if x.strip()}
+    if os.environ.get("RESULT_TRACE_ALL") == "1" or symbol in watch:
+        print(f"  TRACE {symbol or '?'} | {stage} | {reason} | {row['link'].rsplit('/', 1)[-1]}")
+
+
+def _fallback_result_candidate(it):
+    # Explicit results wording wins over administrative words when the filing
+    # combines a formal statement and other board decisions in one PDF.
+    if _has_explicit_financial_results_text(it):
+        return True
+    summary = it.get("summary") or it.get("description") or ""
+    combined = summary + " " + it.get("link", "").rsplit("/", 1)[-1]
+    if _ADMIN_FILING_RE.search(combined):
+        return False
+    return bool(_BOARD_HINT_RE.search(combined) or _is_board_outcome_pdf(it)
+                or _is_bse_results_pdf(it))
+
+
 def _on_calendar_strict(symbol: str, calendar: dict, iso_date: str) -> bool:
     """Unlike _in_result_calendar this does NOT fail open: unknown symbol,
     unknown date or empty calendar -> False. Used only to ADD candidates."""
@@ -1372,7 +1411,7 @@ def _bse_extra_candidate_kind(it: dict, calendar: dict, bse_symbol_map: dict | N
     code = it.get("scripcode", "")
     if not link.lower().endswith(".pdf") or not code:
         return None
-    if is_noise(it):
+    if is_noise(it) or not _fallback_result_candidate(it):
         return None   # trading window, 74(5), scrutinizer, ESOP... never worth a fetch
     sym = ((bse_symbol_map or {}).get(code, code) or "").upper()
     if _NON_STATEMENT_DESC_RE.search(f"{it.get('title', '')} {it.get('summary', '')}"):
@@ -1471,8 +1510,26 @@ For EACH period (current, qoq_prior, yoy_prior), extract exceptional_items indep
 All numeric values must be in the unit you reported (do NOT convert to rupees yourself — the caller handles that). EPS values are per-share rupee amounts regardless of the table's unit — never scale EPS. Use only information present in the document. Do not invent numbers — use null or omit the key when something genuinely isn't there."""
 
 
+_AI_RESPONSE_CACHE = None
+_AI_CACHE_LOCK = None
+_AI_DEFERRED_FILES = set()
+_AI_PROVIDER_BLOCKED = False
+
+
+async def _load_ai_cache(client):
+    global _AI_RESPONSE_CACHE, _AI_CACHE_LOCK
+    if _AI_CACHE_LOCK is None:
+        _AI_CACHE_LOCK = asyncio.Lock()
+    async with _AI_CACHE_LOCK:
+        if _AI_RESPONSE_CACHE is None:
+            payload = await r2_get(client, "results_ai_checkpoint.json")
+            _AI_RESPONSE_CACHE = (payload or {}).get("responses", {})
+            if not isinstance(_AI_RESPONSE_CACHE, dict):
+                _AI_RESPONSE_CACHE = {}
+
+
 async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg: str, pdf_bytes: bytes = None,
-                                 system_prompt: str = None):
+                                 system_prompt: str = None, bypass_cache: bool = False):
     """Calls Gemini to extract structured financial data from the PDF's
     extracted text AND (when provided) the raw PDF itself, sent as a
     native document part — Gemini reads PDFs directly (including
@@ -1497,7 +1554,18 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
     Claude-based version — _build_result_from_ai() downstream needs no
     changes. Gemini has no separate system-prompt slot in this endpoint,
     so the instructions are prepended to the single user turn instead."""
-    if not GEMINI_API_KEY:
+    global _AI_PROVIDER_BLOCKED
+    import hashlib
+    await _load_ai_cache(client)
+    cache_key = hashlib.sha256(
+        (AI_PDF_MODEL + "\n" + (system_prompt or _AI_EXTRACT_SYSTEM_PROMPT)
+         + "\n" + text[:60000]).encode() + (pdf_bytes or b"")).hexdigest()
+    if not bypass_cache and cache_key in _AI_RESPONSE_CACHE:
+        print(f"    · [{fname_dbg}] restored AI checkpoint — no Gemini call")
+        return _AI_RESPONSE_CACHE[cache_key]["response"]
+    if not GEMINI_API_KEY or _AI_PROVIDER_BLOCKED:
+        _AI_DEFERRED_FILES.add(fname_dbg)
+        print(f"    · [{fname_dbg}] AI deferred: credentials/billing unavailable; no document retry charged")
         return None
     try:
         parts = [{"text": (system_prompt or _AI_EXTRACT_SYSTEM_PROMPT) + "\n\n" + text[:60000]}]
@@ -1528,8 +1596,11 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
             },
             timeout=90,
         )
-        if r.status_code == 429:
-            print(f"    · [{fname_dbg}] AI extraction skipped: Gemini quota/rate limit hit")
+        if r.status_code in (401, 402, 403, 408, 429) or r.status_code >= 500:
+            _AI_DEFERRED_FILES.add(fname_dbg)
+            if r.status_code in (401, 402, 403):
+                _AI_PROVIDER_BLOCKED = True
+            print(f"    · [{fname_dbg}] AI deferred: HTTP {r.status_code}; no document retry charged")
             return None
         r.raise_for_status()
         data = r.json()
@@ -1560,9 +1631,32 @@ async def _ai_extract_financials(client: httpx.AsyncClient, text: str, fname_dbg
             print(f"    · [{fname_dbg}] AI JSON parse failed ({je}); finishReason={finish_reason or 'unknown'}, "
                   f"response length={len(raw_text)} chars")
             return None
+        if (not isinstance(parsed, dict)
+                or (system_prompt is None and not isinstance(parsed.get("is_results_table"), bool))):
+            print(f"    · [{fname_dbg}] AI response missing explicit results classification — retryable")
+            return None
+        # A completed response survives interruption; publication/Telegram still
+        # happens through the existing final merge on this or the next run.
+        async with _AI_CACHE_LOCK:
+            _AI_RESPONSE_CACHE[cache_key] = {
+                "filename": fname_dbg, "saved_at": datetime.now(timezone.utc).isoformat(),
+                "response": parsed}
+            while len(_AI_RESPONSE_CACHE) > 3000:
+                del _AI_RESPONSE_CACHE[next(iter(_AI_RESPONSE_CACHE))]
+            try:
+                await r2_put(client, "results_ai_checkpoint.json", {
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "responses": _AI_RESPONSE_CACHE})
+            except Exception as checkpoint_error:
+                print(f"    · [{fname_dbg}] checkpoint save failed: {type(checkpoint_error).__name__}; response kept in memory")
         return parsed
+    except (httpx.TimeoutException, httpx.TransportError) as e:
+        _AI_DEFERRED_FILES.add(fname_dbg)
+        print(f"    · [{fname_dbg}] AI deferred: {type(e).__name__}; no document retry charged")
+        return None
     except Exception as e:
-        print(f"    · [{fname_dbg}] AI extraction failed: {type(e).__name__}: {e}")
+        # Do not print request URLs: Gemini credentials appear in the query.
+        print(f"    · [{fname_dbg}] AI extraction failed: {type(e).__name__}")
         return None
 
 
@@ -2117,7 +2211,7 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
     # already in memory from the fetch) is sent alongside the text and
     # takes priority for the actual numbers — Gemini reads PDFs natively,
     # so there's no need to pre-render pages to images ourselves.
-    ai = await _ai_extract_financials(client, text, fname_dbg, content)
+    ai = await _ai_extract_financials(client, text, fname_dbg, content, bypass_cache=(force_ai or os.environ.get("REPROCESS_STALE_RESULTS") == "1"))
     if not ai:
         if not GEMINI_API_KEY:
             print(f"    · [{fname_dbg}] skipping — GEMINI_API_KEY not set")
@@ -2143,6 +2237,17 @@ async def parse_financial_results_pdf(client: httpx.AsyncClient, content: bytes,
                                     symbol_override=symbol_override, exchange=exchange)
     if not result:
         print(f"    · [{fname_dbg}] AI result failed validation (missing revenue/PAT, bad date, or filename mismatch) — skipping")
+        # Invalid numeric extraction must be allowed a fresh provider attempt.
+        if _AI_CACHE_LOCK is not None:
+            async with _AI_CACHE_LOCK:
+                bad_keys = [key for key, entry in (_AI_RESPONSE_CACHE or {}).items()
+                            if entry.get("filename") == fname_dbg]
+                for key in bad_keys:
+                    del _AI_RESPONSE_CACHE[key]
+                if bad_keys:
+                    await r2_put(client, "results_ai_checkpoint.json", {
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                        "responses": _AI_RESPONSE_CACHE})
     return result
 
 
@@ -3034,6 +3139,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     existing = await r2_get(client, "nse_results_detailed.json")
     existing_items = (existing or {}).get("items", [])
     processed_links = _processed_result_links(existing)
+    for it in pdf_items:
+        _trace_result(it, "candidate", "entered detail parser")
 
     def _basis_key(it):
         """(symbol, period_end) — ignores standalone/consolidated nature,
@@ -3224,6 +3331,14 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             print(f"  ⏭ Skipping {skipped} filing(s) given up after {GIVE_UP_ATTEMPTS}+ failed "
                   f"attempts (see nse_xbrl_failures.json)")
 
+    for it in pdf_items:
+        link = it["link"]
+        if link in processed_links and link not in incomplete_pdf_links:
+            _trace_result(it, "skipped", "already successfully processed")
+        elif link in terminal_links:
+            _trace_result(it, "skipped", "persistent not-results classification")
+        elif link in given_up_links:
+            _trace_result(it, "skipped", "document retry limit reached")
     if not new_xbrl and not new_pdf and not manual_items:
         print("  ✓ nse_results_detailed: no new filings to parse")
         return None
@@ -3253,6 +3368,9 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     dupe_payload = await r2_get(client, "bse_nse_duplicate_links.json")
     known_dupe_links = set((dupe_payload or {}).get("links", []))
     before_dupe = len(new_pdf)
+    for it in new_pdf:
+        if it["link"] in known_dupe_links:
+            _trace_result(it, "skipped", "persistent duplicate URL history")
     new_pdf = [it for it in new_pdf if it["link"] not in known_dupe_links and it["link"] not in manual_links]
     if before_dupe != len(new_pdf):
         print(f"  ⏭ Skipping {before_dupe - len(new_pdf)} PDF(s) already known cross-exchange duplicates")
@@ -3347,6 +3465,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 return None
 
     async def process_pdf(it):
+        _trace_result(it, "processing", "PDF extraction")
         async with sem:
             fname = it["link"].split("/")[-1]
             try:
@@ -3380,6 +3499,9 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                                                                   _bse_fallback_date(it.get("published", ""))
                                                                   if it.get("_manual") else None))
                 if not parsed:
+                    _trace_result(it, "deferred" if fname in _AI_DEFERRED_FILES else "parse_failed",
+                                  "provider unavailable" if fname in _AI_DEFERRED_FILES else
+                                  "see PDF heading, AI classification or validation log")
                     print(f"  ⚠ PDF parse returned None for {fname} "
                           f"(no results heading / AI unavailable / AI said not a results table / "
                           f"AI result failed validation — see parse_financial_results_pdf)")
@@ -3392,6 +3514,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
                 if it.get("_manual"):
                     parsed.setdefault("meta", {})["manual"] = True
                 _attach_fundamentals(parsed)
+                _trace_result(it, "parsed", "successful extraction")
                 return parsed
             except Exception as e:
                 print(f"  ⚠ PDF parse failed for {it['link'].split('/')[-1]}: {e}")
@@ -3404,7 +3527,13 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     # three parts are unambiguous are collapsed; ambiguous/multi-basis PDFs are
     # left untouched.  This prevents burning Gemini calls on corrected/re-filed
     # copies while preserving legitimate Standalone + Consolidated filings.
+    preflight_sem = asyncio.Semaphore(4)
+
     async def _preflight_pdf(it):
+        async with preflight_sem:
+            return await _preflight_pdf_inner(it)
+
+    async def _preflight_pdf_inner(it):
         import pdfplumber
         import io as _io
         try:
@@ -3417,12 +3546,23 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             # Local-only identity: identical PDF bytes never need two AI calls.
             import hashlib
             it["_pre_sha256"] = hashlib.sha256(content).hexdigest()
+            filename = it["link"].split("?", 1)[0].rsplit("/", 1)[-1]
             # Validate the NSE filename metadata before an expensive request.
             # BSE GUID filenames are handled through their published-date fallback.
             if it.get("_exchange", "NSE") != "BSE" and not it.get("_manual"):
                 filename = it["link"].split("?", 1)[0].rsplit("/", 1)[-1]
                 if not _PDF_FILENAME_TS_RE.match(filename):
                     it["_pre_bad_filename"] = True
+            combined_hint = (it.get("summary") or "") + " " + filename
+            if (_ADMIN_FILING_RE.search(combined_hint)
+                    and not _has_statement_evidence(text, content)
+                    and not _scanned_results_likely(content, text)
+                    and not it.get("_manual")):
+                it["_pre_admin"] = True
+                ai_rejections[it["link"]] = {
+                    "terminal_not_result": True, "document_type": "administrative",
+                    "rejected_at": datetime.now(timezone.utc).isoformat()}
+                return it
             if (_is_non_statement_doc(text, content)
                     or (it.get("_narrative") and not _has_statement_evidence(text, content))):
                 it["_pre_non_statement"] = True
@@ -3498,11 +3638,18 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     if singleton_pdf:
         singleton_pdf = list(await asyncio.gather(*(_preflight_pdf(it) for it in singleton_pdf)))
+        admin_items = [it for it in singleton_pdf if it.get("_pre_admin")]
+        for it in admin_items:
+            _trace_result(it, "excluded", "administrative PDF; no formal statement evidence")
+            failed_links.append(it["link"])
+        singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_admin")]
         # Skip invalid NSE metadata BEFORE Gemini; do not charge for a
         # result the downstream validator cannot store.
         bad_filename = [it for it in singleton_pdf if it.get("_pre_bad_filename")]
         if bad_filename:
-            print(f"  ⏭ {len(bad_filename)} PDF(s) missing required NSE filename timestamp — skipped BEFORE Gemini")
+            for it in bad_filename:
+                _trace_result(it, "excluded", "unsupported NSE filename metadata")
+            print(f"  ⏭ {len(bad_filename)} PDF(s) unsupported NSE filename metadata — skipped BEFORE Gemini")
             singleton_pdf = [it for it in singleton_pdf if not it.get("_pre_bad_filename")]
         # Content-addressed dedup also handles PDFs whose headings/periods
         # could not be identified by the conservative business-key preflight.
@@ -3578,6 +3725,11 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         # groups.  Preflight is local (pdfplumber only) and its cached bytes/
         # text are reused by process_pdf if AI is genuinely needed.
         checked_items = list(await asyncio.gather(*(_preflight_pdf(it) for it in group_items)))
+        for it in checked_items:
+            if it.get("_pre_admin"):
+                failed_links.append(it["link"])
+                _trace_result(it, "excluded", "administrative PDF; no formal statement evidence")
+        checked_items = [it for it in checked_items if not it.get("_pre_admin")]
         non_stmt = [it for it in checked_items if it.get("_pre_non_statement")]
         if non_stmt:
             narrative_candidates.extend(non_stmt)
@@ -3690,6 +3842,9 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         await r2_put(client, "bse_nse_duplicate_links.json",
                      {"updated_at": datetime.now(timezone.utc).isoformat(), "links": all_dupe_links})
 
+    failed_links = list(dict.fromkeys(
+        link for link in failed_links
+        if link.rsplit("/", 1)[-1] not in _AI_DEFERRED_FILES))
     if failed_links:
         now_iso = datetime.now(timezone.utc).isoformat()
         for link in failed_links:
@@ -4010,7 +4165,7 @@ async def run():
                 merged_feed.sort(key=_effective_ts, reverse=True)
                 merged_feed = merged_feed[:1000]  # same cap as nse_results_detailed.json
                 added = len(merged_feed) - len(existing_feed_items)
-                print(f"  nse_results_feed.json: {len(existing_feed_items)} existing + "
+                print(f"  nse_results_feed.json: {len(existing_feed_items)} existing; "
                       f"{max(added, 0)} new = {len(merged_feed)} (capped at 1000)")
                 items = merged_feed
                 results_feed_items = items
@@ -4041,11 +4196,16 @@ async def run():
         # fetch of both feeds so a future noise-pattern tweak can't
         # accidentally hide a real results PDF from this detector.
         pdf_source_items = result_map.get("nse_board", []) + result_map.get("nse_announcements", [])
+        for it in pdf_source_items:
+            if it.get("link", "").lower().endswith(".pdf"):
+                _trace_result(it, "fetched", "raw NSE RSS before noise filtering")
         seen_pdf_links = set()
         pdf_candidates_now = []
         for it in pdf_source_items:
             if not _is_board_outcome_pdf(it):
+                _trace_result(it, "not_direct_candidate", "no qualifying results/board-outcome evidence")
                 continue
+            _trace_result(it, "selected", "results description or board-outcome subject")
             link = it.get("link", "")
             if link in seen_pdf_links:
                 continue
@@ -4078,7 +4238,8 @@ async def run():
                 link = it.get("link", "")
                 if not link.lower().endswith(".pdf") or link in seen_pdf_links:
                     continue
-                if is_noise(it) or not _nse_on_calendar_strict(link, calendar_payload):
+                if (is_noise(it) or not _fallback_result_candidate(it)
+                        or not _nse_on_calendar_strict(link, calendar_payload)):
                     continue
                 it["_cal_fallback"] = True
                 seen_pdf_links.add(link)
@@ -4137,8 +4298,8 @@ async def run():
         merged_pdf_feed = all_pdf_candidates
         merged_pdf_feed.sort(key=_effective_ts, reverse=True)
         merged_pdf_feed = merged_pdf_feed[:500]
-        print(f"  nse_results_pdf_feed.json: {len(existing_pdf_items)} existing + "
-              f"{max(len(merged_pdf_feed) - len(existing_pdf_items), 0)} new = {len(merged_pdf_feed)} (capped at 500)")
+        print(f"  nse_results_pdf_feed.json: {len(existing_pdf_items)} existing; "
+              f"{len({it.get('link') for it in merged_pdf_feed} - {it.get('link') for it in existing_pdf_items})} new links; retained {len(merged_pdf_feed)} (capped at 500)")
         await r2_put(client, "nse_results_pdf_feed.json", make_payload(merged_pdf_feed))
 
         # ── BSE results-PDF candidates ──
@@ -4156,9 +4317,14 @@ async def run():
         # item's probable symbol is needed for the calendar lookup itself,
         # not only for later parsing.
         bse_symbol_map = await _load_bse_symbol_map(client)
+        globals()["_TRACE_BSE_MAP"] = bse_symbol_map
         bse_sorted = _dedup_bse_by_link(
             sorted(result_map.get("bse_announcements", []), key=lambda x: x.get("published_ts", 0), reverse=True)
         )
+        # Tag BEFORE universe/calendar matching; BSE GUID filenames cannot
+        # be resolved as NSE symbols. Use the scrip-code mapping instead.
+        for it in bse_sorted:
+            it["_exchange"] = "BSE"
         bse_candidates_now = [it for it in bse_sorted if _is_bse_results_pdf(it)]
         # Extra candidates (calendar-listed symbol, or generic board outcome). They
         # bypass the calendar gate below on purpose - the PDF heading check decides.
@@ -4204,6 +4370,8 @@ async def run():
                 print(f"  🗑 {dropped_bse_universe} BSE result PDF candidate(s) dropped — outside classification.json universe")
         existing_bse_feed = await r2_get(client, "bse_results_pdf_feed.json")
         existing_bse_items = (existing_bse_feed or {}).get("items", [])
+        for it in existing_bse_items:
+            it["_exchange"] = "BSE"
         merged_bse_feed = _dedup_bse_by_link(dedup_items(bse_candidates_now + existing_bse_items))
         if results_universe:
             merged_bse_feed = [
@@ -4212,11 +4380,14 @@ async def run():
             ]
         merged_bse_feed.sort(key=_effective_ts, reverse=True)
         merged_bse_feed = merged_bse_feed[:BSE_PDF_FEED_CAP]
-        print(f"  bse_results_pdf_feed.json: {len(existing_bse_items)} existing + "
-              f"{max(len(merged_bse_feed) - len(existing_bse_items), 0)} new = {len(merged_bse_feed)} (capped at {BSE_PDF_FEED_CAP})")
+        print(f"  bse_results_pdf_feed.json: {len(existing_bse_items)} existing; "
+              f"{len({it.get('link') for it in merged_bse_feed} - {it.get('link') for it in existing_bse_items})} new links; retained {len(merged_bse_feed)} (capped at {BSE_PDF_FEED_CAP})")
         await r2_put(client, "bse_results_pdf_feed.json", make_payload(merged_bse_feed))
 
         # ── Financial results detail (P&L from XBRL / AI-extracted PDF) ──
+        for it in merged_pdf_feed + merged_bse_feed:
+            _trace_result(it, "retained", "results candidate feed")
+        await r2_put(client, "results_pipeline_trace.json", make_payload(_RESULT_TRACE))
         print("\nParsing financial results (PDF-only)...")
         fundamentals = await r2_get(client, FUNDAMENTALS_FILE)
         fundamentals_stocks = (fundamentals or {}).get("stocks")
@@ -4227,6 +4398,8 @@ async def run():
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
 
+    async with httpx.AsyncClient() as trace_client:
+        await r2_put(trace_client, "results_pipeline_trace.json", make_payload(_RESULT_TRACE))
     _print_gemini_usage_summary()
     print("✅ Done")
 
