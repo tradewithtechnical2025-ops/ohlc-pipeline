@@ -2946,7 +2946,9 @@ def _telegram_result_message(group) -> str:
     if board_date:
         lines.append(f"Result Date: {board_date}")
 
-    for i, parsed in enumerate(items):
+    # One basis only (Consolidated, else Standalone) — same rule as the card and caption;
+    # both bases repeated the same highlights / commentary / board decisions.
+    for i, parsed in enumerate(items[:1]):
         nature = parsed.get("meta", {}).get("standalone_consolidated") or ""
         lines.append("")
         if nature:
@@ -2996,16 +2998,19 @@ def _result_card_png(group):
         return None
     items = group if isinstance(group, list) else [group]
     items = sorted(items, key=lambda p: 0 if (p.get("meta", {}).get("standalone_consolidated") == "Consolidated") else 1)
-    sections = []
+    # One basis only: Consolidated when it has a table, otherwise Standalone.
+    sections, shown = [], None
     for parsed in items:
         t = _fin_table_data(parsed)
         if not t:
-            return None                                    # a basis without a table: send the text message
+            continue                                       # this basis has no table: try the next one
         sections.append({"title": parsed.get("meta", {}).get("standalone_consolidated") or "",
                          "cols": t["cols"], "rows": t["rows"], "note": t["note"]})
+        shown = parsed
+        break
     if not sections:
-        return None
-    m = items[0].get("meta", {})
+        return None                                        # no basis with a table: send the text message
+    m = shown.get("meta", {})
     try:
         return render_result_card({"name": m.get("company_name") or items[0].get("title") or "",
                                    "symbol": m.get("symbol") or "", "quarter": m.get("quarter_label") or "",
@@ -3014,6 +3019,17 @@ def _result_card_png(group):
     except Exception as e:
         print(f"  ⚠ result card for {m.get('symbol')}: {e}")
         return None
+
+
+# Highlights that only restate what the card table already shows (Sales, OP/EBITDA, PAT, EPS,
+# margins with their numbers) are left out of the caption. Highlights about anything else
+# (order book, dividend, guidance, volumes, segments, debt...) still go out.
+_CARD_METRIC_HL_RE = re.compile(
+    r"\b(revenue|revenues|sales|total\s+income|income\s+from\s+operations|ebitda|operating\s+profit|"
+    r"\bop\b|pat|net\s+profit|profit\s+after\s+tax|net\s+loss|pbt|profit\s+before\s+tax|"
+    r"eps|earnings\s+per\s+share|opm|operating\s+margin|ebitda\s+margin|pat\s+margin|net\s+margin)\b",
+    re.IGNORECASE,
+)
 
 
 def _telegram_result_caption(group):
@@ -3030,26 +3046,42 @@ def _telegram_result_caption(group):
         head.append(f"Result Date: {m.get('board_meeting_date')}")
     if any((p.get("quarter") or {}).get("yoy_caution") for p in items):
         head += ["", "⚠️ Company notes: results may not be YoY comparable"]
+    # Standalone and Consolidated are extracted from the same PDF, so their highlights /
+    # commentary / board decisions are usually the same text worded slightly differently.
+    # Show each block once: from the Consolidated record, falling back to Standalone
+    # only when Consolidated has nothing for that block (same rule as the card).
+    def _first(get):
+        for p in items:
+            v = get(p)
+            if v:
+                return v
+        return None
+
+    def _hl_key(h):
+        return re.sub(r"[^a-z0-9]+", " ", h.lower()).strip()
+
     hl, seen = [], set()
-    for p in items:
-        for h in p.get("key_highlights") or []:
-            h = _amounts_in_cr(h)
-            if h not in seen:
-                seen.add(h); hl.append(h)
+    for h in _first(lambda p: p.get("key_highlights")) or []:
+        h = _amounts_in_cr(h)
+        k = _hl_key(h)
+        if _CARD_METRIC_HL_RE.search(h) and re.search(r"\d", h):
+            continue                                       # just repeats a number already on the card
+        if k and k not in seen:
+            seen.add(k); hl.append(h)
     # blocks in order; as many whole lines as fit go in the caption, the rest in one follow-up message
     blocks = []
     if hl:
         blocks.append(["<b>✨ Key Highlights</b>"] + [f"• {h}" for h in hl])
-    for p in items:
-        nature = p.get("meta", {}).get("standalone_consolidated") or ""
-        tag = f" ({nature})" if nature and len(items) > 1 else ""
-        segs = [s for s in (p.get("segment_breakup") or []) if s.get("segment") and s.get("revenue") is not None]
-        if segs:
-            blocks.append([f"<b>📦 Segment Revenue{tag}</b>"] + [f"{s['segment']}: {_fmt_cr(s['revenue'])}" for s in segs])
-        if p.get("management_commentary"):
-            blocks.append([f"<b>🗣️ Management Commentary{tag}</b>", p["management_commentary"]])
-        if p.get("board_meeting_outcome"):
-            blocks.append([f"<b>🏛️ Other Board Decisions{tag}</b>", p["board_meeting_outcome"]])
+    segs = _first(lambda p: [s for s in (p.get("segment_breakup") or [])
+                             if s.get("segment") and s.get("revenue") is not None])
+    if segs:
+        blocks.append(["<b>📦 Segment Revenue</b>"] + [f"{s['segment']}: {_fmt_cr(s['revenue'])}" for s in segs])
+    mc = _first(lambda p: p.get("management_commentary"))
+    if mc:
+        blocks.append(["<b>🗣️ Management Commentary</b>", mc])
+    bo = _first(lambda p: p.get("board_meeting_outcome"))
+    if bo:
+        blocks.append(["<b>🏛️ Other Board Decisions</b>", bo])
     cap, extra, full = list(head), [], False
     for b in blocks:
         if full:
