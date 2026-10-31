@@ -48,9 +48,11 @@ def _font(bold, size):
     return _FC[k]
 
 
-BG, CARD, LINE = (15, 18, 25), (23, 27, 36), (42, 48, 60)
-TXT, MUT, ACC = (232, 235, 240), (139, 146, 158), (0, 200, 240)
-GRN, RED, AMB = (34, 197, 94), (239, 68, 68), (245, 158, 11)
+# Light theme (darker green / red / accent than the old dark theme so they read on white)
+BG, CARD, LINE = (243, 246, 250), (255, 255, 255), (222, 228, 236)
+TXT, MUT, ACC = (15, 23, 42), (100, 116, 139), (2, 132, 199)
+GRN, RED, AMB = (22, 163, 74), (220, 38, 38), (180, 83, 9)
+TAG_BG = (224, 242, 254)    # symbol pill background
 
 
 def _num(v, dec=1, kind="pct"):
@@ -115,7 +117,8 @@ def render_result_card(d, scale=2):
     head_h = S(84)
     body_h = 0
     for sec, rows, notes in secs:
-        body_h += (S(24) if sec.get("title") else 0) + rh * (len(rows) + 1) + S(10) + S(17) * len(notes) + S(14)
+        # table box (rows + header + 10) + 10 gap below it + notes + 14 — same steps as the drawing loop
+        body_h += (S(24) if sec.get("title") else 0) + rh * (len(rows) + 1) + S(20) + S(17) * len(notes) + S(14)
     foot_notes = []
     for sec, _, _ in secs:
         n = sec.get("note")
@@ -135,7 +138,7 @@ def render_result_card(d, scale=2):
     g.text((pad, S(18) + S(20 - sz) // 2), name, font=f_title, fill=TXT)
     if sym:
         tw = g.textlength(sym, font=f_tag)
-        g.rounded_rectangle([W - pad - tw - S(16), S(20), W - pad, S(42)], radius=S(6), fill=(0, 60, 75))
+        g.rounded_rectangle([W - pad - tw - S(16), S(20), W - pad, S(42)], radius=S(6), fill=TAG_BG)
         g.text((W - pad - tw - S(8), S(24)), sym, font=f_tag, fill=ACC)
     sub = " · ".join(str(x) for x in [d.get("quarter"), d.get("audit"), f"Result {d['date']}" if d.get("date") else None] if x)
     g.text((pad, S(50)), sub, font=f_sub, fill=MUT)
@@ -148,7 +151,7 @@ def render_result_card(d, scale=2):
             y += S(24)
         cols = list(sec.get("cols") or []) + ["", "", ""]
         th = rh * (len(rows) + 1) + S(10)
-        g.rounded_rectangle([S(12), y, W - S(12), y + th], radius=S(10), fill=CARD)
+        g.rounded_rectangle([S(12), y, W - S(12), y + th], radius=S(10), fill=CARD, outline=LINE, width=max(1, S(1)))
         hy = y + S(10)
         for i, h in enumerate(["", cols[0] or "Now", "QoQ", "YoY", cols[1], cols[2]]):
             if not h: continue
