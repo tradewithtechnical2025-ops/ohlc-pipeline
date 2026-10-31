@@ -112,6 +112,12 @@ FEEDS = [
     ("bse_announcements", "BSE Corporate Announcements", "https://beta.bseindia.com/data/xml/announcements.xml"),
 ]
 
+# NSE feeds that must be fresh: NSE rebuilds them every few minutes (<ttl>5</ttl>),
+# so an old lastBuildDate means a cached/frozen copy, not a quiet day.
+NSE_FRESH_FEEDS = {"nse_announcements", "nse_board"}
+STALE_FEED_BUILD_HOURS = float(os.environ.get("STALE_FEED_BUILD_HOURS", "3"))
+STALE_FEED_ITEM_HOURS = float(os.environ.get("STALE_FEED_ITEM_HOURS", "48"))
+
 # source_key(s) -> R2 output file
 # Single key = individual file, list = merged file
 OUTPUT_MAP = {
@@ -221,7 +227,18 @@ def _truncate_keep_subject(raw: str, limit: int = 300) -> str:
         return raw[:limit]
     tag = raw[idx:]
     head_room = max(0, limit - len(tag) - 4)
-    return raw[:head_room].rstrip() + "... " + tag
+    head = raw[:head_room].rstrip()
+    # Long board-outcome letters often put "approved the ... Financial Results"
+    # after a long preamble ("Further to our letter dated..."). Cutting at the
+    # start would drop that sentence, so the explicit-results check
+    # (_has_explicit_financial_results_text) misses a real results filing and
+    # it then depends on result_calendar.json alone (e.g. CLEAN, 31-Oct-2026).
+    # Keep the results sentence instead of the preamble when it would be cut.
+    m = _PDF_EXPLICIT_RESULT_RE.search(raw[:idx])
+    if m and m.end() > len(head):
+        start = max(0, m.start() - 20)
+        head = "..." + raw[start:idx][:max(0, head_room - 3)].rstrip()
+    return head + "... " + tag
 
 
 def is_noise(item: dict) -> bool:
@@ -285,6 +302,7 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
 
     last_exc = None
     got_empty_after_all_retries = False
+    stale_items = None          # newest stale copy seen (returned with ok=False if nothing fresh)
     v = int(time.time() // 300)  # 5-min cache-buster bucket
 
     for domain_idx, base_url in enumerate(urls_to_try):
@@ -292,11 +310,13 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
         cache_busted_url = f"{base_url}{sep}v={v}"
         domain_label = base_url.split("/")[2]
         is_last_domain = domain_idx == len(urls_to_try) - 1
+        use_plain_url = False   # set after a stale response: retry without the ?v= query
 
         for attempt in range(retries_per_domain):
             is_last_attempt = is_last_domain and attempt == retries_per_domain - 1
             try:
-                r = await client.get(cache_busted_url, headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
+                r = await client.get(base_url if use_plain_url else cache_busted_url,
+                                     headers=BROWSER_HEADERS, timeout=20, follow_redirects=True)
                 r.raise_for_status()
                 feed = feedparser.parse(r.content)
                 items = []
@@ -365,6 +385,38 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                     got_empty_after_all_retries = True
                     break
 
+                # Stale-copy guard (NSE only). On 31-Oct-2026 the runner kept
+                # getting a copy of the NSE feeds frozen at 28-Oct ~21:00 while
+                # the live feed (lastBuildDate refreshed every few minutes) had
+                # all of that day's results — every NSE result for 3 days was
+                # missed with no error. Treat an old copy like a failed fetch:
+                # retry without the cache-buster, then the other domain.
+                if source_key in NSE_FRESH_FEEDS:
+                    now_ts = time.time()
+                    build_ts = 0
+                    bp = feed.feed.get("updated_parsed") if hasattr(feed, "feed") else None
+                    if bp:
+                        try:
+                            build_ts = calendar.timegm(bp)
+                        except Exception:
+                            build_ts = 0
+                    newest_ts = max((it.get("published_ts", 0) for it in items), default=0)
+                    build_age_h = (now_ts - build_ts) / 3600 if build_ts else None
+                    newest_age_h = (now_ts - newest_ts) / 3600 if newest_ts else None
+                    stale = ((build_age_h is not None and build_age_h > STALE_FEED_BUILD_HOURS) or
+                             (newest_age_h is not None and newest_age_h > STALE_FEED_ITEM_HOURS))
+                    age_txt = (f"lastBuildDate {build_age_h:.1f}h old" if build_age_h is not None else "no lastBuildDate") + \
+                              (f", newest item {newest_age_h:.1f}h old" if newest_age_h is not None else "")
+                    if stale:
+                        stale_items = items
+                        print(f"  ⚠ {label} ({domain_label}{'' if not use_plain_url else ', no cache-buster'}): "
+                              f"STALE copy — {age_txt}")
+                        if not use_plain_url and not is_last_attempt:
+                            use_plain_url = True
+                            continue
+                        break   # next domain (or give up below)
+                    print(f"  ✓ {label}: {age_txt}")
+
                 if domain_idx > 0:
                     print(f"  ⚠ {label}: fell back to {domain_label}")
                 print(f"  ✓ {label}: {len(items)} items")
@@ -377,6 +429,12 @@ async def fetch_feed(client: httpx.AsyncClient, source_key: str, label: str, url
                     continue
                 print(f"  ⚠ {label} ({domain_label}): exhausted retries — {type(e).__name__}: {e or '(no message)'}")
 
+    if stale_items is not None:
+        # Only an old copy was available: hand it on (harmless, dedup-ed) but report
+        # failure so the R2 files are not overwritten with it.
+        print(f"  ✗ {label}: only STALE copies on every attempt — keeping existing R2 data; "
+              f"no new NSE filings can be seen this run")
+        return source_key, stale_items, False
     if got_empty_after_all_retries:
         print(f"  ✗ {label}: got 0 items on every attempt across {len(urls_to_try)} domain(s) — "
               f"treating as failure (implausible for this feed), keeping existing data")
