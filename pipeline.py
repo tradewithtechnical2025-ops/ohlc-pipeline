@@ -8,6 +8,7 @@ Usage:
   python pipeline.py daily
   python pipeline.py today
   python pipeline.py full
+  python pipeline.py backfill_missing [SYM1,SYM2]  # fill missing stocks / days; no symbols = auto-detect
   python pipeline.py status
   python pipeline.py fund_daily
   python pipeline.py fund_full
@@ -927,6 +928,36 @@ async def run_full() -> None:
         status.failure(e)
 
 
+BACKFILL_GAP_SESSIONS = 30   # auto mode: look for missing days in this many recent market sessions
+
+
+def _detect_recent_gaps(all_data, ikey_map, sessions=BACKFILL_GAP_SESSIONS, min_share=0.5):
+    """Symbols that miss a recent market session they should have.
+    A market session = a date on which at least `min_share` of the stocks have a candle
+    (so a stray bar on a holiday does not count). A stock is flagged only for sessions
+    after its own first candle, so a new listing is not flagged for days before it listed.
+    Note: a suspended / non-traded stock has no candle at Upstox either; refetching it
+    simply adds nothing."""
+    from collections import Counter
+    count = Counter()
+    for s in all_data.values():
+        count.update(set(str(d)[:10] for d in (s.get("d") or [])[-sessions * 2:]))
+    if not count:
+        return []
+    n_stocks = len(all_data)
+    market = sorted(d for d, c in count.items() if c >= min_share * n_stocks)[-sessions:]
+    out = []
+    for sym in ikey_map:
+        s = all_data.get(sym)
+        if not s or not s.get("d"):
+            continue
+        have = set(str(d)[:10] for d in s["d"])
+        first = str(s["d"][0])[:10]
+        if any(d >= first and d not in have for d in market):
+            out.append(sym)
+    return out
+
+
 async def run_backfill_missing(symbols_arg: str | None = None) -> None:
     """Targeted repair for the 'many stocks missing OHLC after the last run'
     situation — refetches ONLY the affected symbols and merges them into the
@@ -939,6 +970,8 @@ async def run_backfill_missing(symbols_arg: str | None = None) -> None:
       3. any symbol in the ISIN map that's either absent from the current
          R2 data entirely, or has fewer than MIN_HISTORY_DAYS candles
          (a common sign of a partial/interrupted fetch)
+         or is missing a day in the last BACKFILL_GAP_SESSIONS market sessions
+         (a failed daily run leaves such a gap, which run_daily never refills)
 
     Duplicate-candle safety: this reuses merge_candles_into(), the same
     function run_daily() uses for its own gap-fill. It merges by date —
@@ -959,23 +992,34 @@ async def run_backfill_missing(symbols_arg: str | None = None) -> None:
 
             all_data = await download_all_chunks(client)
 
-            if symbols_arg:
-                targets = [s.strip() for s in symbols_arg.split(",") if s.strip()]
+            if symbols_arg and symbols_arg.strip():
+                # Upper-case so "infy" from the workflow form matches "INFY" in the map.
+                targets = [s.strip().upper() for s in symbols_arg.split(",") if s.strip()]
+                log.info(f"Symbols from command line: {targets}")
             elif (HERE / "failed_stocks.txt").exists():
                 targets = [s.strip() for s in (HERE / "failed_stocks.txt").read_text().splitlines() if s.strip()]
                 log.info(f"Using failed_stocks.txt: {len(targets)} symbols")
             else:
-                targets = [sym for sym in ikey_map
-                           if sym not in all_data or len(all_data[sym].get("d", [])) < MIN_HISTORY_DAYS]
-                log.info(f"Auto-detected {len(targets)} symbols missing or under {MIN_HISTORY_DAYS} candles")
+                short = [sym for sym in ikey_map
+                         if sym not in all_data or len(all_data[sym].get("d", [])) < MIN_HISTORY_DAYS]
+                log.info(f"Auto-detected {len(short)} symbols missing or under {MIN_HISTORY_DAYS} candles")
+                # Also catch stocks with full history but a missing day in the recent
+                # sessions (e.g. a daily run that failed): run_daily() only fetches
+                # prev→today for existing stocks, so such a gap is never filled later.
+                gapped = _detect_recent_gaps(all_data, ikey_map, BACKFILL_GAP_SESSIONS)
+                log.info(f"Auto-detected {len(gapped)} symbols with a missing day in the last {BACKFILL_GAP_SESSIONS} sessions")
+                targets = sorted(set(short) | set(gapped))
 
+            unknown = [s for s in targets if s not in ikey_map]
+            if unknown:
+                log.warning(f"  Not in the instrument map, skipped (check the symbol / BSE code): {unknown[:30]}")
             targets = [s for s in targets if s in ikey_map]
             if not targets:
                 log.info("Nothing to backfill — all target symbols already have full history")
                 status.success(); return
 
             log.info(f"━━━ Backfill  {start} → {today}  ({len(targets)} symbols) ━━━")
-            ok = 0; failed = []
+            ok = 0; failed = []; total_added = 0
             for i in range(0, len(targets), 50):
                 chunk = targets[i:i+50]
                 results = await asyncio.gather(*[
@@ -984,15 +1028,19 @@ async def run_backfill_missing(symbols_arg: str | None = None) -> None:
                 for sym, candles in results:
                     if candles:
                         added = merge_candles_into(all_data, sym, candles, cutoff)
-                        ok += 1
-                        log.info(f"  {sym}: +{added} candle(s)")
+                        ok += 1; total_added += added
+                        log.info(f"  {sym}: +{added} candle(s)  (now {len(all_data[sym]['d'])} candles, "
+                                 f"{all_data[sym]['d'][0]} → {all_data[sym]['d'][-1]})")
                     else:
                         failed.append(sym)
                 pct = min(i+50, len(targets))
                 log.info(f"  {pct}/{len(targets)}  OK:{ok}  Failed:{len(failed)}")
 
-            apply_rolling_window(all_data, cutoff)
-            await upload_all_chunks(client, all_data, today)
+            if total_added:
+                apply_rolling_window(all_data, cutoff)
+                await upload_all_chunks(client, all_data, today)
+            else:
+                log.info("No new candles added — R2 chunks left untouched")
 
             if failed:
                 (HERE / "failed_stocks.txt").write_text("\n".join(failed))
