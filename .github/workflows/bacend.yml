@@ -6,6 +6,10 @@ name: OHLC Pipeline Scans (Manual)
 # Option values must be the exact pipeline.py mode names (no spaces).
 # public_alerts*: EOD summaries to the public Telegram group (@twt_alerts).
 #   public_alerts_dryrun = messages in the log only, public_alerts_ping = one test message per topic.
+# backfill_missing: fills missing OHLC in the R2 chunks.
+#   With "symbols" (e.g. INFY,TCS or a BSE code) -> only those stocks.
+#   With "symbols" empty -> auto-detects stocks that are missing, have short history,
+#   or miss a day in the last 30 market sessions.
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +20,7 @@ on:
         type: choice
         options:
           - status
+          - backfill_missing
           - vcp_scan
           - minervini_scan
           - stage2_scan
@@ -35,6 +40,11 @@ on:
           - public_alerts_ping
           - user_alerts_dryrun
           - user_alerts
+      symbols:
+        description: 'backfill_missing only: comma-separated symbols (e.g. INFY,TCS). Leave empty to auto-detect.'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   pipeline-scan:
@@ -60,4 +70,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_PUBLIC_CHAT_ID: ${{ secrets.TELEGRAM_PUBLIC_CHAT_ID }}
-        run: python pipeline.py "${{ inputs.mode }}"
+          MODE: ${{ inputs.mode }}
+          SYMBOLS: ${{ inputs.symbols }}
+        run: |
+          if [ "$MODE" = "backfill_missing" ]; then
+            python pipeline.py "$MODE" "$SYMBOLS"
+          else
+            python pipeline.py "$MODE"
+          fi
