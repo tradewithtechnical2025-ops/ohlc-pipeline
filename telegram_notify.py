@@ -176,6 +176,43 @@ def send_public(text: str, thread_id: int | None = None, silent: bool = False) -
                         thread_id=thread_id, bot_token=TELEGRAM_PUBLIC_BOT_TOKEN)
 
 
+def send_photo(png: bytes, caption: str = "", silent: bool = False, chat_id: str = "",
+               thread_id: int | None = None, bot_token: str = "") -> bool:
+    """Send a PNG (bytes) with an HTML caption (max 1024 chars). Same chat / topic / token
+    rules as send_message. Returns True on success."""
+    target_chat_id = str(chat_id or TELEGRAM_CHAT_ID).strip()
+    token = str(bot_token or TELEGRAM_BOT_TOKEN).strip()
+    if token.lower().startswith("bot"):
+        token = token[3:]
+    if not token or not target_chat_id or not png:
+        print("[telegram_notify] Token, chat_id or image missing — skipping photo.")
+        return False
+    data = {"chat_id": target_chat_id, "caption": caption[:1024], "parse_mode": "HTML",
+            "disable_notification": "true" if silent else "false"}
+    if thread_id:
+        data["message_thread_id"] = str(int(thread_id))
+    try:
+        resp = requests.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data,
+                             files={"photo": ("card.png", png, "image/png")}, timeout=30)
+        if resp.ok:
+            return True
+        try:
+            reason = resp.json().get("description", "")
+        except Exception:
+            reason = resp.text[:200]
+        print(f"[telegram_notify] Failed to send photo: HTTP {resp.status_code} {reason} (chat {target_chat_id})")
+        return False
+    except Exception as exc:
+        print(f"[telegram_notify] Failed to send photo: {exc.__class__.__name__}")
+        return False
+
+
+def send_public_photo(png: bytes, caption: str = "", thread_id: int | None = None, silent: bool = False) -> bool:
+    """Send a PNG to the public alerts group (TELEGRAM_PUBLIC_*), into one topic."""
+    return send_photo(png, caption, silent=silent, chat_id=TELEGRAM_PUBLIC_CHAT_ID,
+                      thread_id=thread_id, bot_token=TELEGRAM_PUBLIC_BOT_TOKEN)
+
+
 # ──────────────────────────────────────────────
 # Convenience shortcut
 # ──────────────────────────────────────────────
