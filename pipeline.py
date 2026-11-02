@@ -7924,8 +7924,9 @@ async def _pr_wait(page, js, timeout_s, label, required=True):
         return False
 
 
-async def _pr_run_screener(snaps):
-    """snaps: {key: snapshot}. Returns (today_day, prev_day, today{key: res}, prev{key: res})."""
+async def _pr_run_screener(snaps, wl_syms=None):
+    """snaps: {key: snapshot}; wl_syms: symbols of watchlist alerts. Returns
+    (today_day, prev_day, today{key: res}, prev{key: res}, wl_today{sym: state}, wl_prev{sym: state})."""
     from playwright.async_api import async_playwright
     email, password = os.environ.get("TWT_BOT_EMAIL"), os.environ.get("TWT_BOT_PASSWORD")
     if not email or not password:
@@ -7959,20 +7960,23 @@ async def _pr_run_screener(snaps):
         await _pr_wait(page, _PR_EXTRAS_JS, 90, "box / HTF / shakeout", required=False)
         await page.wait_for_timeout(3000)
         today_day = str(await page.evaluate("() => window._dataAsOfDate"))[:10]
-        today = await page.evaluate(_PR_EVAL_JS, snaps)
+        today = await page.evaluate(_PR_EVAL_JS, snaps) if snaps else {}
+        wl_list = sorted(wl_syms or [])
+        wl_today = await page.evaluate(_WL_STATE_JS, wl_list) if wl_list else {}
         # 2. the previous session in History mode
         prev_day = await page.evaluate("""async (d) => {
             var ds = await _historyFetchManifest(true);
             return (ds || []).filter(function (x) { return x < d; }).sort().pop() || null;
         }""", today_day)
-        prev = {}
+        prev, wl_prev = {}, {}
         if prev_day:
             await page.evaluate("async (d) => { await loadHistoryDate(d); }", prev_day)
             await _pr_wait(page, f"() => typeof _historyMode !== 'undefined' && _historyMode && String(_historyDate).slice(0, 10) === '{prev_day}'", 120, "history date")
             await page.wait_for_timeout(2000)
-            prev = await page.evaluate(_PR_EVAL_JS, snaps)
+            prev = await page.evaluate(_PR_EVAL_JS, snaps) if snaps else {}
+            wl_prev = await page.evaluate(_WL_STATE_JS, wl_list) if wl_list else {}
         await browser.close()
-        return today_day, prev_day, today, prev
+        return today_day, prev_day, today, prev, wl_today, wl_prev
 
 
 def _pr_esc(t):
@@ -8053,6 +8057,119 @@ async def _pr_send_document(client, chat_id, filename, data, caption=None):
         log.warning(f"  sendDocument failed: {e}"); return False
 
 
+# ══════════════════════════════════════════════════════════════
+# WATCHLIST ALERTS — a user's screener watchlist on Telegram (Pro), run inside preset_alerts
+# The Worker stores one row per watchlist (kind = 'watchlist', snap = {v, wl, syms, ev}). The same headless
+# screener session reads every watched stock today and on the previous session (History mode); each event
+# is "new today" (today vs the previous session) or a today-only fact (52-week high, results due, volume).
+# One digest per watchlist, only when something the user ticked happened.
+# ev keys: box_bo near_bo h52 ath ema50_up ema50_dn ema200 st2 st4 setups res_decl (flags),
+#          rs (cross level), res_due (days ahead), vol (x average), move (abs day %)
+# ══════════════════════════════════════════════════════════════
+WL_SHOW_MAX = 40
+_WL_SETUP_RE = re.compile(r"(^|[^A-Za-z])(EP|VCP|HTF)([^A-Za-z]|$)|episodic|high tight|pullback|shakeout", re.I)
+# per stock: [ltp, ch, rs, above50, above200, wstage, box status, box top, high, wh52, ath, signals, results, declared, rvol, tv, label]
+_WL_STATE_JS = """async (syms) => {
+  var out = {}, by = {};
+  try { (allStocks || []).forEach(function (s) { if (s && s.stock) by[s.stock] = s; }); } catch (e) { return out; }
+  var dec = window._declaredResultsMap || {};
+  var n = function (v) { v = parseFloat(v); return isFinite(v) ? v : null; };
+  var b = function (v) { return v === true || v === 1 || v === 'true' ? true : (v === false || v === 0 || v === 'false' ? false : null); };
+  syms.forEach(function (sym) {
+    var s = by[sym]; if (!s) return;
+    var bx = null; try { bx = typeof window.bscanInfo === 'function' ? window.bscanInfo(sym) : null; } catch (e) { bx = null; }
+    var tv = (s.exchange || 'NSE') + ':' + String(s.trading_symbol || s.stock).replace(/,/g, '');
+    var label = /^\\d+$/.test(String(s.stock)) && s.trading_symbol ? s.trading_symbol : s.stock;
+    var d = dec[sym] || dec[String(sym).toUpperCase()] || null;
+    out[sym] = [n(s.ltp), n(s.ch), n(s.rs), b(s.above_50), b(s.above_200), n(s.w_stage), bx ? (bx.status || null) : null, bx ? n(bx.top) : null,
+      n(s.high), n(s.wh52), n(s.ath), Array.isArray(s.signals) ? s.signals.map(String) : [], s.results ? String(s.results).slice(0, 10) : null,
+      d ? String(d).slice(0, 10) : null, n(s.rvol), tv, label];
+  });
+  return out;
+}"""
+
+
+def _wl_day_txt(d):
+    try: return date.fromisoformat(d).strftime("%d %b").lstrip("0")
+    except (TypeError, ValueError): return str(d)
+
+
+def _wl_events(ev, t, y, today_day):
+    """t / y: today's and the previous session's state rows (y may be None). Returns event texts."""
+    out = []
+    ltp, ch, rs, a50, a200, st, box, top, high, wh52, ath, sig, res, dec, rvol = t[:15]
+    py = y if y else None
+    # box breakout today: Base Scan says BO and the close crossed the box top today (same rule as Lens)
+    if ev.get("box_bo") and box == "BO":
+        prev_close = ltp / (1 + ch / 100) if ltp and ch is not None and ch > -100 else None
+        if top and ltp and ltp > top and (prev_close is None or prev_close <= top or (py and py[6] != "BO")):
+            out.append("Box breakout" + (f" (box top ₹{top:,.2f})" if top else ""))
+    if ev.get("near_bo") and box in ("Near BO", "Consolidation Near BO") and py and py[6] not in ("Near BO", "Consolidation Near BO"):
+        out.append("Near breakout" + (f" (box top ₹{top:,.2f})" if top else ""))
+    if ev.get("ath") and high and ath and high >= ath:
+        out.append("All-time high")
+    elif ev.get("h52") and high and wh52 and high >= wh52:
+        out.append("New 52-week high")
+    if py:
+        if ev.get("ema50_up") and a50 is True and py[3] is False: out.append("Closed above 50 EMA")
+        if ev.get("ema50_dn") and a50 is False and py[3] is True: out.append("Closed below 50 EMA")
+        if ev.get("ema200") and a200 is not None and py[4] is not None and a200 != py[4]:
+            out.append("Closed above 200 EMA" if a200 else "Closed below 200 EMA")
+        if ev.get("st2") and st == 2 and py[5] is not None and py[5] != 2: out.append("Entered Stage 2")
+        if ev.get("st4") and st == 4 and py[5] is not None and py[5] != 4: out.append("Entered Stage 4")
+        if ev.get("setups"):
+            new_sig = [x for x in sig if _WL_SETUP_RE.search(x) and x not in set(py[11] or [])]
+            if new_sig: out.append("New signal: " + ", ".join(new_sig[:3]))
+        lvl = ev.get("rs")
+        if lvl and rs is not None and py[2] is not None and py[2] < lvl <= rs:
+            out.append(f"RS rating crossed {lvl:g} ({py[2]:g} → {rs:g})")
+    due = ev.get("res_due")
+    if due and res:
+        try:
+            days = (date.fromisoformat(res) - date.fromisoformat(today_day)).days
+            if 1 <= days <= due:
+                out.append(f"Results tomorrow ({_wl_day_txt(res)})" if days == 1 else f"Results in {days} days ({_wl_day_txt(res)})")
+        except ValueError:
+            pass
+    if ev.get("res_decl") and dec and dec == today_day:
+        out.append("Results declared")
+    vx = ev.get("vol")
+    if vx and rvol is not None and rvol >= vx:
+        out.append(f"Volume {rvol:.1f}x average")
+    mv = ev.get("move")
+    if mv and ch is not None and abs(ch) >= mv:
+        out.append(f"Moved {ch:+.1f}% today")
+    return out
+
+
+def _wl_message(a, day, hits, total):
+    """hits: [(row, [event texts])]. One message per watchlist; long lists are cut to fit Telegram."""
+    name = _pr_esc(a.get("pname") or a.get("name") or "Watchlist")
+    head = [f"🔔 <b>{name}</b> · {_wl_day_txt(day)}"]
+    tail = [f"<i>{len(hits)} of {total} stock{'s' if total != 1 else ''}</i>"]
+    if a.get("exp"):
+        try: tail.append(f"Until {date.fromisoformat(str(a['exp'])[:10]).strftime('%d %b')}")
+        except ValueError: pass
+    if a.get("msg"): tail += ["", f"📝 {_pr_esc(a['msg'])}"]
+    tail += ["", f'<a href="{PR_SITE_URL}{PR_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
+
+    def build(cap):
+        out = list(head)
+        for row, evs in hits[:cap]:
+            ltp, ch = row[0], row[1]
+            px = (f" ₹{ltp:,.2f}" if ltp else "") + (f" ({ch:+.1f}%)" if ch is not None else "")
+            out += ["", f"<b>{_pr_esc(row[16])}</b>{px}", "• " + _pr_esc(" · ".join(evs))]
+        if len(hits) > cap: out += ["", f"+{len(hits) - cap} more"]
+        out.append("")
+        return "\n".join(out + tail)
+    cap = WL_SHOW_MAX
+    text = build(cap)
+    while len(text) > 3900 and cap > 3:
+        cap = cap * 8 // 10
+        text = build(cap)
+    return text
+
+
 async def run_preset_alerts(dry_run=False, force=False) -> None:
     """force: ignore "already sent for this session" (testing; PR_FORCE=1 or --force)."""
     from telegram_notify import send_message
@@ -8061,9 +8178,19 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
         r = await client.get(f"{WORKER_URL}/alerts/active", headers=WORKER_HEADERS, timeout=60)
         if r.status_code != 200:
             log.warning(f"Preset alerts: /alerts/active answered HTTP {r.status_code} — nothing checked"); return
-        alerts = [a for a in ((r.json() or {}).get("alerts") or []) if a.get("kind") == "preset" and a.get("snap")]
-        log.info(f"Preset alerts: {len(alerts)} active preset alert(s) of linked users")
-        if not alerts: return
+        active = (r.json() or {}).get("alerts") or []
+        alerts = [a for a in active if a.get("kind") == "preset" and a.get("snap")]
+        wl_alerts = [a for a in active if a.get("kind") == "watchlist" and a.get("snap")]
+        log.info(f"Preset alerts: {len(alerts)} active preset alert(s), {len(wl_alerts)} watchlist alert(s) of linked users")
+        if not alerts and not wl_alerts: return
+        wl_specs, wl_syms = {}, set()
+        for a in wl_alerts:
+            try: sn = json.loads(a["snap"]) if isinstance(a["snap"], str) else a["snap"]
+            except (TypeError, ValueError): log.warning(f"  {a.get('id')}: bad watchlist snapshot"); continue
+            syms = [str(x) for x in (sn.get("syms") or [])][:300]
+            ev = sn.get("ev") or {}
+            if not syms or not ev: continue
+            wl_specs[a["id"]] = (syms, ev); wl_syms.update(syms)
         snaps, key_of = {}, {}
         for a in alerts:
             try: snap = json.loads(a["snap"]) if isinstance(a["snap"], str) else a["snap"]
@@ -8071,7 +8198,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
             k = json.dumps(snap, sort_keys=True)
             key_of[a["id"]] = k; snaps[k] = snap
         log.info(f"Preset alerts: {len(snaps)} distinct preset(s) to evaluate")
-        today_day, prev_day, today, prev = await _pr_run_screener(snaps)
+        today_day, prev_day, today, prev, wl_today, wl_prev = await _pr_run_screener(snaps, wl_syms)
         log.info(f"Preset alerts: today {today_day}, previous session {prev_day}")
         fired = []
         for a in alerts:
@@ -8108,6 +8235,37 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 fired.append({"uid": a["uid"], "id": a["id"], "day": today_day, "price": len(rows), "level": len(new_rows)})
             else:
                 log.warning(f"  preset alert {a['id']}: Telegram send failed — will retry next run")
+            await asyncio.sleep(0.05)
+        # watchlist alerts: one digest per watchlist
+        if wl_specs and not wl_prev:
+            log.warning("Watchlist alerts: previous session not available — only today-only events (52W high, results, volume, move) are checked")
+        for a in wl_alerts:
+            spec = wl_specs.get(a["id"])
+            if not spec: continue
+            syms, ev = spec
+            tag = f"  {a['id']} ({a.get('pname')}, watchlist):"
+            if a.get("exp") and today_day > str(a["exp"])[:10]:
+                log.info(f"{tag} expired on {a['exp']} — skipped"); continue
+            if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
+                log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
+            hits = []
+            for sym in syms:
+                t = wl_today.get(sym)
+                if not t: continue
+                evs = _wl_events(ev, t, wl_prev.get(sym), today_day)
+                if evs: hits.append((t, evs))
+            log.info(f"{tag} {len(syms)} stocks, {len(hits)} with events")
+            if not hits: continue
+            hits.sort(key=lambda h: (-len(h[1]), -(h[0][2] or 0)))
+            msg = _wl_message(a, today_day, hits, len(syms))
+            if dry_run:
+                log.info(f"--- {a.get('uid')} {a.get('pname')} ({len(hits)} of {len(syms)}) ---\n{msg}")
+                continue
+            ok = send_message(msg, chat_id=str(a.get("chat_id")))
+            if ok:
+                fired.append({"uid": a["uid"], "id": a["id"], "day": today_day, "price": len(hits), "level": len(syms)})
+            else:
+                log.warning(f"  watchlist alert {a['id']}: Telegram send failed — will retry next run")
             await asyncio.sleep(0.05)
         if fired:
             r2 = await client.post(f"{WORKER_URL}/alerts/fired", headers={**WORKER_HEADERS, "Content-Type": "application/json"},
