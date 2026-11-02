@@ -3288,11 +3288,13 @@ def main():
             for k in ("event_type", "stage"):
                 x.pop(k, None)
             x.update(_event_meta(x.get("subject", ""), x.get("text", ""), cat))
-            if cat == "Negative" and (x.get("cancels") or (x.get("category_override") == "Negative"
-                                                         and (_ORDER_CANCEL.search(f"{x.get('subject', '')} {x.get('text', '')}")
-                                                              or _ORDER_REVOKED.search(f"{x.get('subject', '')} {x.get('text', '')}")))):
+            _neg_txt = f"{x.get('subject', '')} {x.get('text', '')}"
+            # A revoked award is reclassified to Negative with no override, so it is matched directly.
+            if cat == "Negative" and (x.get("cancels") or _ORDER_REVOKED.search(_neg_txt)
+                                      or (x.get("category_override") == "Negative" and _ORDER_CANCEL.search(_neg_txt))):
                 x["negative_type"], x["negative_stage"] = "Order Cancellation", "Cancelled"
-                x.pop("authority", None)
+                for _k in ("authority", "tax_demand_cr", "tax_demand_text"):
+                    x.pop(_k, None)
                 if x.get("amount_cr") is None and x.get("cancels"):
                     _o = next((y for y in history.get(sym, []) if y.get("id") == x["cancels"]), None)
                     if _o and _o.get("order_value_cr") is not None:
