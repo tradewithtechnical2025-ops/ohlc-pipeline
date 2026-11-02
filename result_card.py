@@ -4,6 +4,7 @@
     png = render_result_card({
         "name": "WeWork India Management Limited", "symbol": "WEWORK",
         "quarter": "Q2 FY27", "audit": "Unaudited", "date": "2026-10-26",
+        "grade": {"label": "Good", "flags": ["Weaker than last quarter"]},   # optional, from pipeline_news._result_grade
         "sections": [{
             "title": "Consolidated",
             "cols": ["Sep'26", "Jun'26", "Sep'25"],          # current, previous quarter, year ago
@@ -16,6 +17,8 @@
         }],
     })
 Only Pillow is needed. Fonts: DejaVu (on GitHub's Ubuntu runners), Inter when installed.
+Optional "grade": {"label": Excellent / Good / Mixed / Weak / Turnaround, "flags": [...]} draws a
+coloured pill under the subtitle (label only; flags are not drawn).
 Changes: kind "pct" = % change (from a loss, measured on the size of the loss, so + means better);
 kind "pp" = change in points (margins). A turn from / into a loss is spelled out in a note under
 the table, e.g. "PAT QoQ: loss to profit (-4.3 → 20.3)".
@@ -53,6 +56,10 @@ BG, CARD, LINE = (243, 246, 250), (255, 255, 255), (222, 228, 236)
 TXT, MUT, ACC = (15, 23, 42), (100, 116, 139), (2, 132, 199)
 GRN, RED, AMB = (22, 163, 74), (220, 38, 38), (180, 83, 9)
 TAG_BG = (224, 242, 254)    # symbol pill background
+# Result grade pill: (text colour, background)
+GRADE_COL = {"Excellent": ((21, 128, 61), (220, 252, 231)), "Good": ((3, 105, 161), (224, 242, 254)),
+             "Mixed": ((180, 83, 9), (254, 243, 199)), "Weak": ((185, 28, 28), (254, 226, 226)),
+             "Turnaround": ((109, 40, 217), (237, 233, 254))}
 
 
 def _num(v, dec=1, kind="pct"):
@@ -115,6 +122,13 @@ def render_result_card(d, scale=2):
         secs.append((sec, rows, notes))
 
     head_h = S(84)
+    gr = d.get("grade") or None
+    if gr and gr.get("label") not in GRADE_COL:
+        gr = None
+    if gr:                                              # grade pill only (flags stay in the data, not on the card)
+        f_gr = _font(True, S(12))
+        pill_w = ImageDraw.Draw(Image.new("RGB", (1, 1))).textlength(gr["label"].upper(), font=f_gr) + S(20)
+        head_h += S(32)
     body_h = 0
     for sec, rows, notes in secs:
         # table box (rows + header + 10) + 10 gap below it + notes + 14 — same steps as the drawing loop
@@ -142,6 +156,12 @@ def render_result_card(d, scale=2):
         g.text((W - pad - tw - S(8), S(24)), sym, font=f_tag, fill=ACC)
     sub = " · ".join(str(x) for x in [d.get("quarter"), d.get("audit"), f"Result {d['date']}" if d.get("date") else None] if x)
     g.text((pad, S(50)), sub, font=f_sub, fill=MUT)
+    if gr:                                              # grade pill
+        fc, bc = GRADE_COL[gr["label"]]
+        lbl = gr["label"].upper()
+        gy = S(74)
+        g.rounded_rectangle([pad, gy, pad + pill_w, gy + S(22)], radius=S(6), fill=bc)
+        g.text((pad + S(10), gy + S(4)), lbl, font=f_gr, fill=fc)
 
     # ── sections
     y = head_h
@@ -190,6 +210,7 @@ if __name__ == "__main__":
     png = render_result_card({
         "name": "WeWork India Management Limited", "symbol": "WEWORK",
         "quarter": "Q2 FY27", "audit": "Unaudited", "date": "2026-10-26",
+        "grade": {"label": "Good", "flags": ["Weaker than last quarter"]},
         "sections": [{"title": "Consolidated", "cols": ["Sep'26", "Jun'26", "Sep'25"],
                       "rows": [R("Sales", 767.8, 683.8, 574.7), R("OP", 490.1, 438.0, 380.1), R("PAT", 20.3, -4.3, 6.3),
                                R("EPS", 1.46, -0.31, 0.47, 2), R("OPM%", 63.8, 64.0, 66.1, 1, "pp")],
