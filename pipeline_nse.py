@@ -54,6 +54,10 @@ try:
 except ImportError:
     def send_public(text, thread_id=None, silent=False): return False
     PUBLIC_TOPICS, TELEGRAM_PUBLIC_CHAT_ID = {}, ""
+try:
+    from telegram_notify import send_photo, send_public_photo
+except ImportError:                       # older telegram_notify.py: the FII / DII alert goes as text
+    send_photo = send_public_photo = None
 
 from collections import defaultdict
 
@@ -872,6 +876,61 @@ def _fii_dii_message(snap: dict, hist: list, oi_snapshot) -> list:
     return lines
 
 
+def _fii_dii_card(snap: dict, hist: list, oi_snapshot):
+    """(png, caption) for the FII / DII alert as an image card (fii_card.py), or (None, "") when the
+    card can't be made — the caller then sends the text message from _fii_dii_message()."""
+    try:
+        from fii_card import render_fii_card
+    except Exception as e:
+        print(f"  (FII / DII card off: {e})")
+        return None, ""
+    try:
+        d = date.fromisoformat(snap["date"])
+        d_txt = d.strftime("%a %d %b %Y")
+    except (KeyError, ValueError):
+        d, d_txt = None, str(snap.get("date") or "")
+    rows = sorted((h for h in (hist or []) if isinstance(h, dict) and h.get("date")), key=lambda h: h["date"])
+    last5 = []
+    for h in rows[-5:]:
+        try: dl = date.fromisoformat(h["date"]).strftime("%d %b")
+        except ValueError: dl = h["date"][5:]
+        last5.append((dl, (h.get("fii") or {}).get("net"), (h.get("dii") or {}).get("net")))
+    mtd = None
+    if d:
+        m = [h for h in rows if h["date"][:7] == d.isoformat()[:7]]
+        if m:
+            mtd = {"month": d.strftime("%b"),
+                   "fii": sum(((h.get("fii") or {}).get("net") or 0) for h in m),
+                   "dii": sum(((h.get("dii") or {}).get("net") or 0) for h in m)}
+    fut = None
+    if oi_snapshot and oi_snapshot.get("date") == snap.get("date"):
+        f = (oi_snapshot.get("participants") or {}).get("FII") or {}
+        fut = {"long": f.get("fut_idx_long") or 0, "short": f.get("fut_idx_short") or 0}
+    try:
+        png = render_fii_card({"date": d_txt, "fii": snap.get("fii") or {}, "dii": snap.get("dii") or {},
+                               "last5": last5, "mtd": mtd, "fut": fut})
+    except Exception as e:
+        print(f"  ⚠ FII / DII card failed: {e}")
+        return None, ""
+    caption = f"<b>💰 FII / DII Activity</b> · {d_txt}\n\n" + '<a href="https://tradewithtech.in">FII / DII on TradeWithTech</a>'
+    return png, caption
+
+
+def _send_fii_dii(snap: dict, hist: list, oi_snapshot) -> None:
+    """FII / DII alert: the image card first; the text message when the card can't be made or sent."""
+    png, caption = _fii_dii_card(snap, hist, oi_snapshot)
+    if png and send_photo:
+        thread = PUBLIC_TOPICS.get("fiidii")
+        for attempt in range(3):
+            ok = send_public_photo(png, caption, thread_id=thread) if TELEGRAM_PUBLIC_CHAT_ID else send_photo(png, caption)
+            if ok:
+                print("  Telegram fiidii card: sent")
+                return
+            time.sleep(5 * (attempt + 1))
+        print("  Telegram fiidii card: FAILED — sending the text message instead")
+    _send_alert(_fii_dii_message(snap, hist, oi_snapshot), "fiidii")
+
+
 def _band_sort_val(chg: dict) -> int:
     """
     Sort key for circuit-band Telegram alert ordering. `to` is usually a
@@ -1309,7 +1368,7 @@ async def run():
 
         # ── FII / DII Telegram alert (once per new trading day) ─────────
         if fii_dii_new_day or (force_alerts and fii_dii_snapshot and fii_dii_snapshot.get("date")):
-            _send_alert(_fii_dii_message(fii_dii_snapshot, fii_dii_hist, oi_snapshot), "fiidii")
+            _send_fii_dii(fii_dii_snapshot, fii_dii_hist, oi_snapshot)
 
         status.set("bands", len(bands))
         status.set("circuit_changes", len(changes))
