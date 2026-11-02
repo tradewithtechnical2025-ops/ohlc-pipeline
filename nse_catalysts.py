@@ -253,6 +253,11 @@ _ORDER = re.compile(
 _ORDER_PRE_BID = re.compile(
     r"bid submitted|submission of bid|tender participation|participat(?:e|ion).*tender|"
     r"expression of interest|\beoi\b|pre[- ]qualification|technical bid qualified", re.I)
+# Revocation counts only for an award document. A bare "order revoked" is usually a
+# tax or regulatory order being withdrawn, which is good news for the company.
+_ORDER_REVOKED = re.compile(
+    r"(?:revocation|revoked|revoke)\W+(?:\w+\W+){0,6}?(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|contract)|"
+    r"(?:letter of (?:award|acceptance|intent)|\blo[ai]\b|work order|purchase order|contract)\W+(?:\w+\W+){0,6}?(?:revoked|revocation)", re.I)
 _ORDER_CANCEL = re.compile(
     r"(?:order|contract|letter of (?:award|acceptance|intent)|\blo[ai]\b).*(?:cancelled|canceled|terminated|withdrawn|annulled|short[- ]?closed)|"
     r"(?:cancell?ation|termination|withdrawal|annulment|short[- ]?closure).*(?:order|contract|letter of (?:award|acceptance|intent)|\blo[ai]\b)", re.I)
@@ -435,7 +440,7 @@ def classify(subject: str, text: str) -> str | None:
         return "Negative"
 
     # Cancellation/termination of an order is adverse, never a fresh Order win.
-    if _ORDER_CANCEL.search(both) or _ADVERSE_TAX_ORDER.search(both):
+    if _ORDER_CANCEL.search(both) or _ORDER_REVOKED.search(both) or _ADVERSE_TAX_ORDER.search(both):
         return "Negative"
     if _NEGATIVE.search(both):
         return "Negative"
@@ -2349,7 +2354,8 @@ def _order_doc_check(pdf_text: str, nse_text: str) -> dict:
     subject = _pdf_subject(pdf_text or "")
     head = f"{nse_text or ''} {subject} {clean[:_HEAD_REGION_CHARS]}"
     out = {"subject": subject}
-    if _CANCEL_RE.search(f"{nse_text or ''} {subject}") or _CANCEL_RE.search(clean[:1200]):
+    if (_CANCEL_RE.search(f"{nse_text or ''} {subject}") or _CANCEL_RE.search(clean[:1200])
+            or _ORDER_REVOKED.search(f"{nse_text or ''} {subject}") or _ORDER_REVOKED.search(clean[:1200])):
         out["doc_type"] = "cancellation"
     elif _PLACED_STRONG_RE.search(head) or (
             # Annexure label alone is ambiguous (some recipients name themselves there),
@@ -2603,6 +2609,24 @@ def _to_cancellation(it: dict, history_items: list, hv: float | None, htxt: str)
 STAGE_CHECK_VERSION = 5        # 5: a signed contract is always Awarded, even if the filing mentions L1
 
 
+def fix_revoked_orders(history: dict) -> None:
+    """Move Order rows whose own text says the award was revoked to Negative. No PDF needed."""
+    fixed = 0
+    for items in history.values():
+        for it in items:
+            if it.get("manual") or it.get("category") != "Order":
+                continue
+            if not _ORDER_REVOKED.search(f"{it.get('subject', '')} {it.get('text', '')} {it.get('order_summary', '')}"):
+                continue
+            value, value_text = it.get("order_value_cr"), it.get("order_value_text")
+            _to_cancellation(it, items, value, value_text)
+            it["order_check_v"] = ORDER_CHECK_VERSION
+            it["stage_check_v"] = STAGE_CHECK_VERSION
+            fixed += 1
+    if fixed:
+        print(f"  🚫 Revoked orders moved to Negative → {fixed}")
+
+
 def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
     """Re-run only the PDF type check on rows whose stage/category the first
     order-check version changed (L1 / LoI / Preferred Bidder / Capex)."""
@@ -2691,7 +2715,8 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
             if it.get("manual") or int(it.get("order_check_v") or 0) >= ORDER_CHECK_VERSION:
                 continue
             cat = it.get("category")
-            is_cancel_neg = cat == "Negative" and _ORDER_CANCEL.search(f"{it.get('subject', '')} {it.get('text', '')}")
+            neg_txt = f"{it.get('subject', '')} {it.get('text', '')}"
+            is_cancel_neg = cat == "Negative" and (_ORDER_CANCEL.search(neg_txt) or _ORDER_REVOKED.search(neg_txt))
             if cat == "Order" or is_cancel_neg:
                 queue.append((it.get("dt", ""), sym, it))
     queue.sort(key=lambda t: t[0], reverse=True)
@@ -3264,7 +3289,8 @@ def main():
                 x.pop(k, None)
             x.update(_event_meta(x.get("subject", ""), x.get("text", ""), cat))
             if cat == "Negative" and (x.get("cancels") or (x.get("category_override") == "Negative"
-                                                         and _ORDER_CANCEL.search(f"{x.get('subject', '')} {x.get('text', '')}"))):
+                                                         and (_ORDER_CANCEL.search(f"{x.get('subject', '')} {x.get('text', '')}")
+                                                              or _ORDER_REVOKED.search(f"{x.get('subject', '')} {x.get('text', '')}")))):
                 x["negative_type"], x["negative_stage"] = "Order Cancellation", "Cancelled"
                 x.pop("authority", None)
                 if x.get("amount_cr") is None and x.get("cancels"):
@@ -3365,6 +3391,7 @@ def main():
     apply_headline_quality(history, market_cap_map, ttm_sales_map)
 
     # One-time re-check of stages/categories set by the first order-check version.
+    fix_revoked_orders(history)
     recheck_order_stages(nse_session, history)
 
     # Order check: heading value → PDF type check → AI only when needed.
