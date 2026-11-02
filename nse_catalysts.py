@@ -2318,6 +2318,11 @@ _PREF_BIDDER_RE = re.compile(r"preferred bidder", re.I)
 _MINING_RE = re.compile(r"mining lease|mineral block|composite licen[cs]e|limestone block|coal block", re.I)
 _LOI_RE = re.compile(r"letter of intent|\bloi\b", re.I)
 _FIRM_AWARD_RE = re.compile(r"letter of (?:award|acceptance)|\bloa\b|work order|purchase order|agreement (?:signed|executed)|contract (?:signed|executed)", re.I)
+# The company states that the contract is already signed. An L1 / LoI mention next to
+# this wording is order history, so it must not pull the row back to a pre-award stage.
+_SIGNED_CONTRACT_RE = re.compile(
+    r"\b(?:has|have)\s+(?:duly\s+)?(?:signed|executed|entered\s+into)\s+(?:an?|the)\s+(?:[\w-]+\s+){0,2}?contract\b|"
+    r"\bcontract\s+(?:has\s+been|have\s+been|was|is)\s+(?:duly\s+)?(?:signed|executed)\b", re.I)
 _ANY_AMOUNT_RE = re.compile(
     r"(?:₹|rs\.?|inr|usd|us\$|eur|€|sgd|aed|gbp|£|\$)\s*[0-9]|[0-9][0-9,.]*\s*(?:crores?|lakhs?|lacs?)\b|"
     r"[0-9][0-9,.]*\s*(?:million|billion)\s*(?:us\s*dollars?|usd|dollars?)", re.I)
@@ -2354,7 +2359,9 @@ def _order_doc_check(pdf_text: str, nse_text: str) -> dict:
         out["doc_type"] = "placed"
     else:
         out["doc_type"] = "received"
-        if _PREF_BIDDER_RE.search(head):
+        if _SIGNED_CONTRACT_RE.search(head):
+            out["stage"], out["event_type"] = "Awarded", "Order Award"
+        elif _PREF_BIDDER_RE.search(head):
             out["stage"] = "Preferred Bidder"
             out["event_type"] = "Mining Lease" if _MINING_RE.search(clean) else "Order Award"
         elif _L1_RE.search(head):
@@ -2593,7 +2600,7 @@ def _to_cancellation(it: dict, history_items: list, hv: float | None, htxt: str)
         it["review_reason"] = f"cancellation matches {len(cands)} earlier orders from {party}"
 
 
-STAGE_CHECK_VERSION = 4
+STAGE_CHECK_VERSION = 5        # 5: a signed contract is always Awarded, even if the filing mentions L1
 
 
 def recheck_order_stages(session, history: dict, limit: int = 30) -> None:
