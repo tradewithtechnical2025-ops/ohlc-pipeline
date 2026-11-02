@@ -2832,6 +2832,175 @@ def _fin_table_data(parsed: dict):
     return {"rows": out, "cols": [cur_header or "Cur", qoq_header or "-", yoy_header or "-"], "note": note}
 
 
+# ── Result grade ────────────────────────────────────────────────────
+# RESULT GRADING RULES — v1 (agreed Nov 2026). Facts only: a label for how the quarter's numbers
+# compare, never a buy / sell view. Computed here for every record (old ones too), so changing a
+# rule below re-grades the whole file on the next run. Stored as parsed["grade"] =
+# {"label", "flags", "why", "rules"} and shown on ep.html, Lens, Screener and the Telegram card.
+#
+# Inputs come from the card table (_fin_table_data): Sales, OP (EBITDA excl. other income), PAT,
+# EPS, OPM%. Banks: Sales = NII, OP = PPOP, no OPM. Insurers: not graded (no comparable lines).
+#
+# Step 1 — grade from YoY (same quarter last year), first rule that matches wins:
+#   1. PAT is a loss this quarter                                  -> Weak  (flag "Loss this quarter")
+#   2. Year-ago PAT was a loss, now a profit, OP YoY >= 0,
+#      and the profit is not thin                                  -> Turnaround
+#   3. OP YoY <= -5% and Sales YoY < +5%                           -> Weak  (if year-ago PAT was a loss:
+#                                                                     flag "Loss -> small profit")
+#   4. Sales >= +15%, OP >= +20%, PAT >= +20%, OPM change >= -1 pp -> Excellent
+#   5. Sales >= +5%, PAT >= +10%, OP >= 0%                          -> Good
+#   6. PAT <= -20%, or Sales and PAT both down                     -> Weak
+#   7. anything else                                               -> Mixed
+#   (OP missing -> PAT is used in its place.)
+#
+# Step 2 — caps (Excellent / Good / Mixed only):
+#   - Thin profit (PAT < 1% of Sales) or Low base (year-ago PAT < 1% of year-ago Sales) -> at most Good
+#   - Other-income led (PAT YoY >= +20% but OP YoY < +5%)                               -> at most Mixed
+#
+# Step 3 — QoQ step-down (option B): if OP or PAT fell 10% or more vs the previous quarter
+#   (prior quarter in profit), Excellent drops to Good and Good to Mixed, and the flag
+#   "Weaker than last quarter" is added. Never goes below Mixed (a QoQ fall alone does not make a
+#   result Weak — e.g. LLOYDSENGG, Sales +87% YoY). Mixed, Weak and Turnaround stay as they are.
+#   Why: YoY avoids seasonality, but a big fall from last quarter should show in the label.
+#
+# Flags (information only, never change the grade):
+#   Margin pressure         OPM YoY <= -2 pp
+#   Profit not keeping up   OP YoY minus PAT YoY > 30 points (year-ago PAT in profit)
+#   EPS diluted             EPS YoY more than 5 points below PAT YoY (share count up). Skipped when
+#                           the share count implied by PAT / EPS moved 1.5x or more — that is a bonus /
+#                           split whose old EPS was not adjusted, not dilution.
+#   Strong QoQ              Sales QoQ >= +15% and PAT QoQ >= +15%
+#   Thin profit, Low base, Other-income led, Weaker than last quarter — as above.
+#
+# Test cases used to settle v1 (Q2 FY27): NATIONALUM and
+# PRASOLCHEM Good (QoQ step-down), BALAMINES Good (PAT -10.3% QoQ), CHOICEIN Excellent + EPS diluted,
+# EPACKPEB and LLOYDSENGG Mixed,
+# DIGITIDE / FLAIR / KEC Weak.
+GRADE_RULES_VERSION = "v1"
+GRADE_ORDER = ["Weak", "Mixed", "Good", "Excellent"]
+
+
+def _grade_pct(cur, old):
+    if cur is None or old is None or old == 0:
+        return None
+    return (cur - old) / abs(old) * 100
+
+
+def _grade_fmt(v):
+    if v is None:
+        return "—"
+    return f"{v:+.0f}%" if abs(v) >= 10 else f"{v:+.1f}%"
+
+
+def _result_grade(parsed: dict):
+    """Grade one parsed result (one basis) by the rules above. None when there is nothing to grade."""
+    q = parsed.get("quarter") or {}
+    if q.get("financial_sector") == "insurance":
+        return None
+    t = _fin_table_data(parsed)
+    if not t:
+        return None
+    rows = {r["name"]: r for r in t["rows"]}
+    bank = _is_bank_period(q)
+    rs, ro, rp, re_, rm = (rows.get("NII"), rows.get("PPOP"), rows.get("PAT"), rows.get("EPS"), None) if bank else \
+        (rows.get("Sales"), rows.get("OP"), rows.get("PAT"), rows.get("EPS"), rows.get("OPM%"))
+    if not rs or not rp:
+        return None
+    S, Sy, Sq = rs.get("cur"), rs.get("yago"), rs.get("prev")
+    P, Py, Pq = rp.get("cur"), rp.get("yago"), rp.get("prev")
+    O, Oy, Oq = (ro.get("cur"), ro.get("yago"), ro.get("prev")) if ro else (None, None, None)
+    E, Ey = (re_.get("cur"), re_.get("yago")) if re_ else (None, None)
+    if S is None or P is None or Sy is None or Py is None:
+        return None                                        # no year-ago numbers: no grade
+    s, p, o, e = _grade_pct(S, Sy), _grade_pct(P, Py), _grade_pct(O, Oy), _grade_pct(E, Ey)
+    m = (rm["cur"] - rm["yago"]) if (rm and rm.get("cur") is not None and rm.get("yago") is not None) else None
+    o_eff = o if o is not None else p                      # OP missing -> PAT stands in
+    lp = Py < 0 <= P                                       # loss a year ago, profit now
+    why = (f"Sales {_grade_fmt(s)} · OP {_grade_fmt(o)} · PAT {'L→P' if lp else _grade_fmt(p)}"
+           + ("" if m is None else f" · OPM {m:+.1f} pp")) if not bank else \
+          f"NII {_grade_fmt(s)} · PPOP {_grade_fmt(o)} · PAT {'L→P' if lp else _grade_fmt(p)}"
+
+    flags = []
+    thin = (not bank) and P > 0 and S > 0 and P / S < 0.01
+    low_base = (not bank) and Py > 0 and Sy > 0 and Py / Sy < 0.01
+    oi_led = p is not None and o is not None and Py > 0 and p >= 20 and o < 5
+    if m is not None and m <= -2:
+        flags.append("Margin pressure")
+    if o is not None and p is not None and Py > 0 and o - p > 30:
+        flags.append("Profit not keeping up")
+    if e is not None and p is not None and Py > 0 and Ey and Ey > 0 and E and E > 0 and e < p - 5:
+        shares_ratio = (P / E) / (Py / Ey)
+        if 1 / 1.5 < shares_ratio < 1.5:                   # bigger jumps = bonus / split, old EPS not adjusted
+            flags.append("EPS diluted")
+    sq, pq, oq = _grade_pct(S, Sq), _grade_pct(P, Pq), _grade_pct(O, Oq)
+    if sq is not None and pq is not None and Pq and Pq > 0 and sq >= 15 and pq >= 15:
+        flags.append("Strong QoQ")
+    qoq_fall = (oq is not None and Oq and Oq > 0 and oq <= -10) or (pq is not None and Pq and Pq > 0 and pq <= -10)
+    if thin:
+        flags.append("Thin profit")
+    if low_base:
+        flags.append("Low base")
+    if oi_led:
+        flags.append("Other-income led")
+
+    # Step 1
+    if P < 0:
+        g = "Weak"; flags.insert(0, "Loss this quarter")
+    elif Py < 0 and ((o >= 0) if o is not None else (s >= 0)) and not thin:
+        g = "Turnaround"
+    elif o_eff is not None and o_eff <= -5 and (s is None or s < 5):
+        g = "Weak"
+        if lp:
+            flags.insert(0, "Loss → small profit")
+    elif s >= 15 and o_eff is not None and o_eff >= 20 and p is not None and p >= 20 and (m is None or m >= -1):
+        g = "Excellent"
+    elif s >= 5 and p is not None and p >= 10 and o_eff is not None and o_eff >= 0:
+        g = "Good"
+    elif (p is not None and p <= -20) or (p is not None and s < 0 and p < 0):
+        g = "Weak"
+    else:
+        g = "Mixed"
+    # Step 2 + 3
+    if g in ("Excellent", "Good", "Mixed"):
+        cap = "Mixed" if oi_led else "Good" if (thin or low_base) else "Excellent"
+        if GRADE_ORDER.index(g) > GRADE_ORDER.index(cap):
+            g = cap
+        if qoq_fall and g in ("Excellent", "Good"):
+            g = GRADE_ORDER[GRADE_ORDER.index(g) - 1]          # one level down, never below Mixed
+    if qoq_fall:
+        flags.append("Weaker than last quarter")
+    return {"label": g, "flags": flags, "why": why, "rules": GRADE_RULES_VERSION}
+
+
+def _apply_grade(parsed: dict) -> None:
+    try:
+        gr = _result_grade(parsed)
+    except Exception as e:                                 # never let grading break the run
+        print(f"  ⚠ grade for {(parsed.get('meta') or {}).get('symbol')}: {e}")
+        gr = None
+    if gr:
+        parsed["grade"] = gr
+    else:
+        parsed.pop("grade", None)
+
+
+def _group_grade(group):
+    """Grade of the basis the card shows (Consolidated first, else Standalone)."""
+    items = group if isinstance(group, list) else [group]
+    items = sorted(items, key=lambda p: 0 if (p.get("meta", {}).get("standalone_consolidated") == "Consolidated") else 1)
+    for p in items:
+        if _fin_table_data(p):
+            return p.get("grade")
+    return None
+
+
+def _grade_line(gr) -> str:
+    if not gr:
+        return ""
+    icon = {"Excellent": "🟢", "Good": "🔵", "Mixed": "🟡", "Weak": "🔴", "Turnaround": "🟣"}.get(gr["label"], "")
+    return f"{icon} Grade: <b>{gr['label']}</b>"            # label only for now; flags stay in the JSON
+
+
 def _telegram_fin_table(parsed: dict) -> list:
     """Text version of the comparison table (a Telegram <pre> block). Used when the result card
     image can't be made or sent. Returns [] when there is no prior-period data at all."""
@@ -2945,6 +3114,9 @@ def _telegram_result_message(group) -> str:
         lines.append(" · ".join(tag_bits))
     if board_date:
         lines.append(f"Result Date: {board_date}")
+    gl = _grade_line(_group_grade(items))
+    if gl:
+        lines.append(gl)
 
     # One basis only (Consolidated, else Standalone) — same rule as the card and caption;
     # both bases repeated the same highlights / commentary / board decisions.
@@ -3015,7 +3187,7 @@ def _result_card_png(group):
         return render_result_card({"name": m.get("company_name") or items[0].get("title") or "",
                                    "symbol": m.get("symbol") or "", "quarter": m.get("quarter_label") or "",
                                    "audit": m.get("audited") or "", "date": m.get("board_meeting_date") or "",
-                                   "sections": sections})
+                                   "grade": shown.get("grade"), "sections": sections})
     except Exception as e:
         print(f"  ⚠ result card for {m.get('symbol')}: {e}")
         return None
@@ -3044,6 +3216,9 @@ def _telegram_result_caption(group):
         head.append(" · ".join(tag_bits))
     if m.get("board_meeting_date"):
         head.append(f"Result Date: {m.get('board_meeting_date')}")
+    gl = _grade_line(_group_grade(items))
+    if gl:
+        head.append(gl)
     if any((p.get("quarter") or {}).get("yoy_caution") for p in items):
         head += ["", "⚠️ Company notes: results may not be YoY comparable"]
     # Standalone and Consolidated are extracted from the same PDF, so their highlights /
@@ -4310,6 +4485,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print(f"  🔇 {len(xbrl_backlog_silenced)} XBRL-only result(s) older than 3 days — storing data, "
               f"skipping Telegram (backlog, not fresh news): {', '.join(xbrl_backlog_silenced)}")
     parsed_new_for_telegram = still_notify
+    for r in parsed_new:
+        _apply_grade(r)                                    # result grade (rules above _result_grade)
 
     if parsed_new_for_telegram:
         groups = _group_parsed_results(parsed_new_for_telegram)
@@ -4387,6 +4564,8 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     keep_older = max(0, 1000 - len(parsed_new))
     merged = parsed_new + older_existing[:keep_older]
     merged.sort(key=_effective_ts, reverse=True)
+    for r in merged:
+        _apply_grade(r)                                    # re-grade old records too, so rule changes apply everywhere
 
     payload = make_payload(merged)
     payload["processed_result_links"] = sorted(processed_links)
