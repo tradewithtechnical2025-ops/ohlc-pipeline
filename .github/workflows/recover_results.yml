@@ -1,0 +1,53 @@
+# One-time recovery of nse_results_detailed.json from results_ai_checkpoint.json.
+# Put this file in .github/workflows/ and run it from the Actions tab ("Run workflow").
+# First run with "upload" unticked (dry run), check the log, then run again with it ticked.
+name: Recover results (one-time)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: "Save the merged file to R2 (leave unticked for a dry run)"
+        type: boolean
+        default: false
+
+# Do not run at the same time as the news / results pipeline: both write nse_results_detailed.json.
+# If your pipeline_news workflow has a concurrency group, use the same name here.
+concurrency:
+  group: results-detailed
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: pip install httpx feedparser requests
+
+      - name: Rebuild results from the AI checkpoint
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+        # recover_results.py imports pipeline_news.py, so both must be in this folder
+        # (change working-directory if your pipeline files live in a subfolder)
+        working-directory: .
+        run: |
+          if [ "${{ inputs.upload }}" = "true" ]; then
+            python recover_results.py --upload
+          else
+            python recover_results.py
+          fi
+
+      - name: Keep the rebuilt file as a download
+        uses: actions/upload-artifact@v4
+        with:
+          name: nse_results_detailed.recovered
+          path: nse_results_detailed.recovered.json
+          retention-days: 30
