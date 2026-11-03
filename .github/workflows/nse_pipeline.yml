@@ -17,7 +17,7 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install deps
-        run: pip install httpx requests
+        run: pip install httpx requests pillow   # pillow: FII / DII image card (fii_card.py)
       - name: Print UTC Time
         run: |
           echo "UTC Time:"; date -u
