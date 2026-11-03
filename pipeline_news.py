@@ -2847,6 +2847,8 @@ def _fin_table_data(parsed: dict):
 #      and the profit is not thin                                  -> Turnaround
 #   3. OP YoY <= -5% and Sales YoY < +5%                           -> Weak  (if year-ago PAT was a loss:
 #                                                                     flag "Loss -> small profit")
+#   3b. OP YoY < 0 and PAT YoY < 0 (both down, even if Sales grew) -> Weak  (added Nov 2026: AIAENG,
+#       Sales +6%, OP -4.7%, PAT -10%, OPM -2.9 pp was Mixed)
 #   4. Sales >= +15%, OP >= +20%, PAT >= +20%, OPM change >= -1 pp -> Excellent
 #   5. Sales >= +5%, PAT >= +10%, OP >= 0%                          -> Good
 #   6. PAT <= -20%, or Sales and PAT both down                     -> Weak
@@ -2875,7 +2877,7 @@ def _fin_table_data(parsed: dict):
 # Test cases used to settle v1 (Q2 FY27): NATIONALUM and
 # PRASOLCHEM Good (QoQ step-down), BALAMINES Good (PAT -10.3% QoQ), CHOICEIN Excellent + EPS diluted,
 # EPACKPEB and LLOYDSENGG Mixed,
-# DIGITIDE / FLAIR / KEC Weak.
+# DIGITIDE / FLAIR / KEC / AIAENG Weak, HMAAGRO Good (PAT +16% < 20% for Excellent).
 GRADE_RULES_VERSION = "v1"
 GRADE_ORDER = ["Weak", "Mixed", "Good", "Excellent"]
 
@@ -2952,6 +2954,8 @@ def _result_grade(parsed: dict):
         g = "Weak"
         if lp:
             flags.insert(0, "Loss → small profit")
+    elif o is not None and p is not None and Py > 0 and o < 0 and p < 0:
+        g = "Weak"                                         # rule 3b: OP and PAT both down YoY
     elif s >= 15 and o_eff is not None and o_eff >= 20 and p is not None and p >= 20 and (m is None or m >= -1):
         g = "Excellent"
     elif s >= 5 and p is not None and p >= 10 and o_eff is not None and o_eff >= 0:
