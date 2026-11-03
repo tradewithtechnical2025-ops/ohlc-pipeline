@@ -7,6 +7,11 @@ name: Results Backfill (one-time)
 on:
   workflow_dispatch:
 
+# Same group as news.yml: this rewrites nse_results_detailed.json too.
+concurrency:
+  group: twt-market-data-r2
+  cancel-in-progress: false
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
