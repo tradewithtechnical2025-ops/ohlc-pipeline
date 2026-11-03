@@ -16,6 +16,12 @@ on:
     - cron: "30 11 * * 1-5"   # ← set this to match your OHLC job's timing
   workflow_dispatch: {}        # lets you trigger it manually to test/re-run
 
+# backfill.py reads and rewrites nse_results_detailed.json; without this it could overwrite
+# results that news.yml (pipeline_news.py) saved while it was running. Same group as news.yml.
+concurrency:
+  group: twt-market-data-r2
+  cancel-in-progress: false
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
