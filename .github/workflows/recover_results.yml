@@ -12,9 +12,9 @@ on:
         default: false
 
 # Do not run at the same time as the news / results pipeline: both write nse_results_detailed.json.
-# If your pipeline_news workflow has a concurrency group, use the same name here.
+# Same group as news.yml (pipeline_news.py): only one writer of the results file at a time.
 concurrency:
-  group: results-detailed
+  group: twt-market-data-r2
   cancel-in-progress: false
 
 jobs:
