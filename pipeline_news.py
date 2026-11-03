@@ -524,6 +524,15 @@ def _resolve_symbol(symbol: str, company_name: str, explicit: bool):
     return sym, "symbol_unverified"
 
 
+_BSE_TRADING = {}   # BSE code -> trading symbol (classification.json), filled by _load_bse_symbol_map
+
+
+def _disp_symbol(meta: dict) -> str:
+    """Symbol to show: the BSE trading symbol for BSE-only stocks stored under their numeric code."""
+    s = str((meta or {}).get("symbol") or "").strip()
+    return _BSE_TRADING.get(s, s) if s.isdigit() else s
+
+
 async def _load_bse_symbol_map(client: httpx.AsyncClient) -> dict:
     """bse_code -> canonical `symbol` (classification.json's own field —
     an NSE ticker like 'AUGMONT' for dual-listed stocks, or the numeric
@@ -539,6 +548,11 @@ async def _load_bse_symbol_map(client: httpx.AsyncClient) -> dict:
         sym = row.get("symbol")
         if code and sym and code not in m:
             m[code] = sym
+        # display name for BSE-only stocks (stored under their numeric code): the BSE trading symbol
+        bcode = str(sym).strip() if str(sym or "").strip().isdigit() else code
+        ts = str(row.get("trading_symbol") or row.get("nse_code") or "").strip()
+        if bcode and ts and not ts.isdigit():
+            _BSE_TRADING.setdefault(bcode, ts)
         nse = row.get("nse_code") or sym
         if nse:
             syms.append(nse)
@@ -3197,7 +3211,8 @@ def _result_card_png(group):
     m = shown.get("meta", {})
     try:
         return render_result_card({"name": m.get("company_name") or items[0].get("title") or "",
-                                   "symbol": m.get("symbol") or "", "quarter": m.get("quarter_label") or "",
+                                   "symbol": _disp_symbol(m),
+                                   "quarter": m.get("quarter_label") or "",
                                    "audit": m.get("audited") or "", "date": m.get("board_meeting_date") or "",
                                    "grade": shown.get("grade"), "sections": sections})
     except Exception as e:
@@ -3221,8 +3236,9 @@ def _telegram_result_caption(group):
     items = group if isinstance(group, list) else [group]
     items = sorted(items, key=lambda p: 0 if (p.get("meta", {}).get("standalone_consolidated") == "Consolidated") else 1)
     m = items[0].get("meta", {})
-    company = m.get("company_name") or items[0].get("title") or "Unknown"
-    head = [f"📊 <b>{company}</b>"]
+    company = re.sub(r"\s*\(\d{5,6}\)\s*$", "", m.get("company_name") or items[0].get("title") or "Unknown")
+    sym = _disp_symbol(m)
+    head = [f"📊 <b>{sym}</b> · {company}" if sym else f"📊 <b>{company}</b>"]
     tag_bits = [b for b in (m.get("quarter_label"), m.get("audited")) if b]
     if tag_bits:
         head.append(" · ".join(tag_bits))
@@ -3269,28 +3285,35 @@ def _telegram_result_caption(group):
     bo = _first(lambda p: p.get("board_meeting_outcome"))
     if bo:
         blocks.append(["<b>🏛️ Other Board Decisions</b>", bo])
-    cap, extra, full = list(head), [], False
+    # The analysis sits in an expandable quote: Telegram shows its first lines with "Show more".
+    QO, QC = "<blockquote expandable>", "</blockquote>"
+    head_txt = "\n".join(head)
+    room = 1000 - len(head_txt) - len(QO) - len(QC) - 2
+    body, extra, full = [], [], False
     for b in blocks:
         if full:
             extra += [""] + b; continue
         take = []
         for k, line in enumerate(b):
-            if len("\n".join(cap + [""] + take + [line])) > 1000:
+            if len("\n".join(body + [""] + take + [line])) > room:
                 break
             take.append(line)
         if len(take) > 1 or (take and len(b) == 1):
-            cap += [""] + take
+            body += ([""] if body else []) + take
             rest = b[len(take):]
             if rest:
                 extra += ["", b[0].replace("</b>", " (contd.)</b>")] + rest; full = True
         else:
             extra += [""] + b; full = True
-    caption = "\n".join(cap)[:1024]
+    caption = head_txt + ("\n\n" + QO + "\n".join(body) + QC if body else "")
     text = ""
     if extra:
-        text = f"📊 <b>{company}</b> · more\n" + "\n".join(extra).strip("\n")
-        if len(text) > 4000:
-            text = text[:4000].rsplit("\n", 1)[0] + "\n\n…(truncated, see full data on the site)"
+        inner = "\n".join(extra).strip("\n")
+        hdr = f"📊 <b>{sym or company}</b> · more\n"
+        lim = 4000 - len(hdr) - len(QO) - len(QC)
+        if len(inner) > lim:
+            inner = inner[:lim - 60].rsplit("\n", 1)[0] + "\n\n…(truncated, see full data on the site)"
+        text = hdr + QO + inner + QC
     return caption, text
 
 
