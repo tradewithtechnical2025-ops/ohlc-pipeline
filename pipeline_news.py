@@ -666,6 +666,9 @@ def _filing_ts(link: str) -> str:
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
+RESULTS_KEEP_QUARTERS = int(os.environ.get("RESULTS_KEEP_QUARTERS", "2"))
+
+
 def _effective_ts(it: dict) -> int:
     """Sort key for merging/capping nse_results_detailed.json. Prefers the
     RSS published_ts, but falls back to the filename-embedded submission
@@ -686,7 +689,12 @@ def _effective_ts(it: dict) -> int:
             return int(dt.astimezone(timezone.utc).timestamp())
         except ValueError:
             pass
-    return 0
+    # records without a filing timestamp (e.g. rebuilt from fundamentals): the result date, end of day IST
+    d = str((it.get("meta") or {}).get("board_meeting_date") or "")[:10]
+    try:
+        return int(datetime.strptime(d, "%Y-%m-%d").replace(hour=23, tzinfo=_IST).astimezone(timezone.utc).timestamp())
+    except ValueError:
+        return 0
 
 _XBRL_FIELD_MAP = {
     "RevenueFromOperations":                                              "revenue",
@@ -4618,15 +4626,27 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     new_links = {it.get("link") for it in parsed_new}
     older_existing = [it for it in existing_items if it.get("link") not in new_links]
     older_existing.sort(key=_effective_ts, reverse=True)
-    keep_older = max(0, 1000 - len(parsed_new))
-    merged = parsed_new + older_existing[:keep_older]
+    # Retention (Nov 2026): every result of the latest RESULTS_KEEP_QUARTERS quarters is kept, with no
+    # count cap (a full results season is 2,000+ filings; the old 1,000 cap cut the season short).
+    # Older quarters are dropped. Records without a period_end are kept by the old 1,000 rule.
+    pes = sorted({str((it.get("quarter") or {}).get("period_end") or "")[:10] for it in parsed_new + older_existing} - {""},
+                 reverse=True)
+    keep_pes = set(pes[:RESULTS_KEEP_QUARTERS])
+    in_q = [it for it in older_existing if str((it.get("quarter") or {}).get("period_end") or "")[:10] in keep_pes]
+    no_pe = [it for it in older_existing if not (it.get("quarter") or {}).get("period_end")]
+    merged = parsed_new + in_q + no_pe[:max(0, 1000 - len(parsed_new) - len(in_q))]
+    dropped_old = len(older_existing) - len(merged) + len(parsed_new)
+    if dropped_old:
+        print(f"  🗑 {dropped_old} result(s) from quarters older than the latest {RESULTS_KEEP_QUARTERS} dropped")
     merged.sort(key=_effective_ts, reverse=True)
     for r in merged:
         _apply_grade(r)                                    # re-grade old records too, so rule changes apply everywhere
 
     # Last guard: never save a file with far fewer results than the one read at the start of this run.
-    if len(existing_items) >= 50 and len(merged) < len(existing_items) * 0.5:
-        print(f"  ⛔ results update would shrink nse_results_detailed.json from {len(existing_items)} to "
+    # (results dropped on purpose by the quarter retention above are not counted as a shrink)
+    base = len(existing_items) - dropped_old
+    if base >= 50 and len(merged) < base * 0.5:
+        print(f"  ⛔ results update would shrink nse_results_detailed.json from {base} to "
               f"{len(merged)} items — not saving; check this run's log")
         return None
 
