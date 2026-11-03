@@ -106,12 +106,14 @@ def _turn(cur, old):
 
 def render_result_card(d, scale=2):
     S = lambda x: int(round(x * scale))
-    W = S(560)
-    pad, rh = S(22), S(34)
-    xs = [pad, S(150), S(250), S(360), S(455), W - pad]   # right edges: current | QoQ | YoY | prev | year ago
-    f_title = _font(True, S(20))
-    f_sub, f_h, f_cell, f_cellb = _font(False, S(12.5)), _font(True, S(11)), _font(False, S(14)), _font(True, S(14))
-    f_note, f_tag, f_sec = _font(False, S(10.5)), _font(True, S(10.5)), _font(True, S(11.5))
+    # Landscape (about 1.6 : 1) with large type: Telegram caps a photo's height, so a tall card is shown
+    # narrow in the chat and its numbers come out tiny; a wide card fills the chat width.
+    W = S(680)
+    pad, rh = S(22), S(40)
+    xs = [pad, S(205), S(320), S(440), S(560), W - pad]   # right edges: current | QoQ | YoY | prev | year ago
+    f_title = _font(True, S(24))
+    f_sub, f_h, f_cell, f_cellb = _font(False, S(14)), _font(True, S(13)), _font(False, S(17)), _font(True, S(17))
+    f_note, f_tag, f_sec = _font(False, S(12.5)), _font(True, S(12.5)), _font(True, S(13))
 
     secs = []
     for sec in d.get("sections") or []:
@@ -124,69 +126,63 @@ def render_result_card(d, scale=2):
                 if t: notes.append(f"{r['name']} {lbl}: {t} ({_num(old, r.get('dec', 1))} → {_num(r.get('cur'), r.get('dec', 1))})")
         secs.append((sec, rows, notes))
 
+    single = len(secs) == 1
+    basis = str(secs[0][0].get("title") or "") if single else ""
     head_h = S(84)
     sym = str(d.get("symbol") or "").strip()
     company = re.sub(r"\s*\(\d{5,6}\)\s*$", "", str(d.get("name") or ""))
-    if sym:                                             # trading symbol as the title, company name under it
-        head_h += S(20)
     gr = d.get("grade") or None
     if gr and gr.get("label") not in GRADE_COL:
         gr = None
     if gr:                                              # grade pill only (flags stay in the data, not on the card)
-        f_gr = _font(True, S(12))
+        f_gr = _font(True, S(13))
         pill_w = ImageDraw.Draw(Image.new("RGB", (1, 1))).textlength(gr["label"].upper(), font=f_gr) + S(20)
-        if not sym:                                     # with a symbol the pill sits beside it, no extra row
-            head_h += S(32)
     body_h = 0
     for sec, rows, notes in secs:
         # table box (rows + header + 10) + 10 gap below it + notes + 14 — same steps as the drawing loop
-        body_h += (S(24) if sec.get("title") else 0) + rh * (len(rows) + 1) + S(20) + S(17) * len(notes) + S(14)
+        body_h += (S(26) if (sec.get("title") and not single) else 0) + rh * (len(rows) + 1) + S(20) + S(19) * len(notes) + S(10)
     foot_notes = []
     for sec, _, _ in secs:
         n = sec.get("note")
         if n and n not in foot_notes: foot_notes.append(n)
-    H = head_h + body_h + S(16) * len(foot_notes) + S(34)
+    H = head_h + body_h + S(34)                         # footer: note left, site right, one line
     img = Image.new("RGB", (W, H), BG)
     g = ImageDraw.Draw(img)
 
-    # ── header: trading symbol, then the company name, then quarter · audit · result date
-    room = W - 2 * pad
-    name, sz = (sym or company), 22 if sym else 20
+    # ── header. Line 1: symbol (or company) + grade pill, result date on the right.
+    #    Line 2: company · quarter · audit · basis.
+    date_t = f"Result {d['date']}" if d.get("date") else ""
+    dw = g.textlength(date_t, font=f_tag) + S(16) if date_t else 0
+    if date_t:
+        g.rounded_rectangle([W - pad - dw, S(20), W - pad, S(46)], radius=S(6), fill=TAG_BG)
+        g.text((W - pad - dw + S(8), S(25)), date_t, font=f_tag, fill=ACC)
+    room = W - 2 * pad - dw - S(12)
+    name, sz = (sym or company), 24
     f_title = _font(True, S(sz))
-    while sz > 13 and g.textlength(name, font=f_title) > room:
+    pill_room = (pill_w + S(12)) if gr else 0
+    while sz > 14 and g.textlength(name, font=f_title) > room - pill_room:
         sz -= 1; f_title = _font(True, S(sz))
-    while len(name) > 4 and g.textlength(name, font=f_title) > room:
-        name = name.rstrip("…")[:-1].rstrip() + "…"
-    pill_room = (pill_w + S(12)) if (gr and sym) else 0
-    while sym and pill_room and len(name) > 4 and g.textlength(name, font=f_title) > room - pill_room:
+    while len(name) > 4 and g.textlength(name, font=f_title) > room - pill_room:
         name = name.rstrip("…")[:-1].rstrip() + "…"
     g.text((pad, S(16)), name, font=f_title, fill=TXT)
     title_w = g.textlength(name, font=f_title)
-    y_sub = S(50)
-    if sym and company:
-        cn, f_cn = company, _font(False, S(13.5))
-        while len(cn) > 4 and g.textlength(cn, font=f_cn) > room:
-            cn = cn.rstrip("…")[:-1].rstrip() + "…"
-        g.text((pad, S(48)), cn, font=f_cn, fill=TXT2)
-        y_sub = S(70)
-    sub = " · ".join(str(x) for x in [d.get("quarter"), d.get("audit"), f"Result {d['date']}" if d.get("date") else None] if x)
-    g.text((pad, y_sub), sub, font=f_sub, fill=MUT)
-    if gr:                                              # grade pill
+    if gr:
         fc, bc = GRADE_COL[gr["label"]]
-        lbl = gr["label"].upper()
-        if sym:                                         # beside the symbol, vertically centred on it
-            gx, gy = pad + title_w + S(12), S(16) + (S(sz) - S(22)) // 2 + S(3)
-        else:
-            gx, gy = pad, S(74)
-        g.rounded_rectangle([gx, gy, gx + pill_w, gy + S(22)], radius=S(6), fill=bc)
-        g.text((gx + S(10), gy + S(4)), lbl, font=f_gr, fill=fc)
+        gx, gy = pad + title_w + S(12), S(16) + (S(sz) - S(24)) // 2 + S(4)
+        g.rounded_rectangle([gx, gy, gx + pill_w, gy + S(24)], radius=S(6), fill=bc)
+        g.text((gx + S(10), gy + S(5)), gr["label"].upper(), font=f_gr, fill=fc)
+    bits = [company if sym else None, d.get("quarter"), d.get("audit"), basis.title() if basis else None]
+    sub = " · ".join(str(x) for x in bits if x)
+    while len(sub) > 4 and g.textlength(sub, font=f_sub) > W - 2 * pad:
+        sub = sub.rstrip("…")[:-1].rstrip() + "…"
+    g.text((pad, S(54)), sub, font=f_sub, fill=TXT2)
 
     # ── sections
     y = head_h
     for sec, rows, notes in secs:
-        if sec.get("title"):
+        if sec.get("title") and not single:
             g.text((pad, y), str(sec["title"]).upper(), font=f_sec, fill=ACC)
-            y += S(24)
+            y += S(26)
         cols = list(sec.get("cols") or []) + ["", "", ""]
         th = rh * (len(rows) + 1) + S(10)
         g.rounded_rectangle([S(12), y, W - S(12), y + th], radius=S(10), fill=CARD, outline=LINE, width=max(1, S(1)))
@@ -210,14 +206,13 @@ def render_result_card(d, scale=2):
         y += th + S(10)
         for n in notes:
             g.text((pad, y), "• " + n, font=f_note, fill=AMB)
-            y += S(17)
-        y += S(14)
+            y += S(19)
+        y += S(10)
 
-    # ── footer
-    for n in foot_notes:
-        g.text((pad, y), n, font=f_note, fill=MUT)
-        y += S(16)
-    g.text((pad, H - S(26)), "tradewithtech.in", font=f_tag, fill=ACC)
+    # ── footer: unit note left, site right
+    if foot_notes:
+        g.text((pad, H - S(26)), " · ".join(foot_notes), font=f_note, fill=MUT)
+    g.text((W - pad - g.textlength("tradewithtech.in", font=f_tag), H - S(26)), "tradewithtech.in", font=f_tag, fill=ACC)
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
     return buf.getvalue()
