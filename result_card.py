@@ -17,7 +17,8 @@
         }],
     })
 Only Pillow is needed. Fonts: DejaVu (on GitHub's Ubuntu runners), Inter when installed.
-Optional "grade": {"label": Excellent / Good / Mixed / Weak / Turnaround, "flags": [...]} draws a
+The title is the trading symbol ("symbol"), with the company name ("name") on the line below; without a
+symbol the company name is the title. Optional "grade": {"label": Excellent / Good / Mixed / Weak / Turnaround, "flags": [...]} draws a
 coloured pill under the subtitle (label only; flags are not drawn).
 Changes: kind "pct" = % change (from a loss, measured on the size of the loss, so + means better);
 kind "pp" = change in points (margins). A turn from / into a loss is spelled out in a note under
@@ -25,6 +26,7 @@ the table, e.g. "PAT QoQ: loss to profit (-4.3 → 20.3)".
 """
 import io
 import os
+import re
 from PIL import Image, ImageDraw, ImageFont
 
 _FONT_DIRS = ["/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/opentype/inter", "/usr/share/fonts/truetype/inter"]
@@ -54,6 +56,7 @@ def _font(bold, size):
 # Light theme (darker green / red / accent than the old dark theme so they read on white)
 BG, CARD, LINE = (243, 246, 250), (255, 255, 255), (222, 228, 236)
 TXT, MUT, ACC = (15, 23, 42), (100, 116, 139), (2, 132, 199)
+TXT2 = (51, 65, 85)         # company name under the symbol
 GRN, RED, AMB = (22, 163, 74), (220, 38, 38), (180, 83, 9)
 TAG_BG = (224, 242, 254)    # symbol pill background
 # Result grade pill: (text colour, background)
@@ -122,13 +125,18 @@ def render_result_card(d, scale=2):
         secs.append((sec, rows, notes))
 
     head_h = S(84)
+    sym = str(d.get("symbol") or "").strip()
+    company = re.sub(r"\s*\(\d{5,6}\)\s*$", "", str(d.get("name") or ""))
+    if sym:                                             # trading symbol as the title, company name under it
+        head_h += S(20)
     gr = d.get("grade") or None
     if gr and gr.get("label") not in GRADE_COL:
         gr = None
     if gr:                                              # grade pill only (flags stay in the data, not on the card)
         f_gr = _font(True, S(12))
         pill_w = ImageDraw.Draw(Image.new("RGB", (1, 1))).textlength(gr["label"].upper(), font=f_gr) + S(20)
-        head_h += S(32)
+        if not sym:                                     # with a symbol the pill sits beside it, no extra row
+            head_h += S(32)
     body_h = 0
     for sec, rows, notes in secs:
         # table box (rows + header + 10) + 10 gap below it + notes + 14 — same steps as the drawing loop
@@ -141,27 +149,37 @@ def render_result_card(d, scale=2):
     img = Image.new("RGB", (W, H), BG)
     g = ImageDraw.Draw(img)
 
-    # ── header
-    sym = d.get("symbol") or ""
-    room = W - 2 * pad - (g.textlength(sym, font=f_tag) + S(30) if sym else 0)
-    name, sz = str(d.get("name") or ""), 20
+    # ── header: trading symbol, then the company name, then quarter · audit · result date
+    room = W - 2 * pad
+    name, sz = (sym or company), 22 if sym else 20
+    f_title = _font(True, S(sz))
     while sz > 13 and g.textlength(name, font=f_title) > room:
         sz -= 1; f_title = _font(True, S(sz))
     while len(name) > 4 and g.textlength(name, font=f_title) > room:
         name = name.rstrip("…")[:-1].rstrip() + "…"
-    g.text((pad, S(18) + S(20 - sz) // 2), name, font=f_title, fill=TXT)
-    if sym:
-        tw = g.textlength(sym, font=f_tag)
-        g.rounded_rectangle([W - pad - tw - S(16), S(20), W - pad, S(42)], radius=S(6), fill=TAG_BG)
-        g.text((W - pad - tw - S(8), S(24)), sym, font=f_tag, fill=ACC)
+    pill_room = (pill_w + S(12)) if (gr and sym) else 0
+    while sym and pill_room and len(name) > 4 and g.textlength(name, font=f_title) > room - pill_room:
+        name = name.rstrip("…")[:-1].rstrip() + "…"
+    g.text((pad, S(16)), name, font=f_title, fill=TXT)
+    title_w = g.textlength(name, font=f_title)
+    y_sub = S(50)
+    if sym and company:
+        cn, f_cn = company, _font(False, S(13.5))
+        while len(cn) > 4 and g.textlength(cn, font=f_cn) > room:
+            cn = cn.rstrip("…")[:-1].rstrip() + "…"
+        g.text((pad, S(48)), cn, font=f_cn, fill=TXT2)
+        y_sub = S(70)
     sub = " · ".join(str(x) for x in [d.get("quarter"), d.get("audit"), f"Result {d['date']}" if d.get("date") else None] if x)
-    g.text((pad, S(50)), sub, font=f_sub, fill=MUT)
+    g.text((pad, y_sub), sub, font=f_sub, fill=MUT)
     if gr:                                              # grade pill
         fc, bc = GRADE_COL[gr["label"]]
         lbl = gr["label"].upper()
-        gy = S(74)
-        g.rounded_rectangle([pad, gy, pad + pill_w, gy + S(22)], radius=S(6), fill=bc)
-        g.text((pad + S(10), gy + S(4)), lbl, font=f_gr, fill=fc)
+        if sym:                                         # beside the symbol, vertically centred on it
+            gx, gy = pad + title_w + S(12), S(16) + (S(sz) - S(22)) // 2 + S(3)
+        else:
+            gx, gy = pad, S(74)
+        g.rounded_rectangle([gx, gy, gx + pill_w, gy + S(22)], radius=S(6), fill=bc)
+        g.text((gx + S(10), gy + S(4)), lbl, font=f_gr, fill=fc)
 
     # ── sections
     y = head_h
