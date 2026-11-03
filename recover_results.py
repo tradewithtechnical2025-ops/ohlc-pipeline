@@ -46,7 +46,7 @@ def _fund_record(sym, e):
     if not qs or _pe_iso(qs[0].get("period_end")) != TARGET_PERIOD:
         return None
     rd = e.get("last_result_date")
-    if not rd or rd < TARGET_PERIOD:
+    if not rd or rd <= TARGET_PERIOD:          # a result can only be declared after the quarter ends
         return None
     cur = qs[0]
     by_end = {x.get("period_end"): x for x in qs}
@@ -190,8 +190,16 @@ async def main():
         rebuilt.append(r)
 
     # Older results (before the checkpoint) from fundamentals_rich.json: one record per stock and quarter
-    fund_added, fund_skip = [], {"already in file": 0, "not this quarter / no result date": 0}
+    fund_added, fund_skip = [], {"already in file": 0, "same company stored under its BSE code": 0,
+                                 "not this quarter / no result date": 0}
     have_sym_q = {(k[0], k[1]) for k in map(key, items + rebuilt)}
+    # a company stored from a BSE filing may carry its BSE code (or the code as scrip_code) instead of the NSE symbol
+    have_code_q = set()
+    for r in items + rebuilt:
+        m, pe = r.get("meta") or {}, (r.get("quarter") or {}).get("period_end")
+        for c in (m.get("scrip_code"), m.get("symbol")):
+            if c and str(c).isdigit():
+                have_code_q.add((str(c), pe))
     for sym, e in ((rich or {}).get("stocks") or {}).items():
         r = _fund_record(sym, e or {})
         if not r:
@@ -199,6 +207,9 @@ async def main():
         k = key(r)
         if (k[0], k[1]) in have_sym_q:
             fund_skip["already in file"] += 1; continue
+        code = str((e or {}).get("bse_code") or "")
+        if code and (code, k[1]) in have_code_q:
+            fund_skip["same company stored under its BSE code"] += 1; continue
         have_sym_q.add((k[0], k[1]))
         fund_added.append(r)
     if rich is not None:
