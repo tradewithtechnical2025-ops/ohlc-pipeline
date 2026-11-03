@@ -622,15 +622,29 @@ def _result_candidate_in_universe(it: dict, universe: set[str], bse_symbol_map: 
 
 
 async def r2_put(client: httpx.AsyncClient, filename: str, data: dict):
+    # A dropped connection (httpx.ReadError on the large bse_announcements.json, 03 Nov 2026) used to end
+    # the whole run before results were parsed. Uploads replace the whole file, so retrying is safe.
     body = json.dumps(data, ensure_ascii=False).encode()
-    r = await client.post(
-        f"{WORKER_URL}?file={filename}",
-        headers=UP_HEADERS,
-        content=body,
-        timeout=120
-    )
-    r.raise_for_status()
-    print(f"✓ Uploaded {filename}")
+    for attempt in range(4):
+        try:
+            r = await client.post(
+                f"{WORKER_URL}?file={filename}",
+                headers=UP_HEADERS,
+                content=body,
+                timeout=180
+            )
+            if r.status_code >= 500 and attempt < 3:
+                raise httpx.HTTPStatusError(f"HTTP {r.status_code}", request=r.request, response=r)
+            r.raise_for_status()
+            print(f"✓ Uploaded {filename}" + (f" (try {attempt + 1})" if attempt else ""))
+            return
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if attempt == 3 or (status is not None and status < 500):
+                raise
+            wait = 5 * (attempt + 1)
+            print(f"  ⚠ upload of {filename} failed ({type(e).__name__}), retry {attempt + 1}/3 in {wait}s")
+            await asyncio.sleep(wait)
 
 
 def make_payload(items: list[dict]) -> dict:
