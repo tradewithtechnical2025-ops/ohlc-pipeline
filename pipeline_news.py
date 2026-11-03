@@ -3439,6 +3439,25 @@ def _manual_result_items() -> list:
     return items
 
 
+def _regraded_payload(existing: dict | None):
+    """A run with no new filings still grades the stored records: results from before grading started
+    (Nov 2026), and every record again after a rule change. Returns the payload to save when any grade
+    changed, else None (nothing to upload)."""
+    items = (existing or {}).get("items") or []
+    changed = 0
+    for it in items:
+        before = json.dumps(it.get("grade"), sort_keys=True)
+        _apply_grade(it)
+        if json.dumps(it.get("grade"), sort_keys=True) != before:
+            changed += 1
+    if not changed:
+        return None
+    print(f"  ✓ nse_results_detailed: graded {changed} stored result(s) (no new filings this run)")
+    payload = make_payload(items)
+    payload["processed_result_links"] = sorted(_processed_result_links(existing))
+    return payload
+
+
 def _processed_result_links(payload: dict | None) -> set:
     """Successful URLs survive result replacement, basis cleanup and item caps.
 
@@ -3737,7 +3756,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
             _trace_result(it, "skipped", "document retry limit reached")
     if not new_xbrl and not new_pdf and not manual_items:
         print("  ✓ nse_results_detailed: no new filings to parse")
-        return None
+        return _regraded_payload(existing)               # grade older records even on a quiet run
 
     # Cross-exchange dedup: the same result is very often filed on BOTH NSE
     # and BSE the same day (confirmed directly: AUGMONT's board-outcome PDF
@@ -3809,7 +3828,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 
     if not new_xbrl and not new_pdf and not manual_items:
         print("  ✓ nse_results_detailed: no new filings to parse")
-        return None
+        return _regraded_payload(existing)               # grade older records even on a quiet run
 
     print(f"  Parsing {len(new_xbrl)} new XBRL + {len(new_pdf)} new PDF result filing(s) "
           f"({len(pdf_groups)} cross-exchange group(s), {len(singleton_pdf)} single-exchange)...")
