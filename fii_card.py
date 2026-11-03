@@ -51,50 +51,53 @@ def _cr(v):
 
 def render_fii_card(d, scale=2):
     S = lambda x: int(round(x * scale))
-    W, pad = S(560), S(22)
-    f_title, f_sub, f_tag = _font(True, S(20)), _font(False, S(12.5)), _font(True, S(10.5))
-    f_h, f_sec, f_big = _font(True, S(11)), _font(True, S(11.5)), _font(True, S(22))
-    f_cell, f_cellb, f_note = _font(False, S(13.5)), _font(True, S(13.5)), _font(False, S(10.5))
+    # Narrow card, large type: Telegram shows the photo at the chat width, so on a phone a wide
+    # card's text came out tiny. 440 wide with 13-30 px type reads like a normal message.
+    W, pad = S(440), S(18)
+    f_title, f_sub, f_tag = _font(True, S(22)), _font(False, S(14)), _font(True, S(12.5))
+    f_h, f_sec, f_big = _font(True, S(13)), _font(True, S(13)), _font(True, S(30))
+    f_cell, f_cellb, f_note = _font(False, S(15.5)), _font(True, S(15.5)), _font(False, S(13))
     last5 = list(d.get("last5") or [])[-5:]
     mtd, fut = d.get("mtd") or None, d.get("fut") or None
     fut_ok = bool(fut and (fut.get("long") or 0) + (fut.get("short") or 0))
 
-    rh = S(34)
-    H = S(80) + S(92) + S(16)                                          # header + tiles
+    rh = S(38)
+    TILE_H = S(108)
+    H = S(84) + TILE_H + S(16)                                         # header + tiles
     if last5:
         H += S(22) + rh * (len(last5) + 1) + S(10) + S(14)
-    if mtd or fut_ok:
-        H += S(40)
+    if mtd:
+        H += S(44)
     if fut_ok:
-        H += S(22)
+        H += S(44) + S(24)
     H += S(40)
     img = Image.new("RGB", (W, H), BG)
     g = ImageDraw.Draw(img)
 
     # ── header
-    g.text((pad, S(18)), "FII / DII Activity", font=f_title, fill=TXT)
+    g.text((pad, S(16)), "FII / DII Activity", font=f_title, fill=TXT)
     dt = str(d.get("date") or "")
     if dt:
         tw = g.textlength(dt, font=f_tag)
-        g.rounded_rectangle([W - pad - tw - S(16), S(20), W - pad, S(42)], radius=S(6), fill=TAG_BG)
-        g.text((W - pad - tw - S(8), S(24)), dt, font=f_tag, fill=ACC)
-    g.text((pad, S(50)), "Cash market · ₹ Cr · provisional", font=f_sub, fill=MUT)
+        g.rounded_rectangle([W - pad - tw - S(16), S(19), W - pad, S(43)], radius=S(6), fill=TAG_BG)
+        g.text((W - pad - tw - S(8), S(23)), dt, font=f_tag, fill=ACC)
+    g.text((pad, S(52)), "Cash market · ₹ Cr · provisional", font=f_sub, fill=MUT)
 
     # ── FII / DII net tiles
-    y = S(80)
+    y = S(84)
     tw2 = (W - 2 * S(12) - S(10)) // 2
     for i, key in enumerate(("fii", "dii")):
         e = d.get(key) or {}
         x = S(12) + i * (tw2 + S(10))
         n = e.get("net")
         c = GRN if (n or 0) > 0 else RED if (n or 0) < 0 else MUT
-        g.rounded_rectangle([x, y, x + tw2, y + S(92)], radius=S(10), fill=CARD, outline=LINE, width=max(1, S(1)))
-        g.text((x + S(14), y + S(12)), f"{key.upper()} NET", font=f_h, fill=MUT)
-        g.text((x + S(14), y + S(28)), _cr(n), font=f_big, fill=c)
-        if e.get("buy") is not None or e.get("sell") is not None:
-            g.text((x + S(14), y + S(62)), f"Buy {e.get('buy') or 0:,.0f}  ·  Sell {e.get('sell') or 0:,.0f}",
-                   font=f_note, fill=MUT)
-    y += S(92) + S(16)
+        g.rounded_rectangle([x, y, x + tw2, y + TILE_H], radius=S(10), fill=CARD, outline=LINE, width=max(1, S(1)))
+        g.text((x + S(12), y + S(10)), f"{key.upper()} NET", font=f_h, fill=MUT)
+        g.text((x + S(12), y + S(28)), _cr(n), font=f_big, fill=c)
+        if e.get("buy") is not None or e.get("sell") is not None:   # buy and sell on their own lines: room for big numbers
+            g.text((x + S(12), y + S(68)), f"Buy {e.get('buy') or 0:,.0f}", font=f_note, fill=MUT)
+            g.text((x + S(12), y + S(86)), f"Sell {e.get('sell') or 0:,.0f}", font=f_note, fill=MUT)
+    y += TILE_H + S(16)
 
     # ── last 5 sessions: value + bar from a centre line
     if last5:
@@ -102,25 +105,25 @@ def render_fii_card(d, scale=2):
         y += S(22)
         th = rh * (len(last5) + 1) + S(10)
         g.rounded_rectangle([S(12), y, W - S(12), y + th], radius=S(10), fill=CARD, outline=LINE, width=max(1, S(1)))
-        cols = [("FII", S(120), S(320)), ("DII", S(330), S(530))]
+        cols = [("FII", S(96), S(262)), ("DII", S(266), S(432))]
         mx = max([abs(v) for _, a, b in last5 for v in (a, b) if v is not None] or [1]) or 1
         for name, x0, x1 in cols:
             g.text(((x0 + x1) // 2 - g.textlength(name, font=f_h) // 2, y + S(10)), name, font=f_h, fill=MUT)
-        ry = y + S(38)
+        ry = y + S(40)
         for k, (lbl, a, b) in enumerate(last5):
             last = k == len(last5) - 1
             g.text((pad, ry + S(4)), str(lbl), font=f_cellb if last else f_cell, fill=TXT)
             for (name, x0, x1), v in zip(cols, (a, b)):
                 mid = (x0 + x1) // 2
-                g.line([mid, ry, mid, ry + S(28)], fill=LINE, width=max(1, S(1)))
+                g.line([mid, ry, mid, ry + S(32)], fill=LINE, width=max(1, S(1)))
                 if v is None:
                     continue
                 half = (x1 - x0) // 2 - S(4)
-                w = max(S(2), int(abs(v) / mx * half * 0.55))
+                w = max(S(2), int(abs(v) / mx * half * 0.45))
                 if v > 0:
-                    g.rounded_rectangle([mid, ry + S(6), mid + w, ry + S(22)], radius=S(3), fill=GRN_BG)
+                    g.rounded_rectangle([mid, ry + S(6), mid + w, ry + S(26)], radius=S(3), fill=GRN_BG)
                 elif v < 0:
-                    g.rounded_rectangle([mid - w, ry + S(6), mid, ry + S(22)], radius=S(3), fill=RED_BG)
+                    g.rounded_rectangle([mid - w, ry + S(6), mid, ry + S(26)], radius=S(3), fill=RED_BG)
                 t = _cr(v)
                 c = GRN if v > 0 else RED if v < 0 else MUT
                 tx = mid + S(6) if v < 0 else mid - S(6) - g.textlength(t, font=f_cellb)
@@ -132,28 +135,27 @@ def render_fii_card(d, scale=2):
     if mtd or fut_ok:
         x = S(12)
 
-        def chip(x, parts):
-            w = S(20) + sum(g.textlength(t, font=f) for t, f, _ in parts) + S(6) * (len(parts) - 1)
-            g.rounded_rectangle([x, y, x + w, y + S(30)], radius=S(8), fill=CARD, outline=LINE, width=max(1, S(1)))
-            cx = x + S(10)
-            for t, f, c in parts:
-                g.text((cx, y + (S(8) if f is f_note else S(6))), t, font=f, fill=c)
-                cx += g.textlength(t, font=f) + S(6)
-            return x + w + S(8)
+        def chip(yy, parts):                            # full-width row: label left, values right
+            g.rounded_rectangle([S(12), yy, W - S(12), yy + S(36)], radius=S(8), fill=CARD, outline=LINE, width=max(1, S(1)))
+            g.text((S(24), yy + S(10)), parts[0][0], font=parts[0][1], fill=parts[0][2])
+            cx = W - S(24)
+            for t, f, c in reversed(parts[1:]):
+                cx -= g.textlength(t, font=f)
+                g.text((cx, yy + (S(10) if f is f_note else S(8))), t, font=f, fill=c)
+                cx -= S(8)
 
         if mtd:
             fm, dm = mtd.get("fii"), mtd.get("dii")
-            x = chip(x, [(f"{mtd.get('month', '')} MTD  FII", f_note, MUT),
-                         (_cr(fm), f_cellb, GRN if (fm or 0) > 0 else RED if (fm or 0) < 0 else MUT),
-                         ("DII", f_note, MUT),
-                         (_cr(dm), f_cellb, GRN if (dm or 0) > 0 else RED if (dm or 0) < 0 else MUT)])
+            chip(y, [(f"{mtd.get('month', '')} month to date", f_note, MUT),
+                     ("FII", f_note, MUT), (_cr(fm), f_cellb, GRN if (fm or 0) > 0 else RED if (fm or 0) < 0 else MUT),
+                     ("DII", f_note, MUT), (_cr(dm), f_cellb, GRN if (dm or 0) > 0 else RED if (dm or 0) < 0 else MUT)])
+            y += S(44)
         if fut_ok:
             lo, sh = fut.get("long") or 0, fut.get("short") or 0
-            chip(x, [("FII index futures", f_note, MUT), (f"{lo / (lo + sh) * 100:.0f}% long", f_cellb, TXT)])
-        y += S(40)
-        if fut_ok:
-            g.text((pad, y), f"Index futures: {lo:,} long / {sh:,} short contracts", font=f_note, fill=MUT)
-            y += S(22)
+            chip(y, [("FII index futures", f_note, MUT), (f"{lo / (lo + sh) * 100:.0f}% long", f_cellb, TXT)])
+            y += S(44)
+            g.text((pad, y), f"{lo:,} long / {sh:,} short contracts", font=f_note, fill=MUT)
+            y += S(24)
 
     g.text((pad, H - S(28)), "tradewithtech.in", font=f_tag, fill=ACC)
     buf = io.BytesIO()
