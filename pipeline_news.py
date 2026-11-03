@@ -3439,6 +3439,29 @@ def _manual_result_items() -> list:
     return items
 
 
+async def _load_existing_results(client: httpx.AsyncClient):
+    """nse_results_detailed.json, or None only when the file truly does not exist (404).
+    Any other failure raises after 3 tries, so the caller never mistakes it for an empty history."""
+    last = None
+    for attempt in range(3):
+        try:
+            sep = "?"
+            r = await client.get(f"{WORKER_URL}/nse_results_detailed.json{sep}v={int(time.time())}",
+                                 headers=DL_HEADERS, timeout=120)
+            if r.status_code == 404:
+                return None
+            r.raise_for_status()
+            data = r.json()
+            if not isinstance(data, dict) or not isinstance(data.get("items"), list):
+                raise ValueError("unexpected file shape")
+            return data
+        except Exception as e:
+            last = e
+            print(f"  ⚠ reading nse_results_detailed.json failed (try {attempt + 1}/3): {type(e).__name__}: {e}")
+            await asyncio.sleep(5 * (attempt + 1))
+    raise RuntimeError(f"{type(last).__name__}: {last}")
+
+
 def _regraded_payload(existing: dict | None):
     """A run with no new filings still grades the stored records: results from before grading started
     (Nov 2026), and every record again after a rule change. Returns the payload to save when any grade
@@ -3513,7 +3536,14 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print("  ⚠ No XBRL or board-outcome-PDF results items — skipping detail parse")
         return None
 
-    existing = await r2_get(client, "nse_results_detailed.json")
+    # The stored file is read strictly: a failed read (timeout, 5xx) used to come back as "no file",
+    # so the run saved only its own new results and wiped the history (03 Nov 2026: 92 items left).
+    try:
+        existing = await _load_existing_results(client)
+    except Exception as e:
+        print(f"  ⛔ nse_results_detailed.json could not be read ({e}) — skipping the results update this run "
+              f"so the stored history is not overwritten; new filings are retried next run")
+        return None
     existing_items = (existing or {}).get("items", [])
     processed_links = _processed_result_links(existing)
     for it in pdf_items:
@@ -4508,6 +4538,10 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
         print(f"  🔇 {len(xbrl_backlog_silenced)} XBRL-only result(s) older than 3 days — storing data, "
               f"skipping Telegram (backlog, not fresh news): {', '.join(xbrl_backlog_silenced)}")
     parsed_new_for_telegram = still_notify
+    if os.environ.get("SKIP_RESULT_TELEGRAM", "0").strip().lower() in ("1", "true", "yes"):
+        if parsed_new_for_telegram:
+            print(f"  🔇 SKIP_RESULT_TELEGRAM: storing {len(parsed_new_for_telegram)} result(s) without Telegram (backfill)")
+        parsed_new_for_telegram = []
     for r in parsed_new:
         _apply_grade(r)                                    # result grade (rules above _result_grade)
 
@@ -4589,6 +4623,12 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     merged.sort(key=_effective_ts, reverse=True)
     for r in merged:
         _apply_grade(r)                                    # re-grade old records too, so rule changes apply everywhere
+
+    # Last guard: never save a file with far fewer results than the one read at the start of this run.
+    if len(existing_items) >= 50 and len(merged) < len(existing_items) * 0.5:
+        print(f"  ⛔ results update would shrink nse_results_detailed.json from {len(existing_items)} to "
+              f"{len(merged)} items — not saving; check this run's log")
+        return None
 
     payload = make_payload(merged)
     payload["processed_result_links"] = sorted(processed_links)
