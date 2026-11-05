@@ -604,7 +604,8 @@ def _result_candidate_in_universe(it: dict, universe: set[str], bse_symbol_map: 
     resolver so legitimate filename/live-symbol mismatches (e.g. old internal
     filing codes) are not unnecessarily lost. BSE uses classification's scrip map.
     """
-    if (it.get("_cal_fallback") or it.get("_loose")) and not _fallback_result_candidate(it):
+    if ((it.get("_cal_fallback") and not _calendar_result_candidate(it))
+            or (it.get("_loose") and not it.get("_cal_fallback") and not _fallback_result_candidate(it))):
         _trace_result(it, "excluded", "calendar-only administrative/narrative filing")
         return False
     if not universe:
@@ -1550,6 +1551,30 @@ def _fallback_result_candidate(it):
                 or _is_bse_results_pdf(it))
 
 
+def _calendar_result_candidate(it):
+    """Looser test for a filing whose symbol IS on result_calendar.json today.
+
+    Companies often file the actual statement with an empty description
+    ("Please see annexed enclosure", "As per attachment") — SETL, 05-Nov-2026,
+    was missed because _fallback_result_candidate wants a board-outcome word.
+    For a company due today, only clearly administrative filings (newspaper
+    ad, transcript, call notice, record date...) are excluded; everything else
+    goes to the PDF heading check, which still decides before any Gemini call.
+    """
+    if _has_explicit_financial_results_text(it):
+        return True
+    summary = it.get("summary") or it.get("description") or ""
+    combined = summary + " " + it.get("link", "").rsplit("/", 1)[-1]
+    return not (_ADMIN_FILING_RE.search(combined) or _CAL_NON_RESULT_RE.search(combined))
+
+
+# Clearly-not-results descriptions seen from companies on the calendar the
+# same day; dropped before download (calendar path only).
+_CAL_NON_RESULT_RE = re.compile(
+    r"postal\s+ballot|credit\s+(?:rating|bulletin)|extinguish|incorporation\s+of|"
+    r"clarification|spurt\s+in\s+volume|movement\s+in\s+(?:volume|price)", re.I)
+
+
 def _on_calendar_strict(symbol: str, calendar: dict, iso_date: str) -> bool:
     """Unlike _in_result_calendar this does NOT fail open: unknown symbol,
     unknown date or empty calendar -> False. Used only to ADD candidates."""
@@ -1579,16 +1604,18 @@ def _bse_extra_candidate_kind(it: dict, calendar: dict, bse_symbol_map: dict | N
     code = it.get("scripcode", "")
     if not link.lower().endswith(".pdf") or not code:
         return None
-    if is_noise(it) or not _fallback_result_candidate(it):
+    if is_noise(it):
         return None   # trading window, 74(5), scrutinizer, ESOP... never worth a fetch
     sym = ((bse_symbol_map or {}).get(code, code) or "").upper()
+    on_cal = _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", "")))
+    # Due today -> vague descriptions are allowed; otherwise a board-outcome hint is required.
+    if not (_calendar_result_candidate(it) if on_cal else _fallback_result_candidate(it)):
+        return None
     if _NON_STATEMENT_DESC_RE.search(f"{it.get('title', '')} {it.get('summary', '')}"):
         # Never a numbers source — but a presentation from a company reporting
         # today is the best source of highlights/commentary for its card.
-        if _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", ""))):
-            return "narrative"
-        return None
-    if _on_calendar_strict(sym, calendar, _bse_fallback_date(it.get("published", ""))):
+        return "narrative" if on_cal else None
+    if on_cal:
         return "calendar"
     text = f"{it.get('title', '')} {it.get('summary', '')}"
     if _GENERIC_OUTCOME_RE.search(text) and not _PDF_NON_RESULT_RE.search(text):
@@ -4835,7 +4862,7 @@ async def run():
                 link = it.get("link", "")
                 if not link.lower().endswith(".pdf") or link in seen_pdf_links:
                     continue
-                if (is_noise(it) or not _fallback_result_candidate(it)
+                if (is_noise(it) or not _calendar_result_candidate(it)
                         or not _nse_on_calendar_strict(link, calendar_payload)):
                     continue
                 it["_cal_fallback"] = True
