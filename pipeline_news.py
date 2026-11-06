@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import calendar
+import hashlib
 import json
 import os
 import re
@@ -4718,6 +4719,183 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
     payload["processed_result_links"] = sorted(processed_links)
     return payload
 
+# ─────────────────────────────────────────────────────────────────────────
+# Permanent results archive (Nov 2026)
+#
+# nse_results_detailed.json keeps only the latest RESULTS_KEEP_QUARTERS
+# quarters, so a result's filing time and its AI text (highlights,
+# management commentary, board outcome) used to disappear after two seasons.
+# Two files keep them for good — nothing is ever deleted from either:
+#
+#   result_times.json            small index for the whole universe:
+#     {"updated_at", "stocks": {SYM: [{pe, qtr, date, ts, time, session, h}]}}
+#     - pe = quarter period_end (YYYY-MM-DD), one entry per symbol+quarter
+#     - ts/time/session = EARLIEST filing time seen for that quarter (IST)
+#       session: BH = before 09:15, IH = 09:15-15:30, AH = after 15:30
+#     - h = hash of what was last written to that stock's archive file
+#   results_archive/{SYM}.json   one file per stock, read by ep.html only when
+#     a result card is opened: {"symbol", "updated_at", "quarters": [...]}
+#     each quarter: timing, PDF link, grade, headline numbers and the AI text.
+#
+# A stock's archive file is downloaded+re-uploaded only when its content hash
+# changed, and at most RESULTS_ARCHIVE_MAX_WRITES files per run (the first
+# run back-fills gradually instead of writing ~1,500 files at once).
+# ─────────────────────────────────────────────────────────────────────────
+RESULT_TIMES_FILE = "result_times.json"
+RESULTS_ARCHIVE_DIR = "results_archive"
+RESULTS_ARCHIVE_MAX_WRITES = int(os.environ.get("RESULTS_ARCHIVE_MAX_WRITES", "300"))
+
+
+def _ist_session(ts: int):
+    """(HH:MM, BH/IH/AH) in IST for a unix timestamp, or (None, None)."""
+    if not ts:
+        return None, None
+    dt = datetime.fromtimestamp(ts, tz=_IST)
+    mins = dt.hour * 60 + dt.minute
+    return dt.strftime("%H:%M"), ("BH" if mins < 555 else "IH" if mins < 930 else "AH")
+
+
+def _archive_entry(it: dict) -> dict | None:
+    m, q = it.get("meta") or {}, it.get("quarter") or {}
+    sym = str(m.get("symbol") or "").strip().upper()
+    pe = str(q.get("period_end") or "")[:10]
+    if not sym or not pe:
+        return None
+    ts = _effective_ts(it) or 0
+    hhmm, session = _ist_session(ts)
+    y = it.get("yoy_fundamentals") or {}
+    g = it.get("grade") or {}
+    return {
+        "symbol": sym, "pe": pe, "qtr": m.get("quarter_label") or "",
+        "date": str(m.get("board_meeting_date") or "")[:10],
+        "ts": ts, "time": hhmm, "session": session,
+        "basis": m.get("standalone_consolidated") or "",
+        "exchange": m.get("exchange") or "",
+        "link": it.get("link") or "",
+        "grade": g.get("label"), "grade_why": g.get("why"),
+        "sector": m.get("financial_sector") or "",
+        "revenue": q.get("revenue"), "total_income": q.get("total_income"),
+        "pat": q.get("pat"), "eps": q.get("eps_basic") if q.get("eps_basic") is not None else q.get("eps_diluted"),
+        "opm": q.get("opm"),
+        "sales_yoy_pct": y.get("sales_yoy_pct"), "pat_yoy_pct": y.get("pat_yoy_pct"),
+        "key_highlights": it.get("key_highlights") or [],
+        "management_commentary": it.get("management_commentary"),
+        "board_meeting_outcome": it.get("board_meeting_outcome"),
+    }
+
+
+async def update_results_archive(client: httpx.AsyncClient, items: list[dict]):
+    """Append this run's results to result_times.json and results_archive/{SYM}.json.
+    Never raises: the archive must not break the main results update."""
+    try:
+        idx = await r2_get(client, RESULT_TIMES_FILE)
+        if idx is None:
+            idx = {"stocks": {}}
+        elif not isinstance(idx, dict) or not isinstance(idx.get("stocks"), dict):
+            print(f"  ⛔ {RESULT_TIMES_FILE} unreadable — archive skipped this run (not overwriting it)")
+            return
+        stocks = idx["stocks"]
+
+        # one archive row per symbol + quarter + basis; Consolidated preferred for the index
+        rows: dict[tuple, dict] = {}
+        for it in items:
+            e = _archive_entry(it)
+            if not e:
+                continue
+            k = (e["symbol"], e["pe"], e["basis"])
+            prev = rows.get(k)
+            # same filing seen on NSE and BSE: keep the earliest timestamp, merge the AI text
+            if prev is None or (e["ts"] and (not prev["ts"] or e["ts"] < prev["ts"])):
+                if prev:
+                    for f in ("key_highlights", "management_commentary", "board_meeting_outcome"):
+                        e[f] = e[f] or prev[f]
+                rows[k] = e
+            else:
+                for f in ("key_highlights", "management_commentary", "board_meeting_outcome"):
+                    prev[f] = prev[f] or e[f]
+
+        by_sym: dict[str, list[dict]] = {}
+        for e in rows.values():
+            by_sym.setdefault(e["symbol"], []).append(e)
+
+        changed_idx = 0
+        to_write: list[tuple[str, list[dict], str]] = []
+        for sym, ents in by_sym.items():
+            lst = stocks.setdefault(sym, [])
+            for pe in sorted({e["pe"] for e in ents}):
+                cands = [e for e in ents if e["pe"] == pe]
+                main = next((e for e in cands if e["basis"].lower() == "consolidated"), cands[0])
+                earliest = min((e for e in cands if e["ts"]), key=lambda e: e["ts"], default=main)
+                cur = next((x for x in lst if x.get("pe") == pe), None)
+                if cur is None:
+                    cur = {"pe": pe}
+                    lst.append(cur)
+                    changed_idx += 1
+                if earliest["ts"] and (not cur.get("ts") or earliest["ts"] < cur["ts"]):
+                    cur.update(ts=earliest["ts"], time=earliest["time"], session=earliest["session"])
+                    changed_idx += 1
+                for f in ("qtr", "date"):
+                    if main.get(f) and cur.get(f) != main[f]:
+                        cur[f] = main[f]
+                        changed_idx += 1
+                body = json.dumps(cands, sort_keys=True, ensure_ascii=False, default=str)
+                h = hashlib.md5(body.encode()).hexdigest()[:10]
+                if cur.get("h") != h:
+                    to_write.append((sym, cands, pe))
+            lst.sort(key=lambda x: x.get("pe") or "", reverse=True)
+
+        # per-stock archive files (bounded per run; leftovers go next run since their hash is unchanged)
+        pending = {}
+        for sym, cands, pe in to_write:
+            pending.setdefault(sym, []).append((pe, cands))
+        written = 0
+        sem = asyncio.Semaphore(8)
+
+        async def _write(sym, parts):
+            nonlocal written
+            async with sem:
+                fname = f"{RESULTS_ARCHIVE_DIR}/{sym}.json"
+                cur = await r2_get(client, fname)
+                if cur is not None and not isinstance(cur, dict):
+                    print(f"  ⚠ {fname} unreadable — not overwriting")
+                    return
+                qs = (cur or {}).get("quarters") or []
+                for pe, cands in parts:
+                    for e in cands:
+                        old = next((x for x in qs if x.get("pe") == pe and x.get("basis") == e["basis"]), None)
+                        new = {k: v for k, v in e.items() if k != "symbol"}
+                        if old:
+                            for f in ("key_highlights", "management_commentary", "board_meeting_outcome"):
+                                new[f] = new[f] or old.get(f)       # never lose AI text already archived
+                            if old.get("ts") and (not new["ts"] or old["ts"] < new["ts"]):
+                                new.update(ts=old["ts"], time=old.get("time"), session=old.get("session"))
+                            qs[qs.index(old)] = new
+                        else:
+                            qs.append(new)
+                qs.sort(key=lambda x: (x.get("pe") or "", x.get("basis") or ""), reverse=True)
+                await r2_put(client, fname, {"symbol": sym, "updated_at": datetime.now(timezone.utc).isoformat(), "quarters": qs})
+                for pe, cands in parts:
+                    ent = next((x for x in stocks[sym] if x.get("pe") == pe), None)
+                    if ent is not None:
+                        ent["h"] = hashlib.md5(json.dumps(cands, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:10]
+                written += 1
+
+        syms = list(pending)[:RESULTS_ARCHIVE_MAX_WRITES]
+        results = await asyncio.gather(*[_write(s, pending[s]) for s in syms], return_exceptions=True)
+        errs = [r for r in results if isinstance(r, Exception)]
+        for r in errs[:5]:
+            print(f"  ⚠ archive write failed: {type(r).__name__}: {r}")
+
+        if changed_idx or written:
+            idx["updated_at"] = datetime.now(timezone.utc).isoformat()
+            idx["count"] = sum(len(v) for v in stocks.values())
+            await r2_put(client, RESULT_TIMES_FILE, idx)
+        left = len(pending) - written
+        print(f"  🗄 results archive: {changed_idx} index change(s), {written} stock file(s) written"
+              + (f", {left} left for the next run" if left > 0 else "") + (f", {len(errs)} failed" if errs else ""))
+    except Exception as e:
+        print(f"  ⚠ results archive update failed (main results file is unaffected): {type(e).__name__}: {e}")
+
 
 async def run():
     now = datetime.now(timezone.utc).isoformat()
@@ -5021,6 +5199,7 @@ async def run():
                                                           bse_pdf_items=merged_bse_feed, bse_symbol_map=bse_symbol_map)
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
+            await update_results_archive(client, detailed_payload.get("items") or [])
 
     async with httpx.AsyncClient() as trace_client:
         await r2_put(trace_client, "results_pipeline_trace.json", make_payload(_RESULT_TRACE))
