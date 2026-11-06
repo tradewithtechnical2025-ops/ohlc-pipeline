@@ -3540,6 +3540,8 @@ def _regraded_payload(existing: dict | None):
     (Nov 2026), and every record again after a rule change. Returns the payload to save when any grade
     changed, else None (nothing to upload)."""
     items = (existing or {}).get("items") or []
+    global _ARCHIVE_ITEMS
+    _ARCHIVE_ITEMS = items                               # quiet run: the archive still back-fills from these
     changed = 0
     for it in items:
         before = json.dumps(it.get("grade"), sort_keys=True)
@@ -4742,6 +4744,7 @@ async def build_results_detailed(client: httpx.AsyncClient, results_items: list[
 # run back-fills gradually instead of writing ~1,500 files at once).
 # ─────────────────────────────────────────────────────────────────────────
 RESULT_TIMES_FILE = "result_times.json"
+_ARCHIVE_ITEMS: list = []        # stored results seen on a run with no new filings (set by _regraded_payload)
 RESULTS_ARCHIVE_DIR = "results_archive"
 RESULTS_ARCHIVE_MAX_WRITES = int(os.environ.get("RESULTS_ARCHIVE_MAX_WRITES", "300"))
 
@@ -5199,7 +5202,11 @@ async def run():
                                                           bse_pdf_items=merged_bse_feed, bse_symbol_map=bse_symbol_map)
         if detailed_payload:
             await r2_put(client, "nse_results_detailed.json", detailed_payload)
-            await update_results_archive(client, detailed_payload.get("items") or [])
+        # Archive runs every time — also on quiet runs (no new filings, nothing re-saved), so the
+        # back-fill of results_archive/ and result_times.json does not wait for the next new result.
+        archive_items = (detailed_payload or {}).get("items") or _ARCHIVE_ITEMS
+        if archive_items:
+            await update_results_archive(client, archive_items)
 
     async with httpx.AsyncClient() as trace_client:
         await r2_put(trace_client, "results_pipeline_trace.json", make_payload(_RESULT_TRACE))
