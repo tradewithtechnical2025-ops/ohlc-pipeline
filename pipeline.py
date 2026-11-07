@@ -104,6 +104,30 @@ HERE = Path(__file__).parent
 with open(HERE / "nse_holidays.json") as f:
     NSE_HOLIDAYS: set[str] = set(json.load(f))
 
+# ── Muhurat trading sessions (special ~1-hour Diwali session) ──
+# A Muhurat day is NOT a regular trading day (is_trading_day() stays False —
+# it is usually a Sunday or an exchange holiday), but the exchange does trade,
+# Upstox does return a daily candle for it, and its close is the official
+# previous close for the next session. Add each year's date here (or in an
+# optional muhurat_sessions.json: {"YYYY-MM-DD": "HH:MM", ...}) once NSE announces it.
+# Value = normal-market start time in IST (run_today waits for it).
+MUHURAT_SESSIONS: dict[str, str] = {
+    "2026-11-08": "14:20",   # Sun — Diwali Laxmi Pujan, Samvat 2083 (NSE: 14:20–15:30 IST)
+}
+try:
+    with open(HERE / "muhurat_sessions.json") as f:
+        _m = json.load(f)
+        MUHURAT_SESSIONS.update(_m if isinstance(_m, dict) else {d: "00:00" for d in _m})
+except FileNotFoundError:
+    pass
+
+# How scans treat the Muhurat bar once a regular session has come after it:
+# True  = fold it into the previous regular session (high/low widen, close = Muhurat close,
+#         volume added) so a 1-hour bar never counts as a full "day" in NR7 / inside-bar /
+#         prev-day-high / average-volume logic. Stored OHLC (charts) keeps the bar as it is.
+# False = scans see the Muhurat bar as its own day, like the raw data.
+MUHURAT_FOLD_FOR_SCANS = True
+
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
 
 def _upstox_headers():
@@ -254,6 +278,50 @@ def is_trading_day(d: str) -> bool:
     dt = date.fromisoformat(d)
     return dt.weekday() < 5 and d not in NSE_HOLIDAYS
 
+def is_muhurat_day(d: str) -> bool:
+    return d in MUHURAT_SESSIONS
+
+def is_session_day(d: str) -> bool:
+    """Any day the exchange trades: a regular trading day OR a Muhurat session.
+    Use this where 'will a candle exist for this day?' matters (week / month
+    completeness); keep is_trading_day() for 'is this a normal full session?'."""
+    return is_trading_day(d) or is_muhurat_day(d)
+
+def fold_muhurat_bars(all_data: dict) -> int:
+    """Scan-only view: merges each Muhurat candle into the regular session before it,
+    IN PLACE on the dict given (never call this on data that will be uploaded).
+      - Skipped while the Muhurat bar is still the latest bar (Muhurat evening:
+        screener should show the Muhurat session itself as the day).
+      - Skipped when the previous bar is in another ISO week or month, so weekly /
+        monthly candles are never moved across a boundary.
+    Returns the number of bars folded."""
+    if not MUHURAT_FOLD_FOR_SCANS or not MUHURAT_SESSIONS:
+        return 0
+    folded = 0
+    for s in all_data.values():
+        ds = s.get("d") if isinstance(s, dict) else None
+        if not ds or len(ds) < 3:
+            continue
+        idxs = [i for i in range(1, len(ds) - 1) if str(ds[i])[:10] in MUHURAT_SESSIONS]
+        for i in reversed(idxs):                      # back to front so indexes stay valid
+            d_m, d_p = str(ds[i])[:10], str(ds[i - 1])[:10]
+            dm, dp = date.fromisoformat(d_m), date.fromisoformat(d_p)
+            if dm.isocalendar()[:2] != dp.isocalendar()[:2] or d_m[:7] != d_p[:7]:
+                continue
+            p, m = i - 1, i
+            h, l, c = s["h"], s["l"], s["c"]
+            if h[m] is not None: h[p] = h[m] if h[p] is None else max(h[p], h[m])
+            if l[m] is not None: l[p] = l[m] if l[p] is None else min(l[p], l[m])
+            if c[m] is not None: c[p] = c[m]
+            if "v" in s: s["v"][p] = (s["v"][p] or 0) + (s["v"][m] or 0)
+            if "oi" in s and s["oi"][m] is not None: s["oi"][p] = s["oi"][m]
+            n = len(ds)
+            for k in list(s.keys()):                  # every per-bar array (d, o, h, l, c, v, oi, ...)
+                if isinstance(s[k], list) and len(s[k]) == n:
+                    del s[k][m]
+            folded += 1
+    return folded
+
 def last_trading_day() -> str:
     dt = date.fromisoformat(today_ist())
     for _ in range(14):
@@ -298,7 +366,7 @@ def _is_week_complete(today_d: str) -> bool:
         candidate = dt_today + timedelta(days=delta)
         if candidate.isocalendar()[:2] != (iso_year, iso_week):
             break
-        if is_trading_day(candidate.isoformat()):
+        if is_session_day(candidate.isoformat()):    # a Muhurat Sunday still belongs to this week
             return False
     return True
 
@@ -308,7 +376,7 @@ def _is_month_complete(today_d: str) -> bool:
     next_month_start = date(dt_today.year + 1, 1, 1) if dt_today.month == 12 else date(dt_today.year, dt_today.month + 1, 1)
     d = dt_today + timedelta(days=1)
     while d < next_month_start:
-        if is_trading_day(d.isoformat()): return False
+        if is_session_day(d.isoformat()): return False
         d += timedelta(days=1)
     return True
 
@@ -545,7 +613,9 @@ async def save_result_calendar(client, by_date: dict, keep_days=365):
     await upload_str_with_manifest(client, r2_upload, "result_calendar.json", json.dumps(cal),
                                     schema_v=1, extra_meta={"date_count": len(cal)})
 
-async def download_all_chunks(client) -> dict:
+async def download_all_chunks(client, for_scan: bool = False) -> dict:
+    """for_scan=True: read-only scan view with Muhurat bars folded (see fold_muhurat_bars).
+    Leave it False anywhere the data is merged / uploaded back to R2."""
     tasks = [r2_download(client, f"ohlc_{i+1}.json") for i in range(R2_CHUNKS)]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     all_data = {}
@@ -553,6 +623,9 @@ async def download_all_chunks(client) -> dict:
         if isinstance(res, Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
         elif res and "stocks" in res: all_data.update(res["stocks"])
     log.info(f"Master: {len(all_data)} stocks across {R2_CHUNKS} chunks")
+    if for_scan:
+        n = fold_muhurat_bars(all_data)
+        if n: log.info(f"🪔 Muhurat: folded {n} Muhurat bar(s) into the previous session (scan view only)")
     return all_data
 
 async def upload_all_chunks(client, all_data, today):
@@ -829,6 +902,16 @@ async def run_daily() -> None:
             ath_data = await r2_download_ath(client)
             ath_updated = _update_ath_from_delta(ath_data, delta, today)
             log.info(f"ATH: {ath_updated} new record(s) today")
+            # A Muhurat session between prev and today (e.g. Sunday, seen first on Monday's run)
+            # is merged above but is not "today" — check its highs for ATH too.
+            muh_delta = {}
+            for sym, candles in fetched.items():
+                for c in candles:
+                    if c["d"] != today and is_muhurat_day(c["d"]):
+                        muh_delta[sym] = c
+            if muh_delta:
+                muh_ath = _update_ath_from_delta(ath_data, muh_delta, today)
+                log.info(f"🪔 Muhurat: {len(muh_delta)} candle(s) merged, {muh_ath} ATH record(s) from the Muhurat session")
 
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
@@ -847,9 +930,16 @@ async def run_today() -> None:
     status = PipelineStatus("run_today")
     try:
         today = today_ist()
-        if not is_trading_day(today):
+        if not is_session_day(today):
             log.info(f"⏭  {today} not a trading day — skipping (avoids stale/stuck live-quote data being stamped as today)")
             return
+        if is_muhurat_day(today):
+            start = MUHURAT_SESSIONS.get(today) or "00:00"
+            if datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%H:%M") < start:
+                log.info(f"⏭  {today} is a Muhurat day but the session has not started yet ({start} IST) — "
+                         f"skipping so the last session's quote is not stamped as today")
+                return
+            log.info(f"🪔 {today} — Muhurat trading session")
         log.info(f"━━━ Today  {today} ━━━")
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
@@ -945,7 +1035,10 @@ def _detect_recent_gaps(all_data, ikey_map, sessions=BACKFILL_GAP_SESSIONS, min_
     if not count:
         return []
     n_stocks = len(all_data)
-    market = sorted(d for d, c in count.items() if c >= min_share * n_stocks)[-sessions:]
+    # Muhurat days are left out: an illiquid stock that did not trade in the 1-hour session
+    # has no candle for it, and that is not a gap to refetch on every run.
+    market = sorted(d for d, c in count.items()
+                    if c >= min_share * n_stocks and not is_muhurat_day(d))[-sessions:]
     out = []
     for sym in ikey_map:
         s = all_data.get(sym)
@@ -3894,6 +3987,8 @@ async def run_ep_scan() -> None:
                 if isinstance(res,Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
                 elif res and "stocks" in res: all_data.update(res["stocks"])
             log.info(f"Loaded {len(all_data)} stocks")
+            _nfold = fold_muhurat_bars(all_data)   # scan view only — ep_scan never uploads OHLC back
+            if _nfold: log.info(f"🪔 Muhurat: folded {_nfold} Muhurat bar(s) into the previous session (scan view only)")
 
             # Authoritative market-data date for screener_feed/history.
             # On weekends/holidays the pipeline may run today, while OHLC still
@@ -5044,7 +5139,7 @@ async def run_hlr_scan() -> None:
         async with httpx.AsyncClient() as client:
             global ISIN_MAP,BSE_ISIN_MAP,BSE_META
             ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
-            all_data=await download_all_chunks(client)
+            all_data=await download_all_chunks(client, for_scan=True)
             log.info(f"Loaded {len(all_data)} stocks")
             _zero=[(sym,s_["d"][i]) for sym,s_ in all_data.items() for i,c in enumerate(s_.get("c") or []) if c is not None and c<=0]
             if _zero:
@@ -5191,13 +5286,14 @@ async def run_pattern_scan(force: bool = False) -> None:
     status = PipelineStatus("run_pattern_scan")
     try:
         today=today_ist()
+        if not force and is_muhurat_day(today): log.info(f"⏭  {today} is a Muhurat session — patterns on a ~1-hour bar are skipped; the next regular session's run includes it (folded into the previous day)"); return
         if not force and not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
         if force: log.info(f"⚠️  FORCE MODE — bypassing trading-day check for {today}")
         log.info(f"━━━ Pattern Scan  {today} ━━━")
         async with httpx.AsyncClient() as client:
             global ISIN_MAP,BSE_ISIN_MAP,BSE_META
             ISIN_MAP,BSE_ISIN_MAP,BSE_META=await build_isin_map(client)
-            all_data=await download_all_chunks(client)
+            all_data=await download_all_chunks(client, for_scan=True)
             log.info(f"Loaded {len(all_data)} stocks")
             signals=_detect_patterns(all_data)
             from collections import Counter; counts=Counter(s["pattern"] for s in signals)
@@ -5516,13 +5612,14 @@ async def run_candle_scan(force: bool = False) -> None:
     status = PipelineStatus("run_candle_scan")
     try:
         today = today_ist()
+        if not force and is_muhurat_day(today): log.info(f"⏭  {today} is a Muhurat session — patterns on a ~1-hour bar are skipped; the next regular session's run includes it (folded into the previous day)"); return
         if not force and not is_trading_day(today): log.info(f"⏭  {today} not a trading day"); return
         if force: log.info(f"⚠️  FORCE MODE — bypassing trading-day check for {today}")
         log.info(f"━━━ Candlestick Pattern Scan  {today} ━━━")
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-            all_data = await download_all_chunks(client)
+            all_data = await download_all_chunks(client, for_scan=True)
             log.info(f"Loaded {len(all_data)} stocks")
 
             signals, stats = _detect_candle_patterns(all_data)
@@ -5655,7 +5752,7 @@ async def run_home_ticker() -> None:
                     items.append({"label": pat_name.upper(), "symbol": sym, "tone": tone})
 
             # Market breadth line
-            all_data = await download_all_chunks(client)
+            all_data = await download_all_chunks(client, for_scan=True)
             pct50 = _ticker_breadth_50sma(all_data)
             breadth = None
             if pct50 is not None:
@@ -6107,7 +6204,7 @@ async def run_stage2_scan() -> None:
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-            all_data = await download_all_chunks(client)
+            all_data = await download_all_chunks(client, for_scan=True)
             log.info(f"Loaded {len(all_data)} stocks")
 
             signals, breadth_history = _detect_stage2(all_data)
@@ -6205,7 +6302,7 @@ async def run_minervini_scan(min_rs_rating=70) -> None:
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-            all_data = await download_all_chunks(client)
+            all_data = await download_all_chunks(client, for_scan=True)
             log.info(f"Loaded {len(all_data)} stocks")
 
             rs_data = _calculate_rs(all_data)
@@ -6575,7 +6672,7 @@ async def debug_weinstein_symbol(symbol, weeks_shown=20, **kwargs) -> None:
     async with httpx.AsyncClient() as client:
         global ISIN_MAP, BSE_ISIN_MAP, BSE_META
         ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_data = await download_all_chunks(client)
+        all_data = await download_all_chunks(client, for_scan=True)
     sym = symbol.upper().strip()
     if sym not in all_data:
         print(f"{sym} not found")
@@ -6607,7 +6704,7 @@ async def run_weinstein_scan(dry_run=False, print_top_n=25) -> None:
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-            all_data = await download_all_chunks(client)
+            all_data = await download_all_chunks(client, for_scan=True)
             log.info(f"Loaded {len(all_data)} stocks")
 
             signals, breadth_history = _detect_weinstein_stages(all_data)
@@ -7100,7 +7197,7 @@ async def run_vcp_scan() -> None:
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-            all_data = await download_all_chunks(client)
+            all_data = await download_all_chunks(client, for_scan=True)
             log.info(f"Loaded {len(all_data)} stocks")
             signals = []
             for sym, s in all_data.items():
@@ -7338,7 +7435,7 @@ async def run_box_scan(dry_run=False) -> None:
     from box_finder import build_box_finder
     today = today_ist()
     async with httpx.AsyncClient() as client:
-        all_data = await download_all_chunks(client)
+        all_data = await download_all_chunks(client, for_scan=True)
         payload = build_box_finder(all_data, asof=today)
         from collections import Counter
         counts = Counter(row['status'] for row in payload['stocks'])
@@ -7838,7 +7935,7 @@ async def run_user_alerts(dry_run=False) -> None:
         log.info(f"User alerts: {len(alerts)} active alert(s) of linked users")
         if not alerts:
             return
-        all_data = await download_all_chunks(client)
+        all_data = await download_all_chunks(client, for_scan=True)
         hits = _ua_check(alerts, all_data)
         log.info(f"User alerts: {len(hits)} fired")
         fired = []
