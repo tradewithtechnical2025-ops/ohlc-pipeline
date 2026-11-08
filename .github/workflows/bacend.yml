@@ -6,10 +6,13 @@ name: OHLC Pipeline Scans (Manual)
 # Option values must be the exact pipeline.py mode names (no spaces).
 # public_alerts*: EOD summaries to the public Telegram group (@twt_alerts).
 #   public_alerts_dryrun = messages in the log only, public_alerts_ping = one test message per topic.
-# backfill_missing: fills missing OHLC in the R2 chunks.
+# backfill_missing: fills missing OHLC in the R2 chunks (history now from Finedge, adjusted).
 #   With "symbols" (e.g. INFY,TCS or a BSE code) -> only those stocks.
 #   With "symbols" empty -> auto-detects stocks that are missing, have short history,
 #   or miss a day in the last 30 market sessions.
+# finedge_hist_test: prints what Finedge history returns for "symbols" (e.g. VEDL,ITC,532305)
+#   and compares it with the R2 data — writes nothing.
+# concall_fetch: the week's concall transcript PDFs -> zip, downloadable as the "concall-inbox" artifact.
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +24,8 @@ on:
         options:
           - status
           - backfill_missing
+          - finedge_hist_test
+          - concall_fetch
           - vcp_scan
           - minervini_scan
           - stage2_scan
@@ -41,7 +46,7 @@ on:
           - user_alerts_dryrun
           - user_alerts
       symbols:
-        description: 'backfill_missing only: comma-separated symbols (e.g. INFY,TCS). Leave empty to auto-detect.'
+        description: 'backfill_missing / finedge_hist_test: comma-separated symbols (e.g. INFY,TCS). concall_fetch: days back (max 7). Empty = default.'
         required: false
         default: ''
         type: string
@@ -73,8 +78,15 @@ jobs:
           MODE: ${{ inputs.mode }}
           SYMBOLS: ${{ inputs.symbols }}
         run: |
-          if [ "$MODE" = "backfill_missing" ]; then
-            python pipeline.py "$MODE" "$SYMBOLS"
-          else
-            python pipeline.py "$MODE"
-          fi
+          case "$MODE" in
+            backfill_missing|finedge_hist_test|concall_fetch) python pipeline.py "$MODE" "$SYMBOLS" ;;
+            *) python pipeline.py "$MODE" ;;
+          esac
+
+      - name: Upload concall inbox
+        if: ${{ inputs.mode == 'concall_fetch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: concall-inbox
+          path: concall_inbox_*.zip
+          retention-days: 30
