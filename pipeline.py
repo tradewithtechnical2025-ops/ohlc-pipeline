@@ -8175,7 +8175,8 @@ async def _pr_send_document(client, chat_id, filename, data, caption=None):
 # The Worker stores one row per watchlist (kind = 'watchlist', snap = {v, wl, syms, ev}); ev.scans holds up to
 # 5 of the user's own scans / presets ({t: 'scan'|'preset', id, name, snap}). After market close the digest lists
 # the watched stocks that match them TODAY (no comparison with the previous session):
-#   Script Scan scans  run only on the watched stocks (TWTScan.scanDef with syms), max 3 per user (Worker).
+#   Script Scan scans  run only on the watched stocks (TWTScan.scanDef with syms), max 3 per user (Worker),
+#                      always with Within = 1 bar (a signal today), whatever the saved scan says.
 #                      Every one runs; WL_TWTS_TIMEOUT_S only stops a script that hangs (it is reported, the rest go on)
 #   Strategy Builder   the screener's formula on the default screener ({__base: 1, myscans: [...]})
 #   presets            the saved snapshot as is
@@ -8221,32 +8222,48 @@ def _wl_twts_def(it):
     return None
 
 
-def _wl_message(a, day, hits, total):
-    """hits: [(row, [scan names])]. One message per watchlist; long lists are cut to fit Telegram."""
+def _wl_message(a, day, groups, n_match, total):
+    """Same layout as the preset alert: one <code> block per scan / preset with NSE:SYM,BSE:SYM,... (one tap
+    copies them, and the comma list imports straight into a watchlist). groups: [(scan name, [state rows])].
+    Long lists are cut to fit Telegram's 4096 characters; then the CSV file has everything."""
     name = _pr_esc(a.get("pname") or a.get("name") or "Watchlist")
-    head = [f"🔔 <b>{name}</b> · {_wl_day_txt(day)}"]
-    tail = [f"<i>{len(hits)} of {total} stock{'s' if total != 1 else ''} match today</i>"]
+    head = [f"🔔 <b>Watchlist · {name}</b> · {_wl_day_txt(day)}",
+            f"{n_match} of {total} stock{'s' if total != 1 else ''} match today"]
+    tail = []
     if a.get("exp"):
         try: tail.append(f"Until {date.fromisoformat(str(a['exp'])[:10]).strftime('%d %b')}")
         except ValueError: pass
     if a.get("msg"): tail += ["", f"📝 {_pr_esc(a['msg'])}"]
     tail += ["", f'<a href="{PR_SITE_URL}{PR_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
+    lists = [(label, [r[15] for r in rows]) for label, rows in groups if rows]
 
     def build(cap):
         out = list(head)
-        for row, evs in hits[:cap]:
-            ltp, ch = row[0], row[1]
-            px = (f" ₹{ltp:,.2f}" if ltp else "") + (f" ({ch:+.1f}%)" if ch is not None else "")
-            out += ["", f"<b>{_pr_esc(row[16])}</b>{px}", "• " + _pr_esc(" · ".join(evs))]
-        if len(hits) > cap: out += ["", f"+{len(hits) - cap} more"]
-        out.append("")
-        return "\n".join(out + tail)
-    cap = WL_SHOW_MAX
+        for label, syms in lists:
+            shown = syms[:cap]
+            more = len(syms) - len(shown)
+            out += ["", f"{_pr_esc(label)} ({len(syms)})",
+                    "<code>" + _pr_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else "")]
+        return "\n".join(out + [""] + tail)
+    cap = 2000
     text = build(cap)
-    while len(text) > 3900 and cap > 3:
-        cap = cap * 8 // 10
+    while len(text) > 3900 and cap > 5:   # stay inside Telegram's limit without cutting a tag
+        cap = min(cap, max(len(x[1]) for x in lists)) * 9 // 10 if lists else 5
         text = build(cap)
     return text
+
+
+def _wl_csv(groups):
+    import csv, io
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["Symbol", "TradingView", "Scans", "LTP", "Change %", "RS"])
+    by = {}
+    for label, rows in groups:
+        for r in rows:
+            by.setdefault(r[16], [r, []])[1].append(label)
+    for sym, (r, labels) in sorted(by.items(), key=lambda x: -(x[1][0][2] or 0)):
+        w.writerow([sym, r[15], " · ".join(labels), r[0], r[1], r[2]])
+    return buf.getvalue().encode("utf-8")
 
 
 async def run_preset_alerts(dry_run=False, force=False) -> None:
@@ -8279,6 +8296,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
             for i, it in enumerate(items):
                 d = _wl_twts_def(it)
                 if d is not None:
+                    d = {**d, "within": 1}   # watchlist alerts check today's signal only, whatever the saved scan's Within
                     k = json.dumps(d, sort_keys=True)
                     if k not in twts_jobs: twts_jobs[k] = (d, set())
                     twts_jobs[k][1].update(syms)
@@ -8341,7 +8359,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 log.info(f"{tag} expired on {a['exp']} — skipped"); continue
             if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
                 log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
-            matched, failed = {}, 0   # sym -> [scan names]
+            groups, failed = [], 0   # [(scan name, [state rows])]
             for i, it in enumerate(items):
                 kind, k = wl_item_key.get((a["id"], i), (None, None))
                 res = (twts.get(k) if kind == "twts" else today.get(k)) or {}
@@ -8349,19 +8367,22 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 if not res.get("ok"):
                     failed += 1; log.warning(f"{tag} {label}: {res.get('err') or 'not evaluated'}"); continue
                 got = set(res["set"]) if kind == "twts" else {x[0] for x in res["rows"]}
-                for sym in syms:
-                    if sym in got: matched.setdefault(sym, []).append(label)
-            hits = [(wl_today[sym], names) for sym, names in matched.items() if sym in wl_today]
-            log.info(f"{tag} {len(syms)} stocks, {len(items)} scan(s){f' ({failed} failed)' if failed else ''}, {len(hits)} match today")
-            if not hits: continue
-            hits.sort(key=lambda h: (-len(h[1]), -(h[0][2] or 0)))
-            msg = _wl_message(a, today_day, hits, len(syms))
+                rows = sorted((wl_today[sym] for sym in syms if sym in got and sym in wl_today), key=lambda r: -(r[2] or 0))
+                groups.append((label, rows))
+            n_match = len({r[16] for _, rows in groups for r in rows})
+            log.info(f"{tag} {len(syms)} stocks, {len(items)} scan(s){f' ({failed} failed)' if failed else ''}, {n_match} match today")
+            if not n_match: continue
+            msg = _wl_message(a, today_day, groups, n_match, len(syms))
+            big = "more (CSV)" in msg
             if dry_run:
-                log.info(f"--- {a.get('uid')} {a.get('pname')} ({len(hits)} of {len(syms)}) ---\n{msg}")
+                log.info(f"--- {a.get('uid')} {a.get('pname')} ({n_match} of {len(syms)}){' + CSV' if big else ''} ---\n{msg}")
                 continue
             ok = send_message(msg, chat_id=str(a.get("chat_id")))
+            if ok and big:
+                fname = re.sub(r"[^A-Za-z0-9_-]+", "_", str(a.get("pname") or "watchlist"))[:40] + f"_{today_day}.csv"
+                await _pr_send_document(client, a.get("chat_id"), fname, _wl_csv(groups))
             if ok:
-                fired.append({"uid": a["uid"], "id": a["id"], "day": today_day, "price": len(hits), "level": len(syms)})
+                fired.append({"uid": a["uid"], "id": a["id"], "day": today_day, "price": n_match, "level": len(syms)})
             else:
                 log.warning(f"  watchlist alert {a['id']}: Telegram send failed — will retry next run")
             await asyncio.sleep(0.05)
