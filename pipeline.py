@@ -1131,9 +1131,11 @@ async def run_full() -> None:
                     else: failed.append(sym)
                 pct = min(i+50, len(all_sym_list))
                 log.info(f"  {pct}/{len(all_sym_list)}  OK:{len(all_data)}  Failed:{len(failed)}")
-                if pct % 500 == 0: await upload_all_chunks(client, all_data, today)
+                # no partial uploads: the site keeps the old data until every stock is loaded
             log.info(f"✓ {len(all_data)} loaded  ✗ {len(failed)} failed")
             if failed: (HERE/"failed_stocks.txt").write_text("\n".join(failed))
+            if len(all_data) < 0.9 * len(all_sym_list):
+                raise RuntimeError(f"only {len(all_data)} of {len(all_sym_list)} stocks loaded — R2 left unchanged")
             apply_rolling_window(all_data, cutoff)
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
