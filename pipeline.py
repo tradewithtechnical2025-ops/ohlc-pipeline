@@ -1110,7 +1110,7 @@ async def run_today() -> None:
 async def run_full() -> None:
     status = PipelineStatus("run_full")
     try:
-        today = last_trading_day()
+        today = today_ist() if is_session_day(today_ist()) else last_trading_day()
         start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
         cutoff = start
         sem = asyncio.Semaphore(CONCURRENCY); all_data = {}; failed = []
@@ -1136,6 +1136,22 @@ async def run_full() -> None:
             if failed: (HERE/"failed_stocks.txt").write_text("\n".join(failed))
             if len(all_data) < 0.9 * len(all_sym_list):
                 raise RuntimeError(f"only {len(all_data)} of {len(all_sym_list)} stocks loaded — R2 left unchanged")
+            # Keep what R2 already has AFTER the history's last day (today's / a Muhurat candle from Upstox,
+            # which Finedge may not have yet), and a stock that got no history at all keeps its old series.
+            old = await download_all_chunks(client)
+            kept_days = kept_stocks = 0
+            for sym, o in old.items():
+                if not o or not o.get("d"): continue
+                if sym not in all_data:
+                    if sym in failed: all_data[sym] = o; kept_stocks += 1
+                    continue
+                last = all_data[sym]["d"][-1]
+                extra = [{k: o[k][i] for k in ("d", "o", "h", "l", "c", "v", "oi") if k in o} for i, d in enumerate(o["d"]) if d > last]
+                for c in extra:
+                    c.setdefault("oi", 0)
+                    for k in all_data[sym]: all_data[sym][k].append(c.get(k))
+                kept_days += len(extra)
+            log.info(f"Kept from R2: {kept_days} newer candle(s), {kept_stocks} stock(s) with no new history")
             apply_rolling_window(all_data, cutoff)
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
