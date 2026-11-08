@@ -1,0 +1,27 @@
+# .github/workflows/concall_weekly.yml — every Saturday 10:00 IST: collect the week's concall transcripts
+name: concall weekly
+on:
+  schedule:
+    - cron: "30 4 * * 6"        # 04:30 UTC = 10:00 IST, Saturday
+  workflow_dispatch:
+    inputs:
+      days: { description: "days back (max 7)", default: "7" }
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install httpx numpy requests
+      - run: python pipeline.py concall_fetch ${{ github.event.inputs.days || '7' }}
+        env:
+          UPSTOX_TOKEN: ${{ secrets.UPSTOX_TOKEN }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          FINEDGE_TOKEN: ${{ secrets.FINEDGE_TOKEN }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: concall-inbox
+          path: concall_inbox_*.zip
+          retention-days: 30
