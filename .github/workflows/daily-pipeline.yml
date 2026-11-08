@@ -53,6 +53,15 @@ jobs:
           max_attempts: 3
           retry_wait_seconds: 15
           command: python pipeline_75min.py daily
+      # Chart files (chart/<SYM>.json, 5 years): new candles from Upstox; a new listing's
+      # 5-year history from Finedge (adjusted). Charts only — no scan reads these files.
+      - name: Chart OHLC
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 15
+          max_attempts: 3
+          retry_wait_seconds: 15
+          command: python pipeline_chart.py daily
       - name: HLR Scan
         uses: nick-fields/retry@v3
         with:
