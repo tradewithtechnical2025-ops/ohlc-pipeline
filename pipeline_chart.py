@@ -23,7 +23,8 @@ Data sources:
   history (backfill, rebuild, a new listing's 5-year build): Finedge v2/daily-quotes — adjusted for splits,
     bonus, rights and demergers. A stock Finedge has nothing for falls back to Upstox on its own;
     CHART_HIST_SOURCE=upstox switches history back to Upstox.
-  daily (new candles): Upstox, as before.
+  daily (new candles): Upstox, as before. Stocks pipeline.py "today" found a corporate action in
+    (R2 chart_rebuild.json, same day) are rebuilt from Finedge in "daily".
   BSE history before an NSE listing: Upstox BSE series (same ISIN), as before.
 
 Usage:
@@ -477,6 +478,16 @@ async def run_daily():
             # New in the universe (new listing, or a stock that moved BSE -> NSE): full build
             # incl. BSE history; exchange changed for an existing symbol: rebuild too
             new = sorted(s for s in uni if s not in idx or idx[s].get("ex") != uni[s]["ex"])
+            # Corporate action spotted today by pipeline.py today (chart_rebuild.json): rebuild from Finedge (adjusted)
+            try:
+                cr = await r2_get(client, "chart_rebuild.json") or {}
+            except Exception:
+                cr = {}
+            if cr.get("date") == today:
+                ca = [s for s in (cr.get("symbols") or []) if s in uni and s not in new]
+                if ca:
+                    log.info(f"🔁 Corporate action today, rebuilding {len(ca)} chart file(s): {ca[:15]}")
+                    new = sorted(set(new) | set(ca))
             if new:
                 log.info(f"🆕 {len(new)} new/changed stock(s): {new[:15]}{'…' if len(new) > 15 else ''}")
                 await _build_many(client, uni, bse_keys, idx, new, today)
