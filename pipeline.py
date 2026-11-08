@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 NSE OHLC + Fundamentals Pipeline — GitHub Actions
-OHLC source: daily candles — Upstox API (run_daily new day, run_today);
+OHLC source: today's candle — Finedge v2/quote (run_today; Upstox for the stocks Finedge has no
+             candle for today, e.g. a Muhurat session; OHLC_TODAY_SOURCE=upstox = Upstox only);
+             run_today also spots corporate actions (Finedge's previous close ≠ ours) and rebuilds those
+             stocks' history from Finedge + scales their ATH;
+             missed days — Upstox (run_daily);
              history — Finedge v2/daily-quotes (adjusted for splits, bonus, rights, demergers):
              run_full, backfill_missing, a new stock's deep backfill in run_daily.
              OHLC_HIST_SOURCE=upstox switches history back to Upstox; a symbol Finedge has no data for
@@ -103,6 +107,8 @@ FINEDGE_HIST_URL         = "https://data.finedgeapi.com/api/v2/daily-quotes"
 FINEDGE_HIST_CONCURRENCY = 3
 FINEDGE_HIST_DELAY       = 0.3
 OHLC_HIST_SOURCE         = os.environ.get("OHLC_HIST_SOURCE", "finedge").strip().lower()
+OHLC_TODAY_SOURCE        = os.environ.get("OHLC_TODAY_SOURCE", "finedge").strip().lower()
+CORP_ACTION_TOL          = 0.02    # Finedge previous close vs our last close: more than 2% apart = corporate action
 
 # ── Finedge daily-OHLC (standalone system — does NOT touch Upstox OHLC) ──
 FINEDGE_QUOTE_URL      = "https://data.finedgeapi.com/api/v2/quote"
@@ -1053,6 +1059,63 @@ async def run_daily() -> None:
         status.failure(e)
 
 
+def _finedge_today_candles(quotes: dict, today: str) -> tuple[dict, dict]:
+    """v2/quote records -> ({sym: candle for today}, {sym: Finedge previous close}).
+    A record counts only when its tradetime is today (a stale quote must never be stamped as today).
+    Previous close = price / (1 + change%)."""
+    out, prev = {}, {}
+    for sym, q in (quotes or {}).items():
+        if not isinstance(q, dict): continue
+        if str(q.get("tradetime") or "")[:10] != today: continue
+        o, h, l, c = q.get("open_price"), q.get("high_price"), q.get("low_price"), q.get("current_price")
+        try: o, h, l, c = float(o), float(h), float(l), float(c)
+        except (TypeError, ValueError): continue
+        if min(o, h, l, c) <= 0: continue
+        try: v = int(float(q.get("volume") or 0))
+        except (TypeError, ValueError): v = 0
+        out[sym] = {"d": today, "o": o, "h": max(h, o, c), "l": min(l, o, c), "c": c, "v": v, "oi": 0}
+        try:
+            ch = float(str(q.get("change") or "").replace("%", "").strip())
+            if ch > -100: prev[sym] = c / (1 + ch / 100)
+        except ValueError:
+            pass
+    return out, prev
+
+
+def _corp_action_factors(all_data: dict, prev_close: dict, today: str) -> dict:
+    """{sym: factor} where Finedge's previous close is more than CORP_ACTION_TOL away from our last
+    stored close before today (a split / bonus / demerger adjusted the price; factor = theirs / ours)."""
+    out = {}
+    for sym, pc in prev_close.items():
+        s = all_data.get(sym)
+        if not s or not s.get("d"): continue
+        i = len(s["d"]) - 1
+        while i >= 0 and str(s["d"][i])[:10] >= today: i -= 1
+        if i < 0 or not s["c"][i]: continue
+        f = pc / s["c"][i]
+        if abs(f - 1) > CORP_ACTION_TOL: out[sym] = f
+    return out
+
+
+async def _rebase_from_finedge(client, all_data: dict, syms, today: str) -> list:
+    """Replaces these stocks' history with Finedge's adjusted history (3 years), keeping our candles after
+    Finedge's last day (today's). Returns the symbols rebuilt."""
+    cutoff = rolling_cutoff(today); sem = asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY); done = []
+    async def one(sym):
+        exch = "BSE" if sym in BSE_ISIN_MAP and sym not in ISIN_MAP else "NSE"
+        _, hist = await fetch_finedge_hist(client, sem, sym, cutoff, today, exch)
+        if not hist: return
+        old = all_data.get(sym) or {}
+        last = hist[-1]["d"]
+        newer = [{k: old[k][i] for k in ("d", "o", "h", "l", "c", "v", "oi") if k in old}
+                 for i, d in enumerate(old.get("d") or []) if d > last]
+        for c in newer: c.setdefault("oi", 0)
+        all_data[sym] = build_stock_obj(hist + newer)
+        done.append(sym)
+    await asyncio.gather(*[one(s) for s in syms])
+    return done
+
+
 async def run_today() -> None:
     status = PipelineStatus("run_today")
     try:
@@ -1074,15 +1137,43 @@ async def run_today() -> None:
             all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
             log.info(f"Universe: {len(all_ikeys)} stocks")
 
-            # Fetch chunks + bulk OHLC concurrently
-            fetched, all_data = await asyncio.gather(
-                fetch_ohlc_bulk(client, all_ikeys),
-                download_all_chunks(client),
-            )
+            # Today's candle: Finedge v2/quote (100 symbols a call), Upstox for whatever Finedge lacks
+            fetched, prev_close = {}, {}
+            if OHLC_TODAY_SOURCE != "upstox":
+                quotes, all_data = await asyncio.gather(
+                    fetch_finedge_quotes_all(client, sorted(all_ikeys)),
+                    download_all_chunks(client),
+                )
+                fetched, prev_close = _finedge_today_candles(quotes, today)
+                log.info(f"Finedge today candles: {len(fetched)} of {len(all_ikeys)} (quotes returned: {len(quotes)})")
+                missing = {s: k for s, k in all_ikeys.items() if s not in fetched}
+                if missing and len(missing) > 0.02 * len(all_ikeys):
+                    log.info(f"Upstox for the {len(missing)} stock(s) without a Finedge candle today")
+                    up = await fetch_ohlc_bulk(client, missing)
+                    fetched.update({s: c for s, c in up.items() if c.get("d") == today})
+                elif missing:
+                    log.info(f"No candle today for {len(missing)} stock(s) (not traded / suspended): {sorted(missing)[:10]}")
+            else:
+                fetched, all_data = await asyncio.gather(
+                    fetch_ohlc_bulk(client, all_ikeys),
+                    download_all_chunks(client),
+                )
             log.info(f"Fetched today candles: {len(fetched)}")
 
             if not fetched:
                 log.warning("⚠ No candles fetched — market may be closed or API issue")
+
+            # Corporate actions: Finedge's previous close is adjusted, ours is not -> rebuild that history
+            factors = _corp_action_factors(all_data, prev_close, today)
+            rebased = []
+            if factors:
+                log.info(f"🔁 Corporate action / price adjustment spotted in {len(factors)} stock(s): " +
+                         ", ".join(f"{s} ×{f:.4f}" for s, f in sorted(factors.items())[:20]))
+                rebased = await _rebase_from_finedge(client, all_data, sorted(factors), today)
+                log.info(f"   history rebuilt from Finedge: {len(rebased)} {rebased[:20]}")
+                if rebased:   # pipeline_chart.py daily rebuilds these chart files too (it runs after this step)
+                    await r2_upload(client, "chart_rebuild.json", json.dumps({"date": today, "symbols": rebased,
+                                                                             "factors": {x: round(factors[x], 6) for x in rebased}}))
 
             for sym, c in fetched.items():
                 upsert_candle(all_data, sym, c)
@@ -1090,8 +1181,12 @@ async def run_today() -> None:
             delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
 
             ath_data = await r2_download_ath(client)
+            for sym in rebased:   # the stored all-time high is in the old (unadjusted) prices
+                a = ath_data.get(sym)
+                if a and a.get("ath") and a.get("ath_date", "") < today:
+                    a["ath"] = round(a["ath"] * factors[sym], 2)
             ath_updated = _update_ath_from_delta(ath_data, delta, today)
-            log.info(f"ATH: {ath_updated} new record(s) today")
+            log.info(f"ATH: {ath_updated} new record(s) today" + (f", {len(rebased)} adjusted for corporate actions" if rebased else ""))
 
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
