@@ -19,6 +19,13 @@ NSE + BSE:
   on the first NSE days (within 3%), so a wrong series is never joined.
   "bse_until" in the file = first NSE date; candles before it are BSE.
 
+Data sources:
+  history (backfill, rebuild, a new listing's 5-year build): Finedge v2/daily-quotes — adjusted for splits,
+    bonus, rights and demergers. A stock Finedge has nothing for falls back to Upstox on its own;
+    CHART_HIST_SOURCE=upstox switches history back to Upstox.
+  daily (new candles): Upstox, as before.
+  BSE history before an NSE listing: Upstox BSE series (same ISIN), as before.
+
 Usage:
   python pipeline_chart.py backfill            # first time: build every stock (resumable)
   python pipeline_chart.py daily               # every day: add new candles, build new listings
@@ -26,7 +33,7 @@ Usage:
   python pipeline_chart.py backfill_force      # rebuild every stock from scratch
   python pipeline_chart.py status              # print a summary of chart/_index.json
 
-Env: UPSTOX_TOKEN, WORKER_URL, WORKER_TOKEN   (same secrets as pipeline.py)
+Env: UPSTOX_TOKEN, WORKER_URL, WORKER_TOKEN, FINEDGE_TOKEN   (same secrets as pipeline.py)
 """
 
 import asyncio
@@ -62,6 +69,12 @@ UPSTOX_TOKEN = os.environ["UPSTOX_TOKEN"]
 WORKER_URL   = os.environ["WORKER_URL"].rstrip("/")
 WORKER_TOKEN = os.environ["WORKER_TOKEN"]
 WORKER_HEADERS = {"X-Secret-Token": WORKER_TOKEN}
+
+FINEDGE_TOKEN = os.environ.get("FINEDGE_TOKEN", "")
+FINEDGE_HIST_URL = "https://data.finedgeapi.com/api/v2/daily-quotes"
+FINEDGE_CONCURRENCY = 3
+FINEDGE_DELAY = 0.3
+CHART_HIST_SOURCE = os.environ.get("CHART_HIST_SOURCE", "finedge").strip().lower()
 
 UPSTOX_BASE = "https://api.upstox.com/v2"
 NSE_BOD_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -241,6 +254,71 @@ async def fetch_candles(client, sem, sym, ikey, from_date, to_date) -> list[dict
 
 
 # ══════════════════════════════════════════════════════════════
+# FINEDGE ADJUSTED HISTORY (v2/daily-quotes)
+# ══════════════════════════════════════════════════════════════
+
+def _fe_date(v):
+    """quotes_date -> 'YYYY-MM-DD' (ISO, 'DD-Mon-YYYY', 'DD/MM/YYYY', 'YYYYMMDD' or a unix timestamp)."""
+    if v is None: return None
+    if isinstance(v, (int, float)) and v > 1e9:
+        return datetime.fromtimestamp(v / (1000 if v > 1e12 else 1), ZoneInfo("Asia/Kolkata")).date().isoformat()
+    t = str(v).strip()
+    if len(t) >= 10 and t[4] == "-" and t[7] == "-":
+        try: date.fromisoformat(t[:10]); return t[:10]
+        except ValueError: return None
+    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y%m%d", "%d %b %Y", "%b %d, %Y"):
+        try: return datetime.strptime(t[:11].strip(), fmt).date().isoformat()
+        except ValueError: pass
+    return None
+
+async def fetch_finedge(client, sem, sym, ex, from_date, to_date) -> list[dict]:
+    """Finedge adjusted daily candles from_date..to_date, oldest first (same shape as fetch_candles).
+    One call covers all the years; NSE stocks by NSE symbol, BSE-only stocks by their BSE code / symbol."""
+    if from_date > to_date or not FINEDGE_TOKEN: return []
+    params = {"from": int(from_date[:4]), "to": int(to_date[:4]), "token": FINEDGE_TOKEN,
+              ("bse_symbol" if ex == "BSE" else "nse_symbol"): sym}
+    payload = None
+    async with sem:
+        for attempt in range(RETRY):
+            await asyncio.sleep(FINEDGE_DELAY)
+            try:
+                r = await client.get(f"{FINEDGE_HIST_URL}/{sym}", params=params, timeout=60)
+            except httpx.RequestError as e:
+                log.warning(f"{sym}: Finedge network error ({e}), retry {attempt+1}")
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code == 401: log.error("❌ FINEDGE_TOKEN invalid"); sys.exit(1)
+            if r.status_code == 429: await asyncio.sleep(20); continue
+            if r.status_code in (502, 503, 504): await asyncio.sleep(2 ** attempt); continue
+            if r.status_code != 200 or not r.text.strip(): break
+            try: payload = r.json()
+            except ValueError: payload = None
+            break
+    rows = payload if isinstance(payload, list) else next((payload[k] for k in ("price", "prices", "data", "quotes")
+                                                           if isinstance(payload, dict) and isinstance(payload.get(k), list)), [])
+    out = {}
+    for row in rows:
+        if not isinstance(row, dict): continue
+        d = _fe_date(row.get("quotes_date") or row.get("date"))
+        if not d or not (from_date <= d <= to_date): continue
+        try: o, h, l, c = (float(row[k]) for k in ("open", "high", "low", "close"))
+        except (KeyError, TypeError, ValueError): continue
+        if c <= 0: continue
+        try: v = int(float(row.get("volume") or 0))
+        except (TypeError, ValueError): v = 0
+        out[d] = {"d": d, "o": o, "h": h, "l": l, "c": c, "v": v}
+    return [out[d] for d in sorted(out)]
+
+async def fetch_history(client, sems, sym, info, from_date, to_date) -> list[dict]:
+    """History from the configured source (Finedge by default); Upstox when Finedge has nothing."""
+    fsem, usem = sems
+    if CHART_HIST_SOURCE != "upstox":
+        c = await fetch_finedge(client, fsem, sym, info["ex"], from_date, to_date)
+        if c: return c
+        log.info(f"  {sym}: no Finedge history — falling back to Upstox")
+    return await fetch_candles(client, usem, sym, info["ikey"], from_date, to_date)
+
+
+# ══════════════════════════════════════════════════════════════
 # BUILD / UPDATE ONE STOCK
 # ══════════════════════════════════════════════════════════════
 
@@ -265,10 +343,10 @@ def splice_bse(nse: list[dict], bse: list[dict]):
     pre = [b for b in bse if b["d"] < first]
     return pre, f"{len(pre)} BSE candles before {first}"
 
-async def build_stock(client, sem, sym, info, bse_keys, today):
-    """Full 5-year build for one stock. -> (file obj, index entry) or (None, None)."""
+async def build_stock(client, sem, sym, info, bse_keys, today, fsem=None):
+    """Full 5-year build for one stock (history: Finedge, adjusted). -> (file obj, index entry) or (None, None)."""
     floor = years_floor(today)
-    candles = await fetch_candles(client, sem, sym, info["ikey"], floor, today)
+    candles = await fetch_history(client, (fsem or asyncio.Semaphore(FINEDGE_CONCURRENCY), sem), sym, info, floor, today)
     bse_until = None
     if info["ex"] == "NSE" and info["ikey"].startswith("NSE_EQ|"):
         short = (not candles) or candles[0]["d"] > add_days(floor, BSE_SPLICE_MIN_GAP_DAYS)
@@ -333,11 +411,12 @@ async def save_index(client, stocks: dict, today: str):
 
 async def _build_many(client, uni, bse_keys, idx, syms, today):
     sem = asyncio.Semaphore(UPSTOX_CONCURRENCY); r2sem = asyncio.Semaphore(R2_CONCURRENCY)
+    fsem = asyncio.Semaphore(FINEDGE_CONCURRENCY)
     ok = 0; failed = []; since_save = 0
     async def one(sym):
         nonlocal ok
         try:
-            obj, entry = await build_stock(client, sem, sym, uni[sym], bse_keys, today)
+            obj, entry = await build_stock(client, sem, sym, uni[sym], bse_keys, today, fsem)
             if not obj: failed.append(sym); return
             async with r2sem:
                 await r2_put(client, FOLDER + entry["file"], obj)
@@ -369,7 +448,7 @@ async def run_backfill(force=False, only=None):
                 syms = sorted(uni)
             else:
                 syms = sorted(s for s in uni if s not in idx)
-            log.info(f"━━━ Chart backfill  {years_floor(today)} → {today}  ({len(syms)} stocks) ━━━")
+            log.info(f"━━━ Chart backfill  {years_floor(today)} → {today}  ({len(syms)} stocks, history from {CHART_HIST_SOURCE}) ━━━")
             ok, failed = await _build_many(client, uni, bse_keys, idx, syms, today)
             await save_index(client, idx, today)
             joined = sum(1 for e in idx.values() if e.get("bse_until"))
