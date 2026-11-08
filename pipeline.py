@@ -7994,9 +7994,13 @@ _PR_EXTRAS_JS = """() => {
 }"""
 _PR_EVAL_JS = """async (snaps) => {
   var out = {};
+  // the screener as it opened (no filters): the base of watchlist "scan" items (snapshot {__base: 1, myscans: [...]})
+  try { if (!window.__twtBaseSnap) window.__twtBaseSnap = JSON.parse(JSON.stringify(getFilterSnapshot())); } catch (e) {}
   for (var key in snaps) {
     try {
-      applyFilterSnapshot(JSON.parse(JSON.stringify(snaps[key])));
+      var sn = JSON.parse(JSON.stringify(snaps[key]));
+      if (sn && sn.__base) { var b0 = JSON.parse(JSON.stringify(window.__twtBaseSnap || {})); delete sn.__base; for (var k0 in sn) b0[k0] = sn[k0]; sn = b0; }
+      applyFilterSnapshot(sn);
       await new Promise(function (r) { setTimeout(r, 40); });
       // "RS N days ago" filter (rs_then.js): wait for rs_history.json before filtering
       if (typeof window.twtRsThenReady === 'function') await window.twtRsThenReady();
@@ -8056,6 +8060,7 @@ async def _pr_run_screener(snaps, wl_syms=None):
         await _pr_wait(page, _PR_READY_JS, 300, "screener data")
         await _pr_wait(page, _PR_EXTRAS_JS, 90, "box / HTF / shakeout", required=False)
         await page.wait_for_timeout(3000)
+        await page.evaluate("() => { try { if (!window.__twtBaseSnap) window.__twtBaseSnap = JSON.parse(JSON.stringify(getFilterSnapshot())); } catch (e) {} }")
         today_day = str(await page.evaluate("() => window._dataAsOfDate"))[:10]
         today = await page.evaluate(_PR_EVAL_JS, snaps) if snaps else {}
         wl_list = sorted(wl_syms or [])
@@ -8161,7 +8166,10 @@ async def _pr_send_document(client, chat_id, filename, data, caption=None):
 # is "new today" (today vs the previous session) or a today-only fact (52-week high, results due, volume).
 # One digest per watchlist, only when something the user ticked happened.
 # ev keys: box_bo near_bo h52 ath ema50_up ema50_dn ema200 st2 st4 setups res_decl (flags),
-#          rs (cross level), res_due (days ahead), vol (x average), move (abs day %)
+#          rs (cross level), res_due (days ahead), vol (x average), move (abs day %),
+#          scans: [{t: 'scan'|'preset', id, name, snap}] — "Your scans & presets": a watched stock that matches
+#          one today and did not on the previous session is an event ("Entered scan · <name>"). Each snap is run
+#          once on the screener (a scan on the default screener + its My scans entry, a preset as saved).
 # ══════════════════════════════════════════════════════════════
 WL_SHOW_MAX = 40
 _WL_SETUP_RE = re.compile(r"(^|[^A-Za-z])(EP|VCP|HTF)([^A-Za-z]|$)|episodic|high tight|pullback|shakeout", re.I)
@@ -8289,12 +8297,20 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
             if not syms or not ev: continue
             wl_specs[a["id"]] = (syms, ev); wl_syms.update(syms)
         snaps, key_of = {}, {}
+        wl_scan_key = {}   # (alert id, item index) -> snapshot key
+        for aid, (_syms, ev) in wl_specs.items():
+            for i, it in enumerate(ev.get("scans") or []):
+                snap = it.get("snap") if isinstance(it, dict) else None
+                if not isinstance(snap, dict): continue
+                if it.get("t") != "preset": snap = {**snap, "__base": 1}
+                k = json.dumps(snap, sort_keys=True)
+                wl_scan_key[(aid, i)] = k; snaps[k] = snap
         for a in alerts:
             try: snap = json.loads(a["snap"]) if isinstance(a["snap"], str) else a["snap"]
             except (TypeError, ValueError): log.warning(f"  {a.get('id')}: bad snapshot"); continue
             k = json.dumps(snap, sort_keys=True)
             key_of[a["id"]] = k; snaps[k] = snap
-        log.info(f"Preset alerts: {len(snaps)} distinct preset(s) to evaluate")
+        log.info(f"Preset alerts: {len(snaps)} distinct preset(s) / scan(s) to evaluate")
         today_day, prev_day, today, prev, wl_today, wl_prev = await _pr_run_screener(snaps, wl_syms)
         log.info(f"Preset alerts: today {today_day}, previous session {prev_day}")
         fired = []
@@ -8345,11 +8361,25 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 log.info(f"{tag} expired on {a['exp']} — skipped"); continue
             if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
                 log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
+            # "Your scans & presets": who matches today and who matched on the previous session
+            entered = {}   # sym -> [event texts]
+            for i, it in enumerate(ev.get("scans") or []):
+                k = wl_scan_key.get((a["id"], i))
+                tr, yr = (today.get(k) or {}) if k else {}, (prev.get(k) or {}) if k else {}
+                label = ("preset" if it.get("t") == "preset" else "scan") + " · " + str(it.get("name") or "")
+                if not tr.get("ok"):
+                    log.warning(f"{tag} {label}: {tr.get('err') or 'not evaluated'}"); continue
+                if not yr.get("ok"):
+                    log.warning(f"{tag} {label}: previous session not available — skipped"); continue
+                tset, yset = {x[0] for x in tr["rows"]}, {x[0] for x in yr["rows"]}
+                for sym in syms:
+                    if sym in tset and sym not in yset:
+                        entered.setdefault(sym, []).append("Entered " + label)
             hits = []
             for sym in syms:
                 t = wl_today.get(sym)
                 if not t: continue
-                evs = _wl_events(ev, t, wl_prev.get(sym), today_day)
+                evs = _wl_events(ev, t, wl_prev.get(sym), today_day) + entered.get(sym, [])
                 if evs: hits.append((t, evs))
             log.info(f"{tag} {len(syms)} stocks, {len(hits)} with events")
             if not hits: continue
