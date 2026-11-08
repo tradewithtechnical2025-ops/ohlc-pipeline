@@ -12,6 +12,8 @@ name: OHLC Pipeline Scans (Manual)
 #   or miss a day in the last 30 market sessions.
 # finedge_hist_test: prints what Finedge history returns for "symbols" (e.g. VEDL,ITC,532305)
 #   and compares it with the R2 data — writes nothing.
+# full: rebuilds the screener's 3-year OHLC (ohlc_*.json) from Finedge (adjusted). Uploads only at the end.
+# chart_backfill_force: rebuilds every chart/<SYM>.json (5 years) from Finedge.
 # concall_fetch: the week's concall transcript PDFs -> zip, downloadable as the "concall-inbox" artifact.
 on:
   workflow_dispatch:
@@ -23,6 +25,8 @@ on:
         type: choice
         options:
           - status
+          - full
+          - chart_backfill_force
           - backfill_missing
           - finedge_hist_test
           - concall_fetch
@@ -79,6 +83,7 @@ jobs:
           SYMBOLS: ${{ inputs.symbols }}
         run: |
           case "$MODE" in
+            chart_backfill_force) python pipeline_chart.py backfill_force ;;
             backfill_missing|finedge_hist_test|concall_fetch) python pipeline.py "$MODE" "$SYMBOLS" ;;
             *) python pipeline.py "$MODE" ;;
           esac
