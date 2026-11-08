@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 NSE OHLC + Fundamentals Pipeline — GitHub Actions
-OHLC source: Upstox API (adjusted prices, TV-matching)
+OHLC source: daily candles — Upstox API (run_daily new day, run_today);
+             history — Finedge v2/daily-quotes (adjusted for splits, bonus, rights, demergers):
+             run_full, backfill_missing, a new stock's deep backfill in run_daily.
+             OHLC_HIST_SOURCE=upstox switches history back to Upstox; a symbol Finedge has no data for
+             falls back to Upstox on its own.
 Fundamentals source: Finedge API
 
 Usage:
@@ -9,6 +13,7 @@ Usage:
   python pipeline.py today
   python pipeline.py full
   python pipeline.py backfill_missing [SYM1,SYM2]  # fill missing stocks / days; no symbols = auto-detect
+  python pipeline.py finedge_hist_test SYM [SYM2 …]  # print what Finedge history returns for a few symbols (no R2 writes)
   python pipeline.py status
   python pipeline.py fund_daily
   python pipeline.py fund_full
@@ -92,6 +97,12 @@ RATE_DELAY         = 0.4
 RETRY              = 5
 FUND_CONCURRENCY   = 4
 FINEDGE_DELAY      = 0.25
+
+# ── Finedge adjusted history (v2/daily-quotes): the source of OHLC history (see the docstring) ──
+FINEDGE_HIST_URL         = "https://data.finedgeapi.com/api/v2/daily-quotes"
+FINEDGE_HIST_CONCURRENCY = 3
+FINEDGE_HIST_DELAY       = 0.3
+OHLC_HIST_SOURCE         = os.environ.get("OHLC_HIST_SOURCE", "finedge").strip().lower()
 
 # ── Finedge daily-OHLC (standalone system — does NOT touch Upstox OHLC) ──
 FINEDGE_QUOTE_URL      = "https://data.finedgeapi.com/api/v2/quote"
@@ -457,6 +468,117 @@ async def fetch_ohlc(client, sem, sym, instrument_key, from_date, to_date):
 
     if not all_candles: return sym, None
     return sym, sorted(all_candles.values(), key=lambda x: x["d"])
+
+
+def _finedge_hist_date(v):
+    """quotes_date -> 'YYYY-MM-DD' (ISO, 'DD-Mon-YYYY', 'DD/MM/YYYY', 'YYYYMMDD' or a unix timestamp)."""
+    if v is None: return None
+    if isinstance(v, (int, float)) and v > 1e9:
+        return datetime.fromtimestamp(v / (1000 if v > 1e12 else 1), ZoneInfo("Asia/Kolkata")).date().isoformat()
+    t = str(v).strip()
+    if len(t) >= 10 and t[4] == "-" and t[7] == "-":
+        try: date.fromisoformat(t[:10]); return t[:10]
+        except ValueError: return None
+    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y%m%d", "%d %b %Y", "%b %d, %Y"):
+        try: return datetime.strptime(t[:11].strip(), fmt).date().isoformat()
+        except ValueError: pass
+    return None
+
+
+def _finedge_hist_rows(payload):
+    """The candle list of a daily-quotes answer ({"price": [...]}, or a bare list)."""
+    if isinstance(payload, list): return payload
+    if isinstance(payload, dict):
+        for k in ("price", "prices", "data", "quotes"):
+            if isinstance(payload.get(k), list): return payload[k]
+    return []
+
+
+async def fetch_finedge_hist(client, sem, sym, from_date, to_date, exchange="NSE"):
+    """Finedge adjusted daily history for one stock, same shape as fetch_ohlc():
+    (sym, [{"d","o","h","l","c","v","oi"}, …] sorted by date) or (sym, None).
+    One call covers every year from from_date to to_date (the API takes years, not dates).
+    NSE stocks go by their NSE symbol; a BSE-only stock by its BSE code / symbol."""
+    params = {"from": int(from_date[:4]), "to": int(to_date[:4]), "token": FINEDGE_TOKEN}
+    params["bse_symbol" if exchange == "BSE" else "nse_symbol"] = sym
+    url = f"{FINEDGE_HIST_URL}/{sym}"
+    payload = None
+    async with sem:
+        for attempt in range(RETRY):
+            await asyncio.sleep(FINEDGE_HIST_DELAY)
+            try:
+                r = await client.get(url, params=params, timeout=60)
+            except httpx.RequestError as e:
+                log.warning(f"{sym}: Finedge history network error ({e}), retry {attempt+1}")
+                await asyncio.sleep(2 ** attempt); continue
+            if r.status_code == 401: log.error("❌ FINEDGE TOKEN INVALID"); sys.exit(1)
+            if r.status_code == 429:
+                log.warning(f"{sym}: Finedge history rate limit — 20s"); await asyncio.sleep(20); continue
+            if r.status_code in (502, 503, 504): await asyncio.sleep(2 ** attempt); continue
+            if r.status_code != 200 or not r.text.strip(): break
+            try: payload = r.json()
+            except ValueError: payload = None
+            break
+    candles = {}
+    for row in _finedge_hist_rows(payload):
+        if not isinstance(row, dict): continue
+        d = _finedge_hist_date(row.get("quotes_date") or row.get("date"))
+        if not d or not (from_date <= d <= to_date): continue
+        o, h, l, c = row.get("open"), row.get("high"), row.get("low"), row.get("close")
+        if None in (o, h, l, c): continue
+        try: o, h, l, c = float(o), float(h), float(l), float(c)
+        except (TypeError, ValueError): continue
+        if c <= 0: continue
+        v = row.get("volume")
+        try: v = int(float(v)) if v is not None else 0
+        except (TypeError, ValueError): v = 0
+        candles[d] = {"d": d, "o": o, "h": h, "l": l, "c": c, "v": v, "oi": 0}
+    if not candles: return sym, None
+    return sym, sorted(candles.values(), key=lambda x: x["d"])
+
+
+async def fetch_hist(client, sems, sym, instrument_key, from_date, to_date):
+    """OHLC history from the configured source (Finedge by default), Upstox when Finedge has nothing.
+    sems = (finedge_semaphore, upstox_semaphore)."""
+    fsem, usem = sems
+    if OHLC_HIST_SOURCE != "upstox":
+        exch = "BSE" if sym in BSE_ISIN_MAP and sym not in ISIN_MAP else "NSE"
+        s0, candles = await fetch_finedge_hist(client, fsem, sym, from_date, to_date, exch)
+        if candles: return s0, candles
+        if instrument_key:
+            log.info(f"  {sym}: no Finedge history — falling back to Upstox")
+    if not instrument_key: return sym, None
+    return await fetch_ohlc(client, usem, sym, instrument_key, from_date, to_date)
+
+
+async def run_finedge_hist_test(symbols) -> None:
+    """Prints what Finedge history returns for a few symbols — nothing is written."""
+    today = today_ist(); start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
+    async with httpx.AsyncClient() as client:
+        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
+        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
+        all_data = await download_all_chunks(client)
+        sem = asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY)
+        for sym in symbols:
+            sym = sym.strip().upper()
+            exch = "BSE" if sym in BSE_ISIN_MAP and sym not in ISIN_MAP else "NSE"
+            t0 = time.monotonic()
+            _, c = await fetch_finedge_hist(client, sem, sym, start, today, exch)
+            if not c:
+                log.info(f"{sym} ({exch}): no data from Finedge"); continue
+            log.info(f"{sym} ({exch}): {len(c)} candles {c[0]['d']} → {c[-1]['d']} in {time.monotonic() - t0:.1f}s; last {c[-1]}")
+            have = all_data.get(sym)
+            if have and have.get("d"):
+                idx = {d: i for i, d in enumerate(have["d"])}
+                same = diff = 0; ratios = []
+                for x in c:
+                    i = idx.get(x["d"])
+                    if i is None or not have["c"][i]: continue
+                    r = x["c"] / have["c"][i]; ratios.append((x["d"], r))
+                    if abs(r - 1) < 0.002: same += 1
+                    else: diff += 1
+                log.info(f"   vs R2 ohlc: {same} days same close, {diff} different" +
+                         (f"; first different {next(d for d, r in ratios if abs(r - 1) >= 0.002)} (ratio {next(r for d, r in ratios if abs(r - 1) >= 0.002):.4f})" if diff else ""))
 
 
 async def fetch_ohlc_bulk(client, ikey_map: dict[str, str], batch_size=500) -> dict[str, dict]:
@@ -880,9 +1002,13 @@ async def run_daily() -> None:
                 tasks = [fetch_ohlc(client, sem, sym, all_ikeys[sym], from_date, today) for sym in symbols]
                 return await asyncio.gather(*tasks)
 
+            async def _hist_for(symbols, from_date):   # deep backfill: adjusted history (Finedge)
+                hs = (asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY), sem)
+                return await asyncio.gather(*[fetch_hist(client, hs, sym, all_ikeys[sym], from_date, today) for sym in symbols])
+
             backfill_results, incremental_results = await asyncio.gather(
-                _fetch_for(needs_backfill, cutoff),
-                _fetch_for(existing, prev),
+                _hist_for(needs_backfill, cutoff),
+                _fetch_for(existing, prev),   # the new day: Upstox
             )
             fetched = {sym: c for sym, c in [*backfill_results, *incremental_results] if c}
             log.info(f"✓ {len(fetched)} fetched  ✗ {len(live) - len(fetched)} no data")
@@ -988,14 +1114,16 @@ async def run_full() -> None:
         start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
         cutoff = start
         sem = asyncio.Semaphore(CONCURRENCY); all_data = {}; failed = []
+        hs = (asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY), sem)
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
             all_sym_list = list(ISIN_MAP.items()) + list(BSE_ISIN_MAP.items())
+            log.info(f"History source: {OHLC_HIST_SOURCE}")
             log.info(f"━━━ Full Load  {start} → {today}  ({len(all_sym_list)} stocks) ━━━")
             for i in range(0, len(all_sym_list), 50):
                 chunk = all_sym_list[i:i+50]
-                results = await asyncio.gather(*[fetch_ohlc(client,sem,sym,ikey,start,today) for sym,ikey in chunk])
+                results = await asyncio.gather(*[fetch_hist(client,hs,sym,ikey,start,today) for sym,ikey in chunk])
                 for sym, candles in results:
                     if candles:
                         filtered = [c for c in candles if c["d"] >= cutoff]
@@ -1112,12 +1240,13 @@ async def run_backfill_missing(symbols_arg: str | None = None) -> None:
                 log.info("Nothing to backfill — all target symbols already have full history")
                 status.success(); return
 
-            log.info(f"━━━ Backfill  {start} → {today}  ({len(targets)} symbols) ━━━")
+            log.info(f"━━━ Backfill  {start} → {today}  ({len(targets)} symbols, history from {OHLC_HIST_SOURCE}) ━━━")
+            hs = (asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY), sem)
             ok = 0; failed = []; total_added = 0
             for i in range(0, len(targets), 50):
                 chunk = targets[i:i+50]
                 results = await asyncio.gather(*[
-                    fetch_ohlc(client, sem, sym, ikey_map[sym], start, today) for sym in chunk
+                    fetch_hist(client, hs, sym, ikey_map[sym], start, today) for sym in chunk
                 ])
                 for sym, candles in results:
                     if candles:
@@ -8393,6 +8522,130 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
 
 
 # ══════════════════════════════════════════════════════════════
+# CONCALL — earnings call transcripts → "Latest call" summaries (weekly, by hand in between)
+#   python pipeline.py concall_fetch [days]    Finedge investor-call-transcripts for the last `days` (max 7,
+#                                              default 7) → downloads each transcript PDF from NSE and writes
+#                                              concall_inbox_<to_date>.zip (PDFs + manifest.json). Calls already
+#                                              summarised (R2 concall/index.json, same call date) are skipped.
+#   python pipeline.py concall_upload <zip>    the summaries zip (concall/<SYM>.json + index.json) → R2;
+#                                              index.json is merged with the one on R2.
+# The summaries themselves are written outside the pipeline from the inbox PDFs (one JSON per company,
+# fixed schema: sym, qtr, date, tone, headline, sections{…}, guidance[…], dodged[…], pushback[…]).
+# ══════════════════════════════════════════════════════════════
+CONCALL_CATEGORY_RE = re.compile(r"con\.?\s*call|analyst|investor meet", re.I)
+CONCALL_TRANSCRIPT_RE = re.compile(r"transcript", re.I)
+CONCALL_SKIP_RE = re.compile(r"\b(audio|video)\b|recording(?!.*transcript)|schedule of|intimation of (?:the )?(?:analyst|investor) meet", re.I)
+CONCALL_DATE_RE = re.compile(r"held on\s+([A-Za-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+,?\s+\d{4}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})", re.I)
+NSE_PDF_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                   "Accept": "application/pdf,*/*", "Referer": "https://www.nseindia.com/"}
+
+
+def _concall_call_date(desc, fallback):
+    """'… Transcript of Earning Call held on August 17, 2026' -> '2026-08-17' (else the announcement day)."""
+    m = CONCALL_DATE_RE.search(desc or "")
+    if m:
+        txt = re.sub(r"(\d)(st|nd|rd|th)", r"\1", m.group(1)).replace(".", " ").replace(",", " ")
+        txt = re.sub(r"\s+", " ", txt).strip()
+        for fmt in ("%B %d %Y", "%b %d %Y", "%d %B %Y", "%d %b %Y", "%d-%m-%Y", "%d/%m/%Y", "%d-%m-%y", "%d/%m/%y"):
+            try: return datetime.strptime(txt, fmt).date().isoformat()
+            except ValueError: pass
+    return str(fallback or "")[:10]
+
+
+def _concall_pick(items):
+    """Transcript filings only (not meet intimations, audio / video recordings); newest per company."""
+    best = {}
+    for it in items or []:
+        if not isinstance(it, dict): continue
+        desc, cat = str(it.get("description") or ""), str(it.get("category") or "")
+        link = str(it.get("pdf_file_link") or "").strip()
+        if not link.lower().endswith(".pdf"): continue
+        if cat and not CONCALL_CATEGORY_RE.search(cat): continue
+        if not CONCALL_TRANSCRIPT_RE.search(desc + " " + link): continue
+        if CONCALL_SKIP_RE.search(desc) and not re.search(r"transcript of", desc, re.I): continue
+        sym = str(it.get("nse_code") or it.get("stock_symbol") or "").strip()
+        if not sym: continue
+        ann = str(it.get("announcement_date") or it.get("ex_date") or "")[:19]
+        row = {"sym": sym, "bse": str(it.get("bse_code") or ""), "call_date": _concall_call_date(desc, ann), "announced": ann,
+               "desc": desc[:300], "pdf": link}
+        if sym not in best or ann > best[sym]["announced"]: best[sym] = row
+    return sorted(best.values(), key=lambda r: r["sym"])
+
+
+async def run_concall_fetch(days=7) -> None:
+    import zipfile
+    days = max(1, min(7, int(days)))
+    to_d = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    fr_d = to_d - timedelta(days=days)
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        sem = asyncio.Semaphore(1)
+        items = await _finedge_get(client, sem, "investor-call-transcripts", {"from_date": fr_d.isoformat(), "to_date": to_d.isoformat()})
+        if not isinstance(items, list):
+            log.warning(f"Concall: Finedge answered {type(items).__name__} — nothing fetched"); return
+        rows = _concall_pick(items)
+        log.info(f"Concall: {len(items)} filing(s) {fr_d} → {to_d}, {len(rows)} transcript(s)")
+        done = {}
+        try: done = (await r2_download(client, "concall/index.json") or {}).get("stocks") or {}
+        except Exception as e: log.warning(f"Concall: concall/index.json not read ({e}) — nothing skipped")
+        todo = [r for r in rows if (done.get(r["sym"]) or {}).get("date") != r["call_date"]]
+        log.info(f"Concall: {len(rows) - len(todo)} already summarised, {len(todo)} to fetch")
+        out = Path(f"concall_inbox_{to_d.isoformat()}.zip")
+        got, failed = [], []
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in todo:
+                ok = False
+                for attempt in range(3):
+                    try:
+                        resp = await client.get(r["pdf"], headers=NSE_PDF_HEADERS, timeout=60)
+                        if resp.status_code == 200 and resp.content[:4] == b"%PDF":
+                            name = f"{r['sym']}_{r['call_date'] or to_d.isoformat()}.pdf"
+                            zf.writestr(name, resp.content); r["file"] = name; got.append(r); ok = True; break
+                        log.warning(f"  {r['sym']}: HTTP {resp.status_code}{' (not a PDF)' if resp.status_code == 200 else ''}, retry {attempt + 1}")
+                    except httpx.RequestError as e:
+                        log.warning(f"  {r['sym']}: {e}, retry {attempt + 1}")
+                    await asyncio.sleep(2 ** attempt)
+                if not ok: failed.append(r)
+                await asyncio.sleep(0.4)   # gentle on nsearchives
+            zf.writestr("manifest.json", json.dumps({"from": fr_d.isoformat(), "to": to_d.isoformat(), "transcripts": got,
+                                                     "failed": failed}, indent=1, ensure_ascii=False))
+        log.info(f"Concall: {len(got)} PDF(s) in {out}" + (f", {len(failed)} failed: {', '.join(x['sym'] for x in failed)}" if failed else ""))
+
+
+async def run_concall_upload(zip_path) -> None:
+    import zipfile
+    if not zip_path or not Path(zip_path).exists():
+        log.error(f"Concall upload: zip not found ({zip_path})"); sys.exit(1)
+    with zipfile.ZipFile(zip_path) as zf:
+        files = {n: zf.read(n) for n in zf.namelist() if n.endswith(".json")}
+    summaries = {}
+    for n, raw in files.items():
+        base = n.rsplit("/", 1)[-1]
+        if base == "index.json": continue
+        try: d = json.loads(raw)
+        except ValueError: log.warning(f"  {n}: not JSON — skipped"); continue
+        sym = str(d.get("sym") or base[:-5]).strip()
+        if not re.fullmatch(r"[A-Za-z0-9&_.\-]{1,30}", sym) or not d.get("date"):
+            log.warning(f"  {n}: no valid sym / date — skipped"); continue
+        summaries[sym] = d
+    if not summaries:
+        log.warning("Concall upload: no summaries in the zip"); return
+    async with httpx.AsyncClient() as client:
+        idx = {}
+        try: idx = await r2_download(client, "concall/index.json") or {}
+        except Exception as e: log.warning(f"Concall upload: index not read ({e}) — starting a new one")
+        stocks = idx.get("stocks") or {}
+        for sym, d in sorted(summaries.items()):
+            old = stocks.get(sym) or {}
+            if old.get("date") and str(old["date"]) > str(d["date"]):
+                log.info(f"  {sym}: R2 has a newer call ({old['date']} > {d['date']}) — skipped"); continue
+            await r2_upload(client, f"concall/{sym}.json", json.dumps(d, ensure_ascii=False))
+            stocks[sym] = {"date": d["date"], "qtr": d.get("qtr"), "tone": d.get("tone")}
+        idx = {"updated": datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat(), "stocks": stocks}
+        await r2_upload(client, "concall/index.json", json.dumps(idx, ensure_ascii=False))
+        log.info(f"Concall upload: {len(summaries)} summary file(s), index has {len(stocks)} companies")
+
+
+# ══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
@@ -8452,6 +8705,9 @@ if __name__ == "__main__":
         case "vcp_scan":      asyncio.run(run_vcp_scan())
         case "ath_backfill":  asyncio.run(run_ath_backfill())
         case "ath_reset":     asyncio.run(run_ath_reset())
+        case "finedge_hist_test": asyncio.run(run_finedge_hist_test([x for a in sys.argv[2:] for x in re.split(r"[,\s]+", a) if x] or ["VEDL", "ITC"]))
+        case "concall_fetch": asyncio.run(run_concall_fetch(int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 7))
+        case "concall_upload": asyncio.run(run_concall_upload(sys.argv[2] if len(sys.argv) > 2 else ""))
         case _:
             print(__doc__)
             sys.exit(1)
