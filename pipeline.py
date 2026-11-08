@@ -49,6 +49,7 @@ import logging
 import os
 import re
 import sys
+import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -8025,9 +8026,11 @@ async def _pr_wait(page, js, timeout_s, label, required=True):
         return False
 
 
-async def _pr_run_screener(snaps, wl_syms=None):
-    """snaps: {key: snapshot}; wl_syms: symbols of watchlist alerts. Returns
-    (today_day, prev_day, today{key: res}, prev{key: res}, wl_today{sym: state}, wl_prev{sym: state})."""
+async def _pr_run_screener(snaps, wl_syms=None, prev_snaps=None, twts_jobs=None):
+    """snaps: {key: snapshot} run today; prev_snaps: {key: snapshot} also run on the previous session (preset
+    alerts; none -> History mode is skipped); wl_syms: symbols of watchlist alerts; twts_jobs: {key: (def, syms)}
+    Script Scan scans run only on those stocks, today. Returns
+    (today_day, prev_day, today{key: res}, prev{key: res}, wl_today{sym: state}, twts{key: res})."""
     from playwright.async_api import async_playwright
     email, password = os.environ.get("TWT_BOT_EMAIL"), os.environ.get("TWT_BOT_PASSWORD")
     if not email or not password:
@@ -8065,20 +8068,28 @@ async def _pr_run_screener(snaps, wl_syms=None):
         today = await page.evaluate(_PR_EVAL_JS, snaps) if snaps else {}
         wl_list = sorted(wl_syms or [])
         wl_today = await page.evaluate(_WL_STATE_JS, wl_list) if wl_list else {}
-        # 2. the previous session in History mode
-        prev_day = await page.evaluate("""async (d) => {
-            var ds = await _historyFetchManifest(true);
-            return (ds || []).filter(function (x) { return x < d; }).sort().pop() || null;
-        }""", today_day)
-        prev, wl_prev = {}, {}
-        if prev_day:
-            await page.evaluate("async (d) => { await loadHistoryDate(d); }", prev_day)
-            await _pr_wait(page, f"() => typeof _historyMode !== 'undefined' && _historyMode && String(_historyDate).slice(0, 10) === '{prev_day}'", 120, "history date")
-            await page.wait_for_timeout(2000)
-            prev = await page.evaluate(_PR_EVAL_JS, snaps) if snaps else {}
-            wl_prev = await page.evaluate(_WL_STATE_JS, wl_list) if wl_list else {}
+        # Script Scan scans of watchlist alerts: only the watched stocks, today — every one of them runs
+        twts = {}
+        if twts_jobs:
+            for k, (d, syms) in twts_jobs.items():
+                t1 = time.monotonic()
+                twts[k] = await page.evaluate(_WL_TWTS_JS, {"def": d, "syms": sorted(syms), "timeout": WL_TWTS_TIMEOUT_S})
+                log.info(f"  Script Scan '{(d or {}).get('scriptName') or (d or {}).get('script')}' on {len(syms)} stocks: "
+                         f"{len(twts[k].get('set') or []) if twts[k].get('ok') else twts[k].get('err')} in {time.monotonic() - t1:.1f}s")
+        # 2. the previous session in History mode (only preset alerts need it)
+        prev_day, prev = None, {}
+        if prev_snaps:
+            prev_day = await page.evaluate("""async (d) => {
+                var ds = await _historyFetchManifest(true);
+                return (ds || []).filter(function (x) { return x < d; }).sort().pop() || null;
+            }""", today_day)
+            if prev_day:
+                await page.evaluate("async (d) => { await loadHistoryDate(d); }", prev_day)
+                await _pr_wait(page, f"() => typeof _historyMode !== 'undefined' && _historyMode && String(_historyDate).slice(0, 10) === '{prev_day}'", 120, "history date")
+                await page.wait_for_timeout(2000)
+                prev = await page.evaluate(_PR_EVAL_JS, prev_snaps)
         await browser.close()
-        return today_day, prev_day, today, prev, wl_today, wl_prev
+        return today_day, prev_day, today, prev, wl_today, twts
 
 
 def _pr_esc(t):
@@ -8160,37 +8171,40 @@ async def _pr_send_document(client, chat_id, filename, data, caption=None):
 
 
 # ══════════════════════════════════════════════════════════════
-# WATCHLIST ALERTS — a user's screener watchlist on Telegram (Pro), run inside preset_alerts
-# The Worker stores one row per watchlist (kind = 'watchlist', snap = {v, wl, syms, ev}). The same headless
-# screener session reads every watched stock today and on the previous session (History mode); each event
-# is "new today" (today vs the previous session) or a today-only fact (52-week high, results due, volume).
-# One digest per watchlist, only when something the user ticked happened.
-# ev keys: box_bo near_bo h52 ath ema50_up ema50_dn ema200 st2 st4 setups res_decl (flags),
-#          rs (cross level), res_due (days ahead), vol (x average), move (abs day %),
-#          scans: [{t: 'scan'|'preset', id, name, snap}] — "Your scans & presets": a watched stock that matches
-#          one today and did not on the previous session is an event ("Entered scan · <name>"). Each snap is run
-#          once on the screener (a scan on the default screener + its My scans entry, a preset as saved).
+# WATCHLIST ALERTS v3 — a user's screener watchlist on Telegram (Pro), run inside preset_alerts
+# The Worker stores one row per watchlist (kind = 'watchlist', snap = {v, wl, syms, ev}); ev.scans holds up to
+# 5 of the user's own scans / presets ({t: 'scan'|'preset', id, name, snap}). After market close the digest lists
+# the watched stocks that match them TODAY (no comparison with the previous session):
+#   Script Scan scans  run only on the watched stocks (TWTScan.scanDef with syms), max 3 per user (Worker).
+#                      Every one runs; WL_TWTS_TIMEOUT_S only stops a script that hangs (it is reported, the rest go on)
+#   Strategy Builder   the screener's formula on the default screener ({__base: 1, myscans: [...]})
+#   presets            the saved snapshot as is
+# Each distinct scan / preset is run once, however many alerts share it. Old rows with the fixed events
+# (box_bo, h52, …) and no scans are skipped.
 # ══════════════════════════════════════════════════════════════
 WL_SHOW_MAX = 40
-_WL_SETUP_RE = re.compile(r"(^|[^A-Za-z])(EP|VCP|HTF)([^A-Za-z]|$)|episodic|high tight|pullback|shakeout", re.I)
-# per stock: [ltp, ch, rs, above50, above200, wstage, box status, box top, high, wh52, ath, signals, results, declared, rvol, tv, label]
+WL_MAX_SYMS = 1500
+WL_TWTS_TIMEOUT_S = int(os.environ.get("WL_TWTS_TIMEOUT_S", "600"))   # hang guard only (a normal scan takes seconds)
+# per stock: [ltp, ch, rs, ..., tv (15), label (16)] — only ltp / ch / rs / label are used by the digest
 _WL_STATE_JS = """async (syms) => {
   var out = {}, by = {};
   try { (allStocks || []).forEach(function (s) { if (s && s.stock) by[s.stock] = s; }); } catch (e) { return out; }
-  var dec = window._declaredResultsMap || {};
   var n = function (v) { v = parseFloat(v); return isFinite(v) ? v : null; };
-  var b = function (v) { return v === true || v === 1 || v === 'true' ? true : (v === false || v === 0 || v === 'false' ? false : null); };
   syms.forEach(function (sym) {
     var s = by[sym]; if (!s) return;
-    var bx = null; try { bx = typeof window.bscanInfo === 'function' ? window.bscanInfo(sym) : null; } catch (e) { bx = null; }
     var tv = (s.exchange || 'NSE') + ':' + String(s.trading_symbol || s.stock).replace(/,/g, '');
     var label = /^\\d+$/.test(String(s.stock)) && s.trading_symbol ? s.trading_symbol : s.stock;
-    var d = dec[sym] || dec[String(sym).toUpperCase()] || null;
-    out[sym] = [n(s.ltp), n(s.ch), n(s.rs), b(s.above_50), b(s.above_200), n(s.w_stage), bx ? (bx.status || null) : null, bx ? n(bx.top) : null,
-      n(s.high), n(s.wh52), n(s.ath), Array.isArray(s.signals) ? s.signals.map(String) : [], s.results ? String(s.results).slice(0, 10) : null,
-      d ? String(d).slice(0, 10) : null, n(s.rvol), tv, label];
+    out[sym] = [n(s.ltp), n(s.ch), n(s.rs), null, null, null, null, null, null, null, null, [], null, null, null, tv, label];
   });
   return out;
+}"""
+# one Script Scan scan on the watched stocks (screener.html with scanDef syms / timeoutMs)
+_WL_TWTS_JS = """async (job) => {
+  try {
+    if (!window.TWTScan || !window.TWTScan.scanDef) return { ok: false, err: 'Script Scan is not on this screener page' };
+    var r = await window.TWTScan.scanDef(job.def, { syms: job.syms, timeoutMs: job.timeout * 1000, asOf: null });
+    return { ok: true, set: Object.keys((r && r.set) || {}), total: r ? r.total : 0, errors: r ? r.errors : 0 };
+  } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }
 }"""
 
 
@@ -8199,59 +8213,19 @@ def _wl_day_txt(d):
     except (TypeError, ValueError): return str(d)
 
 
-def _wl_events(ev, t, y, today_day):
-    """t / y: today's and the previous session's state rows (y may be None). Returns event texts."""
-    out = []
-    ltp, ch, rs, a50, a200, st, box, top, high, wh52, ath, sig, res, dec, rvol = t[:15]
-    py = y if y else None
-    # box breakout today: Base Scan says BO and the close crossed the box top today (same rule as Lens)
-    if ev.get("box_bo") and box == "BO":
-        prev_close = ltp / (1 + ch / 100) if ltp and ch is not None and ch > -100 else None
-        if top and ltp and ltp > top and (prev_close is None or prev_close <= top or (py and py[6] != "BO")):
-            out.append("Box breakout" + (f" (box top ₹{top:,.2f})" if top else ""))
-    if ev.get("near_bo") and box in ("Near BO", "Consolidation Near BO") and py and py[6] not in ("Near BO", "Consolidation Near BO"):
-        out.append("Near breakout" + (f" (box top ₹{top:,.2f})" if top else ""))
-    if ev.get("ath") and high and ath and high >= ath:
-        out.append("All-time high")
-    elif ev.get("h52") and high and wh52 and high >= wh52:
-        out.append("New 52-week high")
-    if py:
-        if ev.get("ema50_up") and a50 is True and py[3] is False: out.append("Closed above 50 EMA")
-        if ev.get("ema50_dn") and a50 is False and py[3] is True: out.append("Closed below 50 EMA")
-        if ev.get("ema200") and a200 is not None and py[4] is not None and a200 != py[4]:
-            out.append("Closed above 200 EMA" if a200 else "Closed below 200 EMA")
-        if ev.get("st2") and st == 2 and py[5] is not None and py[5] != 2: out.append("Entered Stage 2")
-        if ev.get("st4") and st == 4 and py[5] is not None and py[5] != 4: out.append("Entered Stage 4")
-        if ev.get("setups"):
-            new_sig = [x for x in sig if _WL_SETUP_RE.search(x) and x not in set(py[11] or [])]
-            if new_sig: out.append("New signal: " + ", ".join(new_sig[:3]))
-        lvl = ev.get("rs")
-        if lvl and rs is not None and py[2] is not None and py[2] < lvl <= rs:
-            out.append(f"RS rating crossed {lvl:g} ({py[2]:g} → {rs:g})")
-    due = ev.get("res_due")
-    if due and res:
-        try:
-            days = (date.fromisoformat(res) - date.fromisoformat(today_day)).days
-            if 1 <= days <= due:
-                out.append(f"Results tomorrow ({_wl_day_txt(res)})" if days == 1 else f"Results in {days} days ({_wl_day_txt(res)})")
-        except ValueError:
-            pass
-    if ev.get("res_decl") and dec and dec == today_day:
-        out.append("Results declared")
-    vx = ev.get("vol")
-    if vx and rvol is not None and rvol >= vx:
-        out.append(f"Volume {rvol:.1f}x average")
-    mv = ev.get("move")
-    if mv and ch is not None and abs(ch) >= mv:
-        out.append(f"Moved {ch:+.1f}% today")
-    return out
+def _wl_twts_def(it):
+    """The Script Scan definition of a watchlist 'scan' item, or None (a Strategy Builder scan / preset)."""
+    if not isinstance(it, dict) or it.get("t") == "preset": return None
+    for m in ((it.get("snap") or {}).get("myscans") or []):
+        if isinstance(m, dict) and m.get("kind") == "twts" and isinstance(m.get("def"), dict): return m["def"]
+    return None
 
 
 def _wl_message(a, day, hits, total):
-    """hits: [(row, [event texts])]. One message per watchlist; long lists are cut to fit Telegram."""
+    """hits: [(row, [scan names])]. One message per watchlist; long lists are cut to fit Telegram."""
     name = _pr_esc(a.get("pname") or a.get("name") or "Watchlist")
     head = [f"🔔 <b>{name}</b> · {_wl_day_txt(day)}"]
-    tail = [f"<i>{len(hits)} of {total} stock{'s' if total != 1 else ''}</i>"]
+    tail = [f"<i>{len(hits)} of {total} stock{'s' if total != 1 else ''} match today</i>"]
     if a.get("exp"):
         try: tail.append(f"Until {date.fromisoformat(str(a['exp'])[:10]).strftime('%d %b')}")
         except ValueError: pass
@@ -8292,26 +8266,34 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
         for a in wl_alerts:
             try: sn = json.loads(a["snap"]) if isinstance(a["snap"], str) else a["snap"]
             except (TypeError, ValueError): log.warning(f"  {a.get('id')}: bad watchlist snapshot"); continue
-            syms = [str(x) for x in (sn.get("syms") or [])][:300]
-            ev = sn.get("ev") or {}
-            if not syms or not ev: continue
-            wl_specs[a["id"]] = (syms, ev); wl_syms.update(syms)
-        snaps, key_of = {}, {}
-        wl_scan_key = {}   # (alert id, item index) -> snapshot key
-        for aid, (_syms, ev) in wl_specs.items():
-            for i, it in enumerate(ev.get("scans") or []):
-                snap = it.get("snap") if isinstance(it, dict) else None
-                if not isinstance(snap, dict): continue
-                if it.get("t") != "preset": snap = {**snap, "__base": 1}
+            syms = [str(x) for x in (sn.get("syms") or [])][:WL_MAX_SYMS]
+            items = [x for x in ((sn.get("ev") or {}).get("scans") or []) if isinstance(x, dict) and isinstance(x.get("snap"), dict)]
+            if not syms: continue
+            if not items:
+                log.info(f"  {a.get('id')} ({a.get('pname')}, watchlist): no scans / presets (old fixed events are no longer sent) — skipped"); continue
+            wl_specs[a["id"]] = (syms, items); wl_syms.update(syms)
+        snaps, key_of, prev_snaps = {}, {}, {}
+        wl_item_key = {}   # (alert id, item index) -> ('snap' | 'twts', key)
+        twts_jobs = {}     # key -> (def, set of watched symbols over all alerts that use it)
+        for aid, (syms, items) in wl_specs.items():
+            for i, it in enumerate(items):
+                d = _wl_twts_def(it)
+                if d is not None:
+                    k = json.dumps(d, sort_keys=True)
+                    if k not in twts_jobs: twts_jobs[k] = (d, set())
+                    twts_jobs[k][1].update(syms)
+                    wl_item_key[(aid, i)] = ("twts", k); continue
+                snap = it["snap"] if it.get("t") == "preset" else {**it["snap"], "__base": 1}
                 k = json.dumps(snap, sort_keys=True)
-                wl_scan_key[(aid, i)] = k; snaps[k] = snap
+                wl_item_key[(aid, i)] = ("snap", k); snaps[k] = snap
         for a in alerts:
             try: snap = json.loads(a["snap"]) if isinstance(a["snap"], str) else a["snap"]
             except (TypeError, ValueError): log.warning(f"  {a.get('id')}: bad snapshot"); continue
             k = json.dumps(snap, sort_keys=True)
-            key_of[a["id"]] = k; snaps[k] = snap
-        log.info(f"Preset alerts: {len(snaps)} distinct preset(s) / scan(s) to evaluate")
-        today_day, prev_day, today, prev, wl_today, wl_prev = await _pr_run_screener(snaps, wl_syms)
+            key_of[a["id"]] = k; snaps[k] = snap; prev_snaps[k] = snap
+        log.info(f"Preset alerts: {len(snaps)} distinct preset(s) / scan(s) today, {len(prev_snaps)} also on the previous session, "
+                 f"{len(twts_jobs)} Script Scan scan(s) on {sum(len(v[1]) for v in twts_jobs.values())} watched stock(s)")
+        today_day, prev_day, today, prev, wl_today, twts = await _pr_run_screener(snaps, wl_syms, prev_snaps, twts_jobs)
         log.info(f"Preset alerts: today {today_day}, previous session {prev_day}")
         fired = []
         for a in alerts:
@@ -8349,39 +8331,28 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
             else:
                 log.warning(f"  preset alert {a['id']}: Telegram send failed — will retry next run")
             await asyncio.sleep(0.05)
-        # watchlist alerts: one digest per watchlist
-        if wl_specs and not wl_prev:
-            log.warning("Watchlist alerts: previous session not available — only today-only events (52W high, results, volume, move) are checked")
+        # watchlist alerts: one digest per watchlist — the watched stocks that match the chosen scans / presets today
         for a in wl_alerts:
             spec = wl_specs.get(a["id"])
             if not spec: continue
-            syms, ev = spec
+            syms, items = spec
             tag = f"  {a['id']} ({a.get('pname')}, watchlist):"
             if a.get("exp") and today_day > str(a["exp"])[:10]:
                 log.info(f"{tag} expired on {a['exp']} — skipped"); continue
             if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
                 log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
-            # "Your scans & presets": who matches today and who matched on the previous session
-            entered = {}   # sym -> [event texts]
-            for i, it in enumerate(ev.get("scans") or []):
-                k = wl_scan_key.get((a["id"], i))
-                tr, yr = (today.get(k) or {}) if k else {}, (prev.get(k) or {}) if k else {}
-                label = ("preset" if it.get("t") == "preset" else "scan") + " · " + str(it.get("name") or "")
-                if not tr.get("ok"):
-                    log.warning(f"{tag} {label}: {tr.get('err') or 'not evaluated'}"); continue
-                if not yr.get("ok"):
-                    log.warning(f"{tag} {label}: previous session not available — skipped"); continue
-                tset, yset = {x[0] for x in tr["rows"]}, {x[0] for x in yr["rows"]}
+            matched, failed = {}, 0   # sym -> [scan names]
+            for i, it in enumerate(items):
+                kind, k = wl_item_key.get((a["id"], i), (None, None))
+                res = (twts.get(k) if kind == "twts" else today.get(k)) or {}
+                label = str(it.get("name") or ("Preset" if it.get("t") == "preset" else "Scan"))
+                if not res.get("ok"):
+                    failed += 1; log.warning(f"{tag} {label}: {res.get('err') or 'not evaluated'}"); continue
+                got = set(res["set"]) if kind == "twts" else {x[0] for x in res["rows"]}
                 for sym in syms:
-                    if sym in tset and sym not in yset:
-                        entered.setdefault(sym, []).append("Entered " + label)
-            hits = []
-            for sym in syms:
-                t = wl_today.get(sym)
-                if not t: continue
-                evs = _wl_events(ev, t, wl_prev.get(sym), today_day) + entered.get(sym, [])
-                if evs: hits.append((t, evs))
-            log.info(f"{tag} {len(syms)} stocks, {len(hits)} with events")
+                    if sym in got: matched.setdefault(sym, []).append(label)
+            hits = [(wl_today[sym], names) for sym, names in matched.items() if sym in wl_today]
+            log.info(f"{tag} {len(syms)} stocks, {len(items)} scan(s){f' ({failed} failed)' if failed else ''}, {len(hits)} match today")
             if not hits: continue
             hits.sort(key=lambda h: (-len(h[1]), -(h[0][2] or 0)))
             msg = _wl_message(a, today_day, hits, len(syms))
