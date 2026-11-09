@@ -4758,13 +4758,40 @@ def _ist_session(ts: int):
     return dt.strftime("%H:%M"), ("BH" if mins < 555 else "IH" if mins < 930 else "AH")
 
 
+def _archive_ts(it: dict) -> int:
+    """Exchange filing time for result_times.json: the RSS published time, else the timestamp in
+    the filing's file name. 0 when neither is known — a record rebuilt from fundamentals (which
+    _effective_ts dates 23:00 on the result day) or a manual PDF (published = the run's own
+    time). No time or session is stored then, rather than a made-up after-market one (Nov 2026)."""
+    if not (it.get("meta") or {}).get("manual"):
+        ts = it.get("published_ts", 0)
+        if ts:
+            return int(ts)
+    fts = _filing_ts(it.get("link", ""))
+    if fts:
+        try:
+            dt = datetime.strptime(fts, "%d%m%Y%H%M%S").replace(tzinfo=_IST)
+            return int(dt.astimezone(timezone.utc).timestamp())
+        except ValueError:
+            pass
+    return 0
+
+
+def _is_placeholder_ts(ts) -> bool:
+    """The 23:00:00 IST stand-in _effective_ts gives a record with no filing time."""
+    if not ts:
+        return False
+    dt = datetime.fromtimestamp(int(ts), tz=_IST)
+    return dt.hour == 23 and dt.minute == 0 and dt.second == 0
+
+
 def _archive_entry(it: dict) -> dict | None:
     m, q = it.get("meta") or {}, it.get("quarter") or {}
     sym = str(m.get("symbol") or "").strip().upper()
     pe = str(q.get("period_end") or "")[:10]
     if not sym or not pe:
         return None
-    ts = _effective_ts(it) or 0
+    ts = _archive_ts(it)
     hhmm, session = _ist_session(ts)
     y = it.get("yoy_fundamentals") or {}
     g = it.get("grade") or {}
@@ -4798,6 +4825,13 @@ async def update_results_archive(client: httpx.AsyncClient, items: list[dict]):
             print(f"  ⛔ {RESULT_TIMES_FILE} unreadable — archive skipped this run (not overwriting it)")
             return
         stocks = idx["stocks"]
+        # Clean-up (Nov 2026): earlier runs stored the 23:00 stand-in time of records that had no
+        # filing time as a real after-market session. Drop those; a real time can still fill them.
+        for lst in stocks.values():
+            for x in lst if isinstance(lst, list) else []:
+                if isinstance(x, dict) and _is_placeholder_ts(x.get("ts")):
+                    for f in ("ts", "time", "session"):
+                        x.pop(f, None)
 
         # one archive row per symbol + quarter + basis; Consolidated preferred for the index
         rows: dict[tuple, dict] = {}
