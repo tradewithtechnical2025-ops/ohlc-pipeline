@@ -7,6 +7,10 @@ see notes near _build_summary_entry below.)
 
 FIX (Aug 2026): insurance P&L fields were resolving to None — see the note
 above CORE_PL_ALIASES for details.
+
+ADDED (Nov 2026): result_dates.json — every stock's result dates (and Finedge's
+result time) for the last 12 quarters, for the chart's QE markers. See
+_result_dates() and r2_upload_summary().
 """
 
 import asyncio, hashlib, json, logging, os, re, sys
@@ -149,18 +153,45 @@ async def r2_upload_symbol(client, sym, obj):
 
 SUMMARY_FILE = "fundamentals_summary.json"
 PENDING_FILE = "fundamentals_pending.json"
+# result_dates.json (Nov 2026): {"updated", "stocks": {SYM: [[YYYYMMDD, HHMM or null], ...]}}, newest first.
+# Built per stock by _build_summary_entry() as the "rdt" key, which is never written into
+# fundamentals_summary.json (every page loads that file); r2_upload_summary() splits it out
+# into this file and r2_download_summary() puts it back, so every run mode keeps it current.
+RESULT_DATES_FILE = "result_dates.json"
 
 
 async def r2_download_summary(client):
     d = await r2_download(client, SUMMARY_FILE)
     if isinstance(d, dict) and "stocks" in d:
-        return d["stocks"]
+        stocks = d["stocks"]
+        rd = await r2_download(client, RESULT_DATES_FILE)
+        rd_stocks = rd.get("stocks") if isinstance(rd, dict) else None
+        if isinstance(rd_stocks, dict):
+            for sym, entry in stocks.items():
+                if isinstance(entry, dict) and "rdt" not in entry and sym in rd_stocks:
+                    entry["rdt"] = rd_stocks[sym]
+        return stocks
     return {}
 
 
 async def r2_upload_summary(client, stocks):
-    payload = json.dumps({"updated": today_ist(), "stocks": stocks}, separators=(",", ":"))
+    rd_stocks = {}
+    out = {}
+    for sym, entry in stocks.items():
+        if isinstance(entry, dict) and "rdt" in entry:
+            if entry["rdt"]:
+                rd_stocks[sym] = entry["rdt"]
+            entry = {k: v for k, v in entry.items() if k != "rdt"}
+        out[sym] = entry
+    payload = json.dumps({"updated": today_ist(), "stocks": out}, separators=(",", ":"))
     await r2_upload(client, SUMMARY_FILE, payload)
+    if rd_stocks:
+        rd_payload = json.dumps({
+            "updated": today_ist(),
+            "note": "result date YYYYMMDD and Finedge result time HHMM (IST); the time is often a later filing, not the first one",
+            "stocks": rd_stocks,
+        }, separators=(",", ":"))
+        await r2_upload(client, RESULT_DATES_FILE, rd_payload)
 
 
 # fundamentals_rich.json (schema 2) — see _build_rich_entry. Lives beside
@@ -881,6 +912,7 @@ def _build_summary_entry(sym, profile, pl, ratios, price_ratios, cf=None, classi
         "quarters": quarters,
         "stype_alt": alt_stype if quarters_alt else None,
         "quarters_alt": quarters_alt,
+        "rdt": _result_dates(pl),   # → result_dates.json (split out by r2_upload_summary)
     }
 
 
@@ -955,6 +987,37 @@ def _fmt_date(yyyymmdd):
         return f"{s[:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 else None
     except (TypeError, ValueError):
         return None
+
+
+def _result_dates(pl):
+    """[[YYYYMMDD, HHMM or None], ...] newest first, from the raw quarterly P&L rows of both
+    statement types (Finedge's result_date / result_timestamp, last 12 quarters).
+
+    result_timestamp is the IST clock time written as if it were UTC (1785518633 is ITC's
+    31-Jul-2026 17:23 IST filing), so it is read in UTC without adding 5:30. It is often a
+    later filing of the same day (TCS 8-Oct-2026: 22:05 while the result was out by 15:56),
+    so consumers may only trust a time before market close. When the timestamp's day is not
+    the result date the time is dropped."""
+    best = {}
+    for stype in ("c", "s"):
+        for row in (pl.get("quarterly", {}).get(stype, {}) or {}).get("raw") or []:
+            try:
+                rd = int(row.get("result_date") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not 19900101 <= rd <= 21001231:
+                continue
+            hhmm = None
+            ts = row.get("result_timestamp")
+            if isinstance(ts, (int, float)) and ts > 0:
+                t = datetime.fromtimestamp(ts, tz=ZoneInfo("UTC"))
+                if int(t.strftime("%Y%m%d")) == rd:
+                    hhmm = t.hour * 100 + t.minute
+            if rd not in best:
+                best[rd] = hhmm
+            elif hhmm is not None and (best[rd] is None or hhmm < best[rd]):
+                best[rd] = hhmm      # same filing on both bases: keep the earlier time
+    return [[rd, best[rd]] for rd in sorted(best, reverse=True)]
 
 
 def _pick_basis(pl):
