@@ -12,6 +12,11 @@ Usage:
     python htf_test_scan.py
     python htf_test_scan.py --min-gain 70 --max-pullback 30
     python htf_test_scan.py --save results.json
+
+Changes:
+    Nov 2026: Mini HTF pole EMA21 check skips the base days at the pole's start
+              (up to 4) before the first close back above EMA21, so a swing low
+              a few days under the EMA is kept as the pole low.
 """
 
 import argparse
@@ -477,20 +482,25 @@ def _try_build_htf_match(lo, hi, dates, highs, lows, closes, n,
     # Pole-cleanliness: a genuine swing low is often the exact day price is
     # still catching up to its 21 EMA (that's normal at a bottom) — requiring
     # EVERY close to be above the EMA throws out the real low and quietly
-    # shifts the pole's start to a later, shallower point instead. Allow up
-    # to 20% of the pole's days to close below EMA21 before rejecting it as
-    # genuinely un-clean/choppy.
+    # shifts the pole's start to a later, shallower point instead.
+    # So the base days at the start of the pole, before the first close back
+    # above EMA21, are not counted (at most 4 days and at most half of the
+    # pole; a longer stretch under the EMA is a base, not the pole's start); from that first close above EMA21 on, allow up to 20% of the
+    # days to close below EMA21 before rejecting it as genuinely un-clean/
+    # choppy. (Before: every day from the low counted, so a low 2-3 days
+    # under the EMA, e.g. NELCAST 23 Oct 2026, was dropped for a later,
+    # higher low.)
     if ema21 is not None:
-        total = 0
-        below = 0
-        for k in range(lo, hi + 1):
-            e = ema21[k]
-            if e is not None and closes[k] is not None:
-                total += 1
-                if closes[k] < e:
-                    below += 1
-        if total > 0 and below / total > 0.20:
-            return _reject("pole_ema21_too_dirty", pct_below_ema=round(below / total, 2))
+        days = [k for k in range(lo, hi + 1) if ema21[k] is not None and closes[k] is not None]
+        lead = 0
+        while lead < len(days) and closes[days[lead]] < ema21[days[lead]]:
+            lead += 1
+        if days and lead > min(4, len(days) // 2):
+            return _reject("pole_ema21_too_dirty", lead_days_below_ema=lead)
+        rest = days[lead:]
+        below = sum(1 for k in rest if closes[k] < ema21[k])
+        if rest and below / len(rest) > 0.20:
+            return _reject("pole_ema21_too_dirty", pct_below_ema=round(below / len(rest), 2))
 
     return _build_flag_and_signal(lo, hi, pole_low, pole_high, gain_pct, pole_days,
                                    dates, highs, lows, closes, n,
