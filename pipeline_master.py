@@ -47,6 +47,16 @@ MIN_TURNOVER_CR = 0.5
 MIN_BSE_PRICE = 20
 MIN_BSE_MCAP_CR = 100
 
+# ── Liquidity: 20-day average turnover (avg_vol20 x price) ──
+# avg_vol20 comes from yesterday's screener_feed.json in R2. It is empty for a
+# stock with fewer than 20 trading days (fresh IPO) and missing for a stock not
+# on the site yet; those fall back to today's turnover (price x today's volume).
+# IPO-tracker and manual stocks are never filtered (see inject_* below).
+LIQUIDITY_FILE           = "screener_feed.json"
+MIN_AVG_TURNOVER_CR      = 0.5    # NSE: Rs 50 lakh per day (20-day average)
+MIN_BSE_AVG_TURNOVER_CR  = 0.01   # BSE-only: Rs 1 lakh per day (20-day average)
+MIN_BSE_TURNOVER_CR      = 0.01   # BSE-only fallback on today's turnover
+
 BSE_ONLY_EXCLUSIVE = True
 
 DEBUG_SYMBOLS = ["CMRGREEN", "GSPL", "MANGCHEFER", "CIGNITITEC"]
@@ -307,6 +317,43 @@ async def r2_upload_guarded(client, filename, new_data, drop_alert_pct):
 
 
 # =========================================================
+# LIQUIDITY (20-day average turnover)
+# =========================================================
+
+async def load_avg_volumes(client) -> dict:
+    """symbol / bse_code / trading_symbol -> avg_vol20 from yesterday's screener_feed.json.
+    Only stocks with a full 20-day average are included. Empty dict = feed unavailable,
+    so every stock is checked on today's turnover (the old rule) this run."""
+    feed = await r2_download(client, LIQUIDITY_FILE)
+    if not isinstance(feed, list) or len(feed) < 500:
+        print(f"  ⚠️  {LIQUIDITY_FILE} missing/too small — liquidity uses today's turnover this run")
+        return {}
+    out = {}
+    for row in feed:
+        try:
+            v = float(row.get("avg_vol20") or 0)
+        except (TypeError, ValueError):
+            v = 0
+        if v <= 0:
+            continue                      # < 20 trading days (fresh IPO): no average yet
+        for key in ("symbol", "trading_symbol"):
+            k = str(row.get(key) or "").strip().upper()
+            if k:
+                out.setdefault(k, v)
+    print(f"  📊 20-day average volume for {len(out)} keys from {LIQUIDITY_FILE}")
+    return out
+
+
+def avg_turnover_cr(avg_vol: dict, price: float, *keys) -> float | None:
+    """20-day average turnover in Cr (avg_vol20 x price), or None if no 20-day average."""
+    for k in keys:
+        v = avg_vol.get(str(k or "").strip().upper())
+        if v:
+            return (price * v) / 1e7
+    return None
+
+
+# =========================================================
 # FETCH STOCK SYMBOLS
 # =========================================================
 
@@ -399,7 +446,7 @@ async def fetch_upstox_quotes(client, instrument_keys):
 # BUILD MASTER  (NSE-centric, filtered)
 # =========================================================
 
-async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_vol_map=None):
+async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_vol_map=None, avg_vol=None):
 
     print()
     print("=" * 50)
@@ -407,6 +454,8 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
     print("=" * 50)
 
     upstox_vol_map = upstox_vol_map or {}
+    avg_vol = avg_vol or {}
+    used_avg = used_day = 0
 
     stock_map = {}
     for stock in data:
@@ -497,7 +546,16 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
             filtered_price += 1
             continue
 
-        if turnover_cr < MIN_TURNOVER_CR:
+        # 20-day average turnover when available; today's turnover otherwise
+        # (fresh listings with < 20 days, or a stock not on the site yet).
+        avg_to = avg_turnover_cr(avg_vol, price, symbol, nse_code)
+        if avg_to is not None:
+            used_avg += 1
+            too_thin = avg_to < MIN_AVG_TURNOVER_CR
+        else:
+            used_day += 1
+            too_thin = turnover_cr < MIN_TURNOVER_CR
+        if too_thin:
             filtered_turnover += 1
             turnover_rejected_list.append({
                 "symbol":      symbol,
@@ -506,6 +564,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
                 "volume":      volume,
                 "market_cap":  market_cap,
                 "turnover_cr": round(turnover_cr, 2),
+                "avg_turnover_cr": round(avg_to, 2) if avg_to is not None else None,
             })
             continue
 
@@ -524,6 +583,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
             "price":            price,
             "volume":           volume,
             "turnover_cr":      round(turnover_cr, 2),
+            "avg_turnover_cr":  round(avg_to, 2) if avg_to is not None else None,
             "new_listing":      is_upstox_src,
         })
 
@@ -545,7 +605,9 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
     print(f"  ✗ Bad Symbol Filtered  : {filtered_bad}")
     print(f"  ✗ MCAP Rejected        : {filtered_mcap}")
     print(f"  ✗ Price Rejected       : {filtered_price}")
-    print(f"  ✗ Turnover Rejected    : {filtered_turnover}")
+    print(f"  ✗ Turnover Rejected    : {filtered_turnover}  "
+          f"(20-day avg < {MIN_AVG_TURNOVER_CR} cr; today < {MIN_TURNOVER_CR} cr if no 20-day avg)")
+    print(f"    — checked on 20-day avg : {used_avg} | on today's turnover : {used_day}")
     print(f"  ✗ Suspended/Stale (merger/delisting etc.) : {filtered_stale}")
     print(f"  ✗ Never Quoted by API  : {len(never_quoted)}")
     print("=" * 50)
@@ -560,6 +622,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
         print(
             f"      {r['symbol']:15s} price={r['price']:>10.2f} "
             f"vol={r['volume']:>12.0f} turnover_cr={r['turnover_cr']:>8.2f} "
+            f"avg20_cr={(r['avg_turnover_cr'] if r['avg_turnover_cr'] is not None else float('nan')):>8.2f} "
             f"mcap={r['market_cap']:>10.0f}"
         )
     print("=" * 50)
@@ -586,7 +649,7 @@ async def build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_
 # BUILD BSE MASTER
 # =========================================================
 
-def build_bse_master(data, quotes, upstox_map, only_exclusive=False):
+def build_bse_master(data, quotes, upstox_map, only_exclusive=False, avg_vol=None):
     print()
     print("=" * 50)
     print("     Building BSE Universe")
@@ -596,6 +659,8 @@ def build_bse_master(data, quotes, upstox_map, only_exclusive=False):
     no_quote    = 0
     below_price = 0
     below_mcap  = 0
+    below_turnover = 0
+    avg_vol = avg_vol or {}
 
     for stock in data:
 
@@ -632,6 +697,15 @@ def build_bse_master(data, quotes, upstox_map, only_exclusive=False):
         if mcap is None or mcap < MIN_BSE_MCAP_CR:
             below_mcap += 1
             continue
+        # Liquidity: 20-day average turnover, else today's (no trade today = 0).
+        avg_to = avg_turnover_cr(avg_vol, price, sym, bse_code, info.get("trading_symbol"))
+        if avg_to is not None:
+            too_thin = avg_to < MIN_BSE_AVG_TURNOVER_CR
+        else:
+            too_thin = (price * (vol or 0)) / 1e7 < MIN_BSE_TURNOVER_CR
+        if too_thin:
+            below_turnover += 1
+            continue
 
         out.append({
             "symbol":        sym or bse_code,
@@ -653,6 +727,7 @@ def build_bse_master(data, quotes, upstox_map, only_exclusive=False):
     print(f"  ✗ No quote / price = 0       : {no_quote}")
     print(f"  ✗ Price <= {MIN_BSE_PRICE}             : {below_price}")
     print(f"  ✗ MCAP < {MIN_BSE_MCAP_CR} cr           : {below_mcap}")
+    print(f"  ✗ Turnover < {MIN_BSE_AVG_TURNOVER_CR} cr (20-day avg) : {below_turnover}")
     print(f"    mode                       : {'BSE-only' if only_exclusive else 'all BSE-listed'}")
     print("=" * 50)
 
@@ -709,7 +784,7 @@ def find_missing_nse(upstox_nse, quotes):
     return missing
 
 
-async def inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map):
+async def inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map, avg_vol=None):
 
     print()
     print("=" * 50)
@@ -800,8 +875,9 @@ async def inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isi
             continue
 
         turnover_cr = (price * vol) / 1e7
+        avg_to = avg_turnover_cr(avg_vol or {}, price, tsym)
 
-        if turnover_cr < MIN_TURNOVER_CR:
+        if (avg_to < MIN_AVG_TURNOVER_CR) if avg_to is not None else (turnover_cr < MIN_TURNOVER_CR):
             if is_debug:
                 print(f"  🔍 DEBUG {tsym}: REJECTED — turnover {turnover_cr:.2f} < {MIN_TURNOVER_CR}")
             below_turnover += 1
@@ -1187,10 +1263,14 @@ async def main():
         else:
             print("  ⚠️  UPSTOX_ACCESS_TOKEN not set — volume cross-check skipped")
 
-        # Pass nse_isin_map + upstox_vol_map to builders
-        master, turnover_rejected_list = await build_master(client, data, quotes, nse_name_map, nse_isin_map, upstox_vol_map)
+        print()
+        avg_vol = await load_avg_volumes(client)
 
-        await inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map)
+        # Pass nse_isin_map + upstox_vol_map to builders
+        master, turnover_rejected_list = await build_master(client, data, quotes, nse_name_map, nse_isin_map,
+                                                            upstox_vol_map, avg_vol)
+
+        await inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map, avg_vol)
 
         await inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse_ikey_map)
 
@@ -1198,7 +1278,7 @@ async def main():
 
         master_uploaded = await r2_upload_guarded(client, OUTPUT_FILE, master, MASTER_DROP_ALERT_PCT)
 
-        bse = build_bse_master(data, quotes, upstox_map, only_exclusive=BSE_ONLY_EXCLUSIVE)
+        bse = build_bse_master(data, quotes, upstox_map, only_exclusive=BSE_ONLY_EXCLUSIVE, avg_vol=avg_vol)
         bse_uploaded = await r2_upload_guarded(client, BSE_OUTPUT_FILE, bse, BSE_DROP_ALERT_PCT)
 
         print()
