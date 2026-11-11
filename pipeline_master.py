@@ -63,9 +63,10 @@ MIN_BSE_TURNOVER_CR      = 0.01   # BSE-only fallback on today's turnover
 # now on (Upstox historical candles carry no VWAP). Only a finished session is
 # saved: a run during market hours is skipped (the value is still moving).
 VWAP_FILE      = "vwap_daily.json"
+VWAP_HIST_PREFIX = "vwap_hist_"      # + YEAR.json: {"days": {date: {SYM: [raw_vwap, raw_close]}}} (see vwap_store.py)
 VWAP_KEEP_DAYS = int(os.environ.get("VWAP_KEEP_DAYS", "60"))
 IST            = timezone(timedelta(hours=5, minutes=30))
-MARKET_CLOSE_SAVE_AFTER = (15, 35)   # IST hh, mm — the day's VWAP is final after this
+MARKET_CLOSE_SAVE_AFTER = (16, 0)    # IST hh, mm — volume/VWAP are final by 4 pm
 
 BSE_ONLY_EXCLUSIVE = True
 
@@ -523,7 +524,7 @@ async def save_daily_vwap(client, master: list, bse: list, nse_ikey_map: dict, b
         print(f"  📡 Quotes received : {len(quotes)} / {len(key_to_symbol)}")
 
         now = datetime.now(IST)
-        day_rows, dates = {}, {}
+        day_rows, dates, close_rows = {}, {}, {}
         for sym, q in quotes.items():
             try:
                 avg = float(q.get("average_price") or 0)
@@ -536,6 +537,12 @@ async def save_daily_vwap(client, master: list, bse: list, nse_ikey_map: dict, b
             d = datetime.fromtimestamp(ltt / 1000, IST).date().isoformat()
             dates[d] = dates.get(d, 0) + 1
             day_rows.setdefault(d, {})[sym] = [round(avg, 2), int(vol)]
+            try:
+                cls = float(q.get("last_price") or (q.get("ohlc") or {}).get("close") or 0)
+            except (TypeError, ValueError):
+                cls = 0
+            if cls > 0:
+                close_rows.setdefault(d, {})[sym] = [round(avg, 2), round(cls, 2)]
         if not day_rows:
             print("  ⚠️  No average_price in the quotes — nothing saved")
             return
@@ -555,6 +562,18 @@ async def save_daily_vwap(client, master: list, bse: list, nse_ikey_map: dict, b
         await r2_upload(client, VWAP_FILE, {"updated": now.isoformat(timespec="seconds"),
                                             "fields": ["vwap", "volume"], "days": days})
         print(f"  ✓ {trade_date}: VWAP saved for {len(rows)} stocks | days kept: {len(days)} (max {VWAP_KEEP_DAYS})")
+
+        # Yearly history for the chart / scanner AVWAP: raw VWAP + raw close (adjusted later per day)
+        yrows = close_rows.get(trade_date) or {}
+        if yrows:
+            yname = f"{VWAP_HIST_PREFIX}{trade_date[:4]}.json"
+            yj = await r2_download(client, yname)
+            ydays = (yj or {}).get("days") if isinstance(yj, dict) else None
+            ydays = ydays if isinstance(ydays, dict) else {}
+            ydays[trade_date] = yrows
+            await r2_upload(client, yname, {"updated": now.isoformat(timespec="seconds"),
+                                            "fields": ["vwap", "close"], "days": dict(sorted(ydays.items()))})
+            print(f"  ✓ {yname}: {trade_date} saved for {len(yrows)} stocks ({len(ydays)} days in the file)")
         for probe in ("HDFCBANK", "RELIANCE"):
             if probe in rows:
                 print(f"      {probe}: vwap={rows[probe][0]} volume={rows[probe][1]:,}")
