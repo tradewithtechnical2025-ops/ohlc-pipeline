@@ -8,7 +8,9 @@ chunks, so pipeline.py and every scan keep working exactly as before.
 
 R2 layout:
   chart/_index.json     list of all stocks: file name, exchange, first/last date, bse_until
-  chart/RELIANCE.json   {"sym","ex","updated","bse_until"?, "d":[],"o":[],"h":[],"l":[],"c":[],"v":[]}
+  chart/RELIANCE.json   {"sym","ex","updated","bse_until"?, "d":[],"o":[],"h":[],"l":[],"c":[],"v":[],"a":[]}
+                        "a" = adjusted daily VWAP per bar (null where unknown), from vwap_hist_YYYY.json
+                        (see vwap_store.py); rebuilt every time the file is written
   chart/M_M.json        (symbols are made URL-safe: M&M -> M_M)
 
 NSE + BSE:
@@ -48,6 +50,8 @@ from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
+
+from vwap_store import load_vwap_store, vwap_array, years_back_floor
 
 # ── Telegram notify (optional, same helper pipeline.py uses) ──
 try:
@@ -323,10 +327,23 @@ async def fetch_history(client, sems, sym, info, from_date, to_date) -> list[dic
 # BUILD / UPDATE ONE STOCK
 # ══════════════════════════════════════════════════════════════
 
+VWAP_STORE: dict = {}   # loaded once per run by _load_vwap(); empty = files go out without "a"
+
+async def _load_vwap(client, today):
+    global VWAP_STORE
+    try:
+        VWAP_STORE = await load_vwap_store(r2_get, client, years_back_floor(today, CHART_YEARS), today)
+        log.info(f"VWAP history: {len(VWAP_STORE)} day(s)")
+    except Exception as e:
+        log.warning(f"VWAP history not loaded ({e}) — chart files go out without \"a\"")
+        VWAP_STORE = {}
+
 def to_file(sym, ex, candles, today, bse_until=None) -> dict:
     obj = {"sym": sym, "ex": ex, "updated": today}
     if bse_until: obj["bse_until"] = bse_until
     for k in KEYS: obj[k] = [c[k] for c in candles]
+    if VWAP_STORE:
+        obj["a"] = vwap_array(sym, obj, VWAP_STORE)
     return obj
 
 def from_file(obj) -> list[dict]:
@@ -441,6 +458,7 @@ async def run_backfill(force=False, only=None):
         async with httpx.AsyncClient() as client:
             uni, bse_keys = await load_universe(client)
             idx = await load_index(client)
+            await _load_vwap(client, today)
             if only:
                 syms = [s for s in only if s in uni]
                 missing = [s for s in only if s not in uni]
@@ -469,6 +487,7 @@ async def run_daily():
             idx = await load_index(client)
             if not idx:
                 log.warning("chart/_index.json is empty — run 'backfill' first"); status.success(); return
+            await _load_vwap(client, today)
 
             # Stocks no longer in classification.json leave the index (their file stays, unused)
             gone = [s for s in idx if s not in uni]
