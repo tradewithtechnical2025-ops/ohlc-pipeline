@@ -5,6 +5,7 @@ import json
 import os
 import re
 import gzip
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -56,6 +57,15 @@ LIQUIDITY_FILE           = "screener_feed.json"
 MIN_AVG_TURNOVER_CR      = 0.5    # NSE: Rs 50 lakh per day (20-day average)
 MIN_BSE_AVG_TURNOVER_CR  = 0.01   # BSE-only: Rs 1 lakh per day (20-day average)
 MIN_BSE_TURNOVER_CR      = 0.01   # BSE-only fallback on today's turnover
+
+# ── Daily VWAP (Upstox full market quote: average_price) ──
+# Saved per trading day so exact daily VWAP / turnover history builds up from
+# now on (Upstox historical candles carry no VWAP). Only a finished session is
+# saved: a run during market hours is skipped (the value is still moving).
+VWAP_FILE      = "vwap_daily.json"
+VWAP_KEEP_DAYS = int(os.environ.get("VWAP_KEEP_DAYS", "60"))
+IST            = timezone(timedelta(hours=5, minutes=30))
+MARKET_CLOSE_SAVE_AFTER = (15, 35)   # IST hh, mm — the day's VWAP is final after this
 
 BSE_ONLY_EXCLUSIVE = True
 
@@ -448,6 +458,108 @@ async def fetch_upstox_quotes(client, instrument_keys):
             break
         await asyncio.sleep(0.3)
     return out
+
+
+# =========================================================
+# DAILY VWAP  (vwap_daily.json)
+# =========================================================
+
+async def fetch_upstox_avg_prices(client, key_to_symbol: dict) -> dict:
+    """instrument_key -> our symbol  ==>  symbol -> quote dict (full market quote).
+    Mapped back via the response's instrument_token, so NSE and BSE-only rows never collide."""
+    out = {}
+    keys = list(key_to_symbol)
+    for i in range(0, len(keys), 500):
+        batch = keys[i:i + 500]
+        for attempt in range(RETRY):
+            try:
+                r = await client.get(
+                    "https://api.upstox.com/v2/market-quote/quotes",
+                    params={"instrument_key": ",".join(batch)},
+                    headers={"Authorization": f"Bearer {UPSTOX_TOKEN}", "Accept": "application/json"},
+                    timeout=60,
+                )
+            except Exception as e:
+                print(f"  ⚠️  VWAP quote network error (attempt {attempt + 1}/{RETRY}): {e}")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            if r.status_code in RETRYABLE_STATUS_CODES:
+                await asyncio.sleep(min(2 ** attempt * 3, 30))
+                continue
+            if r.status_code != 200:
+                print(f"  ❌ VWAP quotes HTTP {r.status_code}: {r.text[:120]}")
+                break
+            for v in (r.json().get("data") or {}).values():
+                sym = key_to_symbol.get(str(v.get("instrument_token") or ""))
+                if sym:
+                    out[sym] = v
+            break
+        await asyncio.sleep(0.3)
+    return out
+
+
+async def save_daily_vwap(client, master: list, bse: list, nse_ikey_map: dict, bse_ikey_map: dict) -> None:
+    """Append today's VWAP (average_price) and volume for every master + BSE-only stock
+    to vwap_daily.json:  {"updated": ..., "days": {"YYYY-MM-DD": {SYMBOL: [vwap, volume]}}}.
+    Turnover of a day = vwap x volume. Never fails the pipeline."""
+    print()
+    print("=" * 50)
+    print("     Daily VWAP (Upstox average_price)")
+    print("=" * 50)
+    if not UPSTOX_TOKEN:
+        print("  ⚠️  UPSTOX_ACCESS_TOKEN not set — VWAP skipped")
+        return
+    try:
+        key_to_symbol = {}
+        for s in master:
+            k = nse_ikey_map.get(s["symbol"])
+            if k:
+                key_to_symbol[k] = s["symbol"]
+        for s in bse:
+            k = bse_ikey_map.get(str(s.get("bse_code") or ""))
+            if k:
+                key_to_symbol[k] = s["symbol"]
+        quotes = await fetch_upstox_avg_prices(client, key_to_symbol)
+        print(f"  📡 Quotes received : {len(quotes)} / {len(key_to_symbol)}")
+
+        now = datetime.now(IST)
+        day_rows, dates = {}, {}
+        for sym, q in quotes.items():
+            try:
+                avg = float(q.get("average_price") or 0)
+                vol = float(q.get("volume") or 0)
+                ltt = int(q.get("last_trade_time") or 0)
+            except (TypeError, ValueError):
+                continue
+            if avg <= 0 or vol <= 0 or not ltt:
+                continue                       # no trade today / no value
+            d = datetime.fromtimestamp(ltt / 1000, IST).date().isoformat()
+            dates[d] = dates.get(d, 0) + 1
+            day_rows.setdefault(d, {})[sym] = [round(avg, 2), int(vol)]
+        if not day_rows:
+            print("  ⚠️  No average_price in the quotes — nothing saved")
+            return
+        trade_date = max(dates, key=dates.get)       # the session most stocks last traded in
+        if (trade_date == now.date().isoformat()
+                and (now.hour, now.minute) < MARKET_CLOSE_SAVE_AFTER):
+            print(f"  ⏭️  Market still open ({now:%H:%M} IST) — today's VWAP is not final, not saved")
+            return
+        rows = day_rows[trade_date]               # stocks that did not trade that day are left out
+
+        hist = await r2_download(client, VWAP_FILE)
+        days = (hist or {}).get("days") if isinstance(hist, dict) else None
+        days = days if isinstance(days, dict) else {}
+        days[trade_date] = rows
+        for old in sorted(days)[:-VWAP_KEEP_DAYS]:
+            days.pop(old, None)
+        await r2_upload(client, VWAP_FILE, {"updated": now.isoformat(timespec="seconds"),
+                                            "fields": ["vwap", "volume"], "days": days})
+        print(f"  ✓ {trade_date}: VWAP saved for {len(rows)} stocks | days kept: {len(days)} (max {VWAP_KEEP_DAYS})")
+        for probe in ("HDFCBANK", "RELIANCE"):
+            if probe in rows:
+                print(f"      {probe}: vwap={rows[probe][0]} volume={rows[probe][1]:,}")
+    except Exception as e:
+        print(f"  ⚠️  VWAP save failed ({type(e).__name__}: {e}) — pipeline continues")
 
 
 # =========================================================
@@ -1203,6 +1315,8 @@ async def main():
         data = await fetch_symbols(client)
 
         upstox_data = await fetch_upstox_master(client, UPSTOX_BSE_URL, "BSE")
+        bse_ikey_map = {str(x["exchange_token"]): x.get("instrument_key")
+                        for x in upstox_data if x.get("segment") == "BSE_EQ" and x.get("instrument_key")}
         upstox_map = {
             str(x["exchange_token"]): {
                 "segment": x.get("segment"),
@@ -1305,6 +1419,8 @@ async def main():
 
         bse = build_bse_master(data, quotes, upstox_map, only_exclusive=BSE_ONLY_EXCLUSIVE, avg_vol=avg_vol)
         bse_uploaded = await r2_upload_guarded(client, BSE_OUTPUT_FILE, bse, BSE_DROP_ALERT_PCT)
+
+        await save_daily_vwap(client, master, bse, nse_ikey_map, bse_ikey_map)
 
         print()
         status_master = "uploaded" if master_uploaded else "SKIPPED (anomaly guard)"
