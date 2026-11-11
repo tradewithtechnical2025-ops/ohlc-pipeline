@@ -2,15 +2,16 @@ name: VWAP Backfill (one-time)
 on:
   workflow_dispatch:
     inputs:
-      days:
-        description: 'Trading days to fill from NSE bhavcopy'
+      years:
+        description: 'Years of daily VWAP to fill from NSE bhavcopy (resumable: re-run to continue)'
         type: string
-        default: '60'
+        default: '5'
 env:
   PYTHONUNBUFFERED: "1"
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,5 +23,5 @@ jobs:
         env:
           WORKER_URL:     ${{ secrets.WORKER_URL }}
           WORKER_TOKEN:   ${{ secrets.WORKER_TOKEN }}
-          BACKFILL_DAYS:  ${{ inputs.days }}
+          BACKFILL_YEARS: ${{ inputs.years }}
         run: python backfill_vwap.py
