@@ -117,7 +117,15 @@ BAD_KEYWORDS = [
     "GOLD", "SILVER", "INDEX", "NEXT50", "MIDCAP", "SMALLCAP",
 ]
 
+# Exact symbols kept off the site (InvIT trusts: not company shares). Listed by
+# symbol on purpose — a keyword such as "TRUST" would also drop real companies.
+EXCLUDE_SYMBOLS = {
+    "CUBEINVIT", "CITIUSINVT", "RIIT", "ANANTAM", "CAPINVIT",
+}
+
 def is_bad_symbol(symbol, name):
+    if str(symbol or "").strip().upper() in EXCLUDE_SYMBOLS:
+        return True
     if symbol.isdigit():
         return True
     if symbol.endswith("-RE"):
@@ -1033,7 +1041,7 @@ async def inject_manual_symbols(client, master, upstox_nse, nse_isin_map, nse_ik
 # IPO LISTINGS INJECTION  (mainboard only, from ipo_data.json in R2)
 # =========================================================
 
-async def inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse_ikey_map):
+async def inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse_ikey_map, avg_vol=None):
     """
     Pulls the IPO tracker file (IPO_DATA_FILE) from R2 and force-adds any
     MAINBOARD stock (issue_type == "regular") that has already LISTED
@@ -1081,6 +1089,9 @@ async def inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse
     already_there = 0
     no_match      = 0
     used_fallback = 0
+    excluded      = 0
+    too_thin      = 0
+    avg_vol       = avg_vol or {}
 
     for ipo in candidates:
         isin = str(ipo.get("isin") or "").strip()
@@ -1094,6 +1105,9 @@ async def inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse
 
         if symbol in existing:
             already_there += 1
+            continue
+        if symbol in EXCLUDE_SYMBOLS:
+            excluded += 1
             continue
 
         name = ipo.get("name") or (upstox_entry or {}).get("name") or symbol
@@ -1137,6 +1151,15 @@ async def inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse
 
         turnover_cr = round((price * volume) / 1e7, 2) if price and volume else 0.0
 
+        # The IPO pass is only for fresh listings with < 20 trading days. Once a
+        # 20-day average exists, the normal liquidity rule applies: an older IPO
+        # that build_master rejected for low turnover is not re-added here.
+        avg_to = avg_turnover_cr(avg_vol, price, symbol)
+        if avg_to is not None and avg_to < MIN_AVG_TURNOVER_CR:
+            print(f"  ✗ {symbol}: 20-day avg turnover {avg_to:.2f} cr < {MIN_AVG_TURNOVER_CR} cr — not re-added")
+            too_thin += 1
+            continue
+
         master.append({
             "symbol":           symbol,
             "name":             name,
@@ -1162,6 +1185,8 @@ async def inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse
     print(f"  ⏭️  Already in master            : {already_there}")
     print(f"  ✗ No ISIN match/OHLC/fallback   : {no_match}")
     print(f"  ⚠️  Used listing_price fallback : {used_fallback}")
+    print(f"  ✗ Excluded (EXCLUDE_SYMBOLS)    : {excluded}")
+    print(f"  ✗ 20-day avg turnover too low   : {too_thin}")
     print("=" * 50)
 
     return injected
@@ -1272,7 +1297,7 @@ async def main():
 
         await inject_missing_from_upstox(client, master, upstox_nse, quotes, nse_isin_map, avg_vol)
 
-        await inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse_ikey_map)
+        await inject_from_ipo_listings(client, master, upstox_nse, nse_isin_map, nse_ikey_map, avg_vol)
 
         await inject_manual_symbols(client, master, upstox_nse, nse_isin_map, nse_ikey_map)
 
