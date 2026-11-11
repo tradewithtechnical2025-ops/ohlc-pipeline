@@ -1,0 +1,26 @@
+name: VWAP Backfill (one-time)
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Trading days to fill from NSE bhavcopy'
+        type: string
+        default: '60'
+env:
+  PYTHONUNBUFFERED: "1"
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install httpx requests pillow   # same as NSE Pipeline (backfill imports pipeline_nse.py)
+      - name: Run VWAP backfill
+        env:
+          WORKER_URL:     ${{ secrets.WORKER_URL }}
+          WORKER_TOKEN:   ${{ secrets.WORKER_TOKEN }}
+          BACKFILL_DAYS:  ${{ inputs.days }}
+        run: python backfill_vwap.py
