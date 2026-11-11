@@ -17,6 +17,34 @@ Output (R2, flat key):
                  (same day before 15:30 IST, next trading day after it).
     session    = BH (before 09:15) | IH (market hours) | AH (after 15:30 or holiday)
                  same codes ep.html already uses for results.
+
+Changes (Nov 2026):
+  - Order annexure rows lettered a … i (instead of 1. … 9.) are now read too, so the
+    customer / work / domestic-international / execution / related-party fields fill
+    in for those filings (they used to come through with the value only).
+  - Row labels with a space around the slash ("order(s) / contract(s)") now match.
+  - A withheld customer reads "Not disclosed (an EPC Company of USA)" instead of the
+    full "For commercial reasons, the Company is unable to disclose…" sentence.
+  - "received an email with intent for supply of …" is tagged Letter of Intent, not Awarded.
+  - Press-note cover letters ('…the Press Note with the title: "X Secures INR 973 crores Order…"'):
+    the value is read from that quoted title (value_source "pdf_title"), so these no longer wait
+    for Gemini on every run.
+  - Plain "label  value" annexure tables (no 1./a. row markers) are read by their SEBI labels,
+    incl. "Client" and "End customer" ("ITI Limited … (end customer: Indian Army)").
+    - Label tables: the next row's bare number no longer sticks to a value ("Indian Company 2");
+      band words ("Major* order") are not used as the purpose; a related-party answer that
+      repeats "arm's length" is read correctly; "overseas project" counts as International.
+    - A "0 - 100" size band is shown as "Up to ₹100 Cr" with no value or ratio (was "₹0+ Cr").
+    - AI-first order fields: Gemini reads every received-order PDF (readable text is sent as text,
+      scanned PDFs as PDF) and fills customer, end customer, purpose, Domestic/International,
+      execution period and related party. The local parser is the cross-check: a different
+      Domestic/International or related-party answer, or a value that differs from the heading or
+      table, sets needs_review and is listed in the log ("Orders to review"). An AI value is used
+      only if that number is printed in the PDF; an AI customer only if its name is in the PDF.
+      Heading / table / band values still come first. AI_ORDER_BATCH default is now 25 (= PDFs per
+      run). If the AI quota runs out, the local result is shown and the AI read is retried next run.
+  - The no-AI one-line order summary stops before the cover-letter boilerplate ("The details as
+    required … enclosed as Annexure I. This is for your information…").
 """
 
 import csv
@@ -687,17 +715,80 @@ def _clean_field(v: str, max_len: int = 350) -> str:
     return v[:max_len].strip(" :-;|")
 
 
+# Lettered SEBI rows ("a Name of the entity…", "(b) Significant terms…", "c) Whether…"): the letter
+# must be followed by one of the standard row labels, so an ordinary "a" in a sentence never counts.
+_LETTER_ROW_RE = re.compile(
+    r"(?<![A-Za-z0-9])\(?([a-i])[).]?\s+(?=(?:name of (?:the )?entity|significant terms|whether|nature of|"
+    r"time period|broad (?:commercial )?consideration|details of|domestic or international))", re.I)
+
+
 def _table_items(clean: str) -> dict[int, str]:
-    """Return numbered SEBI disclosure rows (1..9), bounded by the next row."""
-    hits = list(re.finditer(r"(?<!\d)\b([1-9])\.\s+", clean))
+    """Return SEBI disclosure rows (1..9), bounded by the next row.
+    Rows are numbered "1." … "9." in most filings; some number them a … i (mapped to 1 … 9)."""
     rows = {}
+    hits = list(re.finditer(r"(?<!\d)\b([1-9])\.\s+", clean))
     for i, m in enumerate(hits):
         n = int(m.group(1))
         if n in rows:
             continue
         end = hits[i + 1].start() if i + 1 < len(hits) else len(clean)
         rows[n] = clean[m.end():end].strip()
-    return rows
+    if len(rows) >= 3:
+        return rows
+    lhits = list(_LETTER_ROW_RE.finditer(clean))
+    lrows = {}
+    for i, m in enumerate(lhits):
+        n = ord(m.group(1).lower()) - 96
+        if n in lrows:
+            continue
+        end = lhits[i + 1].start() if i + 1 < len(lhits) else len(clean)
+        lrows[n] = clean[m.end():end].strip()
+    if len(lrows) >= 3:
+        return lrows if len(lrows) > len(rows) else rows
+    # No row numbers or letters at all: a plain "label  value" table. Find the SEBI labels
+    # (worded a little differently by each company) and rebuild each row as the standard
+    # label + its value, so the row readers below work unchanged.
+    found = []
+    for n, (pat, canon) in _LABEL_ROWS.items():
+        m = re.search(pat, clean, re.I)
+        if m:
+            found.append((m.start(), m.end(), n, canon))
+    found.sort()
+    if sum(1 for f in found if f[2] <= 9) < 3:
+        return lrows if len(lrows) > len(rows) else rows
+    brows = {}
+    for i, (st, en, n, canon) in enumerate(found):
+        if n in brows:
+            continue
+        stop = found[i + 1][0] if i + 1 < len(found) else min(len(clean), en + 600)
+        val = clean[en:stop].strip(" :;-")
+        val = re.sub(r"\s+\(?(?:[1-9]|1[0-9])[.)]?\s*$", "", val)   # next row's number, e.g. "Indian Company 2"
+        brows[n] = canon + " " + val
+    return brows
+
+
+# Unnumbered annexure tables: label pattern -> the standard wording the row readers expect.
+_LABEL_ROWS = {
+    1: (r"name of (?:the )?entity awarding (?:the )?order\(s\)\s*/\s*contract\(s\)|"
+        r"(?<![A-Za-z])client(?:\s+name)?\s*:?\s+(?=(?-i:[A-Z]))",
+        "Name of the entity awarding the order(s)/contract(s)"),
+    10: (r"(?<![A-Za-z])end[- ](?:customer|user|client)\s*:?\s+(?=(?-i:[A-Z]))", "End customer"),
+    2: (r"significant terms and conditions of order\(s\)\s*/\s*contract\(s\)(?:\s+awarded)?,?\s*(?:in brief)?;?",
+        "Significant terms and conditions of order(s)/contract(s) awarded in brief"),
+    3: (r"whether order\(s\)\s*/\s*contract\(s\)\s*(?:have been|has been|is|are)\s+awarded by\s+domestic\s*/\s*international\s+entit(?:y|ies)",
+        "Whether order(s)/contract(s) have been awarded by domestic/international entity"),
+    4: (r"nature of order\(s\)\s*/\s*contract\(s\)", "Nature of order(s)/contract(s)"),
+    5: (r"whether domestic or international", "Whether domestic or international"),
+    6: (r"time period (?:by which (?:the )?order\(s\)\s*/?\s*contract\(s\) (?:is|are) to be executed|for execution)",
+        "Time period by which the order(s)/contract(s) is to be executed"),
+    7: (r"broad (?:commercial )?consideration or size of (?:the )?order(?:\(s\))?(?:\s*(?:or|/)\s*(?:order\(s\)\s*/\s*)?contract\(s\))?",
+        "Broad consideration or size of the order(s)/contract(s)"),
+    8: (r"whether the promoter\s*/\s*promoter group\s*/\s*group companies have any interest[^?]{0,120}\?(?:\s*if yes,[^;]{0,60}?details thereof;?)?",
+        "Whether the promoter/promoter group/group companies have any interest? If yes, details thereof"),
+    9: (r"whether the order(?:\(s\)\s*/\s*contract\(s\))?\s+(?:would\s+)?falls?\s+within related party transactions[^.]{0,80}?arm['’`]?s[ ’']*length|"
+        r"whether the order\(s\)\s*/\s*contract\(s\)\s+(?=(?:yes|no)\b)",
+        "Whether the order(s)/contract(s) would fall within related party transactions? If yes, the same is done at arm's length"),
+}
 
 
 def _yes_no_answer(row: str) -> bool | None:
@@ -705,11 +796,19 @@ def _yes_no_answer(row: str) -> bool | None:
     so only the text after the question ("arm's length" / last '?') counts."""
     if not row:
         return None
-    m = None
-    for m in re.finditer(r"arm['’`s ]*\s*length[\"'”’.;:\s]*|\?", row, re.I):
-        pass
-    ans = row[m.end():] if m else row
-    ans = ans.strip(" .:;-\"'”’")
+    cuts = [m.end() for m in re.finditer(r"arm['’`s ]*\s*length[\"'”’.;:\s]*|\?", row, re.I)]
+    if len(cuts) > 1:
+        # The answer itself may repeat "arm's length": take the first decisive answer.
+        for c in cuts:
+            r = _yes_no_answer_text(row[c:])
+            if r is not None:
+                return r
+        return None
+    return _yes_no_answer_text(row[cuts[0]:] if cuts else row)
+
+
+def _yes_no_answer_text(ans: str) -> bool | None:
+    ans = ans.strip(" .:;-?\"'”’")
     if not ans:
         return None
     if re.match(r"(?:no\b|nil\b|none\b|n\.?\s?a\.?\b|not applicable|not interested|does not|do not|is not|are not|not a\b|not fall)", ans, re.I):
@@ -766,11 +865,11 @@ def _extract_order_details(text: str) -> dict:
 
     entity = _row_answer(
         rows.get(1, ""),
-        r"name of (?:the )?entity awarding (?:the )?order\(s\)/\s*contract\(s\)",
+        r"name of (?:the )?entity awarding (?:the )?order\(s\)\s*/\s*contract\(s\)",
     )
     terms = _row_answer(
         rows.get(2, ""),
-        r"significant terms and conditions of order\(s\)/\s*contract\(s\) awarded in brief",
+        r"significant terms and conditions of order\(s\)\s*/\s*contract\(s\) awarded in brief",
     )
     nature = _row_answer(
         rows.get(4, ""),
@@ -778,7 +877,8 @@ def _extract_order_details(text: str) -> dict:
     )
     # Prefer a descriptive terms row, but ignore generic boilerplate.
     _generic = re.compile(r"(?:as per\b.*|general (?:contract|condition)s?\b.*|standard (?:terms|conditions)\b.*|"
-                          r"one[- ]time|letter of (?:award|acceptance|intent)|n\.?a\.?|not applicable|epc|supply|works?)\.?", re.I)
+                          r"one[- ]time|letter of (?:award|acceptance|intent)|n\.?a\.?|not applicable|epc|supply|works?|"
+                          r"(?:significant|large|major|mega|ultra[- ]?mega)\s*\*?\s*orders?)\.?", re.I)
     if terms and not _generic.fullmatch(terms.strip()):
         purpose = terms
     elif nature and not _generic.fullmatch(nature.strip()):
@@ -803,7 +903,10 @@ def _extract_order_details(text: str) -> dict:
     row5 = rows.get(5, "")
     tm = re.search(r"whether domestic or international\s+(domestic|international)\b", row5, re.I)
     if not tm:
-        tm = re.search(r"\b(domestic|international)\b", row5, re.I)
+        # Skip the label's own words; "overseas project" means international.
+        ans5 = re.sub(r"^.*?whether domestic or international", "", row5, count=1, flags=re.I)
+        tm = re.search(r"\b(domestic|international)\b", ans5, re.I) or \
+            re.search(r"\b(international)\b", "international" if re.search(r"\boverseas\b", ans5, re.I) else "")
     if not tm:
         row3 = rows.get(3, "")
         tm = re.search(r"\b(domestic|international)(?:\s+entit(?:y|ies))?\b\s*$", row3, re.I)
@@ -865,6 +968,14 @@ def _extract_order_details(text: str) -> dict:
             "detail_excerpt": _clean_field(context, 500),
         })
     if entity:
+        # "For commercial reasons, the Company is unable to disclose the name of the customer which is
+        # an EPC Company of USA." -> "Not disclosed (an EPC Company of USA)"
+        if re.search(r"unable to disclose|not (?:be )?disclos|confidential|cannot disclose|can not disclose", entity, re.I):
+            who = re.search(r"\b(?:which|who) is\s+(an?\s+[^.;]{3,80})", entity, re.I)
+            entity = "Not disclosed" + (f" ({who.group(1).strip()})" if who else "")
+        endc = _row_answer(rows.get(10, ""), r"end customer")
+        if endc and endc.lower() not in entity.lower():
+            entity = f"{entity} (end customer: {endc[:80]})"
         out["order_from"] = entity
     if purpose:
         out["order_purpose"] = purpose
@@ -883,7 +994,10 @@ GEMINI_ORDER_MODEL = os.environ.get("GEMINI_ORDER_MODEL", os.environ.get("GEMINI
 # Extraction needs little reasoning; thinking tokens bill at the output rate.
 # Set GEMINI_THINKING_LEVEL="" to send no thinking config at all.
 GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip()
-AI_ORDER_BATCH = int(os.environ.get("AI_ORDER_BATCH", "10"))     # max Gemini calls per run
+# AI reads every received-order PDF (all fields); the local parser cross-checks it.
+AI_ORDER_BATCH = int(os.environ.get("AI_ORDER_BATCH", "25"))     # max Gemini calls per run
+AI_TEXT_MIN_CHARS = 600         # PDF text at least this long (and readable) is sent as text, not as the PDF
+AI_TEXT_MAX_CHARS = 30000
 AI_ORDER_MAX_ATTEMPTS = 2       # failed AI calls per row before giving up
 AI_AGREE_TOL = 0.05             # local vs AI within 5% = confirmed
 _GEMINI_RATE_LIMITED = False
@@ -908,14 +1022,25 @@ def _print_gemini_usage_summary() -> None:
           f"output={u['output_tokens']:,}, thoughts={u['thought_tokens']:,}, total={u['total_tokens']:,}")
 
 _ORDER_AI_PROMPT = r"""
-Read this Indian listed company's order/contract announcement PDF. Return ONLY this JSON, nothing else:
-{"value_cr": number|null, "value_basis": "total"|"annual"|"not_disclosed", "tenure_years": number|null, "customer": string|null, "summary": string|null}
+Read this Indian listed company's order/contract announcement. Return ONLY this JSON, nothing else:
+{"value_cr": number|null, "value_basis": "total"|"annual"|"band"|"not_disclosed", "value_as_printed": string|null,
+ "tenure_years": number|null, "customer": string|null, "end_customer": string|null, "purpose": string|null,
+ "order_type": "Domestic"|"International"|null, "execution_period": string|null, "related_party": true|false|null,
+ "summary": string|null}
 Rules:
-- value_cr: the order/contract value in INR crore (convert rupees/lakh). If only a foreign currency is given, use the INR equivalent stated in the PDF, else null. If several orders, use the stated aggregate.
+- value_cr: the order/contract value in INR crore (convert rupees/lakh). If only a foreign currency is given, use the INR equivalent stated in the document, else null. If several orders, use the stated aggregate.
+- If the document has a firm order plus optional/future parts (AMC "if required", options, extensions), value_cr is the firm order only.
+- value_as_printed: the amount exactly as printed, e.g. "₹35,63,18,292.20" or "USD 102.23 million (approx. INR 973 Cr)".
+- If only a size class is given (e.g. "Major*" with a class table), value_basis "band" and value_cr null.
 - Ignore order book, YTD order intake, revenue, turnover and market cap figures.
-- value_basis "annual" when the PDF gives a yearly revenue/tariff for a multi-year period; then value_cr is the yearly figure and tenure_years the period. Otherwise tenure_years is null.
-- customer: name of the entity that awarded the order; null if withheld.
+- value_basis "annual" when the document gives a yearly revenue/tariff for a multi-year period; then value_cr is the yearly figure and tenure_years the period. Otherwise tenure_years is null.
+- customer: name of the entity that awarded the order, as written; null if withheld. end_customer: only if the document names a separate end customer/user.
+- purpose: the work or supply, under 20 words, taken from the nature/terms of the order. Never size words such as "Major order".
+- order_type: "Domestic" if the awarding entity is Indian, "International" if it is foreign, as the document states.
+- execution_period: as stated, under 15 words.
+- related_party: the document's answer to "would the order fall within related party transactions"; null if not stated.
 - summary: one factual sentence under 25 words saying what work and for whom. No opinions.
+- Use only facts written in the document.
 """.strip()
 
 
@@ -945,15 +1070,17 @@ def _extract_pdf_text_bytes(pdf_bytes: bytes) -> str:
         return ""
 
 
-def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict:
+def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "", pdf_text: str = "") -> dict:
     if not GEMINI_API_KEY or not pdf_bytes:
         return {}
     try:
+        # Readable text is far cheaper than the PDF itself; scanned PDFs still go as PDF.
+        if len(pdf_text or "") >= AI_TEXT_MIN_CHARS and not _ocr_garbage(pdf_text[:3000]):
+            doc_part = {"text": "DOCUMENT TEXT:\n" + pdf_text[:AI_TEXT_MAX_CHARS]}
+        else:
+            doc_part = {"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(pdf_bytes).decode("ascii")}}
         payload = {
-            "contents": [{"parts": [
-                {"text": _ORDER_AI_PROMPT},
-                {"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(pdf_bytes).decode("ascii")}},
-            ]}],
+            "contents": [{"parts": [{"text": _ORDER_AI_PROMPT}, doc_part]}],
             "generationConfig": {
                 "temperature": 0.05,
                 "maxOutputTokens": 1024,   # JSON is ~100 tokens; cap includes thinking
@@ -997,7 +1124,7 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
         except (TypeError, ValueError):
             pass
         basis = str(obj.get("value_basis") or "").lower()
-        if basis in {"total", "annual", "not_disclosed"}:
+        if basis in {"total", "annual", "band", "not_disclosed"}:
             out["value_basis"] = basis
         try:
             t = obj.get("tenure_years")
@@ -1006,10 +1133,18 @@ def _gemini_order_details(session, pdf_bytes: bytes, filename: str = "") -> dict
                 out["tenure_years"] = t
         except (TypeError, ValueError):
             pass
-        for src, dst in (("customer", "order_from"), ("summary", "order_summary")):
+        for src, dst, cap in (("customer", "order_from", 200), ("summary", "order_summary", 300),
+                              ("end_customer", "end_customer", 100), ("purpose", "order_purpose", 300),
+                              ("execution_period", "execution_period", 150),
+                              ("value_as_printed", "value_as_printed", 120)):
             v = obj.get(src)
-            if isinstance(v, str) and v.strip() and v.strip().lower() not in {"null", "none", "n/a"}:
-                out[dst] = v.strip()[:300]
+            if isinstance(v, str) and v.strip() and v.strip().lower() not in {"null", "none", "n/a", "not disclosed"}:
+                out[dst] = v.strip()[:cap]
+        ot = str(obj.get("order_type") or "").strip().title()
+        if ot in {"Domestic", "International"}:
+            out["order_type"] = ot
+        if isinstance(obj.get("related_party"), bool):
+            out["related_party"] = obj["related_party"]
         if out:
             out["detail_source"] = "gemini_pdf"
         return out
@@ -1095,7 +1230,7 @@ def _local_corporate_news(category: str, pdf_text: str) -> dict:
     # Work with prose, not annexure tables, signatures or boilerplate.
     prose = re.sub(r"\s+", " ", " ".join(lines[:110])).strip()
     prose = re.split(r"\b(?:kindly take (?:the same|this)|this is for (?:your )?information|thank(?:ing)? you|yours faithfully|for [A-Z ]+ LIMITED)\b", prose, maxsplit=1, flags=re.I)[0]
-    candidates = re.split(r"(?<=[.!?])\s+(?=[A-Z])", prose)
+    candidates = re.split(r"(?<=[.!?])\s+(?=(?-i:[A-Z]))", prose)
     skip = re.compile(r"^(?:sub(?:ject)?|ref(?:erence)?|dear|sir|madam|this is with reference|further to our|we enclose|we wish to inform you that the details required|intimation under|disclosure under)", re.I)
     event = re.compile(r"\b(?:acquir(?:e|ed|ing|es)|acquisition|sale|sold|divest|stake|equity shares?|share transfer|purchase consideration|ceased to be|agreement for sale|entered into.*agreement)\b", re.I)
     selected = []
@@ -2189,6 +2324,18 @@ NOMINAL_ACQ_MAX_CR = 1.0           # shell/SPV purchases for a few lakh are not 
 NOMINAL_ACQ_MAX_MCAP_PCT = 0.1
 
 
+# Cover letters for a press note quote its title: 'please find attached the Press Note with the
+# title: "X Secures INR 973 crores Order for …"'. That title is a headline like NSE's summary.
+_PRESS_TITLE_RE = re.compile(
+    r"(?:with\s+the\s+title|titled|under\s+the\s+(?:title|caption|heading))\s*:?\s*[“\"'‘]\s*(.{15,320}?)\s*[”\"'’]",
+    re.I | re.S)
+
+
+def _press_title(pdf_text: str) -> str:
+    m = _PRESS_TITLE_RE.search(re.sub(r"\s+", " ", (pdf_text or "")[:4000]))
+    return m.group(1).strip() if m else ""
+
+
 def _headline_value(text: str) -> tuple[float | None, str]:
     """First clean ₹ amount in the NSE summary, in crore."""
     import html as _html
@@ -2321,7 +2468,8 @@ _L1_RE = re.compile(
     r"\bl[- ]?1\s*(?:bidder|stage|bid)\b|lowest (?:evaluated )?bidder|first lowest", re.I)
 _PREF_BIDDER_RE = re.compile(r"preferred bidder", re.I)
 _MINING_RE = re.compile(r"mining lease|mineral block|composite licen[cs]e|limestone block|coal block", re.I)
-_LOI_RE = re.compile(r"letter of intent|\bloi\b", re.I)
+# "received an email with intent for supply of …" is an intent too, not a firm order
+_LOI_RE = re.compile(r"letter of intent|\bloi\b|e-?mail (?:with|of|showing) (?:the )?intent|intent (?:for|to) (?:supply|award|place|procure)", re.I)
 _FIRM_AWARD_RE = re.compile(r"letter of (?:award|acceptance)|\bloa\b|work order|purchase order|agreement (?:signed|executed)|contract (?:signed|executed)", re.I)
 # The company states that the contract is already signed. An L1 / LoI mention next to
 # this wording is order history, so it must not pull the row back to a pre-award stage.
@@ -2413,12 +2561,21 @@ def _apply_band(it: dict, chk: dict) -> bool:
     v = it.get("order_value_cr")
     if v is not None and not (abs(v - lo) < 0.01 or (chk.get("band_max") and abs(v - chk["band_max"]) < 0.01)):
         return False          # an exact value was disclosed elsewhere; keep it
+    hi = chk.get("band_max")
+    label = f"{chk['band_label']}: " if chk.get("band_label") else ""
+    if lo <= 0 and hi:
+        # "0 - 100" band has no floor: never show "₹0+ Cr" or a 0% ratio.
+        it["order_value_cr"] = None
+        it["order_value_role"] = "band_max"
+        it["band_max_cr"] = hi
+        it["order_value_text"] = f"{label}Up to ₹{hi:,.0f} Cr (company band)"
+        for k in ("order_to_market_cap_pct", "order_to_ttm_sales_pct", "value_disclosed"):
+            it.pop(k, None)
+        return True
     it["order_value_cr"] = lo
     it["order_value_role"] = "band_min"
-    hi = chk.get("band_max")
     if hi:
         it["band_max_cr"] = hi
-    label = f"{chk['band_label']}: " if chk.get("band_label") else ""
     it["order_value_text"] = (f"{label}₹{lo:,.0f}–{hi:,.0f} Cr (company band)" if hi else f"{label}Over ₹{lo:,.0f} Cr (company band)")
     it.pop("value_disclosed", None)
     return True
@@ -2451,7 +2608,8 @@ _SUBJECT_BOILER = re.compile(
 _GENERIC_SUBJECT = re.compile(r"(?:press release|intimation|disclosure|outcome of board meeting|update|announcement|"
                               r"disclosure regarding receipt of (?:a )?major order)\.?", re.I)
 _GENERIC_PURPOSE = re.compile(r"(?:as per\b.*|general (?:contract|condition)s?\b.*|standard (?:terms|conditions)\b.*|"
-                              r"one[- ]time|letter of (?:award|acceptance|intent)|n\.?a\.?|not applicable|epc|supply|works?)\.?", re.I)
+                              r"one[- ]time|letter of (?:award|acceptance|intent)|n\.?a\.?|not applicable|epc|supply|works?|"
+                          r"(?:significant|large|major|mega|ultra[- ]?mega)\s*\*?\s*orders?)\.?", re.I)
 
 
 def _tidy_lead(t: str) -> str:
@@ -2524,6 +2682,11 @@ def _local_order_lead(pdf_text: str, subject: str, purpose: str = "") -> str:
     if len(subj) >= 25 and not _GENERIC_SUBJECT.fullmatch(subj) and not re.search(r"[A-Za-z]{22,}", subj):
         cands.append(subj)
     for c in cands:
+        # the letter's inform sentence often runs on into the cover boilerplate
+        c = re.split(r"[;.]?\s*(?:the details (?:as required|of the same|in this regard)|details as required under|"
+                     r"(?:are|is) enclosed (?:as|herewith)|this is for your (?:information|kind information)|"
+                     r"you are requested to)", c, maxsplit=1, flags=re.I)[0]
+        c = re.sub(r"\bcroes\b", "crores", c, flags=re.I)
         lead = _tidy_lead(c)
         if lead and not _ocr_garbage(lead):
             return lead
@@ -2537,6 +2700,60 @@ def _set_ratio(it: dict, sym: str, category: str, key: str, value: float,
     it["_lookup_symbol"] = str(sym).strip().upper()
     _apply_materiality_ratios(it, category, {key: value}, market_cap_map, ttm_sales_map)
     it.pop("_lookup_symbol", None)
+
+
+def _value_printed(v: float, text: str) -> bool:
+    """True when a crore figure appears in the document: as crore ("35.63"), lakh ("450")
+    or full rupees ("35,63,18,292" -> "3563…"). Guards against an AI-made number."""
+    plain = re.sub(r"[,\s]", "", text or "").lower()
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return False
+    forms = {f"{v:g}", f"{v:.2f}", f"{v:.1f}", f"{v * 100:g}", str(int(round(v * 100)))}
+    if v >= 1:
+        forms.add(str(int(v)) if float(int(v)) == v else f"{v:.2f}")
+    return any(f and f in plain for f in forms if len(f.replace(".", "")) >= 2)
+
+
+def _name_tokens(name: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z][a-z0-9]{2,}", (name or "").lower())
+            if t not in {"limited", "ltd", "private", "pvt", "the", "and", "company", "co", "inc", "llc"}]
+
+
+def _name_in_text(name: str, text: str) -> bool:
+    toks = _name_tokens(name)
+    own = (text or "").lower()
+    return bool(toks) and sum(t in own for t in toks) / len(toks) >= 0.5
+
+
+def _same_name(a: str, b: str) -> bool:
+    ta, tb = set(_name_tokens(a)), set(_name_tokens(b))
+    return bool(ta and tb) and len(ta & tb) / min(len(ta), len(tb)) >= 0.5
+
+
+def _merge_ai_fields(it: dict, local: dict, ai: dict, text: str) -> list[str]:
+    """AI fields win; the local parse is the cross-check. Returns fields where they disagree."""
+    diffs = []
+    cust = ai.get("order_from")
+    if cust and _name_in_text(cust, text):
+        endc = ai.get("end_customer")
+        if endc and endc.lower() not in cust.lower() and _name_in_text(endc, text):
+            cust = f"{cust} (end customer: {endc})"
+        lo = local.get("order_from") or ""
+        if lo and not lo.lower().startswith("not disclosed") and not _same_name(lo, cust):
+            diffs.append("order_from")
+        it["order_from"] = cust[:220]
+    for k in ("order_purpose", "execution_period"):
+        if ai.get(k):
+            it[k] = ai[k]
+    for k in ("order_type", "related_party"):
+        if ai.get(k) is None:
+            continue
+        if local.get(k) not in (None, "") and local[k] != ai[k]:
+            diffs.append(k)
+        it[k] = ai[k]
+    return diffs
 
 
 _ORDER_OWNED = ("order_value_cr", "order_value_text", "order_value_role", "order_from", "order_purpose",
@@ -2721,9 +2938,11 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                 queue.append((it.get("dt", ""), sym, it))
     queue.sort(key=lambda t: t[0], reverse=True)
     ai_sent = 0
+    review = []
     for _dt, sym, it in queue:
         if stats["checked"] >= pdf_limit:
             break
+        ai, defer, av_ai = {}, False, None
         pdf_bytes = _download_pdf_bytes(session, it.get("link", ""))
         if not pdf_bytes:
             continue      # retried next run; unreachable links are handled by backfill
@@ -2740,6 +2959,10 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
         if hv is None:
             hv, htxt = _headline_value(chk.get("subject", ""))
             hsrc = "pdf_subject"
+        if hv is None:
+            # "Media Release" cover letter: the quoted press-note title carries the value
+            hv, htxt = _headline_value(_press_title(text))
+            hsrc = "pdf_title"
 
         # Fresh local parse with the fixed parser (gemini/manual values are kept).
         local = {}
@@ -2772,6 +2995,35 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
             if chk.get("quantity") and not it.get("quantity_or_capacity"):
                 it["quantity_or_capacity"] = chk["quantity"]
 
+            # AI reads every received order; the local parse above is the cross-check.
+            if GEMINI_API_KEY and ai_sent < ai_limit and not _GEMINI_RATE_LIMITED:
+                ai_sent += 1
+                ai = _gemini_order_details(session, pdf_bytes, it.get("link", "").rsplit("/", 1)[-1], text)
+                if ai:
+                    stats["ai"] += 1
+                    it["ai_checked"] = True
+                    it.pop("ai_attempts", None)
+                    diffs = _merge_ai_fields(it, local, ai, text)
+                    if ai.get("order_summary"):
+                        it["order_summary"] = ai["order_summary"]
+                    if diffs:
+                        it["ai_local_diff"] = diffs
+                        if {"order_type", "related_party"} & set(diffs):
+                            review.append((sym, it, "AI and PDF table disagree on " + ", ".join(diffs)))
+                    else:
+                        it.pop("ai_local_diff", None)
+                elif not _GEMINI_RATE_LIMITED:
+                    it["ai_attempts"] = int(it.get("ai_attempts") or 0) + 1
+                    defer = it["ai_attempts"] < AI_ORDER_MAX_ATTEMPTS
+                else:
+                    defer = True
+            elif GEMINI_API_KEY:
+                defer = True          # budget/rate limit: local result now, AI on a later run
+            av_ai = ai.get("order_value_cr") if ai.get("value_basis") in (None, "total", "annual") else None
+            if av_ai is not None and not _value_printed(av_ai, text):
+                print(f"    · [{sym}] AI value {av_ai} Cr not printed in the PDF; ignored")
+                av_ai = None
+
             if hv is not None and not chk["annual"]:
                 it["order_value_cr"], it["order_value_text"] = hv, htxt
                 it["order_value_role"] = "headline"
@@ -2779,6 +3031,9 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                 lv = local.get("order_value_cr")
                 if lv and abs(lv - hv) / max(lv, hv) > HEADLINE_OVERRIDE_DIFF:
                     it["local_value_cr"] = lv      # audit only; heading wins
+                if av_ai is not None and abs(av_ai - hv) / max(av_ai, hv) > HEADLINE_OVERRIDE_DIFF:
+                    it["ai_value_cr"] = av_ai
+                    review.append((sym, it, f"heading ₹{hv:g} Cr vs AI ₹{av_ai:g} Cr"))
                 _set_ratio(it, sym, "Order", "order_value_cr", hv, market_cap_map, ttm_sales_map)
                 stats["heading"] += 1
             elif (local.get("order_value_cr") is not None and not chk["annual"]
@@ -2790,40 +3045,35 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
                 it["order_value_cr"], it["order_value_text"] = lv, local.get("order_value_text")
                 it["order_value_role"] = "total"
                 it["value_source"] = "pdf_annexure"
+                if av_ai is not None and abs(av_ai - lv) / max(av_ai, lv) > AI_AGREE_TOL:
+                    it["ai_value_cr"] = av_ai
+                    review.append((sym, it, f"table ₹{lv:g} Cr vs AI ₹{av_ai:g} Cr"))
                 _set_ratio(it, sym, "Order", "order_value_cr", lv, market_cap_map, ttm_sales_map)
                 stats["annexure"] = stats.get("annexure", 0) + 1
-            elif chk.get("band_min") is not None and _apply_band(it, chk):
+            elif chk.get("band_min") is not None and av_ai is None and _apply_band(it, chk):
                 it["value_source"] = "pdf_band"
-                _set_ratio(it, sym, "Order", "order_value_cr", it["order_value_cr"], market_cap_map, ttm_sales_map)
+                if it.get("order_value_cr") is not None:
+                    _set_ratio(it, sym, "Order", "order_value_cr", it["order_value_cr"], market_cap_map, ttm_sales_map)
                 stats["band"] = stats.get("band", 0) + 1
-            elif not chk["value_disclosed"]:
+            elif not chk["value_disclosed"] and av_ai is None:
                 for k in ("order_value_cr", "order_value_text", "order_value_role",
                           "order_to_market_cap_pct", "order_to_ttm_sales_pct"):
                     it.pop(k, None)
                 it["value_disclosed"] = False
                 stats["not_disclosed"] += 1
             else:
-                # Value is somewhere in the PDF but not in the heading -> AI.
-                if not GEMINI_API_KEY or ai_sent >= ai_limit or _GEMINI_RATE_LIMITED:
+                # Value is somewhere in the PDF but not in the heading -> AI (already fetched above).
+                if not ai:
                     if local.get("order_value_cr") is not None and it.get("order_value_cr") is None:
                         it["order_value_cr"] = local["order_value_cr"]
                         it["order_value_text"] = local.get("order_value_text")
                         it["order_value_role"] = local.get("order_value_role")
                         _set_ratio(it, sym, "Order", "order_value_cr", local["order_value_cr"],
                                    market_cap_map, ttm_sales_map)
-                    stats["queued"] += 1
-                    continue          # no marker: AI retried on a later run
-                ai_sent += 1
-                ai = _gemini_order_details(session, pdf_bytes, it.get("link", "").rsplit("/", 1)[-1])
-                if _GEMINI_RATE_LIMITED:
-                    stats["queued"] += 1
-                    continue
-                stats["ai"] += 1
-                it["ai_checked"] = True
-                for k in ("order_from", "order_summary"):
-                    if ai.get(k):
-                        it[k] = ai[k]
-                av, basis = ai.get("order_value_cr"), ai.get("value_basis")
+                    if defer or not GEMINI_API_KEY:
+                        stats["queued"] += 1
+                        continue      # no marker: AI retried on a later run
+                av, basis = av_ai, ai.get("value_basis")
                 if basis == "not_disclosed" or av is None:
                     if av is None and local.get("order_value_cr") is not None:
                         av, basis = local["order_value_cr"], "total"
@@ -2871,10 +3121,20 @@ def process_orders(session, history: dict, market_cap_map: dict | None = None,
             lead = _local_order_lead(text, chk.get("subject", ""), it.get("order_purpose") or local.get("order_purpose") or "")
             if lead:
                 it["order_summary"] = lead
+        if defer:
+            stats["queued"] += 1
+            continue              # local result kept; AI read on a later run
         it["order_check_v"] = ORDER_CHECK_VERSION
         it["stage_check_v"] = STAGE_CHECK_VERSION
     stats["queued"] += max(0, len(queue) - stats["checked"])
+    for sym, it, why in review:
+        it["needs_review"] = True
+        it["review_reason"] = why
     print("  🔎 Order check → " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+    if review:
+        print(f"  🧐 Orders to review ({len(review)}):")
+        for sym, it, why in review[:40]:
+            print(f"     {sym} {it.get('dt', '')[:10]} — {why}")
     return stats
 
 
