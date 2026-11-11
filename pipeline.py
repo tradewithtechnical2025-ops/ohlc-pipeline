@@ -68,6 +68,7 @@ from r2_manifest import upload_str_with_manifest
 from breadth_returns import build_index_ma_history, build_group_returns_history
 from structure_scan import build_structure_map
 from structure_history import build_index_structure_history
+from vwap_store import load_vwap_store, vwap_array, coverage   # daily VWAP -> "a" array in the chunks
 
 # ── Telegram notify ──
 try:
@@ -751,17 +752,41 @@ async def download_all_chunks(client, for_scan: bool = False) -> dict:
     for i, res in enumerate(results):
         if isinstance(res, Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
         elif res and "stocks" in res: all_data.update(res["stocks"])
+    for s in all_data.values():   # "a" (VWAP) is rebuilt at upload; the merge code works on d/o/h/l/c/v/oi only
+        if isinstance(s, dict): s.pop("a", None)
     log.info(f"Master: {len(all_data)} stocks across {R2_CHUNKS} chunks")
     if for_scan:
         n = fold_muhurat_bars(all_data)
         if n: log.info(f"🪔 Muhurat: folded {n} Muhurat bar(s) into the previous session (scan view only)")
     return all_data
 
+_VWAP_STORE = None
+
+async def _vwap_store(client, today):
+    """Daily VWAP history (vwap_hist_YYYY.json, see vwap_store.py) for the rolling window; loaded once per run."""
+    global _VWAP_STORE
+    if _VWAP_STORE is None:
+        try:
+            _VWAP_STORE = await load_vwap_store(r2_download, client, rolling_cutoff(today), today)
+            log.info(f"VWAP history: {len(_VWAP_STORE)} day(s)")
+        except Exception as e:
+            log.warning(f"VWAP history not loaded ({e}) — chunks go out without \"a\"")
+            _VWAP_STORE = {}
+    return _VWAP_STORE
+
 async def upload_all_chunks(client, all_data, today):
     symbols = sorted(all_data.keys()); n = len(symbols)
     size = (n + R2_CHUNKS - 1) // R2_CHUNKS; tasks = []
+    # "a" = adjusted daily VWAP per bar (null where unknown: BSE-only, days before the history).
+    # Added to the uploaded copy only, so all_data itself keeps the plain d/o/h/l/c/v/oi arrays.
+    vstore = await _vwap_store(client, today)
+    va = {s: vwap_array(s, all_data[s], vstore) for s in symbols} if vstore else {}
+    if va:
+        have, tot = coverage(va)
+        log.info(f"VWAP \"a\": {have}/{tot} bars ({(have / tot * 100) if tot else 0:.0f}%)")
     for i in range(R2_CHUNKS):
-        chunk_syms = symbols[i*size:(i+1)*size]; chunk = {s: all_data[s] for s in chunk_syms}
+        chunk_syms = symbols[i*size:(i+1)*size]
+        chunk = {s: ({**all_data[s], "a": va[s]} if s in va else all_data[s]) for s in chunk_syms}
         payload = json.dumps({"updated":today,"chunk":i+1,"total":R2_CHUNKS,"stocks":chunk})
         tasks.append(upload_str_with_manifest(
             client, r2_upload, f"ohlc_{i+1}.json", payload,
