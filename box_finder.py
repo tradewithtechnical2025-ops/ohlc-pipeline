@@ -5,12 +5,15 @@ A box's resistance is fixed at its confirmed swing high. Its support follows
 subsequent candle lows, until a breakout or the maximum 30% depth is exceeded.
 Each box has its own lifecycle; a newer pivot never suppresses an older box.
 
-Same rules as the TwT BO Signal script v1.5:
-- a box starts at the FIRST touch of its resistance (EXTEND_BACK);
-- after a breakout, a close up to RETEST_BAND under the top is a retest, a close
-  further back inside within FAIL_WINDOW bars is a failed breakout (poke);
-- a poke raises the top to the highest CLOSE of the poke, never to a wick;
-- up to three nested boxes are kept (outer, middle, inner).
+v2 (Nov 2026) — no repainting:
+- a box starts at its own swing high (it is no longer stretched back to an
+  earlier touch of the same resistance; EXTEND_BACK = 0);
+- the first close above the top is the breakout, and it stays a breakout:
+  no "poke" any more (a quick fall back inside used to cancel the breakout
+  and raise the top afterwards). The high of that move starts the next box;
+- a box that broke out is never removed by the nesting rule (its BO stays);
+- up to three nested boxes are kept (outer, middle, inner); bases need at
+  least MIN_BASE_CANDLES (9) bars.
 """
 import numpy as np
 
@@ -20,11 +23,9 @@ BREAKOUT_BUFFER = .0025
 MIN_BASE_CANDLES = 9  # a box must hold at least this many bars (swing high .. bar before BO)
 SAME_TOP_TOL = .02     # boxes whose tops are this close are the same resistance
 MERGE_GAP = 5          # a same-top box starting within this many bars after a breakout continues it
-FAIL_WINDOW = 5        # a breakout that closes back below the top within this many bars failed (poke)
-POKE_MAX = .05         # total poke allowance above the box's ORIGINAL top; beyond it a move is a real breakout
-RETEST_BAND = .02      # a close up to 2% under the top after a breakout is a retest, not a failed breakout
-POKE_CLOSE_MAX = .02   # a poke only closes marginally above the top; a stronger close is a real breakout
-EXTEND_BACK = 160      # how far back to look for the first touch of the same resistance
+POKE_MAX = .05         # a swing high up to 5% over a running box's top is the same resistance (prune)
+POKE_CLOSE_MAX = .02   # a close this far above a swing high before its swing low: no base there
+EXTEND_BACK = 0        # v2: a box starts at its own swing high (was 160: back to the first touch)
 EXTEND_LOW_TOL = .02   # the walk back stops at a low more than this under the swing low
 MAX_NEST = 2           # a box may sit inside at most this many other boxes (three levels in all)
 
@@ -106,7 +107,8 @@ def prune(boxes):
     def inside(b, a):
         return (a is not b and a['start'] <= b['start'] and a['last'] >= b['last']
                 and a['top'] >= b['top'] and a['bot'] <= b['bot'])
-    return [b for b in out if sum(1 for a in out if inside(b, a)) <= MAX_NEST]
+    # a box that already broke out is never dropped for nesting (its BO stays on the chart)
+    return [b for b in out if b['bo'] is not None or sum(1 for a in out if inside(b, a)) <= MAX_NEST]
 
 
 def detect(a):
@@ -173,31 +175,10 @@ def detect(a):
             if t < skip_until:
                 continue
             if t >= j + 4 and c[t] > top * (1 + BREAKOUT_BUFFER):
-                # Failed breakout (poke): within FAIL_WINDOW bars a close is
-                # back below the top, and closes never went more than
-                # POKE_CLOSE_MAX above the top / POKE_MAX above the box's
-                # original top (pokes do not stack). Wicks may reach POKE_MAX.
-                # The box then continues with its top
-                # raised to the highest close of the poke (wicks are ignored).
-                back, hi_max, cl_max = None, top, top
-                for u in range(t, min(n, t + FAIL_WINDOW + 1)):
-                    # a close back below the top only fails the breakout when it is clearly
-                    # back inside the box; a close within RETEST_BAND of the top is a retest
-                    if u > t and c[u] < top * (1 - RETEST_BAND):
-                        back = u
-                        break
-                    hi_max = max(hi_max, float(h[u]))
-                    cl_max = max(cl_max, float(c[u]))
-                cap = top_hist[0][1] * (1 + POKE_MAX)  # pokes never lift the top past this
-                if back is None or cl_max > cap or cl_max > top * (1 + POKE_CLOSE_MAX):
-                    breakout = t
-                    break
-                top = max(top, cl_max)
-                top_hist.append((t, top))
-                skip_until = back
-                if (top - low) / top > MAX_DEPTH + 1e-10:
-                    overdepth = t
-                    break
+                # v2: the first close above the top is the breakout and stays one
+                # (no poke: a later fall back inside does not cancel it or raise the top).
+                breakout = t
+                break
         if overdepth is not None:
             # Historical box remains visible in box_history but never active.
             state = 'Depth Exceeded'
