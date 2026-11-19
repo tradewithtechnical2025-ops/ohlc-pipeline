@@ -8439,6 +8439,8 @@ async def _pr_send_document(client, chat_id, filename, data, caption=None):
 
 # ══════════════════════════════════════════════════════════════
 # WATCHLIST ALERTS v3 — a user's screener watchlist on Telegram (Pro), run inside preset_alerts
+# v4: a Script Scan saved with "Any of them" names the signal(s) that fired per stock (↳ lines, CSV Signals column);
+#     the alert card can tick which of its signals alert (item 'sig': [titles]; none = all).
 # The Worker stores one row per watchlist (kind = 'watchlist', snap = {v, wl, syms, ev}); ev.scans holds up to
 # 5 of the user's own scans / presets ({t: 'scan'|'preset', id, name, snap}). After market close the digest lists
 # the watched stocks that match them TODAY (no comparison with the previous session):
@@ -8471,7 +8473,7 @@ _WL_TWTS_JS = """async (job) => {
   try {
     if (!window.TWTScan || !window.TWTScan.scanDef) return { ok: false, err: 'Script Scan is not on this screener page' };
     var r = await window.TWTScan.scanDef(job.def, { syms: job.syms, timeoutMs: job.timeout * 1000, asOf: null });
-    return { ok: true, set: Object.keys((r && r.set) || {}), total: r ? r.total : 0, errors: r ? r.errors : 0 };
+    return { ok: true, set: Object.keys((r && r.set) || {}), fired: (r && r.fired) || {}, total: r ? r.total : 0, errors: r ? r.errors : 0 };
   } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }
 }"""
 
@@ -8491,7 +8493,9 @@ def _wl_twts_def(it):
 
 def _wl_message(a, day, groups, n_match, total):
     """Same layout as the preset alert: one <code> block per scan / preset with NSE:SYM,BSE:SYM,... (one tap
-    copies them, and the comma list imports straight into a watchlist). groups: [(scan name, [state rows])].
+    copies them, and the comma list imports straight into a watchlist). groups: [(scan name, [state rows], sig)];
+    sig (Script Scan saved with "Any of them"): {symbol: [alertcondition titles that fired]} -> under the list one
+    line per signal ("↳ Breakout: RELIANCE, TCS"), else None.
     Long lists are cut to fit Telegram's 4096 characters; then the CSV file has everything."""
     name = _pr_esc(a.get("pname") or a.get("name") or "Watchlist")
     head = [f"🔔 <b>Watchlist · {name}</b> · {_wl_day_txt(day)}",
@@ -8502,15 +8506,18 @@ def _wl_message(a, day, groups, n_match, total):
         except ValueError: pass
     if a.get("msg"): tail += ["", f"📝 {_pr_esc(a['msg'])}"]
     tail += ["", f'<a href="{PR_SITE_URL}{PR_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
-    lists = [(label, [r[15] for r in rows]) for label, rows in groups if rows]
+    lists = [(label, [r[15] for r in rows], _wl_by_signal(rows, sig)) for label, rows, sig in groups if rows]
 
     def build(cap):
         out = list(head)
-        for label, syms in lists:
+        for label, syms, by_sig in lists:
             shown = syms[:cap]
             more = len(syms) - len(shown)
             out += ["", f"{_pr_esc(label)} ({len(syms)})",
                     "<code>" + _pr_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else "")]
+            for title, names in by_sig:   # which alertcondition() fired, per signal
+                cut = names[:cap]
+                out.append(f"↳ {_pr_esc(title)}: {_pr_esc(', '.join(cut))}" + (f" +{len(names) - len(cut)}" if len(names) > len(cut) else ""))
         return "\n".join(out + [""] + tail)
     cap = 2000
     text = build(cap)
@@ -8520,16 +8527,27 @@ def _wl_message(a, day, groups, n_match, total):
     return text
 
 
+def _wl_by_signal(rows, sig):
+    """[(alertcondition title, [symbols])] of a Script Scan group (in the order the titles first appear), or []."""
+    if not sig: return []
+    by = {}
+    for r in rows:
+        for t in sig.get(r[16]) or []:
+            by.setdefault(str(t), []).append(str(r[16]))
+    return list(by.items())
+
+
 def _wl_csv(groups):
     import csv, io
     buf = io.StringIO(); w = csv.writer(buf)
-    w.writerow(["Symbol", "TradingView", "Scans", "LTP", "Change %", "RS"])
+    w.writerow(["Symbol", "TradingView", "Scans", "Signals", "LTP", "Change %", "RS"])
     by = {}
-    for label, rows in groups:
+    for label, rows, sig in groups:
         for r in rows:
-            by.setdefault(r[16], [r, []])[1].append(label)
-    for sym, (r, labels) in sorted(by.items(), key=lambda x: -(x[1][0][2] or 0)):
-        w.writerow([sym, r[15], " · ".join(labels), r[0], r[1], r[2]])
+            e = by.setdefault(r[16], [r, [], []]); e[1].append(label)
+            if sig: e[2] += [str(t) for t in (sig.get(r[16]) or []) if str(t) not in e[2]]
+    for sym, (r, labels, sigs) in sorted(by.items(), key=lambda x: -(x[1][0][2] or 0)):
+        w.writerow([sym, r[15], " · ".join(labels), " · ".join(sigs), r[0], r[1], r[2]])
     return buf.getvalue().encode("utf-8")
 
 
@@ -8626,7 +8644,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 log.info(f"{tag} expired on {a['exp']} — skipped"); continue
             if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
                 log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
-            groups, failed = [], 0   # [(scan name, [state rows])]
+            groups, failed = [], 0   # [(scan name, [state rows], {sym: [fired signals]} or None)]
             for i, it in enumerate(items):
                 kind, k = wl_item_key.get((a["id"], i), (None, None))
                 res = (twts.get(k) if kind == "twts" else today.get(k)) or {}
@@ -8634,9 +8652,19 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 if not res.get("ok"):
                     failed += 1; log.warning(f"{tag} {label}: {res.get('err') or 'not evaluated'}"); continue
                 got = set(res["set"]) if kind == "twts" else {x[0] for x in res["rows"]}
+                # Script Scan saved with "Any of them" (or no signal): say which alertcondition() fired per stock, and
+                # keep only the signals ticked on the alert card (it["sig"]; none saved = all)
+                d = _wl_twts_def(it) if kind == "twts" else None
+                sig = res.get("fired") if d is not None and str(d.get("alert") or "*") == "*" and isinstance(res.get("fired"), dict) else None
+                want = [str(t) for t in (it.get("sig") or [])] if sig is not None else []
+                if want:
+                    sig = {x: [t for t in tl if str(t) in want] for x, tl in sig.items()}
+                    sig = {x: tl for x, tl in sig.items() if tl}
+                    got = {x for x in got if x in sig}
                 rows = sorted((wl_today[sym] for sym in syms if sym in got and sym in wl_today), key=lambda r: -(r[2] or 0))
-                groups.append((label, rows))
-            n_match = len({r[16] for _, rows in groups for r in rows})
+                if sig: sig = {wl_today[x][16]: t for x, t in sig.items() if x in wl_today}   # keyed like the rows (their label)
+                groups.append((label, rows, sig))
+            n_match = len({r[16] for _, rows, _s in groups for r in rows})
             log.info(f"{tag} {len(syms)} stocks, {len(items)} scan(s){f' ({failed} failed)' if failed else ''}, {n_match} match today")
             if not n_match: continue
             msg = _wl_message(a, today_day, groups, n_match, len(syms))
