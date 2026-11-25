@@ -293,16 +293,25 @@ def is_bad_index(symbol, index_name):
 # R2 Upload
 # ─────────────────────────────────────────────
 
-async def r2_upload(client, filename, data):
+async def r2_upload(client, filename, data, attempts=4):
+    # Retries a dropped connection / server error (httpx.ReadError on the Worker POST stopped a whole
+    # run once the 5-year history made the files bigger). A bad request is not retried.
     url = f"{WORKER_URL}?file={filename}"
-    r = await client.post(
-        url,
-        headers=WORKER_HEADERS,
-        content=json.dumps(data).encode(),
-        timeout=300,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"{filename} upload failed")
+    body = json.dumps(data).encode()
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            r = await client.post(url, headers=WORKER_HEADERS, content=body, timeout=300)
+            if r.status_code == 200:
+                return
+            last = f"HTTP {r.status_code}"
+            if r.status_code < 500 and r.status_code != 429:
+                break
+        except httpx.HTTPError as e:
+            last = e.__class__.__name__
+        if attempt < attempts:
+            await asyncio.sleep(3 * attempt)
+    raise RuntimeError(f"{filename} upload failed ({last})")
 
 
 # ─────────────────────────────────────────────
@@ -677,22 +686,27 @@ async def fetch_upstox_index_history(client, instrument_key, symbol):
     while cur <= t:  # Upstox gives at most one year of daily candles per call
         chunk_to = min(date(cur.year, 12, 31), t)
         url = f"{UPSTOX_BASE}/historical-candle/{instrument_key}/day/{chunk_to.isoformat()}/{cur.isoformat()}"
-        try:
-            r = await client.get(url, headers=_upstox_headers(), timeout=30)
-            if r.status_code == 429:
-                await asyncio.sleep(20)
+        for attempt in range(1, 4):   # a dropped connection (ReadError) is retried, so a year is not silently missing
+            try:
                 r = await client.get(url, headers=_upstox_headers(), timeout=30)
-            if r.status_code == 200:
-                for c in ((r.json().get("data") or {}).get("candles") or []):
-                    d = str(c[0])[:10]
-                    rows[d] = {"date": d, "open": c[1], "high": c[2], "low": c[3], "close": c[4],
-                               "change_pct": None, "points_change": None,
-                               "volume": c[5] if len(c) > 5 else None, "turnover": None}
-            elif r.status_code == 401:
-                print("  ✗ UPSTOX_TOKEN rejected (401)")
-                return []
-        except httpx.HTTPError as e:
-            print(f"  ⚠ Upstox {symbol} {cur.year}: {e.__class__.__name__}")
+                if r.status_code == 429:
+                    await asyncio.sleep(20)
+                    r = await client.get(url, headers=_upstox_headers(), timeout=30)
+                if r.status_code == 200:
+                    for c in ((r.json().get("data") or {}).get("candles") or []):
+                        d = str(c[0])[:10]
+                        rows[d] = {"date": d, "open": c[1], "high": c[2], "low": c[3], "close": c[4],
+                                   "change_pct": None, "points_change": None,
+                                   "volume": c[5] if len(c) > 5 else None, "turnover": None}
+                elif r.status_code == 401:
+                    print("  ✗ UPSTOX_TOKEN rejected (401)")
+                    return []
+                break
+            except httpx.HTTPError as e:
+                if attempt == 3:
+                    print(f"  ⚠ Upstox {symbol} {cur.year}: {e.__class__.__name__} (after 3 tries)")
+                else:
+                    await asyncio.sleep(2 * attempt)
         cur = date(cur.year + 1, 1, 1)
     return [rows[d] for d in sorted(rows)]
 
@@ -780,8 +794,13 @@ async def fetch_parse_upload_one_history(client, sem, i, total, symbol, meta, da
         if newest_first:
             parsed = parsed[::-1]
         ohlc_arrays = build_ohlc_arrays(parsed)
-        await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
-                                    schema_v=1, extra_meta={"candle_count": len(parsed)})
+        try:
+            await upload_with_manifest(client, r2_upload, f"index_history/{symbol}.json", parsed,
+                                        schema_v=1, extra_meta={"candle_count": len(parsed)})
+        except Exception as e:
+            # one index file failing must not stop the run: the index still goes into index_ohlc.json,
+            # and its own index_history file keeps yesterday's copy until the next run
+            print(f"[{i}/{total}]   ⚠ {symbol}: index_history upload failed after retries ({e}) — kept in index_ohlc.json")
         years_note = f" ({EXTENDED_HISTORY_DAYS[symbol] // 365}Y)" if symbol in EXTENDED_HISTORY_DAYS else ""
         print(f"[{i}/{total}] ✓ {symbol} | {len(parsed)} candles{years_note} | daily-merge: {merge_status}")
         return symbol, weekly, msw, True, merge_status, ohlc_arrays
