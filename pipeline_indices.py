@@ -52,11 +52,13 @@ UPSTOX_INDEX_OVERRIDES: dict = {
 # and only after confirming failure rate stays near zero.
 HISTORY_CONCURRENCY = 3
 
-# Default historical lookback for every index (3 years, matches the stock
-# pipeline's ROLLING_DAYS). EXTENDED_HISTORY_DAYS is only for a symbol that
-# ever needs a lookback LONGER than this baseline — no other code changes
-# required to add one.
-DEFAULT_HISTORY_DAYS = 365 * 3
+# Default historical lookback for every index: 5 years, the same depth as the
+# stock chart files (chart/<SYM>.json), so Seasonality / RRG / the index chart
+# can compare stocks and indices over the same period (was 3 years until Nov 2026).
+# The whole window is re-fetched on every run, so no separate backfill is needed.
+# EXTENDED_HISTORY_DAYS is only for a symbol that ever needs a lookback LONGER
+# than this baseline — no other code changes required to add one.
+DEFAULT_HISTORY_DAYS = 365 * 5 + 2   # +2 days covers the leap days inside 5 years
 
 EXTENDED_HISTORY_DAYS = {
 }
@@ -437,9 +439,9 @@ def parse_index_returns(rows, valid_symbols, weekly_map=None):
 # ─────────────────────────────────────────────
 
 async def fetch_index_history_one(client, api_symbol, symbol):
-    # Every symbol now gets a 3-year lookback by default (DEFAULT_HISTORY_DAYS).
+    # Every symbol gets a 5-year lookback by default (DEFAULT_HISTORY_DAYS).
     # EXTENDED_HISTORY_DAYS is only for a symbol that ever needs a lookback
-    # LONGER than this baseline — currently empty since 3Y is the baseline.
+    # LONGER than this baseline — currently empty since 5Y is the baseline.
     lookback_days = EXTENDED_HISTORY_DAYS.get(symbol, DEFAULT_HISTORY_DAYS)
     today     = datetime.now().date()
     from_date = (today - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
