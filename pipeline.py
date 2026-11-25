@@ -1,15 +1,7 @@
 #!/usr/bin/env python3
 """
 NSE OHLC + Fundamentals Pipeline — GitHub Actions
-OHLC source: today's candle — Finedge v2/quote (run_today; Upstox for the stocks Finedge has no
-             candle for today, e.g. a Muhurat session; OHLC_TODAY_SOURCE=upstox = Upstox only);
-             run_today also spots corporate actions (Finedge's previous close ≠ ours) and rebuilds those
-             stocks' history from Finedge + scales their ATH;
-             missed days — Upstox (run_daily);
-             history — Finedge v2/daily-quotes (adjusted for splits, bonus, rights, demergers):
-             run_full, backfill_missing, a new stock's deep backfill in run_daily.
-             OHLC_HIST_SOURCE=upstox switches history back to Upstox; a symbol Finedge has no data for
-             falls back to Upstox on its own.
+OHLC source: Upstox API (adjusted prices, TV-matching)
 Fundamentals source: Finedge API
 
 Usage:
@@ -17,7 +9,6 @@ Usage:
   python pipeline.py today
   python pipeline.py full
   python pipeline.py backfill_missing [SYM1,SYM2]  # fill missing stocks / days; no symbols = auto-detect
-  python pipeline.py finedge_hist_test SYM [SYM2 …]  # print what Finedge history returns for a few symbols (no R2 writes)
   python pipeline.py status
   python pipeline.py fund_daily
   python pipeline.py fund_full
@@ -68,7 +59,6 @@ from r2_manifest import upload_str_with_manifest
 from breadth_returns import build_index_ma_history, build_group_returns_history
 from structure_scan import build_structure_map
 from structure_history import build_index_structure_history
-from vwap_store import load_vwap_store, vwap_array, coverage   # daily VWAP -> "a" array in the chunks
 
 # ── Telegram notify ──
 try:
@@ -102,14 +92,6 @@ RATE_DELAY         = 0.4
 RETRY              = 5
 FUND_CONCURRENCY   = 4
 FINEDGE_DELAY      = 0.25
-
-# ── Finedge adjusted history (v2/daily-quotes): the source of OHLC history (see the docstring) ──
-FINEDGE_HIST_URL         = "https://data.finedgeapi.com/api/v2/daily-quotes"
-FINEDGE_HIST_CONCURRENCY = 3
-FINEDGE_HIST_DELAY       = 0.3
-OHLC_HIST_SOURCE         = os.environ.get("OHLC_HIST_SOURCE", "finedge").strip().lower()
-OHLC_TODAY_SOURCE        = os.environ.get("OHLC_TODAY_SOURCE", "finedge").strip().lower()
-CORP_ACTION_TOL          = 0.02    # Finedge previous close vs our last close: more than 2% apart = corporate action
 
 # ── Finedge daily-OHLC (standalone system — does NOT touch Upstox OHLC) ──
 FINEDGE_QUOTE_URL      = "https://data.finedgeapi.com/api/v2/quote"
@@ -477,117 +459,6 @@ async def fetch_ohlc(client, sem, sym, instrument_key, from_date, to_date):
     return sym, sorted(all_candles.values(), key=lambda x: x["d"])
 
 
-def _finedge_hist_date(v):
-    """quotes_date -> 'YYYY-MM-DD' (ISO, 'DD-Mon-YYYY', 'DD/MM/YYYY', 'YYYYMMDD' or a unix timestamp)."""
-    if v is None: return None
-    if isinstance(v, (int, float)) and v > 1e9:
-        return datetime.fromtimestamp(v / (1000 if v > 1e12 else 1), ZoneInfo("Asia/Kolkata")).date().isoformat()
-    t = str(v).strip()
-    if len(t) >= 10 and t[4] == "-" and t[7] == "-":
-        try: date.fromisoformat(t[:10]); return t[:10]
-        except ValueError: return None
-    for fmt in ("%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y", "%Y%m%d", "%d %b %Y", "%b %d, %Y"):
-        try: return datetime.strptime(t[:11].strip(), fmt).date().isoformat()
-        except ValueError: pass
-    return None
-
-
-def _finedge_hist_rows(payload):
-    """The candle list of a daily-quotes answer ({"price": [...]}, or a bare list)."""
-    if isinstance(payload, list): return payload
-    if isinstance(payload, dict):
-        for k in ("price", "prices", "data", "quotes"):
-            if isinstance(payload.get(k), list): return payload[k]
-    return []
-
-
-async def fetch_finedge_hist(client, sem, sym, from_date, to_date, exchange="NSE"):
-    """Finedge adjusted daily history for one stock, same shape as fetch_ohlc():
-    (sym, [{"d","o","h","l","c","v","oi"}, …] sorted by date) or (sym, None).
-    One call covers every year from from_date to to_date (the API takes years, not dates).
-    NSE stocks go by their NSE symbol; a BSE-only stock by its BSE code / symbol."""
-    params = {"from": int(from_date[:4]), "to": int(to_date[:4]), "token": FINEDGE_TOKEN}
-    params["bse_symbol" if exchange == "BSE" else "nse_symbol"] = sym
-    url = f"{FINEDGE_HIST_URL}/{sym}"
-    payload = None
-    async with sem:
-        for attempt in range(RETRY):
-            await asyncio.sleep(FINEDGE_HIST_DELAY)
-            try:
-                r = await client.get(url, params=params, timeout=60)
-            except httpx.RequestError as e:
-                log.warning(f"{sym}: Finedge history network error ({e}), retry {attempt+1}")
-                await asyncio.sleep(2 ** attempt); continue
-            if r.status_code == 401: log.error("❌ FINEDGE TOKEN INVALID"); sys.exit(1)
-            if r.status_code == 429:
-                log.warning(f"{sym}: Finedge history rate limit — 20s"); await asyncio.sleep(20); continue
-            if r.status_code in (502, 503, 504): await asyncio.sleep(2 ** attempt); continue
-            if r.status_code != 200 or not r.text.strip(): break
-            try: payload = r.json()
-            except ValueError: payload = None
-            break
-    candles = {}
-    for row in _finedge_hist_rows(payload):
-        if not isinstance(row, dict): continue
-        d = _finedge_hist_date(row.get("quotes_date") or row.get("date"))
-        if not d or not (from_date <= d <= to_date): continue
-        o, h, l, c = row.get("open"), row.get("high"), row.get("low"), row.get("close")
-        if None in (o, h, l, c): continue
-        try: o, h, l, c = float(o), float(h), float(l), float(c)
-        except (TypeError, ValueError): continue
-        if c <= 0: continue
-        v = row.get("volume")
-        try: v = int(float(v)) if v is not None else 0
-        except (TypeError, ValueError): v = 0
-        candles[d] = {"d": d, "o": o, "h": h, "l": l, "c": c, "v": v, "oi": 0}
-    if not candles: return sym, None
-    return sym, sorted(candles.values(), key=lambda x: x["d"])
-
-
-async def fetch_hist(client, sems, sym, instrument_key, from_date, to_date):
-    """OHLC history from the configured source (Finedge by default), Upstox when Finedge has nothing.
-    sems = (finedge_semaphore, upstox_semaphore)."""
-    fsem, usem = sems
-    if OHLC_HIST_SOURCE != "upstox":
-        exch = "BSE" if sym in BSE_ISIN_MAP and sym not in ISIN_MAP else "NSE"
-        s0, candles = await fetch_finedge_hist(client, fsem, sym, from_date, to_date, exch)
-        if candles: return s0, candles
-        if instrument_key:
-            log.info(f"  {sym}: no Finedge history — falling back to Upstox")
-    if not instrument_key: return sym, None
-    return await fetch_ohlc(client, usem, sym, instrument_key, from_date, to_date)
-
-
-async def run_finedge_hist_test(symbols) -> None:
-    """Prints what Finedge history returns for a few symbols — nothing is written."""
-    today = today_ist(); start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
-    async with httpx.AsyncClient() as client:
-        global ISIN_MAP, BSE_ISIN_MAP, BSE_META
-        ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
-        all_data = await download_all_chunks(client)
-        sem = asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY)
-        for sym in symbols:
-            sym = sym.strip().upper()
-            exch = "BSE" if sym in BSE_ISIN_MAP and sym not in ISIN_MAP else "NSE"
-            t0 = time.monotonic()
-            _, c = await fetch_finedge_hist(client, sem, sym, start, today, exch)
-            if not c:
-                log.info(f"{sym} ({exch}): no data from Finedge"); continue
-            log.info(f"{sym} ({exch}): {len(c)} candles {c[0]['d']} → {c[-1]['d']} in {time.monotonic() - t0:.1f}s; last {c[-1]}")
-            have = all_data.get(sym)
-            if have and have.get("d"):
-                idx = {d: i for i, d in enumerate(have["d"])}
-                same = diff = 0; ratios = []
-                for x in c:
-                    i = idx.get(x["d"])
-                    if i is None or not have["c"][i]: continue
-                    r = x["c"] / have["c"][i]; ratios.append((x["d"], r))
-                    if abs(r - 1) < 0.002: same += 1
-                    else: diff += 1
-                log.info(f"   vs R2 ohlc: {same} days same close, {diff} different" +
-                         (f"; first different {next(d for d, r in ratios if abs(r - 1) >= 0.002)} (ratio {next(r for d, r in ratios if abs(r - 1) >= 0.002):.4f})" if diff else ""))
-
-
 async def fetch_ohlc_bulk(client, ikey_map: dict[str, str], batch_size=500) -> dict[str, dict]:
     """
     Upstox OHLC Quotes V3 — bulk fetch live OHLC for all stocks in 1-3 calls.
@@ -752,41 +623,17 @@ async def download_all_chunks(client, for_scan: bool = False) -> dict:
     for i, res in enumerate(results):
         if isinstance(res, Exception): log.warning(f"  ohlc_{i+1}.json error: {res}")
         elif res and "stocks" in res: all_data.update(res["stocks"])
-    for s in all_data.values():   # "a" (VWAP) is rebuilt at upload; the merge code works on d/o/h/l/c/v/oi only
-        if isinstance(s, dict): s.pop("a", None)
     log.info(f"Master: {len(all_data)} stocks across {R2_CHUNKS} chunks")
     if for_scan:
         n = fold_muhurat_bars(all_data)
         if n: log.info(f"🪔 Muhurat: folded {n} Muhurat bar(s) into the previous session (scan view only)")
     return all_data
 
-_VWAP_STORE = None
-
-async def _vwap_store(client, today):
-    """Daily VWAP history (vwap_hist_YYYY.json, see vwap_store.py) for the rolling window; loaded once per run."""
-    global _VWAP_STORE
-    if _VWAP_STORE is None:
-        try:
-            _VWAP_STORE = await load_vwap_store(r2_download, client, rolling_cutoff(today), today)
-            log.info(f"VWAP history: {len(_VWAP_STORE)} day(s)")
-        except Exception as e:
-            log.warning(f"VWAP history not loaded ({e}) — chunks go out without \"a\"")
-            _VWAP_STORE = {}
-    return _VWAP_STORE
-
 async def upload_all_chunks(client, all_data, today):
     symbols = sorted(all_data.keys()); n = len(symbols)
     size = (n + R2_CHUNKS - 1) // R2_CHUNKS; tasks = []
-    # "a" = adjusted daily VWAP per bar (null where unknown: BSE-only, days before the history).
-    # Added to the uploaded copy only, so all_data itself keeps the plain d/o/h/l/c/v/oi arrays.
-    vstore = await _vwap_store(client, today)
-    va = {s: vwap_array(s, all_data[s], vstore) for s in symbols} if vstore else {}
-    if va:
-        have, tot = coverage(va)
-        log.info(f"VWAP \"a\": {have}/{tot} bars ({(have / tot * 100) if tot else 0:.0f}%)")
     for i in range(R2_CHUNKS):
-        chunk_syms = symbols[i*size:(i+1)*size]
-        chunk = {s: ({**all_data[s], "a": va[s]} if s in va else all_data[s]) for s in chunk_syms}
+        chunk_syms = symbols[i*size:(i+1)*size]; chunk = {s: all_data[s] for s in chunk_syms}
         payload = json.dumps({"updated":today,"chunk":i+1,"total":R2_CHUNKS,"stocks":chunk})
         tasks.append(upload_str_with_manifest(
             client, r2_upload, f"ohlc_{i+1}.json", payload,
@@ -1033,13 +880,9 @@ async def run_daily() -> None:
                 tasks = [fetch_ohlc(client, sem, sym, all_ikeys[sym], from_date, today) for sym in symbols]
                 return await asyncio.gather(*tasks)
 
-            async def _hist_for(symbols, from_date):   # deep backfill: adjusted history (Finedge)
-                hs = (asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY), sem)
-                return await asyncio.gather(*[fetch_hist(client, hs, sym, all_ikeys[sym], from_date, today) for sym in symbols])
-
             backfill_results, incremental_results = await asyncio.gather(
-                _hist_for(needs_backfill, cutoff),
-                _fetch_for(existing, prev),   # the new day: Upstox
+                _fetch_for(needs_backfill, cutoff),
+                _fetch_for(existing, prev),
             )
             fetched = {sym: c for sym, c in [*backfill_results, *incremental_results] if c}
             log.info(f"✓ {len(fetched)} fetched  ✗ {len(live) - len(fetched)} no data")
@@ -1084,63 +927,6 @@ async def run_daily() -> None:
         status.failure(e)
 
 
-def _finedge_today_candles(quotes: dict, today: str) -> tuple[dict, dict]:
-    """v2/quote records -> ({sym: candle for today}, {sym: Finedge previous close}).
-    A record counts only when its tradetime is today (a stale quote must never be stamped as today).
-    Previous close = price / (1 + change%)."""
-    out, prev = {}, {}
-    for sym, q in (quotes or {}).items():
-        if not isinstance(q, dict): continue
-        if str(q.get("tradetime") or "")[:10] != today: continue
-        o, h, l, c = q.get("open_price"), q.get("high_price"), q.get("low_price"), q.get("current_price")
-        try: o, h, l, c = float(o), float(h), float(l), float(c)
-        except (TypeError, ValueError): continue
-        if min(o, h, l, c) <= 0: continue
-        try: v = int(float(q.get("volume") or 0))
-        except (TypeError, ValueError): v = 0
-        out[sym] = {"d": today, "o": o, "h": max(h, o, c), "l": min(l, o, c), "c": c, "v": v, "oi": 0}
-        try:
-            ch = float(str(q.get("change") or "").replace("%", "").strip())
-            if ch > -100: prev[sym] = c / (1 + ch / 100)
-        except ValueError:
-            pass
-    return out, prev
-
-
-def _corp_action_factors(all_data: dict, prev_close: dict, today: str) -> dict:
-    """{sym: factor} where Finedge's previous close is more than CORP_ACTION_TOL away from our last
-    stored close before today (a split / bonus / demerger adjusted the price; factor = theirs / ours)."""
-    out = {}
-    for sym, pc in prev_close.items():
-        s = all_data.get(sym)
-        if not s or not s.get("d"): continue
-        i = len(s["d"]) - 1
-        while i >= 0 and str(s["d"][i])[:10] >= today: i -= 1
-        if i < 0 or not s["c"][i]: continue
-        f = pc / s["c"][i]
-        if abs(f - 1) > CORP_ACTION_TOL: out[sym] = f
-    return out
-
-
-async def _rebase_from_finedge(client, all_data: dict, syms, today: str) -> list:
-    """Replaces these stocks' history with Finedge's adjusted history (3 years), keeping our candles after
-    Finedge's last day (today's). Returns the symbols rebuilt."""
-    cutoff = rolling_cutoff(today); sem = asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY); done = []
-    async def one(sym):
-        exch = "BSE" if sym in BSE_ISIN_MAP and sym not in ISIN_MAP else "NSE"
-        _, hist = await fetch_finedge_hist(client, sem, sym, cutoff, today, exch)
-        if not hist: return
-        old = all_data.get(sym) or {}
-        last = hist[-1]["d"]
-        newer = [{k: old[k][i] for k in ("d", "o", "h", "l", "c", "v", "oi") if k in old}
-                 for i, d in enumerate(old.get("d") or []) if d > last]
-        for c in newer: c.setdefault("oi", 0)
-        all_data[sym] = build_stock_obj(hist + newer)
-        done.append(sym)
-    await asyncio.gather(*[one(s) for s in syms])
-    return done
-
-
 async def run_today() -> None:
     status = PipelineStatus("run_today")
     try:
@@ -1162,43 +948,15 @@ async def run_today() -> None:
             all_ikeys = {**ISIN_MAP, **BSE_ISIN_MAP}
             log.info(f"Universe: {len(all_ikeys)} stocks")
 
-            # Today's candle: Finedge v2/quote (100 symbols a call), Upstox for whatever Finedge lacks
-            fetched, prev_close = {}, {}
-            if OHLC_TODAY_SOURCE != "upstox":
-                quotes, all_data = await asyncio.gather(
-                    fetch_finedge_quotes_all(client, sorted(all_ikeys)),
-                    download_all_chunks(client),
-                )
-                fetched, prev_close = _finedge_today_candles(quotes, today)
-                log.info(f"Finedge today candles: {len(fetched)} of {len(all_ikeys)} (quotes returned: {len(quotes)})")
-                missing = {s: k for s, k in all_ikeys.items() if s not in fetched}
-                if missing and len(missing) > 0.02 * len(all_ikeys):
-                    log.info(f"Upstox for the {len(missing)} stock(s) without a Finedge candle today")
-                    up = await fetch_ohlc_bulk(client, missing)
-                    fetched.update({s: c for s, c in up.items() if c.get("d") == today})
-                elif missing:
-                    log.info(f"No candle today for {len(missing)} stock(s) (not traded / suspended): {sorted(missing)[:10]}")
-            else:
-                fetched, all_data = await asyncio.gather(
-                    fetch_ohlc_bulk(client, all_ikeys),
-                    download_all_chunks(client),
-                )
+            # Fetch chunks + bulk OHLC concurrently
+            fetched, all_data = await asyncio.gather(
+                fetch_ohlc_bulk(client, all_ikeys),
+                download_all_chunks(client),
+            )
             log.info(f"Fetched today candles: {len(fetched)}")
 
             if not fetched:
                 log.warning("⚠ No candles fetched — market may be closed or API issue")
-
-            # Corporate actions: Finedge's previous close is adjusted, ours is not -> rebuild that history
-            factors = _corp_action_factors(all_data, prev_close, today)
-            rebased = []
-            if factors:
-                log.info(f"🔁 Corporate action / price adjustment spotted in {len(factors)} stock(s): " +
-                         ", ".join(f"{s} ×{f:.4f}" for s, f in sorted(factors.items())[:20]))
-                rebased = await _rebase_from_finedge(client, all_data, sorted(factors), today)
-                log.info(f"   history rebuilt from Finedge: {len(rebased)} {rebased[:20]}")
-                if rebased:   # pipeline_chart.py daily rebuilds these chart files too (it runs after this step)
-                    await r2_upload(client, "chart_rebuild.json", json.dumps({"date": today, "symbols": rebased,
-                                                                             "factors": {x: round(factors[x], 6) for x in rebased}}))
 
             for sym, c in fetched.items():
                 upsert_candle(all_data, sym, c)
@@ -1206,12 +964,8 @@ async def run_today() -> None:
             delta = {sym: c for sym, c in fetched.items() if c["d"] == today}
 
             ath_data = await r2_download_ath(client)
-            for sym in rebased:   # the stored all-time high is in the old (unadjusted) prices
-                a = ath_data.get(sym)
-                if a and a.get("ath") and a.get("ath_date", "") < today:
-                    a["ath"] = round(a["ath"] * factors[sym], 2)
             ath_updated = _update_ath_from_delta(ath_data, delta, today)
-            log.info(f"ATH: {ath_updated} new record(s) today" + (f", {len(rebased)} adjusted for corporate actions" if rebased else ""))
+            log.info(f"ATH: {ath_updated} new record(s) today")
 
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
@@ -1230,20 +984,18 @@ async def run_today() -> None:
 async def run_full() -> None:
     status = PipelineStatus("run_full")
     try:
-        today = today_ist() if is_session_day(today_ist()) else last_trading_day()
+        today = last_trading_day()
         start = (date.fromisoformat(today) - timedelta(days=ROLLING_DAYS)).isoformat()
         cutoff = start
         sem = asyncio.Semaphore(CONCURRENCY); all_data = {}; failed = []
-        hs = (asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY), sem)
         async with httpx.AsyncClient() as client:
             global ISIN_MAP, BSE_ISIN_MAP, BSE_META
             ISIN_MAP, BSE_ISIN_MAP, BSE_META = await build_isin_map(client)
             all_sym_list = list(ISIN_MAP.items()) + list(BSE_ISIN_MAP.items())
-            log.info(f"History source: {OHLC_HIST_SOURCE}")
             log.info(f"━━━ Full Load  {start} → {today}  ({len(all_sym_list)} stocks) ━━━")
             for i in range(0, len(all_sym_list), 50):
                 chunk = all_sym_list[i:i+50]
-                results = await asyncio.gather(*[fetch_hist(client,hs,sym,ikey,start,today) for sym,ikey in chunk])
+                results = await asyncio.gather(*[fetch_ohlc(client,sem,sym,ikey,start,today) for sym,ikey in chunk])
                 for sym, candles in results:
                     if candles:
                         filtered = [c for c in candles if c["d"] >= cutoff]
@@ -1251,27 +1003,9 @@ async def run_full() -> None:
                     else: failed.append(sym)
                 pct = min(i+50, len(all_sym_list))
                 log.info(f"  {pct}/{len(all_sym_list)}  OK:{len(all_data)}  Failed:{len(failed)}")
-                # no partial uploads: the site keeps the old data until every stock is loaded
+                if pct % 500 == 0: await upload_all_chunks(client, all_data, today)
             log.info(f"✓ {len(all_data)} loaded  ✗ {len(failed)} failed")
             if failed: (HERE/"failed_stocks.txt").write_text("\n".join(failed))
-            if len(all_data) < 0.9 * len(all_sym_list):
-                raise RuntimeError(f"only {len(all_data)} of {len(all_sym_list)} stocks loaded — R2 left unchanged")
-            # Keep what R2 already has AFTER the history's last day (today's / a Muhurat candle from Upstox,
-            # which Finedge may not have yet), and a stock that got no history at all keeps its old series.
-            old = await download_all_chunks(client)
-            kept_days = kept_stocks = 0
-            for sym, o in old.items():
-                if not o or not o.get("d"): continue
-                if sym not in all_data:
-                    if sym in failed: all_data[sym] = o; kept_stocks += 1
-                    continue
-                last = all_data[sym]["d"][-1]
-                extra = [{k: o[k][i] for k in ("d", "o", "h", "l", "c", "v", "oi") if k in o} for i, d in enumerate(o["d"]) if d > last]
-                for c in extra:
-                    c.setdefault("oi", 0)
-                    for k in all_data[sym]: all_data[sym][k].append(c.get(k))
-                kept_days += len(extra)
-            log.info(f"Kept from R2: {kept_days} newer candle(s), {kept_stocks} stock(s) with no new history")
             apply_rolling_window(all_data, cutoff)
             await asyncio.gather(
                 upload_all_chunks(client, all_data, today),
@@ -1378,13 +1112,12 @@ async def run_backfill_missing(symbols_arg: str | None = None) -> None:
                 log.info("Nothing to backfill — all target symbols already have full history")
                 status.success(); return
 
-            log.info(f"━━━ Backfill  {start} → {today}  ({len(targets)} symbols, history from {OHLC_HIST_SOURCE}) ━━━")
-            hs = (asyncio.Semaphore(FINEDGE_HIST_CONCURRENCY), sem)
+            log.info(f"━━━ Backfill  {start} → {today}  ({len(targets)} symbols) ━━━")
             ok = 0; failed = []; total_added = 0
             for i in range(0, len(targets), 50):
                 chunk = targets[i:i+50]
                 results = await asyncio.gather(*[
-                    fetch_hist(client, hs, sym, ikey_map[sym], start, today) for sym in chunk
+                    fetch_ohlc(client, sem, sym, ikey_map[sym], start, today) for sym in chunk
                 ])
                 for sym, candles in results:
                     if candles:
@@ -8439,8 +8172,6 @@ async def _pr_send_document(client, chat_id, filename, data, caption=None):
 
 # ══════════════════════════════════════════════════════════════
 # WATCHLIST ALERTS v3 — a user's screener watchlist on Telegram (Pro), run inside preset_alerts
-# v4: a Script Scan saved with "Any of them" names the signal(s) that fired per stock (↳ lines, CSV Signals column);
-#     the alert card can tick which of its signals alert (item 'sig': [titles]; none = all).
 # The Worker stores one row per watchlist (kind = 'watchlist', snap = {v, wl, syms, ev}); ev.scans holds up to
 # 5 of the user's own scans / presets ({t: 'scan'|'preset', id, name, snap}). After market close the digest lists
 # the watched stocks that match them TODAY (no comparison with the previous session):
@@ -8473,7 +8204,7 @@ _WL_TWTS_JS = """async (job) => {
   try {
     if (!window.TWTScan || !window.TWTScan.scanDef) return { ok: false, err: 'Script Scan is not on this screener page' };
     var r = await window.TWTScan.scanDef(job.def, { syms: job.syms, timeoutMs: job.timeout * 1000, asOf: null });
-    return { ok: true, set: Object.keys((r && r.set) || {}), fired: (r && r.fired) || {}, total: r ? r.total : 0, errors: r ? r.errors : 0 };
+    return { ok: true, set: Object.keys((r && r.set) || {}), total: r ? r.total : 0, errors: r ? r.errors : 0 };
   } catch (e) { return { ok: false, err: String((e && e.message) || e) }; }
 }"""
 
@@ -8493,9 +8224,7 @@ def _wl_twts_def(it):
 
 def _wl_message(a, day, groups, n_match, total):
     """Same layout as the preset alert: one <code> block per scan / preset with NSE:SYM,BSE:SYM,... (one tap
-    copies them, and the comma list imports straight into a watchlist). groups: [(scan name, [state rows], sig)];
-    sig (Script Scan saved with "Any of them"): {symbol: [alertcondition titles that fired]} -> under the list one
-    line per signal ("↳ Breakout: RELIANCE, TCS"), else None.
+    copies them, and the comma list imports straight into a watchlist). groups: [(scan name, [state rows])].
     Long lists are cut to fit Telegram's 4096 characters; then the CSV file has everything."""
     name = _pr_esc(a.get("pname") or a.get("name") or "Watchlist")
     head = [f"🔔 <b>Watchlist · {name}</b> · {_wl_day_txt(day)}",
@@ -8506,18 +8235,15 @@ def _wl_message(a, day, groups, n_match, total):
         except ValueError: pass
     if a.get("msg"): tail += ["", f"📝 {_pr_esc(a['msg'])}"]
     tail += ["", f'<a href="{PR_SITE_URL}{PR_SCREENER_PATH}">Open the screener on TradeWithTech</a>']
-    lists = [(label, [r[15] for r in rows], _wl_by_signal(rows, sig)) for label, rows, sig in groups if rows]
+    lists = [(label, [r[15] for r in rows]) for label, rows in groups if rows]
 
     def build(cap):
         out = list(head)
-        for label, syms, by_sig in lists:
+        for label, syms in lists:
             shown = syms[:cap]
             more = len(syms) - len(shown)
             out += ["", f"{_pr_esc(label)} ({len(syms)})",
                     "<code>" + _pr_esc(",".join(shown)) + "</code>" + (f"  +{more} more (CSV)" if more else "")]
-            for title, names in by_sig:   # which alertcondition() fired, per signal
-                cut = names[:cap]
-                out.append(f"↳ {_pr_esc(title)}: {_pr_esc(', '.join(cut))}" + (f" +{len(names) - len(cut)}" if len(names) > len(cut) else ""))
         return "\n".join(out + [""] + tail)
     cap = 2000
     text = build(cap)
@@ -8527,27 +8253,16 @@ def _wl_message(a, day, groups, n_match, total):
     return text
 
 
-def _wl_by_signal(rows, sig):
-    """[(alertcondition title, [symbols])] of a Script Scan group (in the order the titles first appear), or []."""
-    if not sig: return []
-    by = {}
-    for r in rows:
-        for t in sig.get(r[16]) or []:
-            by.setdefault(str(t), []).append(str(r[16]))
-    return list(by.items())
-
-
 def _wl_csv(groups):
     import csv, io
     buf = io.StringIO(); w = csv.writer(buf)
-    w.writerow(["Symbol", "TradingView", "Scans", "Signals", "LTP", "Change %", "RS"])
+    w.writerow(["Symbol", "TradingView", "Scans", "LTP", "Change %", "RS"])
     by = {}
-    for label, rows, sig in groups:
+    for label, rows in groups:
         for r in rows:
-            e = by.setdefault(r[16], [r, [], []]); e[1].append(label)
-            if sig: e[2] += [str(t) for t in (sig.get(r[16]) or []) if str(t) not in e[2]]
-    for sym, (r, labels, sigs) in sorted(by.items(), key=lambda x: -(x[1][0][2] or 0)):
-        w.writerow([sym, r[15], " · ".join(labels), " · ".join(sigs), r[0], r[1], r[2]])
+            by.setdefault(r[16], [r, []])[1].append(label)
+    for sym, (r, labels) in sorted(by.items(), key=lambda x: -(x[1][0][2] or 0)):
+        w.writerow([sym, r[15], " · ".join(labels), r[0], r[1], r[2]])
     return buf.getvalue().encode("utf-8")
 
 
@@ -8644,7 +8359,7 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 log.info(f"{tag} expired on {a['exp']} — skipped"); continue
             if a.get("last_day") and today_day <= str(a["last_day"])[:10] and not force:
                 log.info(f"{tag} already sent for {a['last_day']} — skipped"); continue
-            groups, failed = [], 0   # [(scan name, [state rows], {sym: [fired signals]} or None)]
+            groups, failed = [], 0   # [(scan name, [state rows])]
             for i, it in enumerate(items):
                 kind, k = wl_item_key.get((a["id"], i), (None, None))
                 res = (twts.get(k) if kind == "twts" else today.get(k)) or {}
@@ -8652,19 +8367,9 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
                 if not res.get("ok"):
                     failed += 1; log.warning(f"{tag} {label}: {res.get('err') or 'not evaluated'}"); continue
                 got = set(res["set"]) if kind == "twts" else {x[0] for x in res["rows"]}
-                # Script Scan saved with "Any of them" (or no signal): say which alertcondition() fired per stock, and
-                # keep only the signals ticked on the alert card (it["sig"]; none saved = all)
-                d = _wl_twts_def(it) if kind == "twts" else None
-                sig = res.get("fired") if d is not None and str(d.get("alert") or "*") == "*" and isinstance(res.get("fired"), dict) else None
-                want = [str(t) for t in (it.get("sig") or [])] if sig is not None else []
-                if want:
-                    sig = {x: [t for t in tl if str(t) in want] for x, tl in sig.items()}
-                    sig = {x: tl for x, tl in sig.items() if tl}
-                    got = {x for x in got if x in sig}
                 rows = sorted((wl_today[sym] for sym in syms if sym in got and sym in wl_today), key=lambda r: -(r[2] or 0))
-                if sig: sig = {wl_today[x][16]: t for x, t in sig.items() if x in wl_today}   # keyed like the rows (their label)
-                groups.append((label, rows, sig))
-            n_match = len({r[16] for _, rows, _s in groups for r in rows})
+                groups.append((label, rows))
+            n_match = len({r[16] for _, rows in groups for r in rows})
             log.info(f"{tag} {len(syms)} stocks, {len(items)} scan(s){f' ({failed} failed)' if failed else ''}, {n_match} match today")
             if not n_match: continue
             msg = _wl_message(a, today_day, groups, n_match, len(syms))
@@ -8689,11 +8394,13 @@ async def run_preset_alerts(dry_run=False, force=False) -> None:
 
 # ══════════════════════════════════════════════════════════════
 # CONCALL — earnings call transcripts → "Latest call" summaries (weekly, by hand in between)
+#   python pipeline.py concall_fetch FROM [TO] backfill a date range (YYYY-MM-DD), asked 7 days at a time;
+#                                              link-only filings are followed to the company site for the PDF.
 #   python pipeline.py concall_fetch [days]    Finedge investor-call-transcripts for the last `days` (max 7,
 #                                              default 7) → downloads each transcript PDF from NSE and writes
 #                                              concall_inbox_<to_date>.zip (PDFs + manifest.json). Calls already
 #                                              summarised (R2 concall/index.json, same call date) are skipped.
-#   python pipeline.py concall_upload <zip>    the summaries zip (concall/<SYM>.json + index.json) → R2;
+#   python pipeline.py concall_upload <zip>    the summaries zip (concall/<SYM>_<quarter>.json + index.json) → R2;
 #                                              index.json is merged with the one on R2.
 # The summaries themselves are written outside the pipeline from the inbox PDFs (one JSON per company,
 # fixed schema: sym, qtr, date, tone, headline, sections{…}, guidance[…], dodged[…], pushback[…]).
@@ -8738,43 +8445,168 @@ def _concall_pick(items):
     return sorted(best.values(), key=lambda r: r["sym"])
 
 
-async def run_concall_fetch(days=7) -> None:
+CONCALL_SITE_HEADERS = {"User-Agent": NSE_PDF_HEADERS["User-Agent"], "Accept": "text/html,application/pdf,*/*"}
+CONCALL_EXCHANGE_RE = re.compile(r"nseindia|bseindia|bsesmart|neaps|listing", re.I)
+
+
+def _concall_pdf_text(raw):
+    """Plain text of a PDF (pypdf, else the pdftotext binary); '' if neither is available."""
+    try:
+        import io
+        from pypdf import PdfReader
+        return " ".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages[:40])
+    except Exception:
+        pass
+    try:
+        import subprocess, tempfile
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tf:
+            tf.write(raw); tmp = tf.name
+        out = subprocess.run(["pdftotext", "-l", "40", tmp, "-"], capture_output=True, text=True, timeout=60).stdout
+        os.unlink(tmp)
+        return out
+    except Exception:
+        return ""
+
+
+def _concall_kind(text):
+    """'ok' (a real transcript), 'link' (only points to a website), 'scanned' (image PDF, no text)."""
+    words = len(text.split())
+    if words >= 500: return "ok"
+    return "link" if re.search(r"https?://|www\.|website", text, re.I) else "scanned"
+
+
+def _concall_links(text):
+    """Company-website links in a link-only filing, direct .pdf links first."""
+    t = re.sub(r"\s+", " ", text)
+    t = re.sub(r"(https?://\S+?)\s+(\S*\.pdf)\b", r"\1\2", t, flags=re.I)     # .pdf link broken over two lines
+    t = re.sub(r"((?:https?://|www\.)[\w.\-]+)\s+(\.(?:com|in|co\.in|net|org|bank\.in)\b)", r"\1\2", t, flags=re.I)
+    urls = []
+    for u in re.findall(r"(?:https?://|www\.)\S+", t, re.I):
+        u = u.rstrip(".,;:)]'\"")
+        if not u.lower().startswith("http"): u = "https://" + u
+        if CONCALL_EXCHANGE_RE.search(u) or u in urls: continue
+        urls.append(u)
+    bare = lambda u: re.sub(r"^https?://[^/]+/?", "", u) == ""
+    return sorted(urls, key=lambda u: (not u.lower().endswith(".pdf"), bare(u)))
+
+
+def _concall_score(href, label, call_date):
+    """How likely a link on an investor page is this quarter's transcript (higher = better, <=0 = no)."""
+    s = (href + " " + label).lower()
+    if "transcript" not in s and "concall" not in s and "con-call" not in s and "earnings call" not in s: return 0
+    if re.search(r"audio|recording|presentation|ppt|intimation|schedule", s) and "transcript" not in s: return 0
+    score = 5 if "transcript" in s else 2
+    try: d = date.fromisoformat(call_date)
+    except ValueError: d = None
+    if d:
+        fy = d.year + 1 if d.month >= 4 else d.year
+        q = (d.month - 4) // 3 + 1 if d.month >= 4 else 4
+        q_res = q - 1 or 4                                     # calls discuss the quarter just ended
+        for tok, pts in ((str(d.year), 2), (d.strftime("%b").lower(), 2), (d.strftime("%B").lower(), 1),
+                         (f"fy{str(fy)[2:]}", 2), (f"fy{fy}", 2), (f"q{q_res}", 3)):
+            if tok in s: score += pts
+    return score
+
+
+async def _concall_follow(client, sym, call_date, urls):
+    """Download the real transcript behind a link-only filing: a direct .pdf link, else the best
+    transcript-looking .pdf link on the linked investor page. Returns (bytes, url) or (None, None)."""
+    from urllib.parse import urljoin
+    for u in urls[:4]:
+        try:
+            r = await client.get(u, headers=CONCALL_SITE_HEADERS, timeout=60)
+        except httpx.RequestError as e:
+            log.warning(f"  {sym}: link {u} — {e}"); continue
+        if r.status_code != 200: log.warning(f"  {sym}: link {u} — HTTP {r.status_code}"); continue
+        if r.content[:4] == b"%PDF":
+            if _concall_kind(_concall_pdf_text(r.content)) == "ok": return r.content, str(r.url)
+            continue
+        cands = []
+        for href, label in re.findall(r"""<a[^>]+href=["']([^"'#]+)["'][^>]*>(.*?)</a>""", r.text, re.I | re.S):
+            label = re.sub(r"<[^>]+>|\s+", " ", label).strip()
+            full = urljoin(str(r.url), href.strip())
+            if ".pdf" not in full.lower(): continue
+            sc = _concall_score(full, label, call_date)
+            if sc > 0: cands.append((sc, full))
+        for sc, full in sorted(set(cands), reverse=True)[:3]:
+            try:
+                p = await client.get(full, headers=CONCALL_SITE_HEADERS, timeout=60)
+            except httpx.RequestError:
+                continue
+            if p.status_code == 200 and p.content[:4] == b"%PDF" and _concall_kind(_concall_pdf_text(p.content)) == "ok":
+                return p.content, full
+            await asyncio.sleep(0.5)
+    return None, None
+
+
+async def run_concall_fetch(days=7, from_date=None, to_date=None) -> None:
+    """concall_fetch [days]            last `days` (max 7)
+       concall_fetch FROM [TO]         backfill FROM..TO (YYYY-MM-DD, TO defaults to today), asked in 7-day windows."""
     import zipfile
-    days = max(1, min(7, int(days)))
-    to_d = datetime.now(ZoneInfo("Asia/Kolkata")).date()
-    fr_d = to_d - timedelta(days=days)
+    today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    if from_date:
+        fr_d = date.fromisoformat(from_date)
+        to_d = date.fromisoformat(to_date) if to_date else today
+    else:
+        to_d = today
+        fr_d = to_d - timedelta(days=max(1, min(7, int(days))))
+    if fr_d > to_d: fr_d, to_d = to_d, fr_d
     async with httpx.AsyncClient(follow_redirects=True) as client:
         sem = asyncio.Semaphore(1)
-        items = await _finedge_get(client, sem, "investor-call-transcripts", {"from_date": fr_d.isoformat(), "to_date": to_d.isoformat()})
-        if not isinstance(items, list):
-            log.warning(f"Concall: Finedge answered {type(items).__name__} — nothing fetched"); return
+        items, w = [], fr_d
+        while w <= to_d:                                      # Finedge serves at most 7 days per request
+            w_end = min(w + timedelta(days=6), to_d)
+            got_w = await _finedge_get(client, sem, "investor-call-transcripts", {"from_date": w.isoformat(), "to_date": w_end.isoformat()})
+            if isinstance(got_w, list): items += got_w
+            else: log.warning(f"Concall: Finedge answered {type(got_w).__name__} for {w} → {w_end}")
+            w = w_end + timedelta(days=1)
+        if not items:
+            log.warning("Concall: no filings — nothing fetched"); return
         rows = _concall_pick(items)
         log.info(f"Concall: {len(items)} filing(s) {fr_d} → {to_d}, {len(rows)} transcript(s)")
         done = {}
         try: done = (await r2_download(client, "concall/index.json") or {}).get("stocks") or {}
         except Exception as e: log.warning(f"Concall: concall/index.json not read ({e}) — nothing skipped")
-        todo = [r for r in rows if (done.get(r["sym"]) or {}).get("date") != r["call_date"]]
+        # skip calls already summarised, and calls older than the latest one we have
+        todo = [r for r in rows if (done.get(r["sym"]) or {}).get("date") != r["call_date"]
+                and str((done.get(r["sym"]) or {}).get("date") or "") <= r["call_date"]]
         log.info(f"Concall: {len(rows) - len(todo)} already summarised, {len(todo)} to fetch")
-        out = Path(f"concall_inbox_{to_d.isoformat()}.zip")
-        got, failed = [], []
+        out = Path(f"concall_inbox_{fr_d.isoformat()}_{to_d.isoformat()}.zip" if from_date else f"concall_inbox_{to_d.isoformat()}.zip")
+        got, failed, link_only, scanned = [], [], [], []
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
             for r in todo:
-                ok = False
+                raw = None
                 for attempt in range(3):
                     try:
                         resp = await client.get(r["pdf"], headers=NSE_PDF_HEADERS, timeout=60)
                         if resp.status_code == 200 and resp.content[:4] == b"%PDF":
-                            name = f"{r['sym']}_{r['call_date'] or to_d.isoformat()}.pdf"
-                            zf.writestr(name, resp.content); r["file"] = name; got.append(r); ok = True; break
+                            raw = resp.content; break
                         log.warning(f"  {r['sym']}: HTTP {resp.status_code}{' (not a PDF)' if resp.status_code == 200 else ''}, retry {attempt + 1}")
                     except httpx.RequestError as e:
                         log.warning(f"  {r['sym']}: {e}, retry {attempt + 1}")
                     await asyncio.sleep(2 ** attempt)
-                if not ok: failed.append(r)
                 await asyncio.sleep(0.4)   # gentle on nsearchives
+                if raw is None: failed.append(r); continue
+                name = f"{r['sym']}_{r['call_date'] or to_d.isoformat()}.pdf"
+                text = _concall_pdf_text(raw)
+                kind = _concall_kind(text) if text else "ok"   # no PDF reader installed: keep as is
+                if kind == "link":
+                    r["links"] = _concall_links(text)
+                    body, via = await _concall_follow(client, r["sym"], r["call_date"], r["links"])
+                    if body:
+                        r["via"] = via; zf.writestr(name, body); r["file"] = name; got.append(r)
+                        log.info(f"  {r['sym']}: transcript fetched from company site")
+                    else:
+                        link_only.append(r); log.info(f"  {r['sym']}: link only, transcript not found on site")
+                    continue
+                if kind == "scanned": r["scanned"] = True; scanned.append(r)
+                zf.writestr(name, raw); r["file"] = name; got.append(r)
             zf.writestr("manifest.json", json.dumps({"from": fr_d.isoformat(), "to": to_d.isoformat(), "transcripts": got,
-                                                     "failed": failed}, indent=1, ensure_ascii=False))
-        log.info(f"Concall: {len(got)} PDF(s) in {out}" + (f", {len(failed)} failed: {', '.join(x['sym'] for x in failed)}" if failed else ""))
+                                                     "link_only": link_only, "failed": failed}, indent=1, ensure_ascii=False))
+        log.info(f"Concall: {len(got)} PDF(s) in {out}"
+                 + (f" ({len(scanned)} scanned)" if scanned else "")
+                 + (f", {len(link_only)} link-only not found: {', '.join(x['sym'] for x in link_only)}" if link_only else "")
+                 + (f", {len(failed)} failed: {', '.join(x['sym'] for x in failed)}" if failed else ""))
 
 
 async def run_concall_upload(zip_path) -> None:
@@ -8802,10 +8634,15 @@ async def run_concall_upload(zip_path) -> None:
         stocks = idx.get("stocks") or {}
         for sym, d in sorted(summaries.items()):
             old = stocks.get(sym) or {}
+            # one file per company and quarter, kept forever (concall/SYM_Q2-FY27.json); index.json names the latest
+            qk = re.sub(r"[^A-Za-z0-9\-]", "", str(d.get("qtr") or d["date"]).replace(" ", "-")) or str(d["date"])
+            await r2_upload(client, f"concall/{sym}_{qk}.json", json.dumps(d, ensure_ascii=False))
+            hist = list(old.get("hist") or [])
+            if qk not in hist: hist.append(qk)
             if old.get("date") and str(old["date"]) > str(d["date"]):
-                log.info(f"  {sym}: R2 has a newer call ({old['date']} > {d['date']}) — skipped"); continue
-            await r2_upload(client, f"concall/{sym}.json", json.dumps(d, ensure_ascii=False))
-            stocks[sym] = {"date": d["date"], "qtr": d.get("qtr"), "tone": d.get("tone")}
+                log.info(f"  {sym}: R2 has a newer call ({old['date']} > {d['date']}) — older quarter saved, latest kept")
+                stocks[sym] = dict(old, hist=hist); continue
+            stocks[sym] = {"date": d["date"], "qtr": d.get("qtr"), "tone": d.get("tone"), "hist": hist, "file": f"{sym}_{qk}.json"}
         idx = {"updated": datetime.now(ZoneInfo("Asia/Kolkata")).date().isoformat(), "stocks": stocks}
         await r2_upload(client, "concall/index.json", json.dumps(idx, ensure_ascii=False))
         log.info(f"Concall upload: {len(summaries)} summary file(s), index has {len(stocks)} companies")
@@ -8871,8 +8708,12 @@ if __name__ == "__main__":
         case "vcp_scan":      asyncio.run(run_vcp_scan())
         case "ath_backfill":  asyncio.run(run_ath_backfill())
         case "ath_reset":     asyncio.run(run_ath_reset())
-        case "finedge_hist_test": asyncio.run(run_finedge_hist_test([x for a in sys.argv[2:] for x in re.split(r"[,\s]+", a) if x] or ["VEDL", "ITC"]))
-        case "concall_fetch": asyncio.run(run_concall_fetch(int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 7))
+        case "concall_fetch":
+            a2 = sys.argv[2] if len(sys.argv) > 2 else ""
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", a2):
+                asyncio.run(run_concall_fetch(from_date=a2, to_date=sys.argv[3] if len(sys.argv) > 3 else None))
+            else:
+                asyncio.run(run_concall_fetch(int(a2) if a2.isdigit() else 7))
         case "concall_upload": asyncio.run(run_concall_upload(sys.argv[2] if len(sys.argv) > 2 else ""))
         case _:
             print(__doc__)
