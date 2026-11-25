@@ -8709,11 +8709,12 @@ if __name__ == "__main__":
         case "ath_backfill":  asyncio.run(run_ath_backfill())
         case "ath_reset":     asyncio.run(run_ath_reset())
         case "concall_fetch":
-            a2 = sys.argv[2] if len(sys.argv) > 2 else ""
-            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", a2):
-                asyncio.run(run_concall_fetch(from_date=a2, to_date=sys.argv[3] if len(sys.argv) > 3 else None))
+            # "7" | "2026-10-01" | "2026-10-01 2026-11-25" | "2026-10-01,2026-11-25" (one arg from GitHub Actions or two)
+            ca = re.split(r"[\s,]+", " ".join(sys.argv[2:]).strip()) if len(sys.argv) > 2 else [""]
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", ca[0]):
+                asyncio.run(run_concall_fetch(from_date=ca[0], to_date=ca[1] if len(ca) > 1 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", ca[1]) else None))
             else:
-                asyncio.run(run_concall_fetch(int(a2) if a2.isdigit() else 7))
+                asyncio.run(run_concall_fetch(int(ca[0]) if ca[0].isdigit() else 7))
         case "concall_upload": asyncio.run(run_concall_upload(sys.argv[2] if len(sys.argv) > 2 else ""))
         case _:
             print(__doc__)
