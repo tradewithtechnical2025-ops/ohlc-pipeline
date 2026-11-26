@@ -3157,7 +3157,13 @@ def _build_screener_feed(all_data, classification, rs_data, mswing_data,
         high52=max(w52_highs) if w52_highs else None; low52=min(w52_lows) if w52_lows else None
         whd52=round((ltp-high52)/high52*100,2) if high52 else None
         wld52=round((ltp-low52)/low52*100,2) if low52 else None
-        new_52wh=bool(high52 and ltp>=high52); new_52wl=bool(low52 and ltp<=low52)
+        # New 52-week high / low = today's high (low) reached the highest high (lowest low) of the earlier
+        # sessions of the same 365-day window, like NSE's 52-week high list. (Before: the close had to be at or
+        # above a 52W high that already included today's high, so only stocks closing at the day's high counted.)
+        prior_h=[v for v in highs[w52_start:-1] if v is not None]; prior_l=[v for v in lows[w52_start:-1] if v is not None]
+        traded_today=closes[-1] is not None
+        new_52wh=bool(traded_today and prior_h and highs[-1] is not None and highs[-1]>=max(prior_h))
+        new_52wl=bool(traded_today and prior_l and lows[-1] is not None and lows[-1]<=min(prior_l))
         avg_vol20=sum(v for v in volumes[-21:-1] if v)/20 if n>=21 else None
         avg_vol50=sum(v for v in volumes[-51:-1] if v)/50 if n>=51 else None
         rvol=round(vol/avg_vol20,2) if avg_vol20 and vol else None
