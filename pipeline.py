@@ -8454,6 +8454,7 @@ def _concall_pdf_text(raw):
     try:
         import io
         from pypdf import PdfReader
+        logging.getLogger("pypdf").setLevel(logging.ERROR)   # font/encoding warnings are noise here
         return " ".join((p.extract_text() or "") for p in PdfReader(io.BytesIO(raw)).pages[:40])
     except Exception:
         pass
@@ -8567,9 +8568,14 @@ async def run_concall_fetch(days=7, from_date=None, to_date=None) -> None:
         done = {}
         try: done = (await r2_download(client, "concall/index.json") or {}).get("stocks") or {}
         except Exception as e: log.warning(f"Concall: concall/index.json not read ({e}) — nothing skipped")
-        # skip calls already summarised, and calls older than the latest one we have
-        todo = [r for r in rows if (done.get(r["sym"]) or {}).get("date") != r["call_date"]
-                and str((done.get(r["sym"]) or {}).get("date") or "") <= r["call_date"]]
+        # skip calls already summarised. The index keeps the date the call was held, while the filing date is
+        # often all we get here (usually 1-10 days later), so a summary dated up to 30 days before counts as this call.
+        def _have(r):
+            d0 = str((done.get(r["sym"]) or {}).get("date") or "")
+            if not d0: return False
+            try: return (date.fromisoformat(r["call_date"]) - date.fromisoformat(d0)).days <= 30
+            except ValueError: return d0 >= r["call_date"]
+        todo = [r for r in rows if not _have(r)]
         log.info(f"Concall: {len(rows) - len(todo)} already summarised, {len(todo)} to fetch")
         out = Path(f"concall_inbox_{fr_d.isoformat()}_{to_d.isoformat()}.zip" if from_date else f"concall_inbox_{to_d.isoformat()}.zip")
         got, failed, link_only, scanned = [], [], [], []
